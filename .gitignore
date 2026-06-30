@@ -12,6 +12,7 @@ build/
 .venv/
 venv/
 env/
+node_modules/
 
 # SQLite databases
 *.db

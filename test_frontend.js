@@ -1,17 +1,31 @@
 const fs = require('fs');
+const assert = require('assert');
 const jsdom = require("jsdom");
 const { JSDOM } = jsdom;
 
 const code = fs.readFileSync('static/translator.js', 'utf-8');
 
-// Mock fetch
 let fetchCalls = [];
 let fetchResponses = [];
+let activeFetches = 0;
+let maxActiveFetches = 0;
+
 global.fetch = async (url, options) => {
-    fetchCalls.push({url, options});
+    activeFetches++;
+    if (activeFetches > maxActiveFetches) {
+        maxActiveFetches = activeFetches;
+    }
+    fetchCalls.push({url, options, time: Date.now()});
+    
+    // Simulate network delay
+    await new Promise(r => setTimeout(r, 50));
+    
     const nextResp = fetchResponses.shift();
+    activeFetches--;
+    
     if (nextResp instanceof Error) throw nextResp;
     if (typeof nextResp === 'function') return nextResp();
+    
     return {
         ok: nextResp ? nextResp.status < 400 : false,
         status: nextResp ? nextResp.status : 500,
@@ -27,9 +41,6 @@ const dom = new JSDOM(`
     <div id="viewer">
         <iframe></iframe>
     </div>
-    <p>para 1</p>
-    <p>para 2</p>
-    <p>para 3</p>
 </body>
 </html>
 `, {
@@ -37,16 +48,16 @@ const dom = new JSDOM(`
     runScripts: "dangerously"
 });
 
-// Setup mock iframe
 const iframeDoc = dom.window.document.querySelector("iframe").contentDocument;
 iframeDoc.body.innerHTML = `
     <p class="calibre1">visible 1</p>
     <p class="calibre1">visible 2</p>
     <p class="calibre1">prefetch 1</p>
     <p class="calibre1">prefetch 2</p>
+    <p class="calibre1">prefetch 3</p>
+    <p class="calibre1">prefetch 4</p>
 `;
 
-// Mock getBoundingClientRect
 iframeDoc.querySelectorAll('p').forEach((p, idx) => {
     p.getBoundingClientRect = () => ({
         width: 100, height: 20,
@@ -57,11 +68,11 @@ dom.window.innerWidth = 800;
 dom.window.innerHeight = 600;
 dom.window.localStorage.setItem('bt_mode', 'translated');
 dom.window.localStorage.setItem('bt_prefetch', '1');
+dom.window.localStorage.setItem('bt_lang', 'English');
 
 dom.window.requestAnimationFrame = (cb) => setTimeout(cb, 16);
 dom.window.fetch = global.fetch;
 
-// Run the script
 const scriptEl = dom.window.document.createElement("script");
 scriptEl.textContent = code;
 dom.window.document.body.appendChild(scriptEl);
@@ -71,33 +82,89 @@ async function wait(ms) {
 }
 
 async function runTest() {
-    console.log("Starting frontend test...");
+    console.log("Starting frontend assertions test...");
     
-    // Wait for init
-    await wait(1000);
-    
-    // There should be a fetch call for the visible elements
-    console.log("Fetch calls:", fetchCalls.length);
-    
-    // Provide a rate limit response
+    // 1. Initial page load will trigger visible queue (1 chunk) then prefetch queue (3 chunks).
+    // Let's provide a 429 response first for the visible request.
     fetchResponses.push({
         status: 429,
-        body: { error: 'rate_limited', retry_after: 2 }
+        body: { error: 'rate_limited', retry_after: 1 } // wait 1s
     });
     
-    // Provide a success response later
+    await wait(800);
+    
+    // Wait for the UI state to update after 429
+    const btBar = dom.window.document.getElementById('bt-bar');
+    const statusText = dom.window.document.getElementById('bt-status-text').textContent;
+    
+    console.log("Status text after 429:", statusText);
+    assert(btBar.dataset.state === 'ratelimit', 'State should be ratelimit');
+    assert(statusText.includes('Rate limited') || statusText.includes('waiting'), 'Should show rate limited message, not fatal error');
+    assert(maxActiveFetches <= 1, 'Only one fetch active at a time');
+    
+    // Provide a valid response for when it resumes (for visible 1)
     fetchResponses.push({
         status: 200,
-        body: { translations: ["Trans 1"] }
+        body: { translations: ["Translated visible 1"] }
     });
-
-    await wait(3000); // Wait for rate limit to expire and next fetch
-    console.log("Fetch calls after wait:", fetchCalls.length);
-    const btBar = dom.window.document.getElementById('bt-bar');
-    console.log("State:", btBar ? btBar.dataset.state : 'No bar');
+    // Provide a valid response for visible 2
+    fetchResponses.push({
+        status: 200,
+        body: { translations: ["Translated visible 2"] }
+    });
     
-    console.log("DONE");
+    // Provide responses for the remaining prefetch blocks
+    fetchResponses.push({
+        status: 200,
+        body: { translations: ["Translated prefetch 1", "Translated prefetch 2", "Translated prefetch 3"] }
+    });
+    fetchResponses.push({
+        status: 200,
+        body: { translations: ["Translated prefetch 4"] }
+    });
+    
+    const timeBeforeResume = Date.now();
+    await wait(3000); // Wait for the 1s retry_after + gap + all fetches to complete
+    
+    // The second and third fetch calls should happen AFTER the retry_after delay
+    assert(fetchCalls.length >= 2, 'Queue should resume after 429');
+    
+    const delay = fetchCalls[1].time - fetchCalls[0].time;
+    console.log("Delay before retry (ms):", delay);
+    assert(delay >= 950, 'Retry-After delay should be honored approximately'); // >= 1000ms theoretically
+    
+    // Look at the bodies of the first few fetch calls to ensure visible happens before prefetch
+    const call1Body = JSON.parse(fetchCalls[0].options.body); // was 429
+    const call2Body = JSON.parse(fetchCalls[1].options.body); // visible 1 retry
+    const call3Body = JSON.parse(fetchCalls[2].options.body); // visible 2
+    
+    assert(call1Body.paragraphs[0] === 'visible 1', 'First fetch should be visible 1');
+    assert(call2Body.paragraphs[0] === 'visible 1', 'Second fetch (retry) should be visible 1');
+    assert(call3Body.paragraphs[0] === 'visible 2', 'Third fetch should be visible 2');
+    
+    const allFetchedParagraphs = fetchCalls.map(c => JSON.parse(c.options.body).paragraphs).flat();
+    
+    fetchCalls.forEach((c, i) => {
+        console.log(`Fetch ${i}:`, JSON.parse(c.options.body).paragraphs);
+    });
+    
+    // visible 1, visible 1, visible 2, prefetch 1, prefetch 2, prefetch 3, prefetch 4
+    // We expect 7 paragraphs in total passed to fetch
+    const uniqueParagraphs = new Set(allFetchedParagraphs);
+    console.log("All fetched paragraphs:", allFetchedParagraphs);
+    
+    // Ensure no accidental duplicates beyond the retry
+    const nonRetryParagraphs = allFetchedParagraphs.slice(1);
+    const hasDups = new Set(nonRetryParagraphs).size !== nonRetryParagraphs.length;
+    assert(!hasDups, 'There should be no duplicate translation blocks requested');
+    
+    assert(maxActiveFetches === 1, 'Never exceeded one active fetch');
+    
+    console.log("All assertions passed.");
     process.exit(0);
 }
 
-runTest().catch(console.error);
+runTest().catch(err => {
+    console.error("Test failed:", err);
+    process.exit(1);
+});

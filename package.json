@@ -1,0 +1,22 @@
+{
+  "name": "book-translator",
+  "version": "1.0.0",
+  "description": "Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated). Translate ebooks paragraph-by-paragraph while reading, using local LLMs (vLLM, LM Studio, Ollama) or any major Cloud API (OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter).",
+  "main": "test_frontend.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "node test_frontend.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://felix:d6f63e2a7b3f419772921df202afc88e94ef6e3c@192.168.0.122:3010/felix/CWA-translate-plugin.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}
