@@ -1,0 +1,241 @@
+/**
+ * book-translator — Bilingual reading styles
+ * Injected into Calibre-Web-Automated reader.
+ */
+
+/* ── Translation paragraph styles ───────────────────────────────────── */
+.bt-translation {
+    color: #1565c0 !important;
+    font-style: italic;
+    padding: 4px 0 12px 16px;
+    margin-bottom: 8px;
+    border-left: 3px solid #90caf9;
+    font-size: 0.95em;
+    line-height: 1.7;
+    opacity: 0;
+    animation: bt-slide-in 0.3s ease forwards;
+}
+
+.bt-translation:hover {
+    opacity: 1 !important;
+}
+
+/* ── Slide-in animation for new translation paragraphs ──────────────── */
+@keyframes bt-slide-in {
+    from {
+        opacity: 0;
+        transform: translateY(-8px);
+    }
+    to {
+        opacity: 0.92;
+        transform: translateY(0);
+    }
+}
+
+/* ── Bilingual mode: original paragraphs get subtle styling ─────────── */
+.bt-original {
+    /* Original text stays default, just a tiny marker */
+}
+
+/* ── Translation-only mode ──────────────────────────────────────────── */
+[data-original-text] {
+    color: #1a1a1a;
+    font-style: normal;
+}
+
+/* ── Toolbar button styles ──────────────────────────────────────────── */
+#btn-translate-toggle {
+    transition: background-color 0.2s, box-shadow 0.2s;
+}
+
+#btn-translate-toggle:hover {
+    background-color: #e3f2fd;
+    box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.15);
+}
+
+#btn-translate-toggle.active {
+    background-color: #bbdefb;
+    border-color: #1a73e8;
+}
+
+/* ── Progress counter ───────────────────────────────────────────────── */
+#bt-progress {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: rgba(26, 115, 232, 0.12);
+    color: #1a73e8;
+    font-size: 12px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-weight: 500;
+    vertical-align: middle;
+    letter-spacing: 0.3px;
+}
+
+/* ── Floating button (glassmorphism design) ──────────────────────────── */
+#translator-float {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9999;
+    background: rgba(26, 115, 232, 0.85);
+    backdrop-filter: blur(12px) saturate(180%);
+    -webkit-backdrop-filter: blur(12px) saturate(180%);
+    color: white;
+    padding: 14px 24px;
+    border-radius: 28px;
+    cursor: pointer;
+    font-size: 16px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-weight: 500;
+    box-shadow:
+        0 8px 32px rgba(26, 115, 232, 0.35),
+        0 2px 8px rgba(0, 0, 0, 0.15),
+        inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    transition: transform 0.2s ease, box-shadow 0.25s ease, background 0.2s;
+    user-select: none;
+}
+
+#translator-float:hover {
+    transform: translateY(-2px);
+    box-shadow:
+        0 12px 40px rgba(26, 115, 232, 0.45),
+        0 4px 12px rgba(0, 0, 0, 0.2),
+        inset 0 1px 0 rgba(255, 255, 255, 0.25);
+    background: rgba(26, 115, 232, 0.95);
+}
+
+#translator-float:active {
+    transform: scale(0.96) translateY(0);
+}
+
+/* ── Language selector ──────────────────────────────────────────────── */
+#target-lang-select {
+    max-width: 140px;
+}
+
+/* ── Loading spinner for translations ────────────────────────────────── */
+.bt-loading {
+    animation: bt-pulse 1.5s infinite;
+    color: #90a4ae;
+    font-style: italic;
+    padding: 4px 0 4px 16px;
+    font-size: 0.9em;
+}
+
+@keyframes bt-pulse {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 1; }
+}
+
+/* ── Toast notification ─────────────────────────────────────────────── */
+#bt-toast {
+    position: fixed;
+    bottom: 80px;
+    right: 24px;
+    z-index: 10000;
+    background: rgba(30, 30, 30, 0.9);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #fff;
+    padding: 12px 24px;
+    border-radius: 12px;
+    font-size: 14px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-weight: 500;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    opacity: 0;
+    transform: translateY(16px) scale(0.95);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    pointer-events: none;
+}
+
+#bt-toast.bt-toast-visible {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+}
+
+/* ── Dark mode support (prefers-color-scheme) ───────────────────────── */
+@media (prefers-color-scheme: dark) {
+    .bt-translation {
+        color: #64b5f6 !important;
+        border-left-color: #1565c0;
+    }
+
+    #btn-translate-toggle:hover {
+        background-color: #1e3a5f;
+    }
+
+    #btn-translate-toggle.active {
+        background-color: #1565c0;
+        color: white;
+    }
+
+    .bt-loading {
+        color: #78909c;
+    }
+
+    #bt-progress {
+        background: rgba(100, 181, 246, 0.15);
+        color: #64b5f6;
+    }
+
+    [data-original-text] {
+        color: #e0e0e0;
+    }
+}
+
+/* ── CWA Theme: Dark ────────────────────────────────────────────────── */
+/* CWA sets inline background-color on #main for dark theme */
+#main[style*="background-color: #000"],
+#main[style*="background-color:#000"],
+#main[style*="background: #000"],
+body.dark-theme {
+    --bt-text: #64b5f6;
+    --bt-border: #1565c0;
+    --bt-original: #e0e0e0;
+}
+
+/* ── CWA Theme: Sepia ───────────────────────────────────────────────── */
+#main[style*="background-color: #f4ecd8"],
+#main[style*="background-color:#f4ecd8"],
+#main[style*="background: #f4ecd8"],
+body.sepia-theme {
+    --bt-text: #5d4037;
+    --bt-border: #a1887f;
+    --bt-original: #3e2723;
+}
+
+/* ── CWA Theme: Black (OLED) ────────────────────────────────────────── */
+#main[style*="background-color: #111"],
+#main[style*="background-color:#111"],
+#main[style*="background: #111"],
+body.black-theme {
+    --bt-text: #90caf9;
+    --bt-border: #1976d2;
+    --bt-original: #bdbdbd;
+}
+
+/* Apply CSS custom properties when set by theme selectors */
+#main[style] .bt-translation,
+body[class*="-theme"] .bt-translation {
+    color: var(--bt-text, #1565c0) !important;
+    border-left-color: var(--bt-border, #90caf9);
+}
+
+#main[style] [data-original-text],
+body[class*="-theme"] [data-original-text] {
+    color: var(--bt-original, #1a1a1a);
+}
+
+/* ── CWA-specific overrides ─────────────────────────────────────────── */
+/* CWA uses Bootstrap 3, so we make sure our styles take priority */
+.cwa-reader .bt-translation,
+.reader-content .bt-translation,
+#book-content .bt-translation {
+    display: block !important;
+    max-width: none !important;
+}
