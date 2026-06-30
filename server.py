@@ -163,9 +163,9 @@ def _translate_paragraphs(
             misses.append(para)
             miss_indices.append(i)
 
-    # Translate misses concurrently
+    # Translate misses concurrently (concurrency controlled by BT_MAX_CONCURRENT)
     if misses:
-        results = translate_batch(misses, source_lang, target_lang, max_concurrent=3)
+        results = translate_batch(misses, source_lang, target_lang)
         for idx, (translated, backend) in zip(miss_indices, results):
             translations[idx] = translated
             if not translated.startswith("[TRANSLATION ERROR:"):

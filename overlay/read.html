@@ -21,9 +21,13 @@
     <!-- book-translator: bilingual reading overlay -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/translator.css') }}">
     <script>
-        // book-translator configuration
+        // book-translator configuration.
+        // Leave apiUrl empty to auto-resolve to http://<current-host>:8390 — this
+        // keeps the overlay working over the LAN (a hardcoded localhost would only
+        // work when the browser runs on the server itself). Set it only if the API
+        // lives on a different host/port.
         window.BOOK_TRANSLATOR = {
-            apiUrl: 'http://localhost:8390',
+            apiUrl: '',
             sourceLang: 'English',
             targetLang: 'Spanish',
             prefetchPages: 5

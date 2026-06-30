@@ -21,6 +21,11 @@ ENV LLM_PROVIDER="local"
 ENV LLM_MODEL="gemma4-12b"
 ENV LLM_API_KEY=""
 
+# Stability tunables (override at runtime). For a slow local model keep
+# concurrency low; BT_LOCAL_URL must point at the host, not the container.
+ENV BT_MAX_CONCURRENT="2"
+ENV BT_TIMEOUT="60"
+
 # Expose the API port
 EXPOSE 8390
 

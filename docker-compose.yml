@@ -12,10 +12,10 @@ services:
       - ./config/cwa:/config
       - ./books:/calibre-library
       - ./ingest:/cwa-book-ingest
-      # Inject the translator plugin files
+      # Inject the translator plugin files (JS/CSS live in ./static, page template in ./overlay)
       - ./overlay/read.html:/app/calibre-web-automated/cps/templates/read.html:ro
-      - ./overlay/translator.js:/app/calibre-web-automated/cps/static/js/translator.js:ro
-      - ./overlay/translator.css:/app/calibre-web-automated/cps/static/css/translator.css:ro
+      - ./static/translator.js:/app/calibre-web-automated/cps/static/js/translator.js:ro
+      - ./static/translator.css:/app/calibre-web-automated/cps/static/css/translator.css:ro
     ports:
       - "8083:8083"
     restart: unless-stopped
@@ -30,7 +30,18 @@ services:
       - LLM_PROVIDER=local
       - LLM_MODEL=gemma4-12b
       - LLM_API_KEY=
-      # If using an external proxy, ensure CORS is handled or map correctly
+      # For provider=local: point at the LLM on the HOST, not the container.
+      # host.docker.internal resolves to the host via the extra_hosts mapping below.
+      - BT_LOCAL_URL=http://host.docker.internal:1234/v1/chat/completions
+      # Slow local model? Lower concurrency (1-2) is more stable than 3.
+      - BT_MAX_CONCURRENT=2
+      - BT_TIMEOUT=60
+      # Optional resilience: fall back to a cloud provider when local fails.
+      # - LLM_FALLBACK_PROVIDER=minimax
+      # - LLM_FALLBACK_MODEL=MiniMax-M3
+      # - LLM_FALLBACK_API_KEY=
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./config/translator:/app/data
     ports:

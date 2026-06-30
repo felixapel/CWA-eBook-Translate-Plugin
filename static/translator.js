@@ -4,19 +4,25 @@
 
 (function () {
     // ── Configuration ──────────────────────────────────────────────────
-    const TRANSLATOR_URL = window.location.protocol === 'https:' ? '' : `http://${window.location.hostname}:8390`;
-    let SOURCE_LANG = 'English'; // Assume source is English
-    
+    // Optional overrides injected by the CWA template (window.BOOK_TRANSLATOR).
+    // An empty/absent apiUrl falls back to dynamic host-based resolution so the
+    // overlay keeps working when accessed over the LAN (not just localhost).
+    const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
+    const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
+        ? cfg.apiUrl
+        : (window.location.protocol === 'https:' ? '' : `http://${window.location.hostname}:8390`);
+    let SOURCE_LANG = cfg.sourceLang || 'English'; // Assume source is English
+
     // Map browser language to full language name for the backend
     const langMap = {
         'es': 'Spanish', 'en': 'English', 'fr': 'French', 'de': 'German',
         'pt': 'Portuguese', 'it': 'Italian', 'ru': 'Russian', 'zh': 'Chinese',
         'ja': 'Japanese'
     };
-    
+
     const browserCode = (navigator.language || 'es').split('-')[0];
     const defaultLang = langMap[browserCode] || 'Spanish';
-    let TARGET_LANG = localStorage.getItem('bt_lang') || defaultLang;
+    let TARGET_LANG = localStorage.getItem('bt_lang') || cfg.targetLang || defaultLang;
 
     let translationMode = localStorage.getItem('bt_mode') || 'off'; // 'off', 'bilingual', 'translated'
     let isTranslating = false;
@@ -24,6 +30,39 @@
     let prefetchQueue = [];
     let isPrefetching = false;
     let lastFirstVisibleHash = null;
+
+    // ── In-flight request control (responsive buttons + language switches) ──
+    // `generation` is bumped whenever the user changes mode/language so that
+    // stale in-flight responses are ignored. `activeControllers` lets us abort
+    // pending fetches immediately instead of blocking the UI until they finish.
+    let generation = 0;
+    const activeControllers = new Set();
+
+    function newGeneration() {
+        generation++;
+        for (const c of activeControllers) {
+            try { c.abort(); } catch (e) { /* ignore */ }
+        }
+        activeControllers.clear();
+        prefetchQueue = [];
+        isTranslating = false;
+        isPrefetching = false;
+        updateLoadingIndicator();
+        return generation;
+    }
+
+    function isBadTranslation(tr) {
+        // Treat backend error markers and empty results as "not translated" so
+        // they are neither rendered nor cached client-side — letting them retry.
+        return !tr || typeof tr !== 'string'
+            || tr.startsWith('[TRANSLATION ERROR')
+            || tr.startsWith('[ERROR');
+    }
+
+    function renderMode(elements) {
+        if (translationMode === 'bilingual') showTranslationsBilingual(elements);
+        else if (translationMode === 'translated') showTranslationsInline('translated', elements);
+    }
 
     // ── i18n ───────────────────────────────────────────────────────────
     const strings = {
@@ -78,8 +117,8 @@
         sel.onchange = (e) => {
             TARGET_LANG = e.target.value;
             localStorage.setItem('bt_lang', TARGET_LANG);
-            translatedParagraphs = {}; // clear cache
-            prefetchQueue = []; // clear prefetch
+            newGeneration();              // abort in-flight old-language requests
+            translatedParagraphs = {};    // clear client cache
             if (translationMode !== 'off') {
                 removeAllTranslations();
                 translateCurrentPage();
@@ -102,18 +141,24 @@
         updateBtnState();
 
         btn.onclick = () => {
+            const prevMode = translationMode;
             if (translationMode === 'off') translationMode = 'bilingual';
             else if (translationMode === 'bilingual') translationMode = 'translated';
             else translationMode = 'off';
-            
+
             localStorage.setItem('bt_mode', translationMode);
             updateBtnState();
 
             if (translationMode === 'off') {
-                prefetchQueue = [];
+                newGeneration();            // cancel in-flight work so the next ON works immediately
                 removeAllTranslations();
                 showToast(t.off);
+            } else if (prevMode === 'off') {
+                translateCurrentPage();     // fresh start
             } else {
+                // Switching bilingual <-> translated: re-render cached paragraphs
+                // instantly (no waiting on the in-flight batch), then keep filling gaps.
+                renderMode(getParagraphs());
                 translateCurrentPage();
             }
         };
@@ -251,11 +296,18 @@
         if (isTranslating || translationMode === 'off') return;
         isTranslating = true;
         updateLoadingIndicator();
+        const myGen = generation;
 
         // 1. Prioritize visible paragraphs
         const visible = getVisibleParagraphs();
         if (visible.length > 0) {
-            await translateBatchOfElements(visible);
+            await translateBatchOfElements(visible, myGen);
+        }
+
+        // Bail if a newer run (mode/language change) superseded us.
+        if (myGen !== generation) {
+            updateLoadingIndicator();
+            return;
         }
 
         // 2. Queue remaining paragraphs in chapter for background prefetch
@@ -263,11 +315,11 @@
         const remaining = all.filter(el => !visible.includes(el));
         queuePrefetch(remaining);
 
-        isTranslating = false;
+        if (myGen === generation) isTranslating = false;
         updateLoadingIndicator();
     }
 
-    async function translateBatchOfElements(elements) {
+    async function translateBatchOfElements(elements, myGen) {
         const toTranslate = [];
         elements.forEach(el => {
             const text = getParagraphText(el);
@@ -279,6 +331,8 @@
         });
 
         if (toTranslate.length > 0) {
+            const controller = new AbortController();
+            activeControllers.add(controller);
             try {
                 const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                     method: 'POST',
@@ -288,31 +342,28 @@
                         source_lang: SOURCE_LANG,
                         target_lang: TARGET_LANG,
                     }),
+                    signal: controller.signal,
                 });
 
                 if (resp.ok) {
                     const data = await resp.json();
+                    if (myGen !== generation) return; // superseded — drop stale result
                     data.translations.forEach((tr, idx) => {
-                        translatedParagraphs[toTranslate[idx].hash] = tr;
+                        // Don't cache errors/empties so they retry next pass.
+                        if (!isBadTranslation(tr)) {
+                            translatedParagraphs[toTranslate[idx].hash] = tr;
+                        }
                     });
-                    
-                    // Render
-                    if (translationMode === 'bilingual') {
-                        showTranslationsBilingual(elements);
-                    } else if (translationMode === 'translated') {
-                        showTranslationsInline('translated', elements);
-                    }
+                    renderMode(elements);
                 }
             } catch (e) {
-                console.error("Batch translation error:", e);
+                if (e.name !== 'AbortError') console.error("Batch translation error:", e);
+            } finally {
+                activeControllers.delete(controller);
             }
         } else {
             // Already cached, just render
-            if (translationMode === 'bilingual') {
-                showTranslationsBilingual(elements);
-            } else if (translationMode === 'translated') {
-                showTranslationsInline('translated', elements);
-            }
+            renderMode(elements);
         }
     }
 
@@ -333,8 +384,9 @@
         if (isPrefetching || prefetchQueue.length === 0) return;
         isPrefetching = true;
         updateLoadingIndicator();
+        const myGen = generation;
 
-        while (prefetchQueue.length > 0 && translationMode !== 'off') {
+        while (prefetchQueue.length > 0 && translationMode !== 'off' && myGen === generation) {
             // Take 3 paragraphs at a time to keep it sequential and light
             const batch = prefetchQueue.slice(0, 3);
             prefetchQueue = prefetchQueue.slice(3);
@@ -349,6 +401,8 @@
             }).filter(b => b.text && b.text.length >= 2 && !translatedParagraphs[b.hash]);
 
             if (toTranslate.length > 0) {
+                const controller = new AbortController();
+                activeControllers.add(controller);
                 try {
                     const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                         method: 'POST',
@@ -358,32 +412,31 @@
                             source_lang: SOURCE_LANG,
                             target_lang: TARGET_LANG,
                         }),
+                        signal: controller.signal,
                     });
 
                     if (resp.ok) {
                         const data = await resp.json();
+                        if (myGen !== generation) break; // superseded — stop the loop
                         data.translations.forEach((tr, idx) => {
-                            translatedParagraphs[toTranslate[idx].hash] = tr;
+                            if (!isBadTranslation(tr)) {
+                                translatedParagraphs[toTranslate[idx].hash] = tr;
+                            }
                         });
-                        
-                        // If they are currently visible, render them immediately
-                        const batchElements = toTranslate.map(b => b.el);
-                        if (translationMode === 'bilingual') {
-                            showTranslationsBilingual(batchElements);
-                        } else if (translationMode === 'translated') {
-                            showTranslationsInline('translated', batchElements);
-                        }
+                        renderMode(toTranslate.map(b => b.el));
                     }
                 } catch (e) {
-                    console.error("Prefetch error:", e);
+                    if (e.name !== 'AbortError') console.error("Prefetch error:", e);
+                } finally {
+                    activeControllers.delete(controller);
                 }
             }
-            
+
             // Sleep 800ms between prefetch requests to prevent API overload
             await new Promise(resolve => setTimeout(resolve, 800));
         }
 
-        isPrefetching = false;
+        if (myGen === generation) isPrefetching = false;
         updateLoadingIndicator();
     }
 
@@ -394,7 +447,7 @@
             if (!text) return;
             const hash = hashText(text);
             const translated = translatedParagraphs[hash];
-            if (!translated || translated === text || translated.startsWith('[ERROR')) return;
+            if (isBadTranslation(translated) || translated === text) return;
 
             let transEl = el.querySelector('.bt-translation');
             if (transEl) {
@@ -420,11 +473,15 @@
             if (!text) return;
             const hash = hashText(text);
             const translated = translatedParagraphs[hash];
-            if (!translated || translated.startsWith('[ERROR')) return;
+            if (isBadTranslation(translated)) return;
 
+            // Store the CLEAN original (getParagraphText strips any bt spans) so
+            // toggling back off restores correctly even after bilingual rendering.
             if (!el.dataset.originalText) {
-                el.dataset.originalText = el.textContent;
+                el.dataset.originalText = text;
             }
+            // Remove any bilingual/loading spans before replacing the text.
+            el.querySelectorAll('.bt-translation, .bt-loading').forEach(n => n.remove());
             el.textContent = translated;
         });
     }

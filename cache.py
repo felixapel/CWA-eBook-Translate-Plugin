@@ -78,7 +78,7 @@ def get_cached(text: str, source_lang: str, target_lang: str) -> str | None:
             return row[0]
         return None
     except Exception:
-        conn.rollback()
+        # Read-only SELECT: nothing to roll back, just surface the error.
         raise
 
 
