@@ -144,9 +144,19 @@ def run():
     check("context: previous/next contexts included in batch prompt", 
           "[NEXT CONTEXT]" in received_contexts[0] and "[PREVIOUS CONTEXT]" in received_contexts[0])
 
-    # Validation.
     check("invalid language rejected",
           client.post("/translate", json={"text": "x", "target_lang": "Klingon"}).status_code == 400)
+
+    # Rate Limiting
+    server._rate_limit_store.clear()
+    limit = server.RATE_LIMIT_MAX
+    for i in range(limit):
+        client.post("/translate", json={"text": f"rate{i}"})
+    resp = client.post("/translate", json={"text": "limit_test"})
+    check("rate limit: returns status 429", resp.status_code == 429)
+    check("rate limit: response has Retry-After header", "Retry-After" in resp.headers)
+    check("rate limit: response JSON has retry_after", resp.get_json().get("retry_after") is not None)
+    server._rate_limit_store.clear()
 
 
 if __name__ == "__main__":

@@ -78,8 +78,11 @@ def _is_origin_allowed(origin: str | None) -> str | None:
 
 _rate_limit_lock = threading.Lock()
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
-RATE_LIMIT_MAX = 60     # requests per window
-RATE_LIMIT_WINDOW = 60  # seconds
+BT_RATE_LIMIT_PER_MINUTE = int(os.environ.get("BT_RATE_LIMIT_PER_MINUTE", "120"))
+BT_RATE_LIMIT_RETRY_AFTER = int(os.environ.get("BT_RATE_LIMIT_RETRY_AFTER", "10"))
+
+RATE_LIMIT_MAX = BT_RATE_LIMIT_PER_MINUTE
+RATE_LIMIT_WINDOW = 60
 
 
 def _cleanup_rate_limits():
@@ -208,10 +211,13 @@ def before_request_hook():
         client_ip = request.remote_addr or "unknown"
         if not _check_rate_limit(client_ip):
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
-            return jsonify({
-                "error": "Rate limit exceeded. Max 60 requests per minute.",
+            response = jsonify({
+                "error": "rate_limited",
+                "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
                 "request_id": request.request_id,
-            }), 429
+            })
+            response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
+            return response, 429
 
 
 @app.after_request

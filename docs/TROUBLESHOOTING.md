@@ -29,6 +29,15 @@ docker exec calibre-web-automated grep -n "BT_UI_VERSION" /app/calibre-web-autom
 
 ---
 
+## 2. Frequent "Rate limited — waiting Ns..." messages
+
+- **Backend limit reached**: You are hitting the global request limit per IP.
+  - The default limit is 120 requests per minute (`BT_RATE_LIMIT_PER_MINUTE`).
+  - Increase this via `BT_RATE_LIMIT_PER_MINUTE` environment variable on the server.
+- **Aggressive frontend prefetch**: The frontend defaults to requesting chapter paragraphs progressively. To slow it down, you can increase `BT_CLIENT_MIN_REQUEST_GAP_MS`.
+
+---
+
 ## 2. Spinner / progress bar missing or invisible
 
 - **Old JS cached**: Hard refresh the reader page (`Ctrl+Shift+R` / `Cmd+Shift+R`).

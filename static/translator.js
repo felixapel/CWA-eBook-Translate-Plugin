@@ -26,10 +26,18 @@
     const defaultLang = langMap[browserCode] || 'Spanish';
     let TARGET_LANG = localStorage.getItem('bt_lang') || cfg.targetLang || defaultLang;
 
+    const BT_CLIENT_MAX_INFLIGHT = 1;
+    const BT_CLIENT_MIN_REQUEST_GAP_MS = 500;
+    const BT_CLIENT_RATE_LIMIT_BACKOFF_MS = 10000;
+
     let translationMode = localStorage.getItem('bt_mode') || 'off'; // 'off', 'bilingual', 'translated'
     let isTranslating = false;
-    let prefetchQueue = [];
     let isPrefetching = false;
+    let visibleQueue = [];
+    let prefetchQueue = [];
+    let isPumpRunning = false;
+    let rateLimitUntil = 0;
+    let lastRequestEnd = 0;
     let lastFirstVisibleHash = null;
 
     // UI / status state
@@ -97,6 +105,7 @@
             try { c.abort(); } catch (e) { /* ignore */ }
         }
         activeControllers.clear();
+        visibleQueue = [];
         prefetchQueue = [];
         isTranslating = false;
         isPrefetching = false;
@@ -121,7 +130,9 @@
     const strings = {
         en: {
             off: 'Original', bilingual: 'Bilingual', translated: 'Translated',
-            translatingPage: 'Translating page…', translatingChapter: 'Preparing next text…', done: '✓ Ready', error: '⚠ Translation error — click to retry',
+            translatingPage: 'Translating current page…', translatingChapter: 'Preparing next paragraphs…', done: '✓ Ready', error: '⚠ Error — click to retry',
+            rateLimited: 'Rate limited — waiting {n}s…',
+            retrying: 'Retrying…',
             restoring: 'Restoring saved translations…',
             cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', settings: 'Settings',
             prefetchWhole: 'Pre-translate whole chapter', clearLang: 'Clear this language\'s cache', clearAll: 'Clear all cache',
@@ -132,7 +143,9 @@
         },
         es: {
             off: 'Original', bilingual: 'Bilingüe', translated: 'Traducido',
-            translatingPage: 'Traduciendo página…', translatingChapter: 'Capítulo', done: '✓ Listo', error: '⚠ Error — reintentar',
+            translatingPage: 'Traduciendo página actual…', translatingChapter: 'Preparando siguientes párrafos…', done: '✓ Listo', error: '⚠ Error — clic para reintentar',
+            rateLimited: 'Límite alcanzado — esperando {n}s…',
+            retrying: 'Reintentando…',
             cycleHint: 'Clic para cambiar: Original → Bilingüe → Traducido', langHint: 'Idioma destino', settings: 'Ajustes',
             prefetchWhole: 'Pre-traducir capítulo completo', clearLang: 'Borrar caché de este idioma', clearAll: 'Borrar toda la caché',
             cached: 'En caché', cleared: 'Caché borrada',
@@ -359,7 +372,22 @@
 
         let state = 'idle';
         if (translationMode !== 'off') {
-            if (errorCount >= 3) {
+            const now = Date.now();
+            if (rateLimitUntil > now) {
+                state = 'ratelimit';
+                const left = Math.ceil((rateLimitUntil - now) / 1000);
+                text.textContent = (t.rateLimited || strings.en.rateLimited).replace('{n}', left);
+                // Ensure UI updates countdown
+                if (!window.btRateLimitTimer) {
+                    window.btRateLimitTimer = setInterval(() => {
+                        if (Date.now() > rateLimitUntil) { clearInterval(window.btRateLimitTimer); window.btRateLimitTimer = null; }
+                        refreshStatus();
+                    }, 1000);
+                }
+            } else if (errorCount > 0 && errorCount < 3) {
+                state = 'page';
+                text.textContent = t.retrying || strings.en.retrying;
+            } else if (errorCount >= 3) {
                 state = 'error';
                 text.textContent = t.error;
             } else if (isTranslating) {
@@ -524,12 +552,8 @@
     }
 
     // ── Translation engine ─────────────────────────────────────────────
-    // Tunables for fluidity. The current page is translated 1 paragraph at a
-    // time so the first line appears as fast as possible; the rest of the
-    // chapter is filled in afterwards, in the background, at low priority.
     const VISIBLE_CHUNK = 1;       // paragraphs per request for the on-screen page
     const PREFETCH_CHUNK = 3;      // paragraphs per request for background fill
-    const PREFETCH_GAP_MS = 600;   // pause between background requests
     const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
 
     function collectUncached(elements) {
@@ -559,7 +583,15 @@
                 body: JSON.stringify({ paragraphs: texts, source_lang: SOURCE_LANG, target_lang: TARGET_LANG }),
                 signal: controller.signal,
             });
-            if (!resp.ok) return null;
+            if (!resp.ok) {
+                if (resp.status === 429) {
+                    let r = {};
+                    try { r = await resp.json(); } catch(e) {}
+                    let after = r.retry_after || parseInt(resp.headers.get('Retry-After')) || (BT_CLIENT_RATE_LIMIT_BACKOFF_MS / 1000);
+                    return { error: 'rate_limited', retry_after: after };
+                }
+                return null;
+            }
             return await resp.json();
         } finally {
             clearTimeout(timer);
@@ -567,98 +599,130 @@
         }
     }
 
-    // Translate a list of {el,text,hash} in chunks, rendering each chunk as soon
-    // as it arrives (progressive paint). Bails immediately if superseded.
-    async function translateElements(items, myGen, chunkSize) {
-        for (let i = 0; i < items.length; i += chunkSize) {
-            if (myGen !== generation || translationMode === 'off') return;
-            const chunk = items.slice(i, i + chunkSize);
-            let data = null;
-            try {
-                data = await postBatch(chunk.map(b => b.text));
-            } catch (e) {
-                if (e.name !== 'AbortError') { console.error("Translation request failed:", e); errorCount++; refreshStatus(); }
-                return; // network/abort/timeout — stop this run; a later trigger retries
+    async function pumpQueue() {
+        if (isPumpRunning) return;
+        isPumpRunning = true;
+        
+        try {
+            while (translationMode !== 'off') {
+                const now = Date.now();
+                if (rateLimitUntil > now) {
+                    refreshStatus();
+                    await new Promise(r => setTimeout(r, Math.min(1000, rateLimitUntil - now)));
+                    continue;
+                }
+                
+                const gap = BT_CLIENT_MIN_REQUEST_GAP_MS - (now - lastRequestEnd);
+                if (gap > 0) {
+                    await new Promise(r => setTimeout(r, gap));
+                    continue;
+                }
+                
+                // Cleanup stale items
+                visibleQueue = visibleQueue.filter(x => x.gen === generation && !translatedParagraphs[x.hash]);
+                prefetchQueue = prefetchQueue.filter(x => x.gen === generation && !translatedParagraphs[x.hash]);
+                
+                if (visibleQueue.length === 0 && prefetchQueue.length === 0) {
+                    break; // Nothing to do
+                }
+                
+                let isVisible = false;
+                let batch = [];
+                if (visibleQueue.length > 0) {
+                    batch = visibleQueue.slice(0, VISIBLE_CHUNK);
+                    visibleQueue = visibleQueue.slice(VISIBLE_CHUNK);
+                    isVisible = true;
+                } else {
+                    batch = prefetchQueue.slice(0, PREFETCH_CHUNK);
+                    prefetchQueue = prefetchQueue.slice(PREFETCH_CHUNK);
+                }
+                
+                isTranslating = isVisible;
+                isPrefetching = !isVisible;
+                refreshStatus();
+                
+                let data = null;
+                try {
+                    data = await postBatch(batch.map(b => b.text));
+                } catch (e) {
+                    if (e.name !== 'AbortError') { 
+                        console.error("Translation request failed:", e); 
+                        errorCount++; 
+                    }
+                    lastRequestEnd = Date.now();
+                    continue;
+                }
+                
+                lastRequestEnd = Date.now();
+                
+                if (data && data.error === 'rate_limited') {
+                    rateLimitUntil = Date.now() + (data.retry_after * 1000);
+                    // Put the batch back at the front of the corresponding queue
+                    if (isVisible) visibleQueue.unshift(...batch);
+                    else prefetchQueue.unshift(...batch);
+                    // errorCount not incremented for rate limit
+                    continue;
+                }
+                
+                if (!data || !Array.isArray(data.translations)) {
+                    errorCount++;
+                    refreshStatus();
+                    continue;
+                }
+                
+                let stored = false, anyGood = false;
+                data.translations.forEach((tr, idx) => {
+                    if (!isBadTranslation(tr)) { 
+                        translatedParagraphs[batch[idx].hash] = tr; 
+                        stored = true; 
+                        anyGood = true; 
+                    }
+                });
+                
+                errorCount = anyGood ? 0 : errorCount + 1;
+                refreshStatus();
+                
+                if (stored) {
+                    schedulePersist();
+                    if (isVisible && batch[0].gen === generation) {
+                        renderMode(batch.map(b => b.el));
+                    }
+                }
             }
-            if (myGen !== generation) return; // superseded — drop stale result
-            if (!data || !Array.isArray(data.translations)) {
-                errorCount++; refreshStatus();   // backend returned non-OK / unexpected payload
-                return;
-            }
-            let stored = false, anyGood = false;
-            data.translations.forEach((tr, idx) => {
-                // Don't cache errors/empties so they retry on the next pass.
-                if (!isBadTranslation(tr)) { translatedParagraphs[chunk[idx].hash] = tr; stored = true; anyGood = true; }
-            });
-            errorCount = anyGood ? 0 : errorCount + 1; // recover on first good chunk
+        } finally {
+            isPumpRunning = false;
+            isTranslating = false;
+            isPrefetching = false;
             refreshStatus();
-            renderMode(chunk.map(b => b.el));
-            if (stored) schedulePersist(); // mirror to localStorage so work survives reloads
         }
     }
 
     async function translateCurrentPage() {
-        if (isTranslating || translationMode === 'off') return;
-        isTranslating = true;
-        refreshStatus();
+        if (translationMode === 'off') return;
+        
         const myGen = generation;
-
-        // Make sure our translation styles + theme are live inside the reader iframe
-        // (parent-page CSS does NOT cascade into the EPUB.js iframe document).
         const idoc = getReaderDoc();
         if (idoc) { ensureIframeStyles(idoc); applyIframeTheme(idoc); }
 
-        // 1. CURRENT PAGE FIRST — progressive, so the first line shows quickly.
         const visibleEls = getVisibleParagraphs();
-        const visibleUncached = collectUncached(visibleEls);
-        if (visibleUncached.length > 0) {
-            await translateElements(visibleUncached, myGen, VISIBLE_CHUNK);
-        }
+        
         // Paint any visible paragraphs that were already cached (revisited page).
-        if (myGen === generation) renderMode(visibleEls);
+        renderMode(visibleEls);
 
-        if (myGen !== generation || translationMode === 'off') {
-            if (myGen === generation) isTranslating = false;
-            refreshStatus();
-            return;
-        }
-
-        // 2. REST OF CHAPTER — queue the background fill BEFORE clearing the
-        // "translating" flag so the indicator stays on without flickering.
-        // Skip entirely if the user turned off whole-chapter pre-translation.
+        visibleQueue = collectUncached(visibleEls).map(x => ({...x, gen: myGen}));
+        
         const visibleSet = new Set(visibleEls);
-        prefetchQueue = prefetchEnabled ? getParagraphs().filter(el => !visibleSet.has(el)) : [];
+        const prefetchEls = prefetchEnabled ? getParagraphs().filter(el => !visibleSet.has(el)) : [];
+        prefetchQueue = collectUncached(prefetchEls).map(x => ({...x, gen: myGen}));
         chapterTotal = prefetchQueue.length;
-        isTranslating = false;
+        
         refreshStatus();
-        triggerPrefetch();
+        pumpQueue();
     }
 
-    // ── Background Prefetching ─────────────────────────────────────────
-    async function triggerPrefetch() {
-        if (isPrefetching || prefetchQueue.length === 0) return;
-        isPrefetching = true;
-        refreshStatus();
-        const myGen = generation;
-
-        // Yield to the visible page: pause whenever a page translation is active.
-        while (prefetchQueue.length > 0 && translationMode !== 'off'
-               && myGen === generation && !isTranslating) {
-            const batch = prefetchQueue.slice(0, PREFETCH_CHUNK);
-            prefetchQueue = prefetchQueue.slice(PREFETCH_CHUNK);
-
-            const items = collectUncached(batch);
-            if (items.length > 0) {
-                await translateElements(items, myGen, PREFETCH_CHUNK);
-            }
-            if (myGen !== generation) break;
-
-            refreshStatus(); // live "remaining" count while filling the chapter
-            await new Promise(resolve => setTimeout(resolve, PREFETCH_GAP_MS));
-        }
-
-        if (myGen === generation) isPrefetching = false;
-        refreshStatus();
+    function triggerPrefetch() {
+        if (!prefetchEnabled || translationMode === 'off') return;
+        pumpQueue();
     }
 
     // ── Iframe styling (parent-page CSS does not cascade into the EPUB iframe) ──
