@@ -278,8 +278,7 @@
             }
         });
 
-
-
+        if (toTranslate.length > 0) {
             try {
                 const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                     method: 'POST',
