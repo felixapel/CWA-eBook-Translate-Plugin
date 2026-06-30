@@ -4,7 +4,7 @@
 
 (function () {
     // ── Configuration ──────────────────────────────────────────────────
-    const TRANSLATOR_URL = window.location.protocol === 'https:' ? '' : '';
+    const TRANSLATOR_URL = window.location.protocol === 'https:' ? '' : `http://${window.location.hostname}:8390`;
     let SOURCE_LANG = 'English'; // Assume source is English
     
     // Map browser language to full language name for the backend
