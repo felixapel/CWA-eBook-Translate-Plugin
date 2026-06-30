@@ -2,7 +2,7 @@
 
 Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated). Translate ebooks paragraph-by-paragraph while reading, using local LLMs (vLLM, LM Studio, Ollama) or any major Cloud API (OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter).
 
-## Features
+## ✨ Features
 
 - 🌐 **Bilingual reading** — original + translation side by side
 - 🔄 **Three modes** — Bilingual / Translation-only / Original
@@ -13,10 +13,72 @@ Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://gi
 - 💾 **SHA-256 cache** — never re-translates the same paragraph (SQLite)
 - 🔒 **Rate limited** — protects your API keys and GPU from runaway requests
 
-## Architecture
+---
+
+## 🚀 Installation
+
+### Option 1: Easy Installation for Unraid (Recommended)
+
+We have created an automated installer script for Unraid users. Open your Unraid Terminal and run:
+
+```bash
+curl -sL https://raw.githubusercontent.com/username/CWA-translate-plugin/main/install_unraid.sh | bash
+```
+
+The script will automatically:
+1. Download the plugin frontend files (`translator.js`, `translator.css`, `read.html`) to your `appdata/calibre-web-automated` folder.
+2. Install the `book-translator-api` Docker template into your Unraid GUI.
+
+**Post-Install Steps**:
+1. Go to your Unraid Docker tab and edit your `calibre-web-automated` container.
+2. Add the 3 paths (as instructed by the script) to inject the plugin files.
+3. Deploy the newly added `book-translator-api` container!
+
+### Option 2: Easy Installation (Docker Compose)
+
+For standard Docker users, we provide a full `docker-compose.yml` that spins up Calibre-Web-Automated along with the Translator API, already pre-configured to inject the plugin files.
+
+```bash
+git clone https://github.com/username/CWA-translate-plugin.git
+cd CWA-translate-plugin
+docker-compose up -d
+```
+
+### Option 3: Manual Installation
+
+1. Build and run the `book-translator-api` backend container manually.
+2. Inject `translator.js`, `translator.css` and `read.html` into Calibre-Web-Automated (using an overlay volume mount or copying files directly).
+3. Configure your reverse proxy (SWAG, Traefik, NPM) to route `/translate` to the API container. Example for NGINX/SWAG:
+   ```nginx
+   location /translate {
+       include /config/nginx/proxy.conf;
+       include /config/nginx/resolver.conf;
+       set $upstream_app book-translator-api;
+       set $upstream_port 8390;
+       set $upstream_proto http;
+       proxy_pass $upstream_proto://$upstream_app:$upstream_port;
+   }
+   ```
+
+---
+
+## ⚙️ Configuration
+
+Environment variables for the `book-translator-api` container:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
+| `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
+| `LLM_API_KEY` | | Your API key for the chosen provider |
+| `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local` |
+
+---
+
+## 🏗️ Architecture
 
 ```text
-Unraid Server
+Unraid Server / Docker Host
 ┌────────────────────────┐             ┌────────────────────────────────┐
 │ CWA (:8383)            │   HTTP      │ book-translator-api (:8390)    │
 │ ┌────────────────────┐ │ ─────────►  │ ├─ POST /translate             │
@@ -35,78 +97,6 @@ Unraid Server
                                        └────────────────────────────────┘
 ```
 
-## Installation
-
-### 1. Build and Run Backend (Docker)
-
-```bash
-cd /opt/book-translator
-docker build -t local/book-translator-api:latest .
-```
-
-Run via Docker Compose or Unraid Template mapping port `8390` and the volume `/mnt/user/appdata/book-translator:/app/data`.
-
-### 2. CWA Overlay & NGINX
-
-1. Inject `translator.js` and `translator.css` into Calibre-Web-Automated (using an overlay volume mount or by copying the files directly into the container's static folder).
-2. Configure SWAG (or your reverse proxy) to route `/translate` to the `book-translator-api` container:
-
-```nginx
-# calibre-web.subdomain.conf
-location /translate {
-    include /config/nginx/proxy.conf;
-    include /config/nginx/resolver.conf;
-    set $upstream_app book-translator-api;
-    set $upstream_port 8390;
-    set $upstream_proto http;
-    proxy_pass $upstream_proto://$upstream_app:$upstream_port;
-}
-```
-
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/translate` | Translate single paragraph |
-| `POST` | `/translate/batch` | Translate multiple paragraphs |
-| `GET` | `/health` | Health check with backend status |
-| `GET` | `/stats` | Cache statistics |
-| `GET` | `/metrics` | Request metrics and latency |
-| `POST` | `/cache/cleanup` | Evict old cache entries |
-
-## Configuration
-
-Environment variables (Docker):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
-| `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
-| `LLM_API_KEY` | | Your API key for the chosen provider |
-| `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local` |
-
-## License
+## 📜 License
 
 MIT
-
-## 🚀 Easy Installation for Unraid Users
-
-We have created an automated installer script for Unraid. Open the Unraid Terminal and run:
-
-```bash
-curl -sL https://raw.githubusercontent.com/username/CWA-translate-plugin/main/install_unraid.sh | bash
-```
-
-The script will automatically:
-1. Download the plugin files (`translator.js`, `translator.css`, `read.html`) to your appdata folder.
-2. Install the `book-translator-api` Docker template into your Unraid GUI.
-
-Once the script finishes, you just need to edit your `calibre-web-automated` container to map the 3 files (as instructed by the script), and then deploy the newly added `book-translator-api` container!
-
-## 🐳 Easy Installation (Docker Compose)
-
-If you use standard Docker, we provide a full `docker-compose.yml` that spins up Calibre-Web-Automated along with the Translator API, already pre-configured to inject the plugin files.
-
-```bash
-docker-compose up -d
-```
