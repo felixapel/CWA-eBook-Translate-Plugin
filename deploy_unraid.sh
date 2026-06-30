@@ -14,19 +14,27 @@ echo "Starting deployment to $UNRAID_HOST..."
 echo "Updating backend code in $API_DIR..."
 ssh $UNRAID_USER@$UNRAID_HOST "cd $API_DIR && git checkout main && git pull origin main"
 
-echo "Ensuring environment variables for book-translator-api..."
-ssh $UNRAID_USER@$UNRAID_HOST "cat << 'EOF' > $API_DIR/.env
-BT_LOCAL_URL=http://192.168.0.122:2819/v1/chat/completions
-BT_BATCH_SIZE=5
-BT_MAX_CONCURRENT=1
-BT_TIMEOUT=120
-BT_CONTEXT_WINDOW=1
-LLM_PROVIDER=local
-LLM_MODEL=gemma4-12b
-EOF"
+echo "Rebuilding Docker image on Unraid..."
+ssh $UNRAID_USER@$UNRAID_HOST "cd $API_DIR && docker build -t local/book-translator-api:latest ."
 
-echo "Rebuilding and restarting backend container..."
-ssh $UNRAID_USER@$UNRAID_HOST "cd $API_DIR && docker compose build && docker compose up -d"
+echo "Recreating container with correct environment variables..."
+ssh $UNRAID_USER@$UNRAID_HOST "
+  docker rm -f book-translator-api || true
+  docker run -d \
+    --name=book-translator-api \
+    --net=bridge \
+    -p 8390:8390 \
+    -v /mnt/user/appdata/book-translator-api/data:/app/data \
+    -e BT_LOCAL_URL=http://192.168.0.122:2819/v1/chat/completions \
+    -e BT_BATCH_SIZE=5 \
+    -e BT_MAX_CONCURRENT=1 \
+    -e BT_TIMEOUT=120 \
+    -e BT_CONTEXT_WINDOW=1 \
+    -e LLM_PROVIDER=local \
+    -e LLM_MODEL=gemma4-12b \
+    --restart=unless-stopped \
+    local/book-translator-api:latest
+"
 
 # 2. Update frontend (CWA overlay)
 echo "Backing up existing frontend scripts on Unraid..."
