@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-30
+UI version marker: `2026-06-30-ui-polish-v1`.
+
+### Fixed
+- **Settings gear opened no visible menu.** The popover was a child of the control
+  bar, which uses `overflow: hidden` to clip the progress bar — so the menu (drawn
+  above the bar) was clipped away. The menu is now a body-level fixed popover.
+- **Bilingual translation looked "glued" to the original and had no colour.** Parent-page
+  CSS does not cascade into the EPUB.js iframe, so the `.bt-translation` class was unstyled
+  inside the reader. The plugin now injects its translation stylesheet directly into the
+  iframe document (with light/dark/sepia theme detection), restoring clear spacing, a blue
+  tint, a left border, and a subtle background — all theme-safe via CSS variables.
+- **Headings/subtitles** ("Chapter Two", section titles, centered epigraphs/quotes) are now
+  reliably translated and rendered with a dedicated `.bt-heading-translation` style (centered
+  when the original is centered) instead of being glued to the original.
+
+### Changed
+- `getTranslatableElements(doc)` is the canonical selector: adds `blockquote` and
+  `epigraph`/`quote`/`verse` classes, excludes plugin UI (`#bt-bar`/`#bt-menu`/`#bt-toast`,
+  `.bt-translation`, `.bt-loading`), preserves standalone TOC links and their `href`.
+- Settings menu now shows: header + UI version, current mode and target language, a
+  persisted background-prefetch toggle, a "retry current page" action, cache-clear actions,
+  and live debug info (queue length, generation, last trigger reason). Closes on outside
+  click and Escape.
+- Bilingual rendering is idempotent: it restores inline-replaced text before inserting,
+  updates the existing translation child instead of duplicating, and survives 10+ mode
+  cycles / page turns / chapter changes without stacking blocks.
+
 ## [1.1.1] - 2026-06-30
 ### Fixed
 - **Deployment sync (Unraid):** CWA container was serving the old bundled `translator.js` instead

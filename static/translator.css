@@ -188,22 +188,41 @@
 /* ── Settings (gear) button + popover menu ──────────────────────────── */
 #bt-gear { padding: 6px 9px; font-size: 15px; line-height: 1; }
 
+/* Popover lives at body level (not inside the overflow:hidden bar) and is
+   anchored bottom-center just above the pill. */
 #bt-menu {
-    position: absolute;
-    bottom: calc(100% + 10px);
-    right: 0;
-    min-width: 220px;
+    position: fixed;
+    left: 50%;
+    bottom: 74px;
+    transform: translateX(-50%);
+    min-width: 250px;
+    max-width: min(92vw, 340px);
     background: var(--bt-bar-bg);
     color: #fff;
     border-radius: 14px;
     padding: 8px;
     box-shadow: 0 10px 34px rgba(0, 0, 0, 0.45);
     border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(14px) saturate(160%);
+    -webkit-backdrop-filter: blur(14px) saturate(160%);
+    z-index: 2147483002;
     display: none;
     flex-direction: column;
     gap: 2px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px;
 }
 #bt-menu.bt-open { display: flex; }
+.bt-menu-header {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+    padding: 6px 10px 8px; font-weight: 600; font-size: 14px;
+}
+.bt-menu-ver { font-size: 10px; font-weight: normal; opacity: 0.6; }
+.bt-menu-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 5px 10px; font-size: 12px; opacity: 0.85;
+}
+.bt-menu-val { font-weight: 600; }
 .bt-menu-item {
     display: flex; align-items: center; justify-content: space-between;
     gap: 10px;
