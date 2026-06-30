@@ -30,12 +30,18 @@
     let isPrefetching = false;
     let lastFirstVisibleHash = null;
 
+    // UI / status state
+    let prefetchEnabled = localStorage.getItem('bt_prefetch') !== '0'; // translate whole chapter ahead
+    let chapterTotal = 0;     // paragraphs queued for the current chapter's background fill
+    let errorCount = 0;       // consecutive failed requests (drives the error state)
+    let doneHideTimer = null;
+
     // ── Persistent translation cache (survives page turns AND browser reloads) ──
     // Per-language map of contentHash -> translation, mirrored to localStorage so
     // the work/API cost already spent is never thrown away. (The backend also
     // caches in SQLite, so even a cleared client never re-pays for a paragraph.)
-    const CACHE_PREFIX = 'bt_cache_';
-    const CACHE_MAX_ENTRIES = 5000; // safety cap to stay under the localStorage quota
+    const CACHE_PREFIX = 'bt_cache_v2_'; // v2: 53-bit hash keys (old caches ignored)
+    const CACHE_MAX_ENTRIES = 5000;      // safety cap to stay under the localStorage quota
 
     function loadCacheForLang(lang) {
         try {
@@ -91,7 +97,7 @@
         prefetchQueue = [];
         isTranslating = false;
         isPrefetching = false;
-        updateLoadingIndicator();
+        refreshStatus();
         return generation;
     }
 
@@ -110,11 +116,41 @@
 
     // ── i18n ───────────────────────────────────────────────────────────
     const strings = {
-        en: { translate: '📖 View: Original', bilingual: '🌐 View: Bilingual', translated: '🌐 View: Translated', off: '📖 Translation disabled', loading: 'Translating...' },
-        es: { translate: '📖 Vista: Original', bilingual: '🌐 Vista: Bilingüe', translated: '🌐 Vista: Traducido', off: '📖 Traducción desactivada', loading: 'Traduciendo...' },
-        fr: { translate: '📖 Vue: Original', bilingual: '🌐 Vue: Bilingue', translated: '🌐 Vue: Traduit', off: '📖 Traduction désactivée', loading: 'Traduction...' },
-        de: { translate: '📖 Ansicht: Original', bilingual: '🌐 Ansicht: Zweisprachig', translated: '🌐 Ansicht: Übersetzt', off: '📖 Übersetzung deaktiviert', loading: 'Übersetzen...' },
-        pt: { translate: '📖 Vista: Original', bilingual: '🌐 Vista: Bilíngue', translated: '🌐 Vista: Traduzido', off: '📖 Tradução desativada', loading: 'Traduzindo...' },
+        en: {
+            off: 'Original', bilingual: 'Bilingual', translated: 'Translated',
+            translatingPage: 'Translating page…', translatingChapter: 'Chapter', done: '✓ Done', error: '⚠ Error — retry',
+            cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', settings: 'Settings',
+            prefetchWhole: 'Pre-translate whole chapter', clearLang: 'Clear this language\'s cache', clearAll: 'Clear all cache',
+            cached: 'Cached', cleared: 'Cache cleared',
+        },
+        es: {
+            off: 'Original', bilingual: 'Bilingüe', translated: 'Traducido',
+            translatingPage: 'Traduciendo página…', translatingChapter: 'Capítulo', done: '✓ Listo', error: '⚠ Error — reintentar',
+            cycleHint: 'Clic para cambiar: Original → Bilingüe → Traducido', langHint: 'Idioma destino', settings: 'Ajustes',
+            prefetchWhole: 'Pre-traducir capítulo completo', clearLang: 'Borrar caché de este idioma', clearAll: 'Borrar toda la caché',
+            cached: 'En caché', cleared: 'Caché borrada',
+        },
+        fr: {
+            off: 'Original', bilingual: 'Bilingue', translated: 'Traduit',
+            translatingPage: 'Traduction de la page…', translatingChapter: 'Chapitre', done: '✓ Terminé', error: '⚠ Erreur — réessayer',
+            cycleHint: 'Cliquez pour changer : Original → Bilingue → Traduit', langHint: 'Langue cible', settings: 'Réglages',
+            prefetchWhole: 'Pré-traduire tout le chapitre', clearLang: 'Vider le cache de cette langue', clearAll: 'Vider tout le cache',
+            cached: 'En cache', cleared: 'Cache vidé',
+        },
+        de: {
+            off: 'Original', bilingual: 'Zweisprachig', translated: 'Übersetzt',
+            translatingPage: 'Seite wird übersetzt…', translatingChapter: 'Kapitel', done: '✓ Fertig', error: '⚠ Fehler — erneut',
+            cycleHint: 'Klicken zum Wechseln: Original → Zweisprachig → Übersetzt', langHint: 'Zielsprache', settings: 'Einstellungen',
+            prefetchWhole: 'Ganzes Kapitel vorübersetzen', clearLang: 'Cache dieser Sprache leeren', clearAll: 'Gesamten Cache leeren',
+            cached: 'Im Cache', cleared: 'Cache geleert',
+        },
+        pt: {
+            off: 'Original', bilingual: 'Bilíngue', translated: 'Traduzido',
+            translatingPage: 'Traduzindo página…', translatingChapter: 'Capítulo', done: '✓ Pronto', error: '⚠ Erro — repetir',
+            cycleHint: 'Clique para alternar: Original → Bilíngue → Traduzido', langHint: 'Idioma de destino', settings: 'Ajustes',
+            prefetchWhole: 'Pré-traduzir capítulo inteiro', clearLang: 'Limpar cache deste idioma', clearAll: 'Limpar todo o cache',
+            cached: 'Em cache', cleared: 'Cache limpo',
+        },
     };
     const t = strings[browserCode] || strings.en;
 
@@ -129,112 +165,187 @@
     ];
 
     // ── UI Components ──────────────────────────────────────────────────
+    function setMode(mode, { silent = false } = {}) {
+        const prevMode = translationMode;
+        if (mode === prevMode) return;
+        translationMode = mode;
+        localStorage.setItem('bt_mode', mode);
+
+        const bar = document.getElementById('bt-bar');
+        if (bar) bar.dataset.mode = mode;
+        const toggle = document.getElementById('bt-toggle-label');
+        if (toggle) toggle.textContent = mode === 'bilingual' ? t.bilingual
+            : mode === 'translated' ? t.translated : t.off;
+
+        if (mode === 'off') {
+            newGeneration();              // cancel in-flight work; next ON starts clean
+            removeAllTranslations();
+            refreshStatus();
+            if (!silent) showToast(t.off);
+        } else if (prevMode === 'off') {
+            translateCurrentPage();       // fresh start
+        } else {
+            // bilingual <-> translated: re-render from cache instantly, keep filling gaps
+            renderMode(getParagraphs());
+            translateCurrentPage();
+        }
+    }
+
     function createFloatingUI() {
-        if (document.getElementById('translator-float-container')) return;
+        if (document.getElementById('bt-bar')) return;
 
-        const container = document.createElement('div');
-        container.id = 'translator-float-container';
-        container.style.cssText = 'position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 99999; display: flex; align-items: center; background: rgba(50, 50, 50, 0.9); backdrop-filter: blur(10px); color: white; padding: 6px 12px; border-radius: 24px; box-shadow: 0 4px 16px rgba(0,0,0,0.25); gap: 8px; user-select: none; transition: background 0.3s;';
+        const bar = document.createElement('div');
+        bar.id = 'bt-bar';
+        bar.dataset.mode = translationMode;
+        bar.dataset.state = 'idle';
 
-        const indicator = document.createElement('div');
-        indicator.id = 'translator-loading-indicator';
-        indicator.innerHTML =
-            '<style>@keyframes bt-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>' +
-            '<div style="width: 15px; height: 15px; border: 2px solid rgba(255,255,255,0.35); border-top-color: white; border-radius: 50%; animation: bt-spin 0.8s linear infinite; flex: 0 0 auto;"></div>' +
-            '<span id="translator-loading-label" style="font-size: 12px; font-weight: 600; white-space: nowrap;">' + t.loading + '</span>';
-        // Hidden by default; updateLoadingIndicator() switches to inline-flex while working.
-        indicator.style.cssText = 'display: none; align-items: center; gap: 6px; margin: 0 2px; color: #fff;';
-        
-        const btn = document.createElement('div');
-        btn.id = 'translator-float-btn';
-        btn.style.cssText = 'cursor: pointer; font-weight: 600; font-family: system-ui, sans-serif; padding: 6px 12px; border-radius: 16px; transition: background 0.2s; text-align: center;';
-        
-        const sel = document.createElement('select');
-        sel.id = 'translator-float-lang';
-        sel.style.cssText = 'background: transparent; color: white; border: 1px solid rgba(255,255,255,0.4); border-radius: 12px; padding: 4px 8px; font-size: 13px; cursor: pointer; outline: none; font-family: system-ui;';
-        
-        availableLangs.forEach(lang => {
-            const opt = document.createElement('option');
-            opt.value = lang.code;
-            opt.textContent = lang.name;
-            opt.style.color = '#000';
-            if (lang.code === TARGET_LANG) opt.selected = true;
-            sel.appendChild(opt);
-        });
+        // Build the language <option> list once.
+        const langOptions = availableLangs.map(l =>
+            `<option value="${l.code}"${l.code === TARGET_LANG ? ' selected' : ''}>${l.name}</option>`
+        ).join('');
 
+        bar.innerHTML =
+            `<button id="bt-toggle" title="${t.cycleHint}">` +
+                `<span class="bt-dot"></span>` +
+                `<span id="bt-toggle-label">${translationMode === 'bilingual' ? t.bilingual : translationMode === 'translated' ? t.translated : t.off}</span>` +
+            `</button>` +
+            `<select id="bt-lang" title="${t.langHint}">${langOptions}</select>` +
+            `<div id="bt-status">` +
+                `<span id="bt-spinner"></span>` +
+                `<span id="bt-status-text"></span>` +
+            `</div>` +
+            `<button id="bt-gear" title="${t.settings}" aria-label="${t.settings}">⚙</button>` +
+            `<div id="bt-progress"><div id="bt-progress-fill"></div></div>` +
+            `<div id="bt-menu"></div>`;
+
+        document.body.appendChild(bar);
+
+        document.getElementById('bt-toggle').onclick = () => {
+            const next = translationMode === 'off' ? 'bilingual'
+                : translationMode === 'bilingual' ? 'translated' : 'off';
+            setMode(next);
+        };
+
+        const sel = document.getElementById('bt-lang');
         sel.onchange = (e) => {
             persistCacheNow();            // flush current language's cache before switching
             TARGET_LANG = e.target.value;
             localStorage.setItem('bt_lang', TARGET_LANG);
             newGeneration();              // abort in-flight old-language requests
-            translatedParagraphs = loadCacheForLang(TARGET_LANG); // restore that language's saved work
+            translatedParagraphs = loadCacheForLang(TARGET_LANG); // restore that language's work
             if (translationMode !== 'off') {
                 removeAllTranslations();
                 translateCurrentPage();
             }
+            refreshStatus();
         };
 
-        const updateBtnState = () => {
-            if (translationMode === 'bilingual') {
-                btn.textContent = t.bilingual;
-                container.style.background = 'rgba(15, 157, 88, 0.9)'; // green
-            } else if (translationMode === 'translated') {
-                btn.textContent = t.translated;
-                container.style.background = 'rgba(244, 180, 0, 0.9)'; // yellow
-            } else {
-                btn.textContent = t.translate;
-                container.style.background = 'rgba(50, 50, 50, 0.9)'; // grey
+        const gear = document.getElementById('bt-gear');
+        gear.onclick = (e) => { e.stopPropagation(); toggleMenu(); };
+        document.addEventListener('click', (e) => {
+            const menu = document.getElementById('bt-menu');
+            if (menu && menu.classList.contains('bt-open') && !bar.contains(e.target)) {
+                menu.classList.remove('bt-open');
+            }
+        });
+
+        // Click the error status to retry.
+        document.getElementById('bt-status').onclick = () => {
+            if (bar.dataset.state === 'error') {
+                errorCount = 0;
+                if (translationMode !== 'off') translateCurrentPage();
             }
         };
 
-        updateBtnState();
-
-        btn.onclick = () => {
-            const prevMode = translationMode;
-            if (translationMode === 'off') translationMode = 'bilingual';
-            else if (translationMode === 'bilingual') translationMode = 'translated';
-            else translationMode = 'off';
-
-            localStorage.setItem('bt_mode', translationMode);
-            updateBtnState();
-
-            if (translationMode === 'off') {
-                newGeneration();            // cancel in-flight work so the next ON works immediately
-                removeAllTranslations();
-                showToast(t.off);
-            } else if (prevMode === 'off') {
-                translateCurrentPage();     // fresh start
-            } else {
-                // Switching bilingual <-> translated: re-render cached paragraphs
-                // instantly (no waiting on the in-flight batch), then keep filling gaps.
-                renderMode(getParagraphs());
-                translateCurrentPage();
-            }
-        };
-
-        btn.onmouseover = () => btn.style.background = 'rgba(255,255,255,0.15)';
-        btn.onmouseout = () => btn.style.background = 'transparent';
-
-        container.appendChild(sel);
-        container.appendChild(indicator);
-        container.appendChild(btn);
-        document.body.appendChild(container);
+        buildMenu();
+        refreshStatus();
     }
 
-    function updateLoadingIndicator() {
-        const ind = document.getElementById('translator-loading-indicator');
-        if (!ind) return;
-        // Stay visible until ALL work is done — the current page AND the
-        // background chapter fill — so it never looks frozen mid-job.
-        const working = (isTranslating || isPrefetching || prefetchQueue.length > 0)
-            && translationMode !== 'off';
-        ind.style.display = working ? 'inline-flex' : 'none';
-        if (working) {
-            const label = document.getElementById('translator-loading-label');
-            if (label) {
-                const remaining = prefetchQueue.length;
-                label.textContent = remaining > 0 ? `${t.loading} (${remaining})` : t.loading;
+    function buildMenu() {
+        const menu = document.getElementById('bt-menu');
+        if (!menu) return;
+        const entryCount = Object.keys(translatedParagraphs).length;
+        menu.innerHTML =
+            `<div class="bt-menu-item" data-action="prefetch">` +
+                `<span>${t.prefetchWhole}</span>` +
+                `<span class="bt-switch${prefetchEnabled ? ' bt-on' : ''}"></span>` +
+            `</div>` +
+            `<div class="bt-menu-sep"></div>` +
+            `<div class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></div>` +
+            `<div class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></div>` +
+            `<div class="bt-menu-note">${t.cached}: ${entryCount} · ${TARGET_LANG}</div>`;
+
+        menu.querySelectorAll('.bt-menu-item').forEach(item => {
+            item.onclick = (e) => {
+                e.stopPropagation();
+                const action = item.dataset.action;
+                if (action === 'prefetch') {
+                    prefetchEnabled = !prefetchEnabled;
+                    localStorage.setItem('bt_prefetch', prefetchEnabled ? '1' : '0');
+                    buildMenu();
+                    if (prefetchEnabled && translationMode !== 'off') triggerPrefetch();
+                } else if (action === 'clear-lang') {
+                    translatedParagraphs = {};
+                    try { localStorage.removeItem(CACHE_PREFIX + TARGET_LANG); } catch (e2) {}
+                    showToast(t.cleared);
+                    buildMenu();
+                } else if (action === 'clear-all') {
+                    translatedParagraphs = {};
+                    try {
+                        Object.keys(localStorage).filter(k => k.startsWith(CACHE_PREFIX))
+                            .forEach(k => localStorage.removeItem(k));
+                    } catch (e2) {}
+                    showToast(t.cleared);
+                    buildMenu();
+                }
+            };
+        });
+    }
+
+    function toggleMenu() {
+        const menu = document.getElementById('bt-menu');
+        if (!menu) return;
+        if (!menu.classList.contains('bt-open')) buildMenu();
+        menu.classList.toggle('bt-open');
+    }
+
+    // Single source of truth for the status zone: derives display from state.
+    function refreshStatus() {
+        const bar = document.getElementById('bt-bar');
+        const text = document.getElementById('bt-status-text');
+        const fill = document.getElementById('bt-progress-fill');
+        if (!bar || !text) return;
+
+        if (doneHideTimer) { clearTimeout(doneHideTimer); doneHideTimer = null; }
+
+        let state = 'idle';
+        if (translationMode !== 'off') {
+            if (errorCount >= 3) {
+                state = 'error';
+                text.textContent = t.error;
+            } else if (isTranslating) {
+                state = 'page';
+                text.textContent = t.translatingPage;
+            } else if (isPrefetching || prefetchQueue.length > 0) {
+                state = 'chapter';
+                const done = Math.max(0, chapterTotal - prefetchQueue.length);
+                if (fill && chapterTotal > 0) fill.style.width = Math.round(done / chapterTotal * 100) + '%';
+                text.textContent = `${t.translatingChapter} ${done}/${chapterTotal}`;
+            } else if (chapterTotal > 0) {
+                state = 'done';
+                if (fill) fill.style.width = '100%';
+                text.textContent = t.done;
+                doneHideTimer = setTimeout(() => {
+                    chapterTotal = 0;
+                    const b = document.getElementById('bt-bar');
+                    if (b && b.dataset.state === 'done') { b.dataset.state = 'idle'; }
+                }, 2500);
             }
+        }
+        bar.dataset.state = state;
+        if (fill && (state === 'idle' || state === 'page')) {
+            // page state uses an indeterminate CSS animation; reset width otherwise
+            if (state === 'idle') fill.style.width = '0%';
         }
     }
 
@@ -244,12 +355,12 @@
         if (!toast) {
             toast = document.createElement('div');
             toast.id = 'bt-toast';
-            toast.style.cssText = 'position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: white; padding: 8px 16px; border-radius: 20px; font-family: system-ui; font-size: 14px; z-index: 100000; opacity: 0; transition: opacity 0.3s; pointer-events: none;';
             document.body.appendChild(toast);
         }
         toast.textContent = message;
-        toast.style.opacity = '1';
-        setTimeout(() => toast.style.opacity = '0', 3000);
+        requestAnimationFrame(() => toast.classList.add('bt-toast-visible'));
+        clearTimeout(toast._btHide);
+        toast._btHide = setTimeout(() => toast.classList.remove('bt-toast-visible'), 2600);
     }
 
     // ── DOM Helpers ────────────────────────────────────────────────────
@@ -298,10 +409,12 @@
 
         // 2. De-duplicate hierarchy: If a parent/ancestor is already in the list to be translated,
         // we skip the child element to translate the parent as a single contextual block.
+        // Use a Set for O(1) ancestor lookups (was O(n²) via Array.includes — janky on big chapters).
+        const filteredSet = new Set(filtered);
         return filtered.filter(el => {
             let parent = el.parentElement;
             while (parent) {
-                if (filtered.includes(parent)) {
+                if (filteredSet.has(parent)) {
                     return false; // Skip, parent will be translated
                 }
                 parent = parent.parentElement;
@@ -311,25 +424,22 @@
     }
 
     function getVisibleParagraphs() {
-        let doc = document;
+        // Filter the SAME canonical, de-duplicated set used everywhere else, so
+        // visible-first covers headings/lists too and the prefetch complement is
+        // exact (no element falls through the cracks between the two selectors).
         const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+        const all = getParagraphs();
         if (!iframe || !iframe.contentDocument) {
-            return Array.from(doc.querySelectorAll('p, div.calibre1, div.text')).slice(0, 5);
+            return all.slice(0, 5);
         }
-        
-        doc = iframe.contentDocument;
-        const paragraphs = Array.from(doc.querySelectorAll('p, div.calibre1, div.text'));
         const iframeWidth = iframe.clientWidth || window.innerWidth;
         const iframeHeight = iframe.clientHeight || window.innerHeight;
-        
-        return paragraphs.filter(el => {
+
+        return all.filter(el => {
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return false;
-            
-            // Check if element is horizontally or vertically visible inside the viewport
             const isHorizVisible = (rect.left >= -100 && rect.left < iframeWidth - 20);
             const isVertVisible = (rect.top >= -100 && rect.top < iframeHeight - 20);
-            
             return isHorizVisible && isVertVisible;
         });
     }
@@ -342,12 +452,17 @@
     }
 
     function hashText(str) {
-        let hash = 0;
+        // cyrb53 — a 53-bit hash. The previous 32-bit hash could collide across a
+        // long book and show the wrong cached translation for a paragraph.
+        let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
         for (let i = 0; i < str.length; i++) {
-            hash = ((hash << 5) - hash) + str.charCodeAt(i);
-            hash = hash & hash;
+            const ch = str.charCodeAt(i);
+            h1 = Math.imul(h1 ^ ch, 2654435761);
+            h2 = Math.imul(h2 ^ ch, 1597334677);
         }
-        return (hash >>> 0).toString(36);
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+        return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
     }
 
     // ── Translation engine ─────────────────────────────────────────────
@@ -378,9 +493,11 @@
         activeControllers.add(controller);
         const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
         try {
+            const headers = { 'Content-Type': 'application/json' };
+            if (cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken; // optional shared secret
             const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers,
                 body: JSON.stringify({ paragraphs: texts, source_lang: SOURCE_LANG, target_lang: TARGET_LANG }),
                 signal: controller.signal,
             });
@@ -402,26 +519,30 @@
             try {
                 data = await postBatch(chunk.map(b => b.text));
             } catch (e) {
-                if (e.name !== 'AbortError') console.error("Translation request failed:", e);
+                if (e.name !== 'AbortError') { console.error("Translation request failed:", e); errorCount++; refreshStatus(); }
                 return; // network/abort/timeout — stop this run; a later trigger retries
             }
             if (myGen !== generation) return; // superseded — drop stale result
-            if (data && Array.isArray(data.translations)) {
-                let stored = false;
-                data.translations.forEach((tr, idx) => {
-                    // Don't cache errors/empties so they retry on the next pass.
-                    if (!isBadTranslation(tr)) { translatedParagraphs[chunk[idx].hash] = tr; stored = true; }
-                });
-                renderMode(chunk.map(b => b.el));
-                if (stored) schedulePersist(); // mirror to localStorage so work survives reloads
+            if (!data || !Array.isArray(data.translations)) {
+                errorCount++; refreshStatus();   // backend returned non-OK / unexpected payload
+                return;
             }
+            let stored = false, anyGood = false;
+            data.translations.forEach((tr, idx) => {
+                // Don't cache errors/empties so they retry on the next pass.
+                if (!isBadTranslation(tr)) { translatedParagraphs[chunk[idx].hash] = tr; stored = true; anyGood = true; }
+            });
+            errorCount = anyGood ? 0 : errorCount + 1; // recover on first good chunk
+            refreshStatus();
+            renderMode(chunk.map(b => b.el));
+            if (stored) schedulePersist(); // mirror to localStorage so work survives reloads
         }
     }
 
     async function translateCurrentPage() {
         if (isTranslating || translationMode === 'off') return;
         isTranslating = true;
-        updateLoadingIndicator();
+        refreshStatus();
         const myGen = generation;
 
         // 1. CURRENT PAGE FIRST — progressive, so the first line shows quickly.
@@ -435,16 +556,18 @@
 
         if (myGen !== generation || translationMode === 'off') {
             if (myGen === generation) isTranslating = false;
-            updateLoadingIndicator();
+            refreshStatus();
             return;
         }
 
         // 2. REST OF CHAPTER — queue the background fill BEFORE clearing the
         // "translating" flag so the indicator stays on without flickering.
+        // Skip entirely if the user turned off whole-chapter pre-translation.
         const visibleSet = new Set(visibleEls);
-        prefetchQueue = getParagraphs().filter(el => !visibleSet.has(el));
+        prefetchQueue = prefetchEnabled ? getParagraphs().filter(el => !visibleSet.has(el)) : [];
+        chapterTotal = prefetchQueue.length;
         isTranslating = false;
-        updateLoadingIndicator();
+        refreshStatus();
         triggerPrefetch();
     }
 
@@ -452,7 +575,7 @@
     async function triggerPrefetch() {
         if (isPrefetching || prefetchQueue.length === 0) return;
         isPrefetching = true;
-        updateLoadingIndicator();
+        refreshStatus();
         const myGen = generation;
 
         // Yield to the visible page: pause whenever a page translation is active.
@@ -467,12 +590,12 @@
             }
             if (myGen !== generation) break;
 
-            updateLoadingIndicator(); // live "remaining" count while filling the chapter
+            refreshStatus(); // live "remaining" count while filling the chapter
             await new Promise(resolve => setTimeout(resolve, PREFETCH_GAP_MS));
         }
 
         if (myGen === generation) isPrefetching = false;
-        updateLoadingIndicator();
+        refreshStatus();
     }
 
     // ── Rendering ──────────────────────────────────────────────────────
@@ -491,13 +614,10 @@
             }
 
             transEl = document.createElement('span');
+            // Styling lives in translator.css (.bt-translation) so the translation
+            // colour adapts to the reader's light/dark/sepia theme.
             transEl.className = 'bt-translation';
-            transEl.style.cssText = 'display: block; margin-top: 8px; color: #1565c0; font-style: italic; border-left: 3px solid #90caf9; padding-left: 12px; font-weight: normal;';
             transEl.textContent = translated;
-            
-            el.style.pageBreakInside = 'avoid';
-            el.style.breakInside = 'avoid';
-            
             el.appendChild(transEl);
         });
     }
@@ -604,10 +724,23 @@
     }
 
     // ── Start ──────────────────────────────────────────────────────────
+    function setupKeyboardShortcut() {
+        // Alt+T cycles the mode (Ctrl/Cmd+T is reserved by the browser for new tabs).
+        document.addEventListener('keydown', (e) => {
+            if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === 't' || e.key === 'T')) {
+                e.preventDefault();
+                const next = translationMode === 'off' ? 'bilingual'
+                    : translationMode === 'bilingual' ? 'translated' : 'off';
+                setMode(next);
+            }
+        });
+    }
+
     function init() {
         createFloatingUI();
         startMutationObserver();
         startPageTurnDetector();
+        setupKeyboardShortcut();
         // Persist any pending translations if the user closes/reloads the tab.
         window.addEventListener('beforeunload', persistCacheNow);
         if (translationMode !== 'off') {

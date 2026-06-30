@@ -3,6 +3,7 @@ book-translator — Flask microservice for ebook paragraph translation.
 Runs on port 8390. Frontend (CWA overlay) calls this service.
 """
 import logging
+import os
 import re
 import time
 import threading
@@ -12,6 +13,10 @@ from flask import Flask, request, jsonify
 
 from translator import translate_text, translate_batch, check_backend_health, LLM_MODEL
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
+
+# Optional shared-secret. When BT_API_TOKEN is set, translate endpoints require
+# the matching `X-BT-Token` header — use it if the API is reachable beyond the LAN.
+API_TOKEN = os.environ.get("BT_API_TOKEN", "")
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -193,6 +198,11 @@ def before_request_hook():
     request.request_id = str(uuid.uuid4())
     request.start_time = time.monotonic()
 
+    # Optional shared-secret auth (skip preflight + health so they always work).
+    if API_TOKEN and request.method != "OPTIONS" and request.path != "/health":
+        if request.headers.get("X-BT-Token") != API_TOKEN:
+            return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
+
     # Rate limiting (H6) — skip for health/metrics
     if request.path not in ("/health", "/metrics"):
         client_ip = request.remote_addr or "unknown"
@@ -221,7 +231,7 @@ def after_request_hook(response):
     allowed = _is_origin_allowed(origin)
     if allowed:
         response.headers["Access-Control-Allow-Origin"] = allowed
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-BT-Token"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
 
     return response

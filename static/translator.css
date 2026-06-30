@@ -1,242 +1,248 @@
 /**
- * book-translator — Bilingual reading styles
- * Injected into Calibre-Web-Automated reader.
+ * book-translator — Calibre-Web-Automated reading overlay styles.
+ * The control bar markup is built by translator.js; everything here is
+ * class-driven so the JS stays free of giant inline-style strings and so
+ * translations adapt to the reader's light/dark/sepia theme.
  */
 
-/* ── Translation paragraph styles ───────────────────────────────────── */
+/* ── Theme tokens ───────────────────────────────────────────────────── */
+:root {
+    --bt-accent: #1a73e8;
+    --bt-accent-2: #1565c0;
+    --bt-bilingual: #0f9d58;
+    --bt-translated: #f4b400;
+    --bt-error: #e2483d;
+    --bt-bar-bg: rgba(32, 33, 36, 0.92);
+    --bt-bar-fg: #ffffff;
+    --bt-tr-color: #1565c0;     /* translation text (light theme) */
+    --bt-tr-border: #90caf9;
+}
+
+/* ── Translation paragraph (bilingual mode) ─────────────────────────── */
 .bt-translation {
-    color: #1565c0 !important;
+    display: block;
+    margin-top: 6px;
+    padding-left: 12px;
+    border-left: 3px solid var(--bt-tr-border);
+    color: var(--bt-tr-color);
     font-style: italic;
-    padding: 4px 0 12px 16px;
-    margin-bottom: 8px;
-    border-left: 3px solid #90caf9;
-    font-size: 0.95em;
-    line-height: 1.7;
+    font-weight: normal;
+    line-height: 1.6;
     opacity: 0;
-    animation: bt-slide-in 0.3s ease forwards;
+    animation: bt-slide-in 0.25s ease forwards;
+    break-inside: avoid;
+    page-break-inside: avoid;
 }
 
-.bt-translation:hover {
-    opacity: 1 !important;
-}
-
-/* ── Slide-in animation for new translation paragraphs ──────────────── */
 @keyframes bt-slide-in {
-    from {
-        opacity: 0;
-        transform: translateY(-8px);
-    }
-    to {
-        opacity: 0.92;
-        transform: translateY(0);
-    }
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 0.95; transform: translateY(0); }
 }
 
-/* ── Bilingual mode: original paragraphs get subtle styling ─────────── */
-.bt-original {
-    /* Original text stays default, just a tiny marker */
+/* Translated-only mode: paragraph text was replaced in place. */
+[data-original-text] { font-style: normal; }
+
+/* ── Theme adaptation (reader is usually inside an iframe; these also
+      apply when CWA sets a theme class/inline bg on the host page) ──── */
+@media (prefers-color-scheme: dark) {
+    :root { --bt-tr-color: #7cb6f7; --bt-tr-border: #1565c0; }
+}
+#main[style*="#000"], #main[style*="#111"], body.dark-theme, body.black-theme {
+    --bt-tr-color: #8ec0f9; --bt-tr-border: #1976d2;
+}
+#main[style*="#f4ecd8"], body.sepia-theme {
+    --bt-tr-color: #6d4c41; --bt-tr-border: #a1887f;
 }
 
-/* ── Translation-only mode ──────────────────────────────────────────── */
-[data-original-text] {
-    color: #1a1a1a;
-    font-style: normal;
-}
+/* ════════════════════════════════════════════════════════════════════
+   Control bar (bottom-center)
+   ════════════════════════════════════════════════════════════════════ */
+#bt-bar, #bt-bar * { box-sizing: border-box; }
 
-/* ── Toolbar button styles ──────────────────────────────────────────── */
-#btn-translate-toggle {
-    transition: background-color 0.2s, box-shadow 0.2s;
-}
-
-#btn-translate-toggle:hover {
-    background-color: #e3f2fd;
-    box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.15);
-}
-
-#btn-translate-toggle.active {
-    background-color: #bbdefb;
-    border-color: #1a73e8;
-}
-
-/* ── Progress counter ───────────────────────────────────────────────── */
-#bt-progress {
-    display: inline-block;
-    margin-left: 8px;
-    padding: 2px 8px;
-    border-radius: 10px;
-    background: rgba(26, 115, 232, 0.12);
-    color: #1a73e8;
-    font-size: 12px;
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    font-weight: 500;
-    vertical-align: middle;
-    letter-spacing: 0.3px;
-}
-
-/* ── Floating button (glassmorphism design) ──────────────────────────── */
-#translator-float {
+#bt-bar {
     position: fixed;
-    bottom: 24px;
     left: 50%;
+    bottom: 22px;
     transform: translateX(-50%);
-    z-index: 9999;
-    background: rgba(26, 115, 232, 0.85);
-    backdrop-filter: blur(12px) saturate(180%);
-    -webkit-backdrop-filter: blur(12px) saturate(180%);
-    color: white;
-    padding: 14px 24px;
-    border-radius: 28px;
-    cursor: pointer;
-    font-size: 16px;
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    font-weight: 500;
-    box-shadow:
-        0 8px 32px rgba(26, 115, 232, 0.35),
-        0 2px 8px rgba(0, 0, 0, 0.15),
-        inset 0 1px 0 rgba(255, 255, 255, 0.2);
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    transition: transform 0.2s ease, box-shadow 0.25s ease, background 0.2s;
+    z-index: 2147483000;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: 26px;
+    background: var(--bt-bar-bg);
+    color: var(--bt-bar-fg);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-size: 13px;
+    backdrop-filter: blur(14px) saturate(160%);
+    -webkit-backdrop-filter: blur(14px) saturate(160%);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
     user-select: none;
+    overflow: hidden;            /* clip the progress bar to the rounded corners */
+    transition: opacity 0.3s ease, transform 0.3s ease;
 }
 
-#translator-float:hover {
-    transform: translateY(-2px);
-    box-shadow:
-        0 12px 40px rgba(26, 115, 232, 0.45),
-        0 4px 12px rgba(0, 0, 0, 0.2),
-        inset 0 1px 0 rgba(255, 255, 255, 0.25);
-    background: rgba(26, 115, 232, 0.95);
+/* Idle-fade: when off and not hovered, dim so it doesn't distract reading. */
+#bt-bar[data-mode="off"]:not(:hover) { opacity: 0.55; }
+
+#bt-bar button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    border-radius: 16px;
+    padding: 6px 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: background 0.15s;
+    white-space: nowrap;
+}
+#bt-bar button:hover { background: rgba(255, 255, 255, 0.14); }
+#bt-bar button:active { transform: scale(0.96); }
+
+/* Main toggle reflects mode via a left color dot */
+#bt-toggle { font-weight: 600; }
+#bt-toggle .bt-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: #9aa0a6; flex: 0 0 auto;
+    box-shadow: 0 0 0 3px rgba(255,255,255,0.06);
+}
+#bt-bar[data-mode="bilingual"] #bt-toggle .bt-dot { background: var(--bt-bilingual); }
+#bt-bar[data-mode="translated"] #bt-toggle .bt-dot { background: var(--bt-translated); }
+
+/* Language select */
+#bt-lang {
+    appearance: none;
+    background: rgba(255, 255, 255, 0.10);
+    color: #fff;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 14px;
+    padding: 5px 10px;
+    font: inherit;
+    cursor: pointer;
+    outline: none;
+}
+#bt-lang option { color: #000; }
+
+/* ── Status zone (spinner + text) ───────────────────────────────────── */
+#bt-status {
+    display: none;               /* shown by JS while working / done / error */
+    align-items: center;
+    gap: 7px;
+    padding: 0 6px 0 4px;
+    max-width: 230px;
+}
+#bt-bar[data-state="page"] #bt-status,
+#bt-bar[data-state="chapter"] #bt-status,
+#bt-bar[data-state="done"] #bt-status,
+#bt-bar[data-state="error"] #bt-status { display: inline-flex; }
+
+#bt-spinner {
+    width: 15px; height: 15px; flex: 0 0 auto;
+    border: 2px solid rgba(255, 255, 255, 0.30);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: bt-spin 0.8s linear infinite;
+}
+@keyframes bt-spin { to { transform: rotate(360deg); } }
+/* Spinner only while actively working */
+#bt-bar[data-state="done"] #bt-spinner,
+#bt-bar[data-state="error"] #bt-spinner { display: none; }
+
+#bt-status-text { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#bt-bar[data-state="done"] #bt-status-text { color: #8ed99f; }
+#bt-bar[data-state="error"] #bt-status { cursor: pointer; }
+#bt-bar[data-state="error"] #bt-status-text { color: #ff9e96; }
+
+/* ── Progress bar (thin, along the bottom edge of the pill) ─────────── */
+#bt-progress {
+    position: absolute;
+    left: 0; bottom: 0;
+    height: 3px;
+    width: 100%;
+    background: transparent;
+    pointer-events: none;
+}
+#bt-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--bt-accent), #66a6ff);
+    transition: width 0.3s ease;
+    border-radius: 0 3px 3px 0;
+}
+#bt-bar[data-state="error"] #bt-progress-fill { background: var(--bt-error); }
+/* Indeterminate sweep while translating the current page (unknown duration) */
+#bt-bar[data-state="page"] #bt-progress-fill {
+    width: 35% !important;
+    animation: bt-indeterminate 1.1s ease-in-out infinite;
+}
+@keyframes bt-indeterminate {
+    0%   { margin-left: -35%; }
+    100% { margin-left: 100%; }
 }
 
-#translator-float:active {
-    transform: scale(0.96) translateY(0);
-}
+/* ── Settings (gear) button + popover menu ──────────────────────────── */
+#bt-gear { padding: 6px 9px; font-size: 15px; line-height: 1; }
 
-/* ── Language selector ──────────────────────────────────────────────── */
-#target-lang-select {
-    max-width: 140px;
+#bt-menu {
+    position: absolute;
+    bottom: calc(100% + 10px);
+    right: 0;
+    min-width: 220px;
+    background: var(--bt-bar-bg);
+    color: #fff;
+    border-radius: 14px;
+    padding: 8px;
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    display: none;
+    flex-direction: column;
+    gap: 2px;
 }
-
-/* ── Loading spinner for translations ────────────────────────────────── */
-.bt-loading {
-    animation: bt-pulse 1.5s infinite;
-    color: #90a4ae;
-    font-style: italic;
-    padding: 4px 0 4px 16px;
-    font-size: 0.9em;
+#bt-menu.bt-open { display: flex; }
+.bt-menu-item {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: 9px;
+    cursor: pointer;
+    font-size: 13px;
 }
-
-@keyframes bt-pulse {
-    0%, 100% { opacity: 0.6; }
-    50% { opacity: 1; }
+.bt-menu-item:hover { background: rgba(255, 255, 255, 0.10); }
+.bt-menu-sep { height: 1px; margin: 4px 2px; background: rgba(255, 255, 255, 0.12); }
+.bt-menu-note { padding: 6px 10px; font-size: 11px; opacity: 0.65; }
+.bt-switch {
+    width: 34px; height: 19px; border-radius: 10px; flex: 0 0 auto;
+    background: rgba(255, 255, 255, 0.22); position: relative; transition: background 0.2s;
 }
+.bt-switch::after {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 15px; height: 15px; border-radius: 50%; background: #fff; transition: left 0.2s;
+}
+.bt-switch.bt-on { background: var(--bt-bilingual); }
+.bt-switch.bt-on::after { left: 17px; }
 
-/* ── Toast notification ─────────────────────────────────────────────── */
+/* ── Toast ──────────────────────────────────────────────────────────── */
 #bt-toast {
     position: fixed;
-    bottom: 80px;
-    right: 24px;
-    z-index: 10000;
-    background: rgba(30, 30, 30, 0.9);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    left: 50%; bottom: 84px;
+    transform: translateX(-50%) translateY(10px);
+    z-index: 2147483001;
+    background: rgba(20, 20, 20, 0.92);
     color: #fff;
-    padding: 12px 24px;
-    border-radius: 12px;
-    font-size: 14px;
+    padding: 9px 18px;
+    border-radius: 20px;
     font-family: 'Segoe UI', system-ui, sans-serif;
-    font-weight: 500;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 13px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
     opacity: 0;
-    transform: translateY(16px) scale(0.95);
     transition: opacity 0.3s ease, transform 0.3s ease;
     pointer-events: none;
 }
+#bt-toast.bt-toast-visible { opacity: 1; transform: translateX(-50%) translateY(0); }
 
-#bt-toast.bt-toast-visible {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-}
-
-/* ── Dark mode support (prefers-color-scheme) ───────────────────────── */
-@media (prefers-color-scheme: dark) {
-    .bt-translation {
-        color: #64b5f6 !important;
-        border-left-color: #1565c0;
-    }
-
-    #btn-translate-toggle:hover {
-        background-color: #1e3a5f;
-    }
-
-    #btn-translate-toggle.active {
-        background-color: #1565c0;
-        color: white;
-    }
-
-    .bt-loading {
-        color: #78909c;
-    }
-
-    #bt-progress {
-        background: rgba(100, 181, 246, 0.15);
-        color: #64b5f6;
-    }
-
-    [data-original-text] {
-        color: #e0e0e0;
-    }
-}
-
-/* ── CWA Theme: Dark ────────────────────────────────────────────────── */
-/* CWA sets inline background-color on #main for dark theme */
-#main[style*="background-color: #000"],
-#main[style*="background-color:#000"],
-#main[style*="background: #000"],
-body.dark-theme {
-    --bt-text: #64b5f6;
-    --bt-border: #1565c0;
-    --bt-original: #e0e0e0;
-}
-
-/* ── CWA Theme: Sepia ───────────────────────────────────────────────── */
-#main[style*="background-color: #f4ecd8"],
-#main[style*="background-color:#f4ecd8"],
-#main[style*="background: #f4ecd8"],
-body.sepia-theme {
-    --bt-text: #5d4037;
-    --bt-border: #a1887f;
-    --bt-original: #3e2723;
-}
-
-/* ── CWA Theme: Black (OLED) ────────────────────────────────────────── */
-#main[style*="background-color: #111"],
-#main[style*="background-color:#111"],
-#main[style*="background: #111"],
-body.black-theme {
-    --bt-text: #90caf9;
-    --bt-border: #1976d2;
-    --bt-original: #bdbdbd;
-}
-
-/* Apply CSS custom properties when set by theme selectors */
-#main[style] .bt-translation,
-body[class*="-theme"] .bt-translation {
-    color: var(--bt-text, #1565c0) !important;
-    border-left-color: var(--bt-border, #90caf9);
-}
-
-#main[style] [data-original-text],
-body[class*="-theme"] [data-original-text] {
-    color: var(--bt-original, #1a1a1a);
-}
-
-/* ── CWA-specific overrides ─────────────────────────────────────────── */
-/* CWA uses Bootstrap 3, so we make sure our styles take priority */
-.cwa-reader .bt-translation,
-.reader-content .bt-translation,
-#book-content .bt-translation {
-    display: block !important;
-    max-width: none !important;
-}
+@media print { #bt-bar, #bt-toast { display: none !important; } }
