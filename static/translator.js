@@ -618,9 +618,18 @@
                     continue;
                 }
                 
-                // Cleanup stale items
-                visibleQueue = visibleQueue.filter(x => x.gen === generation && !translatedParagraphs[x.hash]);
-                prefetchQueue = prefetchQueue.filter(x => x.gen === generation && !translatedParagraphs[x.hash]);
+                // Cleanup stale items and deduplicate
+                const seenHash = new Set();
+                visibleQueue = visibleQueue.filter(x => {
+                    if (x.gen !== generation || translatedParagraphs[x.hash] || seenHash.has(x.hash)) return false;
+                    seenHash.add(x.hash);
+                    return true;
+                });
+                prefetchQueue = prefetchQueue.filter(x => {
+                    if (x.gen !== generation || translatedParagraphs[x.hash] || seenHash.has(x.hash)) return false;
+                    seenHash.add(x.hash);
+                    return true;
+                });
                 
                 if (visibleQueue.length === 0 && prefetchQueue.length === 0) {
                     break; // Nothing to do
