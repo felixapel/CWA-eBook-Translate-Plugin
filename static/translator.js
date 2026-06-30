@@ -7,6 +7,8 @@
     // Optional overrides injected by the CWA template (window.BOOK_TRANSLATOR).
     // An empty/absent apiUrl falls back to dynamic host-based resolution so the
     // overlay keeps working when accessed over the LAN (not just localhost).
+    const BT_UI_VERSION = '2026-06-30-chapter-auto-v1';
+    console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
         ? cfg.apiUrl
@@ -118,7 +120,8 @@
     const strings = {
         en: {
             off: 'Original', bilingual: 'Bilingual', translated: 'Translated',
-            translatingPage: 'Translating page…', translatingChapter: 'Chapter', done: '✓ Done', error: '⚠ Error — retry',
+            translatingPage: 'Translating page…', translatingChapter: 'Preparing next text…', done: '✓ Ready', error: '⚠ Translation error — click to retry',
+            restoring: 'Restoring saved translations…',
             cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', settings: 'Settings',
             prefetchWhole: 'Pre-translate whole chapter', clearLang: 'Clear this language\'s cache', clearAll: 'Clear all cache',
             cached: 'Cached', cleared: 'Cache cleared',
@@ -273,7 +276,9 @@
             `<div class="bt-menu-sep"></div>` +
             `<div class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></div>` +
             `<div class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></div>` +
-            `<div class="bt-menu-note">${t.cached}: ${entryCount} · ${TARGET_LANG}</div>`;
+            `<div class="bt-menu-sep"></div>` +
+            `<div class="bt-menu-note">${t.cached}: ${entryCount} · ${TARGET_LANG}</div>` +
+            `<div class="bt-menu-note">v${BT_UI_VERSION}</div>`;
 
         menu.querySelectorAll('.bt-menu-item').forEach(item => {
             item.onclick = (e) => {
@@ -663,49 +668,77 @@
     const isBtNode = (n) => n.nodeType === 1 && n.classList &&
         (n.classList.contains('bt-translation') || n.classList.contains('bt-loading'));
 
-    function startMutationObserver() {
-        let translateTimeout = null;
-        const observer = new MutationObserver((mutations) => {
-            if (translationMode === 'off') return;
-            // Ignore mutations caused by our own inserted translations, otherwise
-            // appending a translation would re-trigger translation forever.
-            let shouldTranslate = false;
-            for (const m of mutations) {
-                for (const n of m.addedNodes) {
-                    if (!isBtNode(n)) { shouldTranslate = true; break; }
-                }
-                if (shouldTranslate) break;
-            }
-            if (shouldTranslate) {
-                clearTimeout(translateTimeout);
-                translateTimeout = setTimeout(() => {
-                    translateCurrentPage();
-                }, 200);
-            }
-        });
+    let translateTimeout = null;
+    let lastDocumentIdentity = null;
+    let iframeObserver = null;
+    let mainObserver = null;
 
-        const observeIframes = () => {
-            const iframes = document.querySelectorAll('iframe');
-            iframes.forEach(iframe => {
-                try {
-                    const idoc = iframe.contentDocument || iframe.contentWindow.document;
-                    if (idoc && idoc.body && !idoc.body.dataset.btObserved) {
-                        observer.observe(idoc.body, { childList: true, subtree: true });
-                        idoc.body.dataset.btObserved = "true";
-                        if (translationMode !== 'off') translateCurrentPage();
-                    }
-                } catch (e) {}
-            });
-        };
+    function scheduleTranslate(reason, { immediate = false, forceRediscover = false } = {}) {
+        if (translationMode === 'off') return;
+        
+        if (forceRediscover) {
+            newGeneration(); // Cancel stale work immediately if it's a chapter/page turn
+            lastFirstVisibleHash = null; // force the detector to pick up the new page
+        }
 
-        observer.observe(document.body, { childList: true, subtree: true });
-        setInterval(observeIframes, 500);
-        observeIframes();
+        clearTimeout(translateTimeout);
+        if (immediate) {
+            translateCurrentPage();
+        } else {
+            translateTimeout = setTimeout(() => {
+                translateCurrentPage();
+            }, 250);
+        }
     }
 
-    function startPageTurnDetector() {
+    function setupObservers() {
+        if (!mainObserver) {
+            mainObserver = new MutationObserver((mutations) => {
+                let shouldTranslate = false;
+                for (const m of mutations) {
+                    for (const n of m.addedNodes) {
+                        if (!isBtNode(n)) { shouldTranslate = true; break; }
+                    }
+                    if (shouldTranslate) break;
+                }
+                if (shouldTranslate) scheduleTranslate('main_mutation');
+            });
+            mainObserver.observe(document.body, { childList: true, subtree: true });
+        }
+
+        // We check for iframe document changes or page turns
         setInterval(() => {
             if (translationMode === 'off') return;
+
+            // 1. Iframe discovery and identity tracking
+            const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+            if (iframe) {
+                try {
+                    const idoc = iframe.contentDocument || iframe.contentWindow.document;
+                    if (idoc && idoc !== lastDocumentIdentity) {
+                        lastDocumentIdentity = idoc;
+                        
+                        if (iframeObserver) iframeObserver.disconnect();
+                        iframeObserver = new MutationObserver((mutations) => {
+                            let shouldTranslate = false;
+                            for (const m of mutations) {
+                                for (const n of m.addedNodes) {
+                                    if (!isBtNode(n)) { shouldTranslate = true; break; }
+                                }
+                                if (shouldTranslate) break;
+                            }
+                            if (shouldTranslate) scheduleTranslate('iframe_mutation');
+                        });
+                        
+                        if (idoc.body) {
+                            iframeObserver.observe(idoc.body, { childList: true, subtree: true });
+                            scheduleTranslate('new_document', { immediate: true, forceRediscover: true });
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            // 2. Page turn detector
             const visible = getVisibleParagraphs();
             if (visible.length > 0) {
                 const firstText = getParagraphText(visible[0]);
@@ -713,14 +746,24 @@
                     const hash = hashText(firstText);
                     if (hash !== lastFirstVisibleHash) {
                         lastFirstVisibleHash = hash;
-                        // Page/chapter changed: preempt any stale background prefetch
-                        // so the LLM is freed up to translate the NEW visible page now.
-                        newGeneration();
-                        translateCurrentPage();
+                        scheduleTranslate('page_turn', { immediate: true, forceRediscover: true });
                     }
                 }
             }
         }, 350);
+    }
+
+    function attachEpubHooks() {
+        if (window.reader && window.reader.rendition) {
+            window.reader.rendition.on('relocated', () => {
+                scheduleTranslate('epub_relocated', { immediate: true, forceRediscover: true });
+            });
+            window.reader.rendition.on('rendered', () => {
+                scheduleTranslate('epub_rendered', { immediate: true, forceRediscover: true });
+            });
+        } else {
+            setTimeout(attachEpubHooks, 1000);
+        }
     }
 
     // ── Start ──────────────────────────────────────────────────────────
@@ -738,8 +781,8 @@
 
     function init() {
         createFloatingUI();
-        startMutationObserver();
-        startPageTurnDetector();
+        setupObservers();
+        attachEpubHooks();
         setupKeyboardShortcut();
         // Persist any pending translations if the user closes/reloads the tab.
         window.addEventListener('beforeunload', persistCacheNow);
