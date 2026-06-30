@@ -30,9 +30,15 @@ services:
       - LLM_PROVIDER=local
       - LLM_MODEL=gemma4-12b
       - LLM_API_KEY=
-      # For provider=local: point at the LLM on the HOST, not the container.
-      # host.docker.internal resolves to the host via the extra_hosts mapping below.
-      - BT_LOCAL_URL=http://host.docker.internal:1234/v1/chat/completions
+      # For provider=local: OpenAI-compatible endpoint of your LLM. The PATH is
+      # always /v1/chat/completions (vLLM, LM Studio, Ollama and Llama.cpp all
+      # speak it); only host:PORT changes. Point at the HOST, not this container
+      # (host.docker.internal resolves to the host via extra_hosts below).
+      #   vLLM         -> typically :8000   (e.g. http://host.docker.internal:8000/v1/chat/completions)
+      #   LM Studio    -> :1234
+      #   Ollama       -> :11434
+      # Change the port to match YOUR server (e.g. your vLLM on 192.168.0.122:2819).
+      - BT_LOCAL_URL=http://host.docker.internal:8000/v1/chat/completions
       # Slow local model? Lower concurrency (1-2) is more stable than 3.
       - BT_MAX_CONCURRENT=2
       - BT_TIMEOUT=60

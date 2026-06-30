@@ -71,7 +71,7 @@ Environment variables for the `book-translator-api` container:
 | `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
 | `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
 | `LLM_API_KEY` | | Your API key for the chosen provider |
-| `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local`. **In Docker, `localhost` is the container itself** — point this at your host (e.g. `http://host.docker.internal:1234/...` or the host IP). |
+| `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local`. OpenAI-compatible endpoint — the **path is always `/v1/chat/completions`** (vLLM, LM Studio, Ollama, llama.cpp all speak it); only host:port changes (vLLM `:8000`, LM Studio `:1234`, Ollama `:11434`). **In Docker, `localhost` is the container itself** — use `http://host.docker.internal:<port>/...` or the host IP. |
 | `BT_MAX_CONCURRENT` | `2` | Simultaneous translation requests per batch. For a slow single-GPU local model, `1`–`2` is **more** stable than `3` (avoids timeout cascades). |
 | `BT_TIMEOUT` | `60` | Seconds before a single translation request is abandoned. Raise it if a slow local model times out on long paragraphs. |
 | `LLM_FALLBACK_PROVIDER` | | Optional. A secondary provider used automatically when the primary fails (e.g. `minimax` while `local` is slow/down). |

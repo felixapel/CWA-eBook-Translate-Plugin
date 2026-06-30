@@ -292,148 +292,117 @@
     }
 
     // ── Translation engine ─────────────────────────────────────────────
+    // Tunables for fluidity. The current page is translated 1 paragraph at a
+    // time so the first line appears as fast as possible; the rest of the
+    // chapter is filled in afterwards, in the background, at low priority.
+    const VISIBLE_CHUNK = 1;       // paragraphs per request for the on-screen page
+    const PREFETCH_CHUNK = 3;      // paragraphs per request for background fill
+    const PREFETCH_GAP_MS = 600;   // pause between background requests
+    const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
+
+    function collectUncached(elements) {
+        const out = [];
+        const seen = new Set();
+        for (const el of elements) {
+            const text = getParagraphText(el);
+            if (!text || text.length < 2) continue;
+            const hash = hashText(text);
+            if (translatedParagraphs[hash] || seen.has(hash)) continue;
+            seen.add(hash);
+            out.push({ el, text, hash });
+        }
+        return out;
+    }
+
+    async function postBatch(texts) {
+        const controller = new AbortController();
+        activeControllers.add(controller);
+        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        try {
+            const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ paragraphs: texts, source_lang: SOURCE_LANG, target_lang: TARGET_LANG }),
+                signal: controller.signal,
+            });
+            if (!resp.ok) return null;
+            return await resp.json();
+        } finally {
+            clearTimeout(timer);
+            activeControllers.delete(controller);
+        }
+    }
+
+    // Translate a list of {el,text,hash} in chunks, rendering each chunk as soon
+    // as it arrives (progressive paint). Bails immediately if superseded.
+    async function translateElements(items, myGen, chunkSize) {
+        for (let i = 0; i < items.length; i += chunkSize) {
+            if (myGen !== generation || translationMode === 'off') return;
+            const chunk = items.slice(i, i + chunkSize);
+            let data = null;
+            try {
+                data = await postBatch(chunk.map(b => b.text));
+            } catch (e) {
+                if (e.name !== 'AbortError') console.error("Translation request failed:", e);
+                return; // network/abort/timeout — stop this run; a later trigger retries
+            }
+            if (myGen !== generation) return; // superseded — drop stale result
+            if (data && Array.isArray(data.translations)) {
+                data.translations.forEach((tr, idx) => {
+                    // Don't cache errors/empties so they retry on the next pass.
+                    if (!isBadTranslation(tr)) translatedParagraphs[chunk[idx].hash] = tr;
+                });
+                renderMode(chunk.map(b => b.el));
+            }
+        }
+    }
+
     async function translateCurrentPage() {
         if (isTranslating || translationMode === 'off') return;
         isTranslating = true;
         updateLoadingIndicator();
         const myGen = generation;
 
-        // 1. Prioritize visible paragraphs
-        const visible = getVisibleParagraphs();
-        if (visible.length > 0) {
-            await translateBatchOfElements(visible, myGen);
+        // 1. CURRENT PAGE FIRST — progressive, so the first line shows quickly.
+        const visibleEls = getVisibleParagraphs();
+        const visibleUncached = collectUncached(visibleEls);
+        if (visibleUncached.length > 0) {
+            await translateElements(visibleUncached, myGen, VISIBLE_CHUNK);
         }
-
-        // Bail if a newer run (mode/language change) superseded us.
-        if (myGen !== generation) {
-            updateLoadingIndicator();
-            return;
-        }
-
-        // 2. Queue remaining paragraphs in chapter for background prefetch
-        const all = getParagraphs();
-        const remaining = all.filter(el => !visible.includes(el));
-        queuePrefetch(remaining);
+        // Paint any visible paragraphs that were already cached (revisited page).
+        if (myGen === generation) renderMode(visibleEls);
 
         if (myGen === generation) isTranslating = false;
         updateLoadingIndicator();
-    }
 
-    async function translateBatchOfElements(elements, myGen) {
-        const toTranslate = [];
-        elements.forEach(el => {
-            const text = getParagraphText(el);
-            if (!text || text.length < 2) return;
-            const hash = hashText(text);
-            if (!translatedParagraphs[hash]) {
-                toTranslate.push({ el, text, hash });
-            }
-        });
+        if (myGen !== generation || translationMode === 'off') return;
 
-        if (toTranslate.length > 0) {
-            const controller = new AbortController();
-            activeControllers.add(controller);
-            try {
-                const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        paragraphs: toTranslate.map(b => b.text),
-                        source_lang: SOURCE_LANG,
-                        target_lang: TARGET_LANG,
-                    }),
-                    signal: controller.signal,
-                });
-
-                if (resp.ok) {
-                    const data = await resp.json();
-                    if (myGen !== generation) return; // superseded — drop stale result
-                    data.translations.forEach((tr, idx) => {
-                        // Don't cache errors/empties so they retry next pass.
-                        if (!isBadTranslation(tr)) {
-                            translatedParagraphs[toTranslate[idx].hash] = tr;
-                        }
-                    });
-                    renderMode(elements);
-                }
-            } catch (e) {
-                if (e.name !== 'AbortError') console.error("Batch translation error:", e);
-            } finally {
-                activeControllers.delete(controller);
-            }
-        } else {
-            // Already cached, just render
-            renderMode(elements);
-        }
-    }
-
-    // ── Background Prefetching ─────────────────────────────────────────
-    function queuePrefetch(elements) {
-        const uncached = elements.filter(el => {
-            const text = getParagraphText(el);
-            if (!text || text.length < 2) return false;
-            const hash = hashText(text);
-            return !translatedParagraphs[hash];
-        });
-
-        prefetchQueue = uncached;
+        // 2. REST OF CHAPTER — background fill, low priority and preemptible.
+        const visibleSet = new Set(visibleEls);
+        prefetchQueue = getParagraphs().filter(el => !visibleSet.has(el));
         triggerPrefetch();
     }
 
+    // ── Background Prefetching ─────────────────────────────────────────
     async function triggerPrefetch() {
         if (isPrefetching || prefetchQueue.length === 0) return;
         isPrefetching = true;
         updateLoadingIndicator();
         const myGen = generation;
 
-        while (prefetchQueue.length > 0 && translationMode !== 'off' && myGen === generation) {
-            // Take 3 paragraphs at a time to keep it sequential and light
-            const batch = prefetchQueue.slice(0, 3);
-            prefetchQueue = prefetchQueue.slice(3);
+        // Yield to the visible page: pause whenever a page translation is active.
+        while (prefetchQueue.length > 0 && translationMode !== 'off'
+               && myGen === generation && !isTranslating) {
+            const batch = prefetchQueue.slice(0, PREFETCH_CHUNK);
+            prefetchQueue = prefetchQueue.slice(PREFETCH_CHUNK);
 
-            const toTranslate = batch.map(el => {
-                const text = getParagraphText(el);
-                return {
-                    el: el,
-                    text: text,
-                    hash: hashText(text)
-                };
-            }).filter(b => b.text && b.text.length >= 2 && !translatedParagraphs[b.hash]);
-
-            if (toTranslate.length > 0) {
-                const controller = new AbortController();
-                activeControllers.add(controller);
-                try {
-                    const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            paragraphs: toTranslate.map(b => b.text),
-                            source_lang: SOURCE_LANG,
-                            target_lang: TARGET_LANG,
-                        }),
-                        signal: controller.signal,
-                    });
-
-                    if (resp.ok) {
-                        const data = await resp.json();
-                        if (myGen !== generation) break; // superseded — stop the loop
-                        data.translations.forEach((tr, idx) => {
-                            if (!isBadTranslation(tr)) {
-                                translatedParagraphs[toTranslate[idx].hash] = tr;
-                            }
-                        });
-                        renderMode(toTranslate.map(b => b.el));
-                    }
-                } catch (e) {
-                    if (e.name !== 'AbortError') console.error("Prefetch error:", e);
-                } finally {
-                    activeControllers.delete(controller);
-                }
+            const items = collectUncached(batch);
+            if (items.length > 0) {
+                await translateElements(items, myGen, PREFETCH_CHUNK);
             }
+            if (myGen !== generation) break;
 
-            // Sleep 800ms between prefetch requests to prevent API overload
-            await new Promise(resolve => setTimeout(resolve, 800));
+            await new Promise(resolve => setTimeout(resolve, PREFETCH_GAP_MS));
         }
 
         if (myGen === generation) isPrefetching = false;
@@ -505,22 +474,27 @@
     }
 
     // ── Observers & Polling ────────────────────────────────────────────
+    const isBtNode = (n) => n.nodeType === 1 && n.classList &&
+        (n.classList.contains('bt-translation') || n.classList.contains('bt-loading'));
+
     function startMutationObserver() {
         let translateTimeout = null;
         const observer = new MutationObserver((mutations) => {
             if (translationMode === 'off') return;
+            // Ignore mutations caused by our own inserted translations, otherwise
+            // appending a translation would re-trigger translation forever.
             let shouldTranslate = false;
             for (const m of mutations) {
-                if (m.addedNodes.length > 0) {
-                    shouldTranslate = true;
-                    break;
+                for (const n of m.addedNodes) {
+                    if (!isBtNode(n)) { shouldTranslate = true; break; }
                 }
+                if (shouldTranslate) break;
             }
             if (shouldTranslate) {
                 clearTimeout(translateTimeout);
                 translateTimeout = setTimeout(() => {
                     translateCurrentPage();
-                }, 150);
+                }, 200);
             }
         });
 
@@ -553,12 +527,14 @@
                     const hash = hashText(firstText);
                     if (hash !== lastFirstVisibleHash) {
                         lastFirstVisibleHash = hash;
-                        console.log("[book-translator] Page change detected!");
+                        // Page/chapter changed: preempt any stale background prefetch
+                        // so the LLM is freed up to translate the NEW visible page now.
+                        newGeneration();
                         translateCurrentPage();
                     }
                 }
             }
-        }, 400);
+        }, 350);
     }
 
     // ── Start ──────────────────────────────────────────────────────────
