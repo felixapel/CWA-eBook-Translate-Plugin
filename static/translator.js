@@ -7,7 +7,7 @@
     // Optional overrides injected by the CWA template (window.BOOK_TRANSLATOR).
     // An empty/absent apiUrl falls back to dynamic host-based resolution so the
     // overlay keeps working when accessed over the LAN (not just localhost).
-    const BT_UI_VERSION = '2026-06-30-opus-deploy-sync-v1';
+    const BT_UI_VERSION = '2026-06-30-ui-polish-v1';
     console.info(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
@@ -37,6 +37,7 @@
     let chapterTotal = 0;     // paragraphs queued for the current chapter's background fill
     let errorCount = 0;       // consecutive failed requests (drives the error state)
     let doneHideTimer = null;
+    let lastTriggerReason = 'init'; // why translateCurrentPage last ran (shown in the debug menu)
 
     // ── Persistent translation cache (survives page turns AND browser reloads) ──
     // Per-language map of contentHash -> translation, mirrored to localStorage so
@@ -125,6 +126,9 @@
             cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', settings: 'Settings',
             prefetchWhole: 'Pre-translate whole chapter', clearLang: 'Clear this language\'s cache', clearAll: 'Clear all cache',
             cached: 'Cached', cleared: 'Cache cleared',
+            bookTranslator: 'Book Translator', modeLabel: 'Mode', langLabel: 'Language',
+            retryPage: 'Retry current page', debug: 'Debug',
+            dbgQueue: 'Queue', dbgGen: 'Generation', dbgTrigger: 'Last trigger',
         },
         es: {
             off: 'Original', bilingual: 'Bilingüe', translated: 'Traducido',
@@ -132,6 +136,9 @@
             cycleHint: 'Clic para cambiar: Original → Bilingüe → Traducido', langHint: 'Idioma destino', settings: 'Ajustes',
             prefetchWhole: 'Pre-traducir capítulo completo', clearLang: 'Borrar caché de este idioma', clearAll: 'Borrar toda la caché',
             cached: 'En caché', cleared: 'Caché borrada',
+            bookTranslator: 'Book Translator', modeLabel: 'Modo', langLabel: 'Idioma',
+            retryPage: 'Reintentar página actual', debug: 'Depuración',
+            dbgQueue: 'Cola', dbgGen: 'Generación', dbgTrigger: 'Último disparo',
         },
         fr: {
             off: 'Original', bilingual: 'Bilingue', translated: 'Traduit',
@@ -155,7 +162,9 @@
             cached: 'Em cache', cleared: 'Cache limpo',
         },
     };
-    const t = strings[browserCode] || strings.en;
+    // English is the base; the locale (if any) overrides it, so menu-only keys
+    // added only to `en` never come out undefined in another language.
+    const t = Object.assign({}, strings.en, strings[browserCode] || {});
 
     const availableLangs = [
         { code: 'Spanish', name: 'Español' },
@@ -218,10 +227,16 @@
                 `<span id="bt-status-text"></span>` +
             `</div>` +
             `<button id="bt-gear" title="${t.settings}" aria-label="${t.settings}">⚙</button>` +
-            `<div id="bt-progress"><div id="bt-progress-fill"></div></div>` +
-            `<div id="bt-menu"></div>`;
+            `<div id="bt-progress"><div id="bt-progress-fill"></div></div>`;
 
         document.body.appendChild(bar);
+
+        // The settings popover lives at body level (NOT inside #bt-bar) because the
+        // bar uses overflow:hidden to clip the progress bar, which would also clip
+        // a child popover — that's why the gear "did nothing" before.
+        const menu = document.createElement('div');
+        menu.id = 'bt-menu';
+        document.body.appendChild(menu);
 
         document.getElementById('bt-toggle').onclick = () => {
             const next = translationMode === 'off' ? 'bilingual'
@@ -245,11 +260,15 @@
 
         const gear = document.getElementById('bt-gear');
         gear.onclick = (e) => { e.stopPropagation(); toggleMenu(); };
+        // Close on outside click (anywhere not on the bar or the menu)...
         document.addEventListener('click', (e) => {
-            const menu = document.getElementById('bt-menu');
-            if (menu && menu.classList.contains('bt-open') && !bar.contains(e.target)) {
-                menu.classList.remove('bt-open');
+            if (menu.classList.contains('bt-open') && !bar.contains(e.target) && !menu.contains(e.target)) {
+                closeMenu();
             }
+        });
+        // ...and on Escape.
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && menu.classList.contains('bt-open')) closeMenu();
         });
 
         // Click the error status to retry.
@@ -268,17 +287,23 @@
         const menu = document.getElementById('bt-menu');
         if (!menu) return;
         const entryCount = Object.keys(translatedParagraphs).length;
+        const modeLabel = t[translationMode] || translationMode;
+        const esc = (s) => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
         menu.innerHTML =
+            `<div class="bt-menu-header">${t.bookTranslator}<span class="bt-menu-ver">v${BT_UI_VERSION}</span></div>` +
+            `<div class="bt-menu-row"><span>${t.modeLabel}</span><span class="bt-menu-val">${modeLabel}</span></div>` +
+            `<div class="bt-menu-row"><span>${t.langLabel}</span><span class="bt-menu-val">${TARGET_LANG}</span></div>` +
+            `<div class="bt-menu-sep"></div>` +
             `<div class="bt-menu-item" data-action="prefetch">` +
                 `<span>${t.prefetchWhole}</span>` +
                 `<span class="bt-switch${prefetchEnabled ? ' bt-on' : ''}"></span>` +
             `</div>` +
-            `<div class="bt-menu-sep"></div>` +
+            `<div class="bt-menu-item" data-action="retry"><span>↻ ${t.retryPage}</span></div>` +
             `<div class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></div>` +
             `<div class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></div>` +
             `<div class="bt-menu-sep"></div>` +
-            `<div class="bt-menu-note">${t.cached}: ${entryCount} · ${TARGET_LANG}</div>` +
-            `<div class="bt-menu-note">v${BT_UI_VERSION}</div>`;
+            `<div class="bt-menu-note">${t.cached}: ${entryCount} · ${esc(TARGET_LANG)}</div>` +
+            `<div class="bt-menu-note">${t.debug}: ${t.dbgQueue} ${prefetchQueue.length} · ${t.dbgGen} ${generation} · ${t.dbgTrigger} ${esc(lastTriggerReason)}</div>`;
 
         menu.querySelectorAll('.bt-menu-item').forEach(item => {
             item.onclick = (e) => {
@@ -289,6 +314,10 @@
                     localStorage.setItem('bt_prefetch', prefetchEnabled ? '1' : '0');
                     buildMenu();
                     if (prefetchEnabled && translationMode !== 'off') triggerPrefetch();
+                } else if (action === 'retry') {
+                    errorCount = 0;
+                    closeMenu();
+                    if (translationMode !== 'off') scheduleTranslate('manual_retry', { immediate: true, forceRediscover: true });
                 } else if (action === 'clear-lang') {
                     translatedParagraphs = {};
                     try { localStorage.removeItem(CACHE_PREFIX + TARGET_LANG); } catch (e2) {}
@@ -307,10 +336,15 @@
         });
     }
 
+    function closeMenu() {
+        const menu = document.getElementById('bt-menu');
+        if (menu) menu.classList.remove('bt-open');
+    }
+
     function toggleMenu() {
         const menu = document.getElementById('bt-menu');
         if (!menu) return;
-        if (!menu.classList.contains('bt-open')) buildMenu();
+        if (!menu.classList.contains('bt-open')) buildMenu(); // refresh snapshot (mode/queue/gen)
         menu.classList.toggle('bt-open');
     }
 
@@ -369,63 +403,82 @@
     }
 
     // ── DOM Helpers ────────────────────────────────────────────────────
-    function getParagraphs() {
-        let doc = document;
+    function getReaderDoc() {
         const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
-        if (iframe && iframe.contentDocument) {
-            doc = iframe.contentDocument;
+        if (iframe) {
+            try { return iframe.contentDocument || iframe.contentWindow.document; } catch (e) { return null; }
         }
-        
-        // Match standard tags and custom title/chapter classes commonly used in EPUBs
+        return null;
+    }
+
+    const HEADING_CLASS_RE = /title|subtitle|chapter|heading|epigraph/i;
+
+    function isHeading(el) {
+        if (/^h[1-6]$/i.test(el.tagName)) return true;
+        const c = (el.getAttribute && el.getAttribute('class')) || '';
+        return HEADING_CLASS_RE.test(c);
+    }
+
+    function isCentered(el) {
+        try {
+            const win = el.ownerDocument.defaultView || window;
+            return win.getComputedStyle(el).textAlign === 'center';
+        } catch (e) { return false; }
+    }
+
+    function isPluginNode(el) {
+        return !!(el.closest && el.closest('#bt-bar, #bt-menu, #bt-toast'))
+            || (el.classList && (el.classList.contains('bt-translation') || el.classList.contains('bt-loading')));
+    }
+
+    // Canonical, de-duplicated set of translatable elements in a given document.
+    function getTranslatableElements(doc) {
+        if (!doc) return [];
         const rawElements = Array.from(doc.querySelectorAll(
-            'p, h1, h2, h3, h4, h5, h6, li, td, div.calibre1, div.text, a, ' +
-            '[class*="title"], [class*="subtitle"], [class*="chapter"], [class*="author"], [class*="heading"]'
+            'p, blockquote, li, td, h1, h2, h3, h4, h5, h6, div.calibre1, div.text, a, ' +
+            '[class*="title"], [class*="subtitle"], [class*="chapter"], [class*="author"], ' +
+            '[class*="heading"], [class*="epigraph"], [class*="quote"], [class*="verse"]'
         ));
-        
-        // 1. Initial filter for content and layout constraints
+
+        // 1. Filter for content, layout, and exclusions.
         const filtered = rawElements.filter(el => {
+            if (isPluginNode(el)) return false;                 // never translate our own UI
             const text = el.textContent.trim();
             if (text.length < 2) return false;
-            
+
             const tagName = el.tagName.toLowerCase();
-            
-            // If it's a link
+
             if (tagName === 'a') {
-                // Only translate standalone links (like in TOC). Filter out links inside body paragraphs.
-                const insideParagraph = el.closest('p, div.calibre1, div.text');
-                if (insideParagraph) return false;
+                // Only standalone links (e.g. TOC entries); skip links inside prose.
+                if (el.closest('p, div.calibre1, div.text, blockquote, li')) return false;
                 return true;
             }
-            
-            // If it's a block that contains links, let the links translate themselves to preserve clickability
-            if (['li', 'div', 'td'].includes(tagName)) {
-                const hasLink = el.querySelector('a');
-                if (hasLink) return false; 
-            }
-            
-            // If it's a container holding other block children, don't translate the container itself
-            if (tagName === 'div') {
-                const hasBlockChildren = el.querySelector('p, h1, h2, h3, h4, h5, h6, li');
-                if (hasBlockChildren) return false;
-            }
-            
+
+            // Blocks containing a link: let the link translate itself (keeps it clickable).
+            if (['li', 'div', 'td'].includes(tagName) && el.querySelector('a')) return false;
+
+            // Containers holding other block children: translate the children, not the wrapper.
+            if (['div', 'blockquote', 'li', 'td'].includes(tagName)
+                && el.querySelector('p, h1, h2, h3, h4, h5, h6, li, blockquote')) return false;
+
             return true;
         });
 
-        // 2. De-duplicate hierarchy: If a parent/ancestor is already in the list to be translated,
-        // we skip the child element to translate the parent as a single contextual block.
-        // Use a Set for O(1) ancestor lookups (was O(n²) via Array.includes — janky on big chapters).
+        // 2. De-duplicate hierarchy via a Set (O(n)): skip a child if an ancestor is
+        // already selected, so we translate the logical block once.
         const filteredSet = new Set(filtered);
         return filtered.filter(el => {
             let parent = el.parentElement;
             while (parent) {
-                if (filteredSet.has(parent)) {
-                    return false; // Skip, parent will be translated
-                }
+                if (filteredSet.has(parent)) return false;
                 parent = parent.parentElement;
             }
             return true;
         });
+    }
+
+    function getParagraphs() {
+        return getTranslatableElements(getReaderDoc() || document);
     }
 
     function getVisibleParagraphs() {
@@ -550,6 +603,11 @@
         refreshStatus();
         const myGen = generation;
 
+        // Make sure our translation styles + theme are live inside the reader iframe
+        // (parent-page CSS does NOT cascade into the EPUB.js iframe document).
+        const idoc = getReaderDoc();
+        if (idoc) { ensureIframeStyles(idoc); applyIframeTheme(idoc); }
+
         // 1. CURRENT PAGE FIRST — progressive, so the first line shows quickly.
         const visibleEls = getVisibleParagraphs();
         const visibleUncached = collectUncached(visibleEls);
@@ -603,6 +661,44 @@
         refreshStatus();
     }
 
+    // ── Iframe styling (parent-page CSS does not cascade into the EPUB iframe) ──
+    const IFRAME_STYLE_ID = 'bt-injected-styles';
+    const IFRAME_CSS = `
+:root,html{--bt-translation-color:#1565c0;--bt-translation-border:#90caf9;--bt-translation-bg:rgba(21,101,192,0.06);}
+html[data-bt-theme="dark"]{--bt-translation-color:#8ec0f9;--bt-translation-border:#1976d2;--bt-translation-bg:rgba(142,192,249,0.10);}
+html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-border:#a1887f;--bt-translation-bg:rgba(109,76,65,0.08);}
+.bt-translation{display:block;margin:0.5em 0 0.25em;padding:0.15em 0 0.15em 0.7em;border-left:3px solid var(--bt-translation-border);background:var(--bt-translation-bg);color:var(--bt-translation-color)!important;font-style:italic;font-weight:normal;line-height:1.5;}
+.bt-heading-translation{border-left:none;background:transparent;padding-left:0;font-size:0.72em;opacity:0.92;margin-top:0.3em;break-inside:avoid;page-break-inside:avoid;}
+.bt-center{text-align:center;}
+.bt-loading{opacity:0.6;font-style:italic;}
+`;
+
+    function ensureIframeStyles(idoc) {
+        try {
+            if (!idoc || idoc.getElementById(IFRAME_STYLE_ID)) return;
+            const style = idoc.createElement('style');
+            style.id = IFRAME_STYLE_ID;
+            style.textContent = IFRAME_CSS;
+            (idoc.head || idoc.documentElement).appendChild(style);
+        } catch (e) { /* cross-origin or detached doc — ignore */ }
+    }
+
+    function applyIframeTheme(idoc) {
+        try {
+            if (!idoc || !idoc.body) return;
+            const win = idoc.defaultView || window;
+            const m = (win.getComputedStyle(idoc.body).backgroundColor || '').match(/\d+/g);
+            let theme = 'light';
+            if (m && m.length >= 3) {
+                const [r, g, b] = m.map(Number);
+                const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                if (lum < 110) theme = 'dark';
+                else if (r >= g && g > b && (r - b) > 12) theme = 'sepia';
+            }
+            idoc.documentElement.dataset.btTheme = theme;
+        } catch (e) { /* ignore */ }
+    }
+
     // ── Rendering ──────────────────────────────────────────────────────
     function showTranslationsBilingual(paragraphs) {
         paragraphs.forEach((el) => {
@@ -612,16 +708,21 @@
             const translated = translatedParagraphs[hash];
             if (isBadTranslation(translated) || translated === text) return;
 
-            let transEl = el.querySelector('.bt-translation');
-            if (transEl) {
-                transEl.textContent = translated;
-                return;
+            // If this element was previously inline-translated, restore the clean
+            // original first so we never stack a bilingual block onto replaced text.
+            if (el.dataset.originalText !== undefined) {
+                el.textContent = el.dataset.originalText;
+                delete el.dataset.originalText;
             }
 
-            transEl = document.createElement('span');
-            // Styling lives in translator.css (.bt-translation) so the translation
-            // colour adapts to the reader's light/dark/sepia theme.
-            transEl.className = 'bt-translation';
+            // Idempotent: update the existing direct-child translation instead of duplicating.
+            let transEl = el.querySelector(':scope > .bt-translation');
+            if (transEl) { transEl.textContent = translated; return; }
+
+            const heading = isHeading(el);
+            transEl = el.ownerDocument.createElement(heading ? 'div' : 'span');
+            transEl.className = 'bt-translation ' + (heading ? 'bt-heading-translation' : 'bt-translation-bilingual');
+            if (heading && isCentered(el)) transEl.className += ' bt-center';
             transEl.textContent = translated;
             el.appendChild(transEl);
         });
@@ -675,7 +776,8 @@
 
     function scheduleTranslate(reason, { immediate = false, forceRediscover = false } = {}) {
         if (translationMode === 'off') return;
-        
+        lastTriggerReason = reason;
+
         if (forceRediscover) {
             newGeneration(); // Cancel stale work immediately if it's a chapter/page turn
             lastFirstVisibleHash = null; // force the detector to pick up the new page
@@ -731,6 +833,8 @@
                         });
                         
                         if (idoc.body) {
+                            ensureIframeStyles(idoc);   // inject our CSS into the new chapter doc
+                            applyIframeTheme(idoc);
                             iframeObserver.observe(idoc.body, { childList: true, subtree: true });
                             scheduleTranslate('new_document', { immediate: true, forceRediscover: true });
                         }

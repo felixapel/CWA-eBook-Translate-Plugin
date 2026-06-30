@@ -6,7 +6,7 @@
 
 Open browser DevTools (F12), go to **Console** tab, then:
 - Open an EPUB in CWA at `http://192.168.0.122:8383`.
-- You should see: `[BookTranslator] loaded version 2026-06-30-opus-deploy-sync-v1`
+- You should see: `[BookTranslator] loaded version 2026-06-30-ui-polish-v1`
 - A version toast will appear briefly in the UI.
 
 To grep version on the server:
@@ -45,7 +45,7 @@ docker exec calibre-web-automated grep -n "BT_UI_VERSION" /app/calibre-web-autom
 
 ## 3. Page / chapter change stops translating (requires button toggle)
 
-- **Old JS**: Ensure `BT_UI_VERSION = '2026-06-30-opus-deploy-sync-v1'` or newer.
+- **Old JS**: Ensure `BT_UI_VERSION = '2026-06-30-ui-polish-v1'` or newer.
 - **Iframe not detected**: Viewer uses epub.js inside an `<iframe>`. Open DevTools console,
   look for `scheduleTranslate(reason=...)` log lines. If absent, iframe detection failed.
 - **epub.js hooks**: The `attachEpubHooks` function retries for `window.reader.rendition`
@@ -112,3 +112,37 @@ docker inspect calibre-web-automated --format "{{range .Mounts}}{{.Source}} -> {
   Our overlay files are mounted `ro` — this is intentional for the plugin files only.
 - If CWA crashes, check: `docker logs calibre-web-automated 2>&1 | tail -50`
 - If `cwa-init` complains about file ownership, add `NETWORK_SHARE_MODE=true` env.
+
+---
+
+## 8. Settings gear (⚙) does nothing
+
+- **Fixed in `2026-06-30-ui-polish-v1`.** The menu was being clipped by the control
+  bar's `overflow: hidden`; it is now a body-level popover anchored above the pill.
+- If the gear still seems dead, you are running an **older cached JS** — hard refresh
+  (`Ctrl+Shift+R`) and confirm the console shows `loaded version 2026-06-30-ui-polish-v1`.
+- The menu closes on a click outside it or on `Escape`. It shows the UI version, current
+  mode/language, a background-prefetch toggle, retry, cache-clear actions, and debug info.
+
+---
+
+## 9. Bilingual translation is glued to the original / hard to read
+
+- **Fixed in `2026-06-30-ui-polish-v1`.** Parent-page CSS does not reach inside the
+  EPUB.js `<iframe>`, so the translation styles are now injected directly into the reader
+  document. The Spanish line appears under the original with spacing, a blue tint, a
+  left border, and a faint background.
+- Theme-safe: the blue adapts to white / dark / sepia readers automatically (the plugin
+  measures the reader background and sets `data-bt-theme` on the iframe `<html>`).
+- If translations look unstyled, the injected `<style id="bt-injected-styles">` may have
+  failed — reload the page so the iframe is re-detected.
+
+---
+
+## 10. Some headings / subtitles aren't translated, or are glued
+
+- **Improved in `2026-06-30-ui-polish-v1`.** The selector now covers `h1`–`h6`,
+  `blockquote`, and `title`/`subtitle`/`chapter`/`heading`/`epigraph`/`quote` classes,
+  and headings render with a dedicated, spaced, centered-when-appropriate style.
+- If a specific heading still isn't picked up, it likely uses an unusual class/structure —
+  note the element (DevTools → Inspect) so the selector can be extended.
