@@ -121,6 +121,29 @@ def run():
     d = client.post("/translate/batch", json={"paragraphs": ["x", "", "y"]}).get_json()
     check("batch: retried after recovery", d["translations"][0] == "[LOCAL] x" and d["translations"][2] == "[LOCAL] y")
 
+    # Context Window.
+    os.environ["BT_CONTEXT_WINDOW"] = "1"
+    # reload settings by resetting module variable if needed, but translator.py reads it at import time.
+    # Because translator is already imported, we'll patch it directly.
+    import translator
+    translator.BT_CONTEXT_WINDOW = 1
+    
+    # We mock fake_post to verify context is received
+    received_contexts = []
+    original_post = requests.post
+    def context_check_post(url, headers=None, json=None, timeout=None):
+        user_text = json["messages"][-1]["content"]
+        received_contexts.append(user_text)
+        return fake_post(url, headers, json, timeout)
+    
+    requests.post = context_check_post
+    client.post("/translate/batch", json={"paragraphs": ["uncached_context_para_1", "uncached_context_para_2"]}).get_json()
+    requests.post = original_post
+    translator.BT_CONTEXT_WINDOW = 0
+    
+    check("context: previous/next contexts included in batch prompt", 
+          "[NEXT CONTEXT]" in received_contexts[0] and "[PREVIOUS CONTEXT]" in received_contexts[0])
+
     # Validation.
     check("invalid language rejected",
           client.post("/translate", json={"text": "x", "target_lang": "Klingon"}).status_code == 400)

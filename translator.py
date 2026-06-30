@@ -45,6 +45,7 @@ BT_BATCH_SIZE = int(os.environ.get("BT_BATCH_SIZE", "5"))
 # Larger token ceiling for batched calls (several paragraphs in + out).
 BT_MAX_TOKENS = int(os.environ.get("BT_MAX_TOKENS", "4096"))
 BT_BATCH_MAX_TOKENS = int(os.environ.get("BT_BATCH_MAX_TOKENS", "8192"))
+BT_CONTEXT_WINDOW = int(os.environ.get("BT_CONTEXT_WINDOW", "0"))
 
 LOCAL_BACKEND_URL = os.environ.get("BT_LOCAL_URL", "http://localhost:1234/v1/chat/completions")
 
@@ -155,15 +156,16 @@ Rules:
 3. Do NOT add any commentary, notes, or explanations.
 4. Return ONLY the translated text, nothing else."""
 
-BATCH_SYSTEM_PROMPT = """You are a professional literary translator. You will receive several text segments. Each segment is introduced by a marker line that looks EXACTLY like `@@SEG N@@` (where N is a number).
+BATCH_SYSTEM_PROMPT = """You are a professional literary translator. You will receive several text segments. Each segment to be translated is introduced by a marker line that looks EXACTLY like `@@SEG N@@` (where N is a number).
 
-Translate EACH segment from {source_lang} to {target_lang}.
+Translate EACH marked segment from {source_lang} to {target_lang}.
 
 Rules:
 1. Output the SAME marker lines `@@SEG N@@`, in the SAME order, each immediately followed by that segment's translation on the next line(s).
-2. Translate EVERY segment. NEVER merge, drop, reorder, or renumber segments.
+2. Translate EVERY marked segment. NEVER merge, drop, reorder, or renumber segments.
 3. Preserve formatting within each segment (line breaks, quotes, *italics*, **bold**).
-4. Output ONLY the markers and their translations — no commentary, notes, or explanations."""
+4. Do NOT translate [CONTEXT] blocks. They are only provided to help you understand the surrounding story.
+5. Output ONLY the markers and their translations — no commentary, notes, or explanations."""
 
 _SEG_RE = re.compile(r"@@\s*SEG\s*(\d+)\s*@@", re.IGNORECASE)
 
@@ -315,37 +317,53 @@ def _parse_segments(output: str, n: int) -> Optional[list[str]]:
     return out
 
 
-def _translate_group(texts: list[str], source_lang: str, target_lang: str) -> list[str]:
+def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str, target_lang: str) -> list[str]:
     """
     Translate a group of paragraphs in ONE LLM call. Falls back to per-paragraph
     translation if the segmented response can't be parsed (count mismatch, dropped
     segment, etc.) so correctness is preserved.
     """
-    if len(texts) == 1:
-        return [translate_text(texts[0], source_lang, target_lang)[0]]
+    group_texts = [all_texts[i] for i in idxs]
+    if len(group_texts) == 1 and BT_CONTEXT_WINDOW == 0:
+        return [translate_text(group_texts[0], source_lang, target_lang)[0]]
 
-    combined = "\n\n".join(f"@@SEG {i + 1}@@\n{t}" for i, t in enumerate(texts))
+    combined_parts = []
+    for k, i in enumerate(idxs):
+        combined_parts.append(f"@@SEG {k + 1}@@\n{all_texts[i]}")
+        
+        # Add context if enabled
+        if BT_CONTEXT_WINDOW > 0:
+            ctx_parts = []
+            if i > 0:
+                ctx_parts.append(f"[PREVIOUS CONTEXT]: {all_texts[max(0, i - BT_CONTEXT_WINDOW):i]}")
+            if i < len(all_texts) - 1:
+                ctx_parts.append(f"[NEXT CONTEXT]: {all_texts[i + 1:min(len(all_texts), i + 1 + BT_CONTEXT_WINDOW)]}")
+            if ctx_parts:
+                combined_parts.append("\n".join(ctx_parts))
+
+    combined = "\n\n".join(combined_parts)
     system = BATCH_SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
 
     try:
         output, _ = _complete(combined, system, max_retries=2, max_tokens=BT_BATCH_MAX_TOKENS)
-        parsed = _parse_segments(output, len(texts))
+        parsed = _parse_segments(output, len(group_texts))
     except Exception as e:
-        log.warning("Batch call failed (%d segs): %s — falling back to per-paragraph", len(texts), e)
+        log.warning("Batch call failed (%d segs): %s — falling back to per-paragraph", len(group_texts), e)
         parsed = None
 
     if parsed is not None:
         return parsed
 
-    log.info("Batch parse mismatch for %d segments; translating individually", len(texts))
+    log.info("Batch parse mismatch for %d segments; translating individually", len(group_texts))
     out = []
-    for t in texts:
+    for t in group_texts:
         try:
             out.append(translate_text(t, source_lang, target_lang)[0])
         except Exception as e:
             log.error("Per-paragraph fallback failed: %s", e)
             out.append(f"[TRANSLATION ERROR: {e}]")
     return out
+
 
 
 def translate_batch(
@@ -372,11 +390,12 @@ def translate_batch(
     # Split the work into groups of batch_size, preserving original indices.
     groups = [work[k:k + batch_size] for k in range(0, len(work), batch_size)]
 
+    work_texts = [t for _, t in work]
     def _do_group(group):
         idxs = [i for i, _ in group]
         gtexts = [t for _, t in group]
         try:
-            translations = _translate_group(gtexts, source_lang, target_lang)
+            translations = _translate_group(texts, idxs, source_lang, target_lang)
         except Exception as e:
             log.error("Group translation failed: %s", e)
             translations = [f"[TRANSLATION ERROR: {e}]"] * len(gtexts)
