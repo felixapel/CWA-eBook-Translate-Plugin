@@ -7,8 +7,8 @@
     // Optional overrides injected by the CWA template (window.BOOK_TRANSLATOR).
     // An empty/absent apiUrl falls back to dynamic host-based resolution so the
     // overlay keeps working when accessed over the LAN (not just localhost).
-    const BT_UI_VERSION = '2026-06-30-chapter-auto-v1';
-    console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
+    const BT_UI_VERSION = '2026-06-30-opus-deploy-sync-v1';
+    console.info(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
         ? cfg.apiUrl
@@ -786,6 +786,8 @@
         setupKeyboardShortcut();
         // Persist any pending translations if the user closes/reloads the tab.
         window.addEventListener('beforeunload', persistCacheNow);
+        // Brief version toast helps Felix confirm the correct JS is loaded after deploys.
+        setTimeout(() => showToast(`BookTranslator ${BT_UI_VERSION}`), 1200);
         if (translationMode !== 'off') {
             translateCurrentPage();
         }
