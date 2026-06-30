@@ -88,3 +88,25 @@ Environment variables (Docker):
 ## License
 
 MIT
+
+## 🚀 Easy Installation for Unraid Users
+
+We have created an automated installer script for Unraid. Open the Unraid Terminal and run:
+
+```bash
+curl -sL https://raw.githubusercontent.com/username/CWA-translate-plugin/main/install_unraid.sh | bash
+```
+
+The script will automatically:
+1. Download the plugin files (`translator.js`, `translator.css`, `read.html`) to your appdata folder.
+2. Install the `book-translator-api` Docker template into your Unraid GUI.
+
+Once the script finishes, you just need to edit your `calibre-web-automated` container to map the 3 files (as instructed by the script), and then deploy the newly added `book-translator-api` container!
+
+## 🐳 Easy Installation (Docker Compose)
+
+If you use standard Docker, we provide a full `docker-compose.yml` that spins up Calibre-Web-Automated along with the Translator API, already pre-configured to inject the plugin files.
+
+```bash
+docker-compose up -d
+```
