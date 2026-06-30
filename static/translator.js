@@ -3,12 +3,10 @@
  */
 
 (function () {
-    // ── Configuration ──────────────────────────────────────────────────
-    // Optional overrides injected by the CWA template (window.BOOK_TRANSLATOR).
-    // An empty/absent apiUrl falls back to dynamic host-based resolution so the
-    // overlay keeps working when accessed over the LAN (not just localhost).
-    const BT_UI_VERSION = '2026-06-30-ui-polish-v1';
-    console.info(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
+    'use strict';
+    // ── Version & Telemetry ──────────────────────────────────────────
+    const BT_UI_VERSION = '2026-06-30-rate-limit-backoff-v1';
+    console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
         ? cfg.apiUrl

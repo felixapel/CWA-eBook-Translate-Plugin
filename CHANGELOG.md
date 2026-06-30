@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.2.1] - 2026-06-30
-UI version marker: `2026-06-30-ui-polish-v1` (backend/frontend rate limit improvements).
+UI version marker: `2026-06-30-rate-limit-backoff-v1` (backend/frontend rate limit improvements).
 
 ### Added
 - **Frontend translation queue**: All translation requests now go through a single scheduler to enforce `BT_CLIENT_MAX_INFLIGHT` (default 1) and pause background prefetching during active page translation.
