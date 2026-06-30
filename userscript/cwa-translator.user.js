@@ -201,6 +201,12 @@
         const container = doc.querySelector('body') || doc;
         return Array.from(container.querySelectorAll('p, h1, h2, h3, h4, blockquote'));
     }
+    function getParagraphText(el) {
+        if (el.dataset.btOriginal) {
+            return el.dataset.btOriginal.trim();
+        }
+        return el.textContent.trim();
+    }
 
     // === TRANSLATION ===
     async function translatePage() {
@@ -212,7 +218,7 @@
         console.log(`[BT] Translating ${paras.length} paragraphs to ${targetLang}...`);
 
         for (let i = 0; i < paras.length; i++) {
-            const text = paras[i].textContent.trim();
+            const text = getParagraphText(paras[i]);
             if (!text || text.length < 3) continue;
 
             const hash = hashText(text);
@@ -277,7 +283,7 @@
     function showTranslatedOnly() {
         const paras = getParagraphs();
         paras.forEach((el) => {
-            const text = el.textContent.trim();
+            const text = getParagraphText(el);
             if (!text) return;
             const hash = hashText(text);
             if (translatedParagraphs[hash]) {

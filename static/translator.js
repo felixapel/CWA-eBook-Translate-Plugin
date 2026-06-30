@@ -245,6 +245,12 @@
     }
 
     function getParagraphText(el) {
+        if (el.dataset.originalText) {
+            return el.dataset.originalText.trim();
+        }
+        if (el.dataset.btOriginal) {
+            return el.dataset.btOriginal.trim();
+        }
         return el.textContent.trim();
     }
 
