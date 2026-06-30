@@ -25,9 +25,15 @@ ENV LLM_API_KEY=""
 # concurrency low; BT_LOCAL_URL must point at the host, not the container.
 ENV BT_MAX_CONCURRENT="2"
 ENV BT_TIMEOUT="60"
+# Paragraphs per LLM call — >1 is much faster on slow models (1 = legacy).
+ENV BT_BATCH_SIZE="5"
 
 # Expose the API port
 EXPOSE 8390
 
-# Command to run gunicorn
+# Liveness probe (Python only; no curl in the slim alpine image).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8390/health', timeout=4).status==200 else 1)"
+
+# Command to run gunicorn (1 worker so the in-memory rate-limit/metrics/cache stay coherent)
 CMD ["gunicorn", "--bind", "0.0.0.0:8390", "--workers", "1", "--threads", "8", "--timeout", "120", "server:app"]

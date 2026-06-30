@@ -40,8 +40,8 @@
     // Per-language map of contentHash -> translation, mirrored to localStorage so
     // the work/API cost already spent is never thrown away. (The backend also
     // caches in SQLite, so even a cleared client never re-pays for a paragraph.)
-    const CACHE_PREFIX = 'bt_cache_';
-    const CACHE_MAX_ENTRIES = 5000; // safety cap to stay under the localStorage quota
+    const CACHE_PREFIX = 'bt_cache_v2_'; // v2: 53-bit hash keys (old caches ignored)
+    const CACHE_MAX_ENTRIES = 5000;      // safety cap to stay under the localStorage quota
 
     function loadCacheForLang(lang) {
         try {
@@ -409,10 +409,12 @@
 
         // 2. De-duplicate hierarchy: If a parent/ancestor is already in the list to be translated,
         // we skip the child element to translate the parent as a single contextual block.
+        // Use a Set for O(1) ancestor lookups (was O(n²) via Array.includes — janky on big chapters).
+        const filteredSet = new Set(filtered);
         return filtered.filter(el => {
             let parent = el.parentElement;
             while (parent) {
-                if (filtered.includes(parent)) {
+                if (filteredSet.has(parent)) {
                     return false; // Skip, parent will be translated
                 }
                 parent = parent.parentElement;
@@ -422,25 +424,22 @@
     }
 
     function getVisibleParagraphs() {
-        let doc = document;
+        // Filter the SAME canonical, de-duplicated set used everywhere else, so
+        // visible-first covers headings/lists too and the prefetch complement is
+        // exact (no element falls through the cracks between the two selectors).
         const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+        const all = getParagraphs();
         if (!iframe || !iframe.contentDocument) {
-            return Array.from(doc.querySelectorAll('p, div.calibre1, div.text')).slice(0, 5);
+            return all.slice(0, 5);
         }
-        
-        doc = iframe.contentDocument;
-        const paragraphs = Array.from(doc.querySelectorAll('p, div.calibre1, div.text'));
         const iframeWidth = iframe.clientWidth || window.innerWidth;
         const iframeHeight = iframe.clientHeight || window.innerHeight;
-        
-        return paragraphs.filter(el => {
+
+        return all.filter(el => {
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return false;
-            
-            // Check if element is horizontally or vertically visible inside the viewport
             const isHorizVisible = (rect.left >= -100 && rect.left < iframeWidth - 20);
             const isVertVisible = (rect.top >= -100 && rect.top < iframeHeight - 20);
-            
             return isHorizVisible && isVertVisible;
         });
     }
@@ -453,12 +452,17 @@
     }
 
     function hashText(str) {
-        let hash = 0;
+        // cyrb53 — a 53-bit hash. The previous 32-bit hash could collide across a
+        // long book and show the wrong cached translation for a paragraph.
+        let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
         for (let i = 0; i < str.length; i++) {
-            hash = ((hash << 5) - hash) + str.charCodeAt(i);
-            hash = hash & hash;
+            const ch = str.charCodeAt(i);
+            h1 = Math.imul(h1 ^ ch, 2654435761);
+            h2 = Math.imul(h2 ^ ch, 1597334677);
         }
-        return (hash >>> 0).toString(36);
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+        return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
     }
 
     // ── Translation engine ─────────────────────────────────────────────
@@ -489,9 +493,11 @@
         activeControllers.add(controller);
         const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
         try {
+            const headers = { 'Content-Type': 'application/json' };
+            if (cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken; // optional shared secret
             const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers,
                 body: JSON.stringify({ paragraphs: texts, source_lang: SOURCE_LANG, target_lang: TARGET_LANG }),
                 signal: controller.signal,
             });

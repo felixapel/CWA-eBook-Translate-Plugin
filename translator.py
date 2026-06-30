@@ -3,8 +3,14 @@ book-translator — Unified Multi-provider translation
 Supports OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter, and Local LLMs.
 A primary provider plus an OPTIONAL fallback provider for resilience when a
 local LLM is slow or temporarily unavailable.
+
+Batched translation: multiple paragraphs can be translated in a SINGLE LLM call
+(see BT_BATCH_SIZE) which is far faster on slow local models. If the model's
+segmented response can't be parsed cleanly, the batch transparently falls back
+to one-call-per-paragraph so correctness is never sacrificed for speed.
 """
 import os
+import re
 import json
 import time
 import hashlib
@@ -23,20 +29,23 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemma4-12b")
 
 # Optional fallback provider — used automatically when the primary errors out.
-# Leave LLM_FALLBACK_PROVIDER empty to disable.
 LLM_FALLBACK_PROVIDER = os.environ.get("LLM_FALLBACK_PROVIDER", "").lower()
 LLM_FALLBACK_API_KEY = os.environ.get("LLM_FALLBACK_API_KEY", "")
 LLM_FALLBACK_MODEL = os.environ.get("LLM_FALLBACK_MODEL", "")
 
-# Tunables — especially important for slow local LLMs.
+# Tunables.
 #   BT_TIMEOUT        seconds before a single request is abandoned
-#   BT_MAX_CONCURRENT simultaneous requests in a batch. For a slow single-GPU
-#                     local model, 1–2 is MORE stable than 3 (avoids timeout
-#                     cascades from requests starving each other).
+#   BT_MAX_CONCURRENT simultaneous requests (batches). For a slow single-GPU
+#                     model, 1–2 is more stable than 3.
+#   BT_BATCH_SIZE     paragraphs translated per LLM call. >1 is dramatically
+#                     faster on slow models; 1 = one call per paragraph (legacy).
 BT_TIMEOUT = int(os.environ.get("BT_TIMEOUT", "60"))
 BT_MAX_CONCURRENT = int(os.environ.get("BT_MAX_CONCURRENT", "2"))
+BT_BATCH_SIZE = int(os.environ.get("BT_BATCH_SIZE", "5"))
+# Larger token ceiling for batched calls (several paragraphs in + out).
+BT_MAX_TOKENS = int(os.environ.get("BT_MAX_TOKENS", "4096"))
+BT_BATCH_MAX_TOKENS = int(os.environ.get("BT_BATCH_MAX_TOKENS", "8192"))
 
-# Local backend endpoint (only used when a provider == "local").
 LOCAL_BACKEND_URL = os.environ.get("BT_LOCAL_URL", "http://localhost:1234/v1/chat/completions")
 
 PROVIDER_ENDPOINTS = {
@@ -59,7 +68,6 @@ def _load_primary_api_key() -> str:
         log.info("Loaded API key from LLM_API_KEY env var")
         return LLM_API_KEY
 
-    # Legacy fallbacks
     env_key = os.environ.get("MINIMAX_API_KEY")
     if env_key and len(env_key) > 10:
         return env_key
@@ -147,6 +155,18 @@ Rules:
 3. Do NOT add any commentary, notes, or explanations.
 4. Return ONLY the translated text, nothing else."""
 
+BATCH_SYSTEM_PROMPT = """You are a professional literary translator. You will receive several text segments. Each segment is introduced by a marker line that looks EXACTLY like `@@SEG N@@` (where N is a number).
+
+Translate EACH segment from {source_lang} to {target_lang}.
+
+Rules:
+1. Output the SAME marker lines `@@SEG N@@`, in the SAME order, each immediately followed by that segment's translation on the next line(s).
+2. Translate EVERY segment. NEVER merge, drop, reorder, or renumber segments.
+3. Preserve formatting within each segment (line breaks, quotes, *italics*, **bold**).
+4. Output ONLY the markers and their translations — no commentary, notes, or explanations."""
+
+_SEG_RE = re.compile(r"@@\s*SEG\s*(\d+)\s*@@", re.IGNORECASE)
+
 
 def get_cache_key(text: str, source_lang: str, target_lang: str) -> str:
     content = f"{text}|{source_lang}|{target_lang}"
@@ -155,7 +175,7 @@ def get_cache_key(text: str, source_lang: str, target_lang: str) -> str:
 
 # ── Per-provider request helpers ─────────────────────────────────────────────
 
-def _translate_openai(p: _Provider, text: str, source_lang: str, target_lang: str, timeout: int) -> str:
+def _translate_openai(p: _Provider, user_content: str, system_prompt: str, timeout: int, max_tokens: int) -> str:
     headers = {"Content-Type": "application/json"}
     if p.api_key:
         headers["Authorization"] = f"Bearer {p.api_key}"
@@ -163,10 +183,10 @@ def _translate_openai(p: _Provider, text: str, source_lang: str, target_lang: st
     payload = {
         "model": p.model,
         "temperature": 0.3,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)},
-            {"role": "user", "content": text},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
         ],
     }
 
@@ -180,7 +200,7 @@ def _translate_openai(p: _Provider, text: str, source_lang: str, target_lang: st
     return translated
 
 
-def _translate_anthropic(p: _Provider, text: str, source_lang: str, target_lang: str, timeout: int) -> str:
+def _translate_anthropic(p: _Provider, user_content: str, system_prompt: str, timeout: int, max_tokens: int) -> str:
     headers = {"Content-Type": "application/json"}
     if "minimax" in p.url:
         headers["Authorization"] = f"Bearer {p.api_key}"
@@ -190,10 +210,10 @@ def _translate_anthropic(p: _Provider, text: str, source_lang: str, target_lang:
 
     payload = {
         "model": p.model,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens,
         "temperature": 0.3,
-        "system": SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang),
-        "messages": [{"role": "user", "content": text}],
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_content}],
     }
 
     resp = requests.post(p.url, headers=headers, json=payload, timeout=timeout)
@@ -207,15 +227,15 @@ def _translate_anthropic(p: _Provider, text: str, source_lang: str, target_lang:
     return translated
 
 
-def _call_provider(p: _Provider, text: str, source_lang: str, target_lang: str,
-                   max_retries: int, timeout: int) -> str:
+def _call_provider(p: _Provider, user_content: str, system_prompt: str,
+                   max_retries: int, timeout: int, max_tokens: int) -> str:
     """Call one provider with retry/backoff. Raises on definitive failure."""
     last_error = None
     for attempt in range(max_retries):
         try:
             if p.api_type == "openai":
-                return _translate_openai(p, text, source_lang, target_lang, timeout)
-            return _translate_anthropic(p, text, source_lang, target_lang, timeout)
+                return _translate_openai(p, user_content, system_prompt, timeout, max_tokens)
+            return _translate_anthropic(p, user_content, system_prompt, timeout, max_tokens)
         except requests.exceptions.RequestException as e:
             status_code = getattr(e.response, "status_code", 0)
             error_body = getattr(e.response, "text", str(e))[:300]
@@ -234,20 +254,9 @@ def _call_provider(p: _Provider, text: str, source_lang: str, target_lang: str,
     raise RuntimeError(last_error or "unknown error")
 
 
-def translate_text(
-    text: str,
-    source_lang: str = "English",
-    target_lang: str = "Spanish",
-    max_retries: int = 2,
-    timeout: Optional[int] = None,
-    prefer_local: bool = True,  # Ignored, preserved for backward compatibility
-) -> tuple[str, str]:
-    """
-    Translate text using the primary provider, falling back to the optional
-    secondary provider if the primary fails.
-
-    Returns (translated_text, provider_name).
-    """
+def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
+              timeout: Optional[int] = None, max_tokens: int = BT_MAX_TOKENS) -> tuple[str, str]:
+    """Run a completion through the primary provider, falling back to the secondary."""
     if timeout is None:
         timeout = BT_TIMEOUT
 
@@ -259,15 +268,84 @@ def translate_text(
     last_error = None
     for p in providers:
         try:
-            translated = _call_provider(p, text, source_lang, target_lang, max_retries, timeout)
-            log.debug("Translated %d chars %s→%s via %s", len(text), source_lang, target_lang, p.name)
-            return translated, p.name
+            out = _call_provider(p, user_content, system_prompt, max_retries, timeout, max_tokens)
+            return out, p.name
         except Exception as e:
             last_error = f"{p.name}: {e}"
             log.warning("Provider %s exhausted: %s", p.name, e)
-            continue
 
     raise RuntimeError(f"Translation failed (all providers): {last_error}")
+
+
+def translate_text(
+    text: str,
+    source_lang: str = "English",
+    target_lang: str = "Spanish",
+    max_retries: int = 2,
+    timeout: Optional[int] = None,
+    prefer_local: bool = True,  # Ignored, preserved for backward compatibility
+) -> tuple[str, str]:
+    """Translate a single text. Returns (translated_text, provider_name)."""
+    system = SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
+    translated, provider = _complete(text, system, max_retries, timeout, BT_MAX_TOKENS)
+    log.debug("Translated %d chars %s→%s via %s", len(text), source_lang, target_lang, provider)
+    return translated, provider
+
+
+# ── Batched translation ──────────────────────────────────────────────────────
+
+def _parse_segments(output: str, n: int) -> Optional[list[str]]:
+    """Split a batched response back into n segment translations, or None on mismatch."""
+    matches = list(_SEG_RE.finditer(output))
+    if not matches:
+        return None
+    by_num = {}
+    for k, m in enumerate(matches):
+        num = int(m.group(1))
+        start = m.end()
+        end = matches[k + 1].start() if k + 1 < len(matches) else len(output)
+        seg = output[start:end].strip()
+        if seg:
+            by_num[num] = seg
+    out = []
+    for i in range(1, n + 1):
+        if i not in by_num:
+            return None  # a segment is missing/empty — treat the whole batch as failed
+        out.append(by_num[i])
+    return out
+
+
+def _translate_group(texts: list[str], source_lang: str, target_lang: str) -> list[str]:
+    """
+    Translate a group of paragraphs in ONE LLM call. Falls back to per-paragraph
+    translation if the segmented response can't be parsed (count mismatch, dropped
+    segment, etc.) so correctness is preserved.
+    """
+    if len(texts) == 1:
+        return [translate_text(texts[0], source_lang, target_lang)[0]]
+
+    combined = "\n\n".join(f"@@SEG {i + 1}@@\n{t}" for i, t in enumerate(texts))
+    system = BATCH_SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
+
+    try:
+        output, _ = _complete(combined, system, max_retries=2, max_tokens=BT_BATCH_MAX_TOKENS)
+        parsed = _parse_segments(output, len(texts))
+    except Exception as e:
+        log.warning("Batch call failed (%d segs): %s — falling back to per-paragraph", len(texts), e)
+        parsed = None
+
+    if parsed is not None:
+        return parsed
+
+    log.info("Batch parse mismatch for %d segments; translating individually", len(texts))
+    out = []
+    for t in texts:
+        try:
+            out.append(translate_text(t, source_lang, target_lang)[0])
+        except Exception as e:
+            log.error("Per-paragraph fallback failed: %s", e)
+            out.append(f"[TRANSLATION ERROR: {e}]")
+    return out
 
 
 def translate_batch(
@@ -276,29 +354,41 @@ def translate_batch(
     target_lang: str = "Spanish",
     max_concurrent: Optional[int] = None,
 ) -> list[tuple[str, str]]:
+    """
+    Translate multiple texts. Non-empty texts are grouped into batches of
+    BT_BATCH_SIZE and each batch is translated in a single LLM call; batches run
+    concurrently (up to max_concurrent). Returns a (text, provider) per input.
+    """
     if max_concurrent is None:
         max_concurrent = BT_MAX_CONCURRENT
     max_concurrent = max(1, max_concurrent)
+    batch_size = max(1, BT_BATCH_SIZE)
 
     results: list[tuple[str, str]] = [("", "")] * len(texts)
-    work_items = [(i, t) for i, t in enumerate(texts) if t.strip()]
-
-    if not work_items:
+    work = [(i, t) for i, t in enumerate(texts) if t.strip()]
+    if not work:
         return results
 
-    def _do_translate(index: int, text: str) -> tuple[int, str, str]:
+    # Split the work into groups of batch_size, preserving original indices.
+    groups = [work[k:k + batch_size] for k in range(0, len(work), batch_size)]
+
+    def _do_group(group):
+        idxs = [i for i, _ in group]
+        gtexts = [t for _, t in group]
         try:
-            translated, backend = translate_text(text, source_lang, target_lang)
-            return index, translated, backend
+            translations = _translate_group(gtexts, source_lang, target_lang)
         except Exception as e:
-            log.error("Batch translation failed at chunk %d: %s", index, e)
-            return index, f"[TRANSLATION ERROR: {e}]", "error"
+            log.error("Group translation failed: %s", e)
+            translations = [f"[TRANSLATION ERROR: {e}]"] * len(gtexts)
+        return idxs, translations
 
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        futures = {executor.submit(_do_translate, idx, txt): idx for idx, txt in work_items}
+        futures = [executor.submit(_do_group, g) for g in groups]
         for future in as_completed(futures):
-            idx, translated, backend = future.result()
-            results[idx] = (translated, backend)
+            idxs, translations = future.result()
+            for j, idx in enumerate(idxs):
+                tr = translations[j] if j < len(translations) else "[TRANSLATION ERROR: missing segment]"
+                results[idx] = (tr, LLM_PROVIDER)
 
     return results
 
