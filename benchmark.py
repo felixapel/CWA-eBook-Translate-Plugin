@@ -2,7 +2,7 @@ import requests
 import time
 import concurrent.futures
 
-BASE_URL = 'http://localhost:8390'
+BASE_URL = 'http://192.168.0.122:8390'
 
 def make_request(i):
     res = requests.post(f'{BASE_URL}/translate', json={

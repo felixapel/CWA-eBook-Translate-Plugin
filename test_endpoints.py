@@ -2,7 +2,7 @@ import requests
 import json
 import time
 
-BASE_URL = 'http://localhost:8390'
+BASE_URL = 'http://192.168.0.122:8390'
 
 def test_health():
     res = requests.get(f'{BASE_URL}/health')

@@ -1,7 +1,7 @@
 import requests
 import time
 
-BASE_URL = 'http://localhost:8390'
+BASE_URL = 'http://192.168.0.122:8390'
 
 successes = 0
 failures = 0
