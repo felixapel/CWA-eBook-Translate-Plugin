@@ -51,8 +51,8 @@ def _validate_languages(source_lang: str, target_lang: str):
 # ── CORS whitelist (H5) ─────────────────────────────────────────────────────
 
 ALLOWED_ORIGINS = {
-    "http://192.168.0.122:8383",
-    "http://192.168.0.122:8083",
+    "http://localhost:8383",
+    "http://localhost:8083",
     "https://calibre.felitounraid.de",
 }
 _LOCAL_ORIGIN_RE = re.compile(r"^https?://192\.168\.0\.\d{1,3}(:\d+)?$")

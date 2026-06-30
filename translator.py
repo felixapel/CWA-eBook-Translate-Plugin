@@ -21,7 +21,7 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemma4-12b")
 
 # Legacy fallbacks
-LOCAL_BACKEND_URL = os.environ.get("BT_LOCAL_URL", "http://192.168.0.122:2819/v1/chat/completions")
+LOCAL_BACKEND_URL = os.environ.get("BT_LOCAL_URL", "http://localhost:1234/v1/chat/completions")
 
 PROVIDER_ENDPOINTS = {
     "openai": ("https://api.openai.com/v1/chat/completions", "openai"),
@@ -49,7 +49,7 @@ def _load_api_key() -> str:
     if env_key and len(env_key) > 10:
         return env_key
 
-    auth_path = Path("/home/hermes/.hermes/auth.json")
+    auth_path = Path("auth.json")
     if auth_path.exists():
         try:
             with open(auth_path) as f:
@@ -59,7 +59,7 @@ def _load_api_key() -> str:
         except Exception:
             pass
 
-    env_path = Path("/home/hermes/.hermes/.env")
+    env_path = Path(".env")
     if env_path.exists():
         try:
             with open(env_path) as f:

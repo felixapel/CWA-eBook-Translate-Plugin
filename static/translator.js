@@ -4,7 +4,7 @@
 
 (function () {
     // ── Configuration ──────────────────────────────────────────────────
-    const TRANSLATOR_URL = window.location.protocol === 'https:' ? '' : 'http://192.168.0.122:8390';
+    const TRANSLATOR_URL = window.location.protocol === 'https:' ? '' : '';
     let SOURCE_LANG = 'English'; // Assume source is English
     
     // Map browser language to full language name for the backend
@@ -53,6 +53,11 @@
         container.id = 'translator-float-container';
         container.style.cssText = 'position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 99999; display: flex; align-items: center; background: rgba(50, 50, 50, 0.9); backdrop-filter: blur(10px); color: white; padding: 6px 12px; border-radius: 24px; box-shadow: 0 4px 16px rgba(0,0,0,0.25); gap: 8px; user-select: none; transition: background 0.3s;';
 
+        const indicator = document.createElement('div');
+        indicator.id = 'translator-loading-indicator';
+        indicator.innerHTML = '<style>@keyframes bt-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style><div style="width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: bt-spin 1s linear infinite;"></div>';
+        indicator.style.cssText = 'display: none; margin-left: 4px; margin-right: 4px;';
+        
         const btn = document.createElement('div');
         btn.id = 'translator-float-btn';
         btn.style.cssText = 'cursor: pointer; font-weight: 600; font-family: system-ui, sans-serif; padding: 6px 12px; border-radius: 16px; transition: background 0.2s; text-align: center;';
@@ -117,8 +122,16 @@
         btn.onmouseout = () => btn.style.background = 'transparent';
 
         container.appendChild(sel);
+        container.appendChild(indicator);
         container.appendChild(btn);
         document.body.appendChild(container);
+    }
+
+    function updateLoadingIndicator() {
+        const ind = document.getElementById('translator-loading-indicator');
+        if (ind) {
+            ind.style.display = (isTranslating || isPrefetching) ? 'block' : 'none';
+        }
     }
 
     // ── Toast Notifications ────────────────────────────────────────────
@@ -237,6 +250,7 @@
     async function translateCurrentPage() {
         if (isTranslating || translationMode === 'off') return;
         isTranslating = true;
+        updateLoadingIndicator();
 
         // 1. Prioritize visible paragraphs
         const visible = getVisibleParagraphs();
@@ -250,6 +264,7 @@
         queuePrefetch(remaining);
 
         isTranslating = false;
+        updateLoadingIndicator();
     }
 
     async function translateBatchOfElements(elements) {
@@ -263,18 +278,7 @@
             }
         });
 
-        if (toTranslate.length > 0) {
-            // Show short temporary loading indicator on button
-            const btn = document.getElementById('translator-float-btn');
-            if (btn && !btn.textContent.includes('...')) {
-                const oldText = btn.textContent;
-                btn.textContent = t.loading;
-                setTimeout(() => {
-                    if (translationMode === 'bilingual') btn.textContent = t.bilingual;
-                    else if (translationMode === 'translated') btn.textContent = t.translated;
-                    else btn.textContent = t.translate;
-                }, 1500);
-            }
+
 
             try {
                 const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
@@ -329,6 +333,7 @@
     async function triggerPrefetch() {
         if (isPrefetching || prefetchQueue.length === 0) return;
         isPrefetching = true;
+        updateLoadingIndicator();
 
         while (prefetchQueue.length > 0 && translationMode !== 'off') {
             // Take 3 paragraphs at a time to keep it sequential and light
@@ -380,6 +385,7 @@
         }
 
         isPrefetching = false;
+        updateLoadingIndicator();
     }
 
     // ── Rendering ──────────────────────────────────────────────────────

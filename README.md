@@ -40,7 +40,7 @@ Unraid Server
 ### 1. Build and Run Backend (Docker)
 
 ```bash
-cd ~/.hermes/projects/book-translator
+cd /opt/book-translator
 docker build -t local/book-translator-api:latest .
 ```
 
@@ -83,7 +83,7 @@ Environment variables (Docker):
 | `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
 | `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
 | `LLM_API_KEY` | | Your API key for the chosen provider |
-| `BT_LOCAL_URL` | `http://192.168.0.122:2819/v1/chat/completions` | Only used if `LLM_PROVIDER=local` |
+| `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local` |
 
 ## License
 
