@@ -26,10 +26,54 @@
 
     let translationMode = localStorage.getItem('bt_mode') || 'off'; // 'off', 'bilingual', 'translated'
     let isTranslating = false;
-    let translatedParagraphs = {}; // hash -> text
     let prefetchQueue = [];
     let isPrefetching = false;
     let lastFirstVisibleHash = null;
+
+    // ── Persistent translation cache (survives page turns AND browser reloads) ──
+    // Per-language map of contentHash -> translation, mirrored to localStorage so
+    // the work/API cost already spent is never thrown away. (The backend also
+    // caches in SQLite, so even a cleared client never re-pays for a paragraph.)
+    const CACHE_PREFIX = 'bt_cache_';
+    const CACHE_MAX_ENTRIES = 5000; // safety cap to stay under the localStorage quota
+
+    function loadCacheForLang(lang) {
+        try {
+            const raw = localStorage.getItem(CACHE_PREFIX + lang);
+            if (raw) return JSON.parse(raw) || {};
+        } catch (e) { /* ignore corrupt/missing cache */ }
+        return {};
+    }
+
+    let persistTimer = null;
+    function schedulePersist() {
+        if (persistTimer) return;
+        persistTimer = setTimeout(persistCacheNow, 1500);
+    }
+    function persistCacheNow() {
+        if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+        try {
+            let keys = Object.keys(translatedParagraphs);
+            if (keys.length > CACHE_MAX_ENTRIES) {
+                // Object string-keys keep insertion order: keep the most recent N.
+                const trimmed = {};
+                for (const k of keys.slice(keys.length - CACHE_MAX_ENTRIES)) trimmed[k] = translatedParagraphs[k];
+                translatedParagraphs = trimmed;
+            }
+            localStorage.setItem(CACHE_PREFIX + TARGET_LANG, JSON.stringify(translatedParagraphs));
+        } catch (e) {
+            // Quota exceeded — drop the oldest half and retry once.
+            try {
+                const keys = Object.keys(translatedParagraphs);
+                const trimmed = {};
+                for (const k of keys.slice(Math.floor(keys.length / 2))) trimmed[k] = translatedParagraphs[k];
+                translatedParagraphs = trimmed;
+                localStorage.setItem(CACHE_PREFIX + TARGET_LANG, JSON.stringify(trimmed));
+            } catch (e2) { /* give up persisting; in-memory cache still works */ }
+        }
+    }
+
+    let translatedParagraphs = loadCacheForLang(TARGET_LANG); // hash -> text (restored from last session)
 
     // ── In-flight request control (responsive buttons + language switches) ──
     // `generation` is bumped whenever the user changes mode/language so that
@@ -94,8 +138,12 @@
 
         const indicator = document.createElement('div');
         indicator.id = 'translator-loading-indicator';
-        indicator.innerHTML = '<style>@keyframes bt-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style><div style="width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: bt-spin 1s linear infinite;"></div>';
-        indicator.style.cssText = 'display: none; margin-left: 4px; margin-right: 4px;';
+        indicator.innerHTML =
+            '<style>@keyframes bt-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>' +
+            '<div style="width: 15px; height: 15px; border: 2px solid rgba(255,255,255,0.35); border-top-color: white; border-radius: 50%; animation: bt-spin 0.8s linear infinite; flex: 0 0 auto;"></div>' +
+            '<span id="translator-loading-label" style="font-size: 12px; font-weight: 600; white-space: nowrap;">' + t.loading + '</span>';
+        // Hidden by default; updateLoadingIndicator() switches to inline-flex while working.
+        indicator.style.cssText = 'display: none; align-items: center; gap: 6px; margin: 0 2px; color: #fff;';
         
         const btn = document.createElement('div');
         btn.id = 'translator-float-btn';
@@ -115,10 +163,11 @@
         });
 
         sel.onchange = (e) => {
+            persistCacheNow();            // flush current language's cache before switching
             TARGET_LANG = e.target.value;
             localStorage.setItem('bt_lang', TARGET_LANG);
             newGeneration();              // abort in-flight old-language requests
-            translatedParagraphs = {};    // clear client cache
+            translatedParagraphs = loadCacheForLang(TARGET_LANG); // restore that language's saved work
             if (translationMode !== 'off') {
                 removeAllTranslations();
                 translateCurrentPage();
@@ -174,8 +223,18 @@
 
     function updateLoadingIndicator() {
         const ind = document.getElementById('translator-loading-indicator');
-        if (ind) {
-            ind.style.display = (isTranslating || isPrefetching) ? 'block' : 'none';
+        if (!ind) return;
+        // Stay visible until ALL work is done — the current page AND the
+        // background chapter fill — so it never looks frozen mid-job.
+        const working = (isTranslating || isPrefetching || prefetchQueue.length > 0)
+            && translationMode !== 'off';
+        ind.style.display = working ? 'inline-flex' : 'none';
+        if (working) {
+            const label = document.getElementById('translator-loading-label');
+            if (label) {
+                const remaining = prefetchQueue.length;
+                label.textContent = remaining > 0 ? `${t.loading} (${remaining})` : t.loading;
+            }
         }
     }
 
@@ -348,11 +407,13 @@
             }
             if (myGen !== generation) return; // superseded — drop stale result
             if (data && Array.isArray(data.translations)) {
+                let stored = false;
                 data.translations.forEach((tr, idx) => {
                     // Don't cache errors/empties so they retry on the next pass.
-                    if (!isBadTranslation(tr)) translatedParagraphs[chunk[idx].hash] = tr;
+                    if (!isBadTranslation(tr)) { translatedParagraphs[chunk[idx].hash] = tr; stored = true; }
                 });
                 renderMode(chunk.map(b => b.el));
+                if (stored) schedulePersist(); // mirror to localStorage so work survives reloads
             }
         }
     }
@@ -372,14 +433,18 @@
         // Paint any visible paragraphs that were already cached (revisited page).
         if (myGen === generation) renderMode(visibleEls);
 
-        if (myGen === generation) isTranslating = false;
-        updateLoadingIndicator();
+        if (myGen !== generation || translationMode === 'off') {
+            if (myGen === generation) isTranslating = false;
+            updateLoadingIndicator();
+            return;
+        }
 
-        if (myGen !== generation || translationMode === 'off') return;
-
-        // 2. REST OF CHAPTER — background fill, low priority and preemptible.
+        // 2. REST OF CHAPTER — queue the background fill BEFORE clearing the
+        // "translating" flag so the indicator stays on without flickering.
         const visibleSet = new Set(visibleEls);
         prefetchQueue = getParagraphs().filter(el => !visibleSet.has(el));
+        isTranslating = false;
+        updateLoadingIndicator();
         triggerPrefetch();
     }
 
@@ -402,6 +467,7 @@
             }
             if (myGen !== generation) break;
 
+            updateLoadingIndicator(); // live "remaining" count while filling the chapter
             await new Promise(resolve => setTimeout(resolve, PREFETCH_GAP_MS));
         }
 
@@ -542,6 +608,8 @@
         createFloatingUI();
         startMutationObserver();
         startPageTurnDetector();
+        // Persist any pending translations if the user closes/reloads the tab.
+        window.addEventListener('beforeunload', persistCacheNow);
         if (translationMode !== 'off') {
             translateCurrentPage();
         }
