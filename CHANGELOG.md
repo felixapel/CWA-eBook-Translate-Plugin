@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-06-30
+### Added
+- **Context-Aware Translation (`BT_CONTEXT_WINDOW`, default 0):** option to send previous/next paragraphs to the LLM to improve literary quality and pronoun accuracy.
+- **Unraid deployment & verification automation:** created `deploy_unraid.sh` and `verify_unraid.sh` for safe script and backend upgrades with automatic backups.
+- **Build/Version indicator:** Version `2026-06-30-chapter-auto-v1` logged to console and displayed in the settings menu.
+
+### Fixed
+- **Chapter-Change Auto-Translation:** Resolved bug where navigating from chapter 1 to chapter 2 sometimes didn't auto-translate. Built a unified `scheduleTranslate` debouncing strategy and iframe document identity tracking.
+- **UI status messages:** Unified and improved status text (`✓ Ready`, `Preparing next text…`) adapting cleanly to dark/sepia themes.
+
 ## [Unreleased]
 ### Added
 - Multi-provider support directly from environment variables.
