@@ -524,12 +524,10 @@
         })
             .then(resp => resp.json())
             .then(data => {
-                console.log(`[book-translator] Pre-fetch complete: ${data.cached_count} cached, ${data.fresh_count} fresh`);
-                // Update local cache with returned translations (H3: using content hash)
-                if (data.translations) {
-                    data.translations.forEach((t, j) => {
-                        if (t) translatedParagraphs[untranslatedHashes[j]] = t;
-                    });
+                if (data.status === 'accepted') {
+                    console.log(`[book-translator] Pre-fetch job started (ID: ${data.job_id})`);
+                } else {
+                    console.error('[book-translator] Pre-fetch failed:', data);
                 }
             })
             .catch(e => console.error('[book-translator] Pre-fetch error:', e));
