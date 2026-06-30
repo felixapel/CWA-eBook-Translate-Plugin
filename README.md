@@ -9,6 +9,7 @@ Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://gi
 - ⚡ **Visible-First Translation** — prioritizes paragraphs visible on screen for instant rendering
 - 🚀 **Background Prefetching** — translates the rest of the chapter sequentially in the background
 - 🌍 **Multi-Language Support** — built-in language selector and UI localized to browser language
+- 🧠 **Context-Aware Translation** — feeds previous/next paragraphs to the LLM to improve literary quality and character voice
 - 📚 **Deep DOM Parsing** — accurately captures headings, custom title classes, and clickable TOC links
 - 💾 **Persistent Double Cache** — server-side SQLite (SHA-256) + client-side `localStorage` caching ensures you never lose a translation or re-pay API costs
 - 🔒 **Rate limited & Stable** — protects your API keys and GPU from runaway requests, featuring `AbortController` cancellation for perfectly responsive UI buttons
@@ -86,6 +87,7 @@ Environment variables for the `book-translator-api` container:
 | `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local`. OpenAI-compatible endpoint — the **path is always `/v1/chat/completions`** (vLLM, LM Studio, Ollama, llama.cpp all speak it); only host:port changes (vLLM `:8000`, LM Studio `:1234`, Ollama `:11434`). **In Docker, `localhost` is the container itself** — use `http://host.docker.internal:<port>/...` or the host IP. |
 | `BT_MAX_CONCURRENT` | `2` | Simultaneous translation requests (batches). For a slow single-GPU local model, `1`–`2` is **more** stable than `3` (avoids timeout cascades). |
 | `BT_BATCH_SIZE` | `5` | Paragraphs translated per LLM call. `>1` is dramatically faster on slow models (one generation instead of one-per-paragraph); if the model's segmented reply can't be parsed it transparently falls back to per-paragraph. Set `1` for legacy one-call-per-paragraph. |
+| `BT_CONTEXT_WINDOW` | `0` | Number of previous/next paragraphs to include as context for the LLM during translation. Set to `1` or `2` for context-aware translations. Context improves literary quality but consumes more tokens per request. |
 | `BT_TIMEOUT` | `60` | Seconds before a single translation request is abandoned. Raise it if a slow local model times out on long paragraphs. |
 | `LLM_FALLBACK_PROVIDER` | | Optional. A secondary provider used automatically when the primary fails (e.g. `minimax` while `local` is slow/down). |
 | `LLM_FALLBACK_MODEL` | | Model name for the fallback provider. |
