@@ -121,6 +121,14 @@ def _record_metric(latency_ms: float, cache_hit: bool = False, error: bool = Fal
 _prefetch_jobs: dict[str, dict] = {}
 _prefetch_jobs_lock = threading.Lock()
 
+def _cleanup_prefetch_jobs():
+    """Keep only the 100 most recent jobs to prevent memory leaks."""
+    with _prefetch_jobs_lock:
+        if len(_prefetch_jobs) > 100:
+            # Sort by started_at and keep the newest 50
+            sorted_jobs = sorted(_prefetch_jobs.items(), key=lambda x: x[1].get("started_at", 0))
+            for k, _ in sorted_jobs[:-50]:
+                del _prefetch_jobs[k]
 
 # ── Shared batch helper (M3) ───────────────────────────────────────────────
 
@@ -408,6 +416,7 @@ def prefetch():
     if lang_error:
         return jsonify({"error": lang_error}), 400
 
+    _cleanup_prefetch_jobs()
     job_id = str(uuid.uuid4())
 
     # Register job
