@@ -26,6 +26,7 @@ def _get_conn() -> sqlite3.Connection:
         conn = sqlite3.connect(str(DB_PATH))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         _thread_local.conn = conn
     return conn
 
@@ -73,12 +74,6 @@ def get_cached(text: str, source_lang: str, target_lang: str) -> str | None:
             (cache_key,),
         ).fetchone()
         if row:
-            # Update hit count
-            conn.execute(
-                "UPDATE translations SET hit_count = hit_count + 1 WHERE cache_key = ?",
-                (cache_key,),
-            )
-            conn.commit()
             log.debug("Cache HIT for %d chars %s→%s", len(text), source_lang, target_lang)
             return row[0]
         return None

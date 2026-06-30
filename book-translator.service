@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/home/hermes/.hermes/projects/book-translator
-ExecStart=/home/hermes/.hermes/projects/book-translator/.venv/bin/gunicorn -w 2 -b 0.0.0.0:8390 --timeout 120 server:app
+ExecStart=/home/hermes/.hermes/projects/book-translator/.venv/bin/gunicorn -w 1 --threads 8 -b 0.0.0.0:8390 --timeout 120 server:app
 Restart=always
 RestartSec=5
 StandardOutput=journal

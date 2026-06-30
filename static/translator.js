@@ -230,7 +230,7 @@
             hash = ((hash << 5) - hash) + str.charCodeAt(i);
             hash = hash & hash;
         }
-        return Math.abs(hash).toString(36);
+        return (hash >>> 0).toString(36);
     }
 
     // ── Translation engine ─────────────────────────────────────────────
@@ -335,11 +335,14 @@
             const batch = prefetchQueue.slice(0, 3);
             prefetchQueue = prefetchQueue.slice(3);
 
-            const toTranslate = batch.map(el => ({
-                el: el,
-                text: getParagraphText(el),
-                hash: hashText(getParagraphText(el))
-            })).filter(b => b.text && b.text.length >= 2 && !translatedParagraphs[b.hash]);
+            const toTranslate = batch.map(el => {
+                const text = getParagraphText(el);
+                return {
+                    el: el,
+                    text: text,
+                    hash: hashText(text)
+                };
+            }).filter(b => b.text && b.text.length >= 2 && !translatedParagraphs[b.hash]);
 
             if (toTranslate.length > 0) {
                 try {

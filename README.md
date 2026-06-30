@@ -1,6 +1,6 @@
 # CWA Translate Plugin
 
-Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated). Translate ebooks paragraph-by-paragraph while reading, using local LLMs (vLLM, LM Studio, Ollama) or cloud APIs (MiniMax-M3).
+Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated). Translate ebooks paragraph-by-paragraph while reading, using local LLMs (vLLM, LM Studio, Ollama) or any major Cloud API (OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter).
 
 ## Features
 
@@ -21,16 +21,17 @@ Unraid Server
 │ CWA (:8383)            │   HTTP      │ book-translator-api (:8390)    │
 │ ┌────────────────────┐ │ ─────────►  │ ├─ POST /translate             │
 │ │ Overlay files:     │ │             │ ├─ POST /translate/batch       │
-│ │ translator.js      │ │             │ ├─ POST /prefetch              │
-│ │ translator.css     │ │             │ ├─ GET  /health                │
-│ └────────────────────┘ │             │ ├─ GET  /metrics               │
-└───────────┬────────────┘             │ └─ SQLite cache                │
-            │                          └────────────┬───────────────────┘
-     NGINX (SWAG)                                   │ HTTP
-     Proxy Route: /translate           ┌────────────▼───────────────────┐
-                                       │ vLLM / LM Studio / Ollama      │
-                                       │ gemma4-12b (primary)           │
-                                       │ MiniMax-M3 (fallback)          │
+│ │ translator.js      │ │             │ ├─ GET  /health                │
+│ │ translator.css     │ │             │ ├─ GET  /metrics               │
+│ └────────────────────┘ │             │ └─ SQLite cache                │
+└───────────┬────────────┘             │ └────────────┬─────────────────┤
+            │                          └──────────────│─────────────────┘
+     NGINX (SWAG)                                     │ HTTP
+     Proxy Route: /translate           ┌──────────────▼─────────────────┐
+                                       │ Providers:                     │
+                                       │ Local, OpenAI, Anthropic,      │
+                                       │ Gemini, Groq, Together, MiniMax│
+                                       │ DeepSeek, OpenRouter           │
                                        └────────────────────────────────┘
 ```
 
@@ -68,8 +69,6 @@ location /translate {
 |--------|----------|-------------|
 | `POST` | `/translate` | Translate single paragraph |
 | `POST` | `/translate/batch` | Translate multiple paragraphs |
-| `POST` | `/prefetch` | Async pre-translate (returns immediately) |
-| `GET` | `/prefetch/<id>/status` | Check prefetch job status |
 | `GET` | `/health` | Health check with backend status |
 | `GET` | `/stats` | Cache statistics |
 | `GET` | `/metrics` | Request metrics and latency |
@@ -77,15 +76,14 @@ location /translate {
 
 ## Configuration
 
-Environment variables:
+Environment variables (Docker):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BT_LOCAL_URL` | `http://192.168.0.122:2819/v1/chat/completions` | Local LLM endpoint |
-| `BT_LOCAL_MODEL` | `gemma4-12b` | Model name for local backend |
-| `BT_LOCAL_ENABLED` | `1` | Enable/disable local backend |
-
-MiniMax API key is loaded from `auth.json` (credential_pool.minimax) or `.env` (MINIMAX_API_KEY=...).
+| `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
+| `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
+| `LLM_API_KEY` | | Your API key for the chosen provider |
+| `BT_LOCAL_URL` | `http://192.168.0.122:2819/v1/chat/completions` | Only used if `LLM_PROVIDER=local` |
 
 ## License
 

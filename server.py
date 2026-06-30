@@ -10,13 +10,13 @@ import uuid
 from collections import defaultdict
 from flask import Flask, request, jsonify
 
-from translator import translate_text, translate_batch, check_backend_health
+from translator import translate_text, translate_batch, check_backend_health, LLM_MODEL
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
@@ -77,6 +77,25 @@ RATE_LIMIT_MAX = 60     # requests per window
 RATE_LIMIT_WINDOW = 60  # seconds
 
 
+def _cleanup_rate_limits():
+    """Background thread to clean up inactive IPs from the rate limiter."""
+    while True:
+        time.sleep(3600)  # Every hour
+        now = time.monotonic()
+        cutoff = now - RATE_LIMIT_WINDOW
+        with _rate_limit_lock:
+            keys_to_delete = []
+            for ip, timestamps in _rate_limit_store.items():
+                active = [t for t in timestamps if t > cutoff]
+                if not active:
+                    keys_to_delete.append(ip)
+                else:
+                    _rate_limit_store[ip] = active
+            for ip in keys_to_delete:
+                del _rate_limit_store[ip]
+
+threading.Thread(target=_cleanup_rate_limits, daemon=True).start()
+
 def _check_rate_limit(ip: str) -> bool:
     """Return True if the request should be allowed, False if rate-limited."""
     now = time.monotonic()
@@ -103,32 +122,16 @@ _metrics = {
 }
 
 
-def _record_metric(latency_ms: float, cache_hit: bool = False, error: bool = False):
+def _record_metric(latency_ms: float, hits: int = 0, misses: int = 0, error: bool = False):
     """Record request metrics (thread-safe)."""
     with _metrics_lock:
         _metrics["total_requests"] += 1
         _metrics["total_latency_ms"] += latency_ms
-        if cache_hit:
-            _metrics["cache_hits"] += 1
-        else:
-            _metrics["cache_misses"] += 1
+        _metrics["cache_hits"] += hits
+        _metrics["cache_misses"] += misses
         if error:
             _metrics["errors"] += 1
 
-
-# ── Prefetch job tracking (H4) ──────────────────────────────────────────────
-
-_prefetch_jobs: dict[str, dict] = {}
-_prefetch_jobs_lock = threading.Lock()
-
-def _cleanup_prefetch_jobs():
-    """Keep only the 100 most recent jobs to prevent memory leaks."""
-    with _prefetch_jobs_lock:
-        if len(_prefetch_jobs) > 100:
-            # Sort by started_at and keep the newest 50
-            sorted_jobs = sorted(_prefetch_jobs.items(), key=lambda x: x[1].get("started_at", 0))
-            for k, _ in sorted_jobs[:-50]:
-                del _prefetch_jobs[k]
 
 # ── Shared batch helper (M3) ───────────────────────────────────────────────
 
@@ -136,40 +139,41 @@ def _translate_paragraphs(
     paragraphs: list[str], source_lang: str, target_lang: str
 ) -> dict:
     """
-    Shared helper for batch translation logic used by /translate/batch and /prefetch.
+    Shared helper for batch translation logic used by /translate/batch.
 
     Returns dict with translations list, cached_count, fresh_count, and elapsed_ms.
     """
-    translations = []
+    translations = [""] * len(paragraphs)
     cached_count = 0
     fresh_count = 0
     start = time.monotonic()
 
-    for para in paragraphs:
+    # Identify cache misses
+    misses = []
+    miss_indices = []
+    
+    for i, para in enumerate(paragraphs):
         if not para.strip():
-            translations.append("")
             continue
-
-        # Check cache
         cached = get_cached(para, source_lang, target_lang)
         if cached is not None:
-            translations.append(cached)
+            translations[i] = cached
             cached_count += 1
-            continue
+        else:
+            misses.append(para)
+            miss_indices.append(i)
 
-        # Translate fresh
-        try:
-            translated, backend = translate_text(para, source_lang, target_lang)
-            translations.append(translated)
-            fresh_count += 1
-            try:
-                model_name = LOCAL_BACKEND_MODEL if backend == "local" else "MiniMax-M3"
-                put_cache(para, source_lang, target_lang, translated, model=model_name)
-            except Exception:
-                pass
-        except Exception as e:
-            log.error("Batch: translation failed for paragraph: %s", e)
-            translations.append(f"[ERROR: {e}]")
+    # Translate misses concurrently
+    if misses:
+        results = translate_batch(misses, source_lang, target_lang, max_concurrent=3)
+        for idx, (translated, backend) in zip(miss_indices, results):
+            translations[idx] = translated
+            if not translated.startswith("[TRANSLATION ERROR:"):
+                fresh_count += 1
+                try:
+                    put_cache(paragraphs[idx], source_lang, target_lang, translated, model=LLM_MODEL)
+                except Exception:
+                    pass
 
     total_elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -179,10 +183,6 @@ def _translate_paragraphs(
         "fresh_count": fresh_count,
         "total_elapsed_ms": total_elapsed_ms,
     }
-
-
-# Need LOCAL_BACKEND_MODEL for model name resolution in _translate_paragraphs
-from translator import LOCAL_BACKEND_MODEL  # noqa: E402
 
 
 # ── Request middleware (M5: request ID + timing, H6: rate limiting) ─────────
@@ -289,9 +289,9 @@ def translate():
         "request_id": "uuid"
     }
     """
-    data = request.get_json()
-    if not data or "text" not in data:
-        return jsonify({"error": "Missing 'text' field"}), 400
+    data = request.get_json(silent=True) or {}
+    if "text" not in data or not isinstance(data["text"], str):
+        return jsonify({"error": "Missing or invalid 'text' field"}), 400
 
     text = data["text"].strip()
     source_lang = data.get("source_lang", "English")
@@ -305,13 +305,13 @@ def translate():
     req_id = getattr(request, "request_id", None)
 
     if not text:
-        _record_metric(0, cache_hit=False)
+        _record_metric(0, hits=0, misses=1)
         return jsonify({"translated": "", "cached": False, "elapsed_ms": 0, "request_id": req_id})
 
     # Check cache first
     cached = get_cached(text, source_lang, target_lang)
     if cached is not None:
-        _record_metric(0, cache_hit=True)
+        _record_metric(0, hits=1, misses=0)
         return jsonify({
             "translated": cached,
             "cached": True,
@@ -325,18 +325,17 @@ def translate():
         translated, backend = translate_text(text, source_lang, target_lang)
     except Exception as e:
         elapsed_ms = int((time.monotonic() - start) * 1000)
-        _record_metric(elapsed_ms, cache_hit=False, error=True)
+        _record_metric(elapsed_ms, hits=0, misses=1, error=True)
         log.exception("Translation failed")
         return jsonify({"error": str(e), "request_id": req_id}), 500
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
-    _record_metric(elapsed_ms, cache_hit=False)
+    _record_metric(elapsed_ms, hits=0, misses=1)
 
     # Store in cache with correct model name
     try:
-        model_name = LOCAL_BACKEND_MODEL if backend == "local" else "MiniMax-M3"
-        put_cache(text, source_lang, target_lang, translated, model=model_name)
-    except Exception:
+        put_cache(text, source_lang, target_lang, translated, model=LLM_MODEL)
+    except Exception as e:
         log.exception("Cache write failed (non-fatal)")
 
     return jsonify({
@@ -367,9 +366,9 @@ def translate_batch_endpoint():
         "request_id": "uuid"
     }
     """
-    data = request.get_json()
-    if not data or "paragraphs" not in data:
-        return jsonify({"error": "Missing 'paragraphs' field"}), 400
+    data = request.get_json(silent=True) or {}
+    if "paragraphs" not in data or not isinstance(data["paragraphs"], list):
+        return jsonify({"error": "Missing or invalid 'paragraphs' field"}), 400
 
     paragraphs = data["paragraphs"]
     source_lang = data.get("source_lang", "English")
@@ -383,89 +382,11 @@ def translate_batch_endpoint():
     result = _translate_paragraphs(paragraphs, source_lang, target_lang)
     result["request_id"] = getattr(request, "request_id", None)
 
-    _record_metric(result["total_elapsed_ms"], cache_hit=False)
+    _record_metric(result["total_elapsed_ms"], hits=result["cached_count"], misses=result["fresh_count"])
 
     return jsonify(result)
 
 
-@app.route("/prefetch", methods=["POST"])
-def prefetch():
-    """
-    Pre-fetch translations for upcoming paragraphs (async, H4).
-    Returns immediately with a job ID; work runs in background thread.
-
-    POST body: {
-        "paragraphs": [...],
-        "source_lang": "English",
-        "target_lang": "Spanish",
-        "book_id": "optional_book_identifier"
-    }
-
-    Returns: {"status": "accepted", "job_id": "uuid"}
-    """
-    data = request.get_json()
-    if not data or "paragraphs" not in data:
-        return jsonify({"error": "Missing 'paragraphs' field"}), 400
-
-    paragraphs = data["paragraphs"]
-    source_lang = data.get("source_lang", "English")
-    target_lang = data.get("target_lang", "Spanish")
-
-    # Validate languages (H7)
-    lang_error = _validate_languages(source_lang, target_lang)
-    if lang_error:
-        return jsonify({"error": lang_error}), 400
-
-    _cleanup_prefetch_jobs()
-    job_id = str(uuid.uuid4())
-
-    # Register job
-    with _prefetch_jobs_lock:
-        _prefetch_jobs[job_id] = {
-            "status": "running",
-            "total": len(paragraphs),
-            "cached_count": 0,
-            "fresh_count": 0,
-            "error": None,
-            "started_at": time.time(),
-        }
-
-    def _run_prefetch():
-        try:
-            result = _translate_paragraphs(paragraphs, source_lang, target_lang)
-            with _prefetch_jobs_lock:
-                _prefetch_jobs[job_id].update({
-                    "status": "complete",
-                    "cached_count": result["cached_count"],
-                    "fresh_count": result["fresh_count"],
-                    "total_elapsed_ms": result["total_elapsed_ms"],
-                })
-        except Exception as e:
-            log.error("Prefetch job %s failed: %s", job_id, e)
-            with _prefetch_jobs_lock:
-                _prefetch_jobs[job_id].update({
-                    "status": "error",
-                    "error": str(e),
-                })
-
-    thread = threading.Thread(target=_run_prefetch, daemon=True)
-    thread.start()
-
-    return jsonify({
-        "status": "accepted",
-        "job_id": job_id,
-        "request_id": getattr(request, "request_id", None),
-    })
-
-
-@app.route("/prefetch/<job_id>/status")
-def prefetch_status(job_id):
-    """Check the status of a prefetch job (H4)."""
-    with _prefetch_jobs_lock:
-        job = _prefetch_jobs.get(job_id)
-    if job is None:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify({"job_id": job_id, **job})
 
 
 @app.route("/cache/cleanup", methods=["POST"])
