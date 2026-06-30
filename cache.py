@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 
 log = logging.getLogger("book-translator.cache")
 
-DB_PATH = Path("/home/hermes/.hermes/projects/book-translator/translations.db")
+DB_PATH = Path(os.getenv("DB_PATH", "translations.db"))
 
 # ── Thread-local connection pool (M1) ──────────────────────────────────────
 _thread_local = threading.local()

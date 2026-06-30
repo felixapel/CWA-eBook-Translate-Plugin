@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+translations.db
+translations.db-*
+overlay
+userscript
+README.md
+benchmark.py
+test_*.py

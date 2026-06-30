@@ -77,7 +77,8 @@
 #translator-float {
     position: fixed;
     bottom: 24px;
-    right: 24px;
+    left: 50%;
+    transform: translateX(-50%);
     z-index: 9999;
     background: rgba(26, 115, 232, 0.85);
     backdrop-filter: blur(12px) saturate(180%);
