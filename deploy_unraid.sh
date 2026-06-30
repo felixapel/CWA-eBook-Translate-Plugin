@@ -40,8 +40,12 @@ ssh $UNRAID_USER@$UNRAID_HOST "
 echo "Backing up existing frontend scripts on Unraid..."
 ssh $UNRAID_USER@$UNRAID_HOST "mkdir -p $CWA_OVERLAY_DIR/backups && cp $CWA_OVERLAY_DIR/translator.js $CWA_OVERLAY_DIR/backups/translator_$TIMESTAMP.js || true"
 ssh $UNRAID_USER@$UNRAID_HOST "cp $CWA_OVERLAY_DIR/translator.css $CWA_OVERLAY_DIR/backups/translator_$TIMESTAMP.css || true"
+ssh $UNRAID_USER@$UNRAID_HOST "cp $CWA_OVERLAY_DIR/read.html $CWA_OVERLAY_DIR/backups/read_$TIMESTAMP.html || true"
 
 echo "Copying new frontend scripts to CWA overlay..."
-scp static/translator.js static/translator.css $UNRAID_USER@$UNRAID_HOST:$CWA_OVERLAY_DIR/
+scp static/translator.js static/translator.css overlay/read.html $UNRAID_USER@$UNRAID_HOST:$CWA_OVERLAY_DIR/
+
+echo "Restarting calibre-web-automated to inject overlay..."
+ssh $UNRAID_USER@$UNRAID_HOST "docker restart calibre-web-automated"
 
 echo "Deployment complete! Run verify_unraid.sh to check status."

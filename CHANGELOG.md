@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-06-30
+### Fixed
+- **Deployment sync (Unraid):** CWA container was serving the old bundled `translator.js` instead
+  of the overlay files because the container lacked file-level bind mounts. Container recreated
+  with the correct mounts from the Unraid XML template. Overlay and container now serve identical
+  files (verified by SHA-256 hash match).
+- **Version marker bumped to `2026-06-30-opus-deploy-sync-v1`** — a brief toast is shown on load
+  so users can confirm the correct JS version is running without opening DevTools.
+- **Cache-busting query strings** added to `read.html` asset URLs
+  (`?v=2026-06-30-opus-deploy-sync-v1`) so browser caches are bypassed after upgrades.
+
+### Documentation
+- Rewrote `docs/DEPLOY_UNRAID.md` to document the real architecture: file bind mounts via the
+  Unraid XML template, the `/mnt/user/appdata/calibre-web-automated/overlay/` deploy target, and
+  why `docker restart` alone is insufficient if template mounts change.
+- Rewrote `docs/TROUBLESHOOTING.md` with verified steps for every known issue.
+
 ## [1.1.0] - 2026-06-30
 ### Added
 - **Context-Aware Translation (`BT_CONTEXT_WINDOW`, default 0):** option to send previous/next paragraphs to the LLM to improve literary quality and pronoun accuracy.
