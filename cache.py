@@ -58,14 +58,27 @@ def init_db():
     log.info("Translation cache initialized at %s", DB_PATH)
 
 
+# Optional hard cap on cache rows (0 = unlimited). Checked cheaply on writes:
+# when exceeded, the oldest rows are evicted down to the cap.
+CACHE_MAX_ENTRIES = int(os.getenv("BT_CACHE_MAX_ENTRIES", "0"))
+_put_counter = 0
+_ENFORCE_EVERY = 200  # only run the COUNT/DELETE housekeeping every N writes
+
+
 def compute_cache_key(text: str, source_lang: str, target_lang: str) -> str:
-    """SHA-256 hash of (text + source + target)."""
-    content = f"{text}|{source_lang}|{target_lang}"
+    """SHA-256 hash of (normalized text + source + target).
+
+    The text is stripped so the single and batch endpoints (which historically
+    differed in whitespace handling) always agree on the same key — the same
+    paragraph is never translated and paid for twice.
+    """
+    content = f"{text.strip()}|{source_lang}|{target_lang}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def get_cached(text: str, source_lang: str, target_lang: str) -> str | None:
-    """Look up a translation in the cache. Returns None if not found."""
+    """Look up a translation in the cache. Returns None if not found.
+    A hit increments hit_count so /stats reflects real cache usage."""
     cache_key = compute_cache_key(text, source_lang, target_lang)
     conn = _get_conn()
     try:
@@ -75,6 +88,14 @@ def get_cached(text: str, source_lang: str, target_lang: str) -> str | None:
         ).fetchone()
         if row:
             log.debug("Cache HIT for %d chars %s→%s", len(text), source_lang, target_lang)
+            try:
+                conn.execute(
+                    "UPDATE translations SET hit_count = hit_count + 1 WHERE cache_key = ?",
+                    (cache_key,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()  # stats bookkeeping must never break a read
             return row[0]
         return None
     except Exception:
@@ -89,23 +110,53 @@ def put_cache(
     translated_text: str,
     model: str = "MiniMax-M3",
 ):
-    """Store a translation in the cache."""
+    """Store a translation in the cache (upsert; re-puts keep the hit count)."""
+    global _put_counter
     cache_key = compute_cache_key(text, source_lang, target_lang)
     now = datetime.now(timezone.utc).isoformat()
     conn = _get_conn()
     try:
         conn.execute(
-            """INSERT OR REPLACE INTO translations
+            """INSERT INTO translations
                (cache_key, source_text, source_lang, target_lang,
                 translated_text, model, created_at, hit_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
-            (cache_key, text, source_lang, target_lang, translated_text, model, now),
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+               ON CONFLICT(cache_key) DO UPDATE SET
+                 translated_text = excluded.translated_text,
+                 model = excluded.model,
+                 created_at = excluded.created_at""",
+            (cache_key, text.strip(), source_lang, target_lang, translated_text, model, now),
         )
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     log.debug("Cache PUT: %d chars %s→%s", len(text), source_lang, target_lang)
+
+    if CACHE_MAX_ENTRIES > 0:
+        _put_counter += 1
+        if _put_counter >= _ENFORCE_EVERY:
+            _put_counter = 0
+            _enforce_max_entries(conn)
+
+
+def _enforce_max_entries(conn: sqlite3.Connection):
+    """Evict oldest rows beyond CACHE_MAX_ENTRIES (best-effort housekeeping)."""
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
+        excess = total - CACHE_MAX_ENTRIES
+        if excess > 0:
+            conn.execute(
+                """DELETE FROM translations WHERE cache_key IN (
+                       SELECT cache_key FROM translations
+                       ORDER BY created_at ASC LIMIT ?)""",
+                (excess,),
+            )
+            conn.commit()
+            log.info("Cache cap: evicted %d oldest entries (cap %d)", excess, CACHE_MAX_ENTRIES)
+    except Exception:
+        conn.rollback()
+        log.exception("Cache cap enforcement failed (non-fatal)")
 
 
 def get_cache_stats() -> dict:

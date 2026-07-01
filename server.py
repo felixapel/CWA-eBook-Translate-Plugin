@@ -14,9 +14,22 @@ from flask import Flask, request, jsonify
 from translator import translate_text, translate_batch, check_backend_health, LLM_MODEL
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
 
+__version__ = "2.0.0"
+
 # Optional shared-secret. When BT_API_TOKEN is set, translate endpoints require
 # the matching `X-BT-Token` header — use it if the API is reachable beyond the LAN.
 API_TOKEN = os.environ.get("BT_API_TOKEN", "")
+
+# Request-size caps: one request must not be able to trigger unbounded LLM work
+# (GPU starvation locally, an open-ended bill on cloud APIs). Oversized input is
+# rejected with 413 rather than truncated — silent truncation would corrupt text.
+BT_MAX_BATCH_PARAGRAPHS = int(os.environ.get("BT_MAX_BATCH_PARAGRAPHS", "50"))
+BT_MAX_PARAGRAPH_CHARS = int(os.environ.get("BT_MAX_PARAGRAPH_CHARS", "8000"))
+
+# Rate-limit key: request.remote_addr by default. Behind a reverse proxy every
+# client shares the proxy's address, so opt in to X-Forwarded-For ONLY when the
+# proxy is trusted to set it (never trust it from direct clients).
+BT_TRUST_PROXY = os.environ.get("BT_TRUST_PROXY", "false").lower() in ("1", "true", "yes")
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -54,13 +67,28 @@ def _validate_languages(source_lang: str, target_lang: str):
 
 
 # ── CORS whitelist (H5) ─────────────────────────────────────────────────────
+# Configure with BT_ALLOWED_ORIGINS (comma-separated exact origins, e.g.
+# "https://books.example.com,http://mynas:8083"). BT_ALLOW_PRIVATE_LAN
+# (default true) additionally allows localhost and RFC1918 addresses on any
+# port — the common self-hosted case. Note: in proxy-injection mode the overlay
+# is same-origin and CORS never comes into play.
 
 ALLOWED_ORIGINS = {
-    "http://localhost:8383",
-    "http://localhost:8083",
-    "https://calibre.felitounraid.de",
+    o.strip()
+    for o in os.environ.get(
+        "BT_ALLOWED_ORIGINS", "http://localhost:8083,http://localhost:8383"
+    ).split(",")
+    if o.strip()
 }
-_LOCAL_ORIGIN_RE = re.compile(r"^https?://192\.168\.0\.\d{1,3}(:\d+)?$")
+BT_ALLOW_PRIVATE_LAN = os.environ.get("BT_ALLOW_PRIVATE_LAN", "true").lower() in ("1", "true", "yes")
+_PRIVATE_ORIGIN_RE = re.compile(
+    r"^https?://("
+    r"localhost|127\.0\.0\.1|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+    r")(:\d+)?$"
+)
 
 
 def _is_origin_allowed(origin: str | None) -> str | None:
@@ -69,7 +97,7 @@ def _is_origin_allowed(origin: str | None) -> str | None:
         return None
     if origin in ALLOWED_ORIGINS:
         return origin
-    if _LOCAL_ORIGIN_RE.match(origin):
+    if BT_ALLOW_PRIVATE_LAN and _PRIVATE_ORIGIN_RE.match(origin):
         return origin
     return None
 
@@ -103,6 +131,16 @@ def _cleanup_rate_limits():
                 del _rate_limit_store[ip]
 
 threading.Thread(target=_cleanup_rate_limits, daemon=True).start()
+
+def _client_ip() -> str:
+    """Rate-limit key. Uses X-Forwarded-For's first hop only when BT_TRUST_PROXY
+    is enabled (i.e. a trusted reverse proxy sets it); otherwise remote_addr."""
+    if BT_TRUST_PROXY:
+        fwd = request.headers.get("X-Forwarded-For", "")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
 
 def _check_rate_limit(ip: str) -> bool:
     """Return True if the request should be allowed, False if rate-limited."""
@@ -208,7 +246,7 @@ def before_request_hook():
 
     # Rate limiting (H6) — skip for health/metrics/ping
     if request.path not in ("/health", "/metrics", "/ping"):
-        client_ip = request.remote_addr or "unknown"
+        client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
             response = jsonify({
@@ -239,6 +277,8 @@ def after_request_hook(response):
         response.headers["Access-Control-Allow-Origin"] = allowed
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-BT-Token"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        # Let cross-origin JS read the request ID and 429 Retry-After header.
+        response.headers["Access-Control-Expose-Headers"] = "X-Request-ID, Retry-After"
 
     return response
 
@@ -264,6 +304,7 @@ def health():
     return jsonify({
         "status": overall,
         "service": "book-translator",
+        "version": __version__,
         "backends": backend_health,
         "request_id": getattr(request, "request_id", None),
     })
@@ -318,6 +359,11 @@ def translate():
         return jsonify({"error": "Missing or invalid 'text' field"}), 400
 
     text = data["text"].strip()
+    if len(text) > BT_MAX_PARAGRAPH_CHARS:
+        return jsonify({
+            "error": f"'text' exceeds the {BT_MAX_PARAGRAPH_CHARS}-character limit"
+        }), 413
+
     source_lang = data.get("source_lang", "English")
     target_lang = data.get("target_lang", "Spanish")
 
@@ -395,6 +441,18 @@ def translate_batch_endpoint():
         return jsonify({"error": "Missing or invalid 'paragraphs' field"}), 400
 
     paragraphs = data["paragraphs"]
+    if len(paragraphs) > BT_MAX_BATCH_PARAGRAPHS:
+        return jsonify({
+            "error": f"Too many paragraphs ({len(paragraphs)}); max {BT_MAX_BATCH_PARAGRAPHS} per request"
+        }), 413
+    if not all(isinstance(p, str) for p in paragraphs):
+        return jsonify({"error": "All 'paragraphs' entries must be strings"}), 400
+    oversized = next((i for i, p in enumerate(paragraphs) if len(p) > BT_MAX_PARAGRAPH_CHARS), None)
+    if oversized is not None:
+        return jsonify({
+            "error": f"Paragraph {oversized} exceeds the {BT_MAX_PARAGRAPH_CHARS}-character limit"
+        }), 413
+
     source_lang = data.get("source_lang", "English")
     target_lang = data.get("target_lang", "Spanish")
 
@@ -415,9 +473,13 @@ def translate_batch_endpoint():
 
 @app.route("/cache/cleanup", methods=["POST"])
 def cache_cleanup():
-    """Evict old cache entries. Optional body: {"days": 30}"""
+    """Evict old cache entries. Optional body: {"days": 30}.
+    `days` must be an integer >= 1 — a negative value would match every row
+    (created_at < future date) and silently wipe the whole cache."""
     data = request.get_json(silent=True) or {}
     days = data.get("days", 30)
+    if isinstance(days, bool) or not isinstance(days, int) or not (1 <= days <= 3650):
+        return jsonify({"error": "'days' must be an integer between 1 and 3650"}), 400
     deleted = cleanup_old_entries(days=days)
     return jsonify({"deleted": deleted, "days": days})
 

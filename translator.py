@@ -11,13 +11,10 @@ to one-call-per-paragraph so correctness is never sacrificed for speed.
 """
 import os
 import re
-import json
 import time
-import hashlib
 import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger("book-translator.translator")
@@ -83,41 +80,13 @@ PROVIDER_ENDPOINTS = {
 # ── API key loading (primary) ────────────────────────────────────────────────
 
 def _load_primary_api_key() -> str:
-    """Load the primary API key from env, or legacy auth.json/.env configs."""
-    if LLM_API_KEY and len(LLM_API_KEY) > 1:
+    """The primary API key comes from the LLM_API_KEY env var — the only
+    supported mechanism. (Legacy auth.json / .env / MINIMAX_API_KEY fallbacks
+    were removed in 2.0.0; see CHANGELOG.)"""
+    key = LLM_API_KEY.strip()
+    if key:
         log.info("Loaded API key from LLM_API_KEY env var")
-        return LLM_API_KEY
-
-    env_key = os.environ.get("MINIMAX_API_KEY")
-    if env_key and len(env_key) > 10:
-        return env_key
-
-    auth_path = Path("auth.json")
-    if auth_path.exists():
-        try:
-            with open(auth_path) as f:
-                auth = json.load(f)
-            pool = auth.get("credential_pool", {})
-            key = pool.get(LLM_PROVIDER, pool.get("minimax", ""))
-            if key:
-                return key
-        except Exception:
-            pass
-
-    env_path = Path(".env")
-    if env_path.exists():
-        try:
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("#"):
-                        continue
-                    if line.startswith(f"{LLM_PROVIDER.upper()}_API_KEY=") or line.startswith("MINIMAX_API_KEY="):
-                        return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except Exception:
-            pass
-
-    return ""
+    return key
 
 
 # ── Provider model ───────────────────────────────────────────────────────────
@@ -187,11 +156,6 @@ Rules:
 5. Output ONLY the markers and their translations — no commentary, notes, or explanations."""
 
 _SEG_RE = re.compile(r"@@\s*SEG\s*(\d+)\s*@@", re.IGNORECASE)
-
-
-def get_cache_key(text: str, source_lang: str, target_lang: str) -> str:
-    content = f"{text}|{source_lang}|{target_lang}"
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 # ── Per-provider request helpers ─────────────────────────────────────────────
@@ -336,51 +300,72 @@ def _parse_segments(output: str, n: int) -> Optional[list[str]]:
     return out
 
 
-def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str, target_lang: str) -> list[str]:
+def _build_context_block(all_texts: list[str], idxs: list[int]) -> Optional[str]:
+    """
+    One [CONTEXT] block for the whole group: the BT_CONTEXT_WINDOW paragraphs
+    before the group's first segment and after its last. Plain joined text —
+    never a Python list repr — placed BEFORE the first @@SEG@@ marker so it can
+    never be confused with a segment body.
+    """
+    if BT_CONTEXT_WINDOW <= 0 or not idxs:
+        return None
+
+    first, last = idxs[0], idxs[-1]
+    before = [t.strip() for t in all_texts[max(0, first - BT_CONTEXT_WINDOW):first] if t.strip()]
+    after = [t.strip() for t in all_texts[last + 1:last + 1 + BT_CONTEXT_WINDOW] if t.strip()]
+
+    sections = []
+    if before:
+        sections.append("[CONTEXT BEFORE]\n" + "\n".join(before))
+    if after:
+        sections.append("[CONTEXT AFTER]\n" + "\n".join(after))
+    if not sections:
+        return None
+
+    return "[CONTEXT] Surrounding story context — do NOT translate:\n" + "\n\n".join(sections)
+
+
+def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str, target_lang: str) -> list[tuple[str, str]]:
     """
     Translate a group of paragraphs in ONE LLM call. Falls back to per-paragraph
     translation if the segmented response can't be parsed (count mismatch, dropped
     segment, etc.) so correctness is preserved.
+
+    Returns one (translated_text, provider_name) per input segment.
     """
     group_texts = [all_texts[i] for i in idxs]
     if len(group_texts) == 1 and BT_CONTEXT_WINDOW == 0:
-        return [translate_text(group_texts[0], source_lang, target_lang)[0]]
+        return [translate_text(group_texts[0], source_lang, target_lang)]
 
     combined_parts = []
+    context_block = _build_context_block(all_texts, idxs)
+    if context_block:
+        combined_parts.append(context_block)
     for k, i in enumerate(idxs):
         combined_parts.append(f"@@SEG {k + 1}@@\n{all_texts[i]}")
-        
-        # Add context if enabled
-        if BT_CONTEXT_WINDOW > 0:
-            ctx_parts = []
-            if i > 0:
-                ctx_parts.append(f"[PREVIOUS CONTEXT]: {all_texts[max(0, i - BT_CONTEXT_WINDOW):i]}")
-            if i < len(all_texts) - 1:
-                ctx_parts.append(f"[NEXT CONTEXT]: {all_texts[i + 1:min(len(all_texts), i + 1 + BT_CONTEXT_WINDOW)]}")
-            if ctx_parts:
-                combined_parts.append("\n".join(ctx_parts))
 
     combined = "\n\n".join(combined_parts)
     system = BATCH_SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
 
+    parsed = None
+    provider = ""
     try:
-        output, _ = _complete(combined, system, max_retries=2, max_tokens=_output_cap(combined, BT_BATCH_MAX_TOKENS))
+        output, provider = _complete(combined, system, max_retries=2, max_tokens=_output_cap(combined, BT_BATCH_MAX_TOKENS))
         parsed = _parse_segments(output, len(group_texts))
     except Exception as e:
         log.warning("Batch call failed (%d segs): %s — falling back to per-paragraph", len(group_texts), e)
-        parsed = None
 
     if parsed is not None:
-        return parsed
+        return [(seg, provider) for seg in parsed]
 
     log.info("Batch parse mismatch for %d segments; translating individually", len(group_texts))
     out = []
     for t in group_texts:
         try:
-            out.append(translate_text(t, source_lang, target_lang)[0])
+            out.append(translate_text(t, source_lang, target_lang))
         except Exception as e:
             log.error("Per-paragraph fallback failed: %s", e)
-            out.append(f"[TRANSLATION ERROR: {e}]")
+            out.append((f"[TRANSLATION ERROR: {e}]", ""))
     return out
 
 
@@ -409,15 +394,13 @@ def translate_batch(
     # Split the work into groups of batch_size, preserving original indices.
     groups = [work[k:k + batch_size] for k in range(0, len(work), batch_size)]
 
-    work_texts = [t for _, t in work]
     def _do_group(group):
         idxs = [i for i, _ in group]
-        gtexts = [t for _, t in group]
         try:
             translations = _translate_group(texts, idxs, source_lang, target_lang)
         except Exception as e:
             log.error("Group translation failed: %s", e)
-            translations = [f"[TRANSLATION ERROR: {e}]"] * len(gtexts)
+            translations = [(f"[TRANSLATION ERROR: {e}]", "")] * len(idxs)
         return idxs, translations
 
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
@@ -425,8 +408,10 @@ def translate_batch(
         for future in as_completed(futures):
             idxs, translations = future.result()
             for j, idx in enumerate(idxs):
-                tr = translations[j] if j < len(translations) else "[TRANSLATION ERROR: missing segment]"
-                results[idx] = (tr, LLM_PROVIDER)
+                # Each entry carries the provider that ACTUALLY served it (the
+                # fallback provider when the primary failed), not the configured
+                # primary — so logs and debugging reflect reality.
+                results[idx] = translations[j] if j < len(translations) else ("[TRANSLATION ERROR: missing segment]", "")
 
     return results
 

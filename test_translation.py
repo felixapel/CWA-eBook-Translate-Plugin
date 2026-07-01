@@ -121,28 +121,90 @@ def run():
     d = client.post("/translate/batch", json={"paragraphs": ["x", "", "y"]}).get_json()
     check("batch: retried after recovery", d["translations"][0] == "[LOCAL] x" and d["translations"][2] == "[LOCAL] y")
 
-    # Context Window.
-    os.environ["BT_CONTEXT_WINDOW"] = "1"
-    # reload settings by resetting module variable if needed, but translator.py reads it at import time.
-    # Because translator is already imported, we'll patch it directly.
+    # Context Window. translator.py reads BT_CONTEXT_WINDOW at import time, so
+    # patch the module variable directly for this block.
     import translator
     translator.BT_CONTEXT_WINDOW = 1
-    
-    # We mock fake_post to verify context is received
-    received_contexts = []
+
+    # Capture the exact prompt the LLM receives to verify the context block.
+    received_prompts = []
     original_post = requests.post
     def context_check_post(url, headers=None, json=None, timeout=None):
         user_text = json["messages"][-1]["content"]
-        received_contexts.append(user_text)
+        received_prompts.append(user_text)
         return fake_post(url, headers, json, timeout)
-    
+
     requests.post = context_check_post
-    client.post("/translate/batch", json={"paragraphs": ["uncached_context_para_1", "uncached_context_para_2"]}).get_json()
+    # 4 paragraphs at BT_BATCH_SIZE=3 -> group 1 covers indices 0..2 (context
+    # after = para D), group 2 covers index 3 (context before = para C). Use a
+    # direct translator call so the full chapter is visible to the context
+    # builder regardless of server-side cache state.
+    translator.translate_batch(
+        ["ctx_para_A", "ctx_para_B", "ctx_para_C", "ctx_para_D"], "English", "Spanish")
     requests.post = original_post
     translator.BT_CONTEXT_WINDOW = 0
-    
-    check("context: previous/next contexts included in batch prompt",
-          "[NEXT CONTEXT]" in received_contexts[0] and "[PREVIOUS CONTEXT]" in received_contexts[0])
+
+    batch_prompts = [p for p in received_prompts if "@@SEG" in p]
+    check("context: [CONTEXT] block included in batch prompt",
+          any("[CONTEXT]" in p for p in batch_prompts))
+    check("context: plain text, never a Python list repr",
+          all("['" not in p and '["' not in p for p in batch_prompts))
+    check("context: context precedes the first segment marker",
+          all(p.index("[CONTEXT]") < p.index("@@SEG") for p in batch_prompts if "[CONTEXT]" in p))
+
+    # Request-size caps: oversized input is rejected, not silently truncated.
+    too_many = [f"p{i}" for i in range(server.BT_MAX_BATCH_PARAGRAPHS + 1)]
+    check("caps: too many paragraphs -> 413",
+          client.post("/translate/batch", json={"paragraphs": too_many}).status_code == 413)
+    big = "x" * (server.BT_MAX_PARAGRAPH_CHARS + 1)
+    check("caps: oversized paragraph in batch -> 413",
+          client.post("/translate/batch", json={"paragraphs": ["ok", big]}).status_code == 413)
+    check("caps: oversized single text -> 413",
+          client.post("/translate", json={"text": big}).status_code == 413)
+    check("caps: non-string paragraph entry -> 400",
+          client.post("/translate/batch", json={"paragraphs": ["ok", 42]}).status_code == 400)
+
+    # /cache/cleanup input validation: negative days would wipe the whole cache.
+    check("cleanup: negative days rejected",
+          client.post("/cache/cleanup", json={"days": -1}).status_code == 400)
+    check("cleanup: non-integer days rejected",
+          client.post("/cache/cleanup", json={"days": "abc"}).status_code == 400)
+    check("cleanup: valid days accepted",
+          client.post("/cache/cleanup", json={"days": 3650}).status_code == 200)
+
+    # Cache-key normalization: single + batch endpoints must share entries, and
+    # surrounding whitespace must not cause a second paid translation.
+    STATE["local_up"] = True
+    d1 = client.post("/translate", json={"text": "norm_test_para"}).get_json()
+    check("normalization: first translate is fresh", d1.get("cached") is False)
+    d2 = client.post("/translate/batch", json={"paragraphs": ["  norm_test_para  "]}).get_json()
+    check("normalization: whitespace variant hits cache via batch",
+          d2.get("cached_count") == 1 and d2.get("fresh_count") == 0)
+
+    # hit_count: a real cache hit increments /stats total_hits.
+    before_hits = client.get("/stats").get_json()["total_hits"]
+    client.post("/translate", json={"text": "norm_test_para"})
+    after_hits = client.get("/stats").get_json()["total_hits"]
+    check("stats: cache hit increments total_hits", after_hits == before_hits + 1)
+
+    # Provider attribution: batch results report the provider that ACTUALLY
+    # served them (fallback when local is down), not the configured primary.
+    STATE["local_up"] = False
+    STATE["fallback_up"] = True
+    results = translator.translate_batch(["attribution_test_para"], "English", "Spanish")
+    check("attribution: fallback provider reported in batch results",
+          results[0][0] == "[FB] attribution_test_para" and results[0][1] == "minimax")
+    STATE["local_up"] = True
+
+    # CORS: private-LAN origins allowed (default), exposes Retry-After header.
+    r = client.get("/ping", headers={"Origin": "http://192.168.1.50:8083"})
+    check("cors: private LAN origin allowed",
+          r.headers.get("Access-Control-Allow-Origin") == "http://192.168.1.50:8083")
+    check("cors: Retry-After exposed to JS",
+          "Retry-After" in (r.headers.get("Access-Control-Expose-Headers") or ""))
+    r = client.get("/ping", headers={"Origin": "https://evil.example.com"})
+    check("cors: unknown public origin rejected",
+          r.headers.get("Access-Control-Allow-Origin") is None)
 
     # Output token cap is proportional to input and clamped to the ceiling, so a
     # rambling model can't burn thousands of tokens on a short paragraph.
