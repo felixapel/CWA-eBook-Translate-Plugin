@@ -1,0 +1,15 @@
+# Normalize line endings. Files that execute inside the Linux container or are
+# parsed by nginx/envsubst MUST be LF even when the repo is cloned on Windows —
+# a CRLF shebang (#!/bin/sh\r) breaks the entrypoint at container start.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.template text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+Dockerfile text eol=lf
+VERSION text eol=lf
