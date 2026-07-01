@@ -2,12 +2,21 @@ FROM python:3.11-alpine
 
 WORKDIR /app
 
+# nginx powers the optional proxy-injection mode (enabled by setting
+# CWA_UPSTREAM); gettext provides envsubst for rendering its config template.
+RUN apk add --no-cache nginx gettext
+
 # Copy requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
+# Copy source code and runtime assets
 COPY *.py ./
+COPY VERSION ./
+COPY static/ ./static/
+COPY proxy/ ./proxy/
+COPY docker-entrypoint.sh ./
+RUN chmod +x docker-entrypoint.sh
 
 # Create a volume for the sqlite database
 VOLUME ["/app/data"]
@@ -28,21 +37,20 @@ ENV BT_TIMEOUT="60"
 # Paragraphs per LLM call — >1 is much faster on slow models (1 = legacy).
 ENV BT_BATCH_SIZE="5"
 
-# Expose the default port. PORT is honored at runtime (gunicorn bind + healthcheck
-# below); if you remap it, also remap the -p flag / docker-compose port accordingly —
-# EXPOSE itself is documentation only, Docker can't make it dynamic.
-EXPOSE 8390
+# 8390 = translation API (always on). 8080 = injection proxy, active only when
+# CWA_UPSTREAM is set (read CWA through it and the overlay appears with zero
+# changes to the CWA container). PORT/BT_PROXY_PORT are honored at runtime;
+# EXPOSE itself is documentation only.
+EXPOSE 8390 8080
 
 # Liveness probe (Python only; no curl in the slim alpine image). Reads $PORT so a
-# remapped port is still probed correctly.
+# remapped port is still probed correctly. Probes the API — the entrypoint's
+# monitor loop already exits the container if nginx dies in proxy mode.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import os,urllib.request,sys; p=os.environ.get('PORT','8390'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/ping', timeout=4).status==200 else 1)"
 
-# Command to run gunicorn (1 worker so the in-memory rate-limit/metrics/cache stay
-# coherent — see README "Why a single worker"). Shell form so $PORT expands; `exec`
-# is required so gunicorn replaces the shell as PID 1 and receives `docker stop`'s
-# SIGTERM directly, instead of the shell swallowing it and Docker having to wait out
-# the full grace period and SIGKILL. Verified: `docker stop` on this image returns
-# in ~1s. Docker's linter flags shell-form CMD generically — that warning is for the
-# no-`exec` case and doesn't apply here.
-CMD sh -c 'exec gunicorn --bind 0.0.0.0:${PORT:-8390} --workers 1 --threads 8 --timeout 120 server:app'
+# The entrypoint runs gunicorn (1 worker so the in-memory rate-limit/metrics
+# stay coherent — see README "Why a single worker") and, in proxy mode, nginx.
+# It forwards SIGTERM to both and exits if either dies, so `docker stop` stays
+# fast and the restart policy can recover a half-dead container.
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

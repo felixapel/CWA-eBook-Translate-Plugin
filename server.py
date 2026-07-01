@@ -14,7 +14,13 @@ from flask import Flask, request, jsonify
 from translator import translate_text, translate_batch, check_backend_health, LLM_MODEL
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
 
-__version__ = "2.0.0"
+# Single version source: the VERSION file (also stamped into cache-bust query
+# strings by the proxy). Falls back to "dev" for odd working directories.
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")) as _vf:
+        __version__ = _vf.read().strip() or "dev"
+except OSError:
+    __version__ = "dev"
 
 # Optional shared-secret. When BT_API_TOKEN is set, translate endpoints require
 # the matching `X-BT-Token` header — use it if the API is reachable beyond the LAN.

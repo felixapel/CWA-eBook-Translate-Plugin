@@ -1,8 +1,16 @@
-version: '3.8'
+# CWA Translate Plugin — recommended setup (proxy-injection mode).
+#
+# The translator container proxies CWA and injects the overlay into reader
+# pages on the fly: stock CWA image, NO template mounts, survives CWA updates.
+# Read your library through http://<host>:8084 and the translator UI appears.
+# (The classic bind-mount install remains documented in the README under
+# "Advanced: bind-mount install".)
 
 services:
   calibre-web:
-    image: crocodilestick/calibre-web-automated:latest
+    # Pinned to a version the overlay is tested against. `latest` can pull a
+    # reader rewrite mid-flight; bump this deliberately instead.
+    image: crocodilestick/calibre-web-automated:v4.0.6
     container_name: calibre-web-automated
     environment:
       - PUID=1000
@@ -12,21 +20,24 @@ services:
       - ./config/cwa:/config
       - ./books:/calibre-library
       - ./ingest:/cwa-book-ingest
-      # Inject the translator plugin files (JS/CSS live in ./static, page template in ./overlay)
-      - ./overlay/read.html:/app/calibre-web-automated/cps/templates/read.html:ro
-      - ./static/translator.js:/app/calibre-web-automated/cps/static/js/translator.js:ro
-      - ./static/translator.css:/app/calibre-web-automated/cps/static/css/translator.css:ro
-    ports:
-      - "8083:8083"
+    # No published port needed: read CWA through the translator proxy below.
+    # Uncomment to also keep direct (overlay-less) access on :8083.
+    # ports:
+    #   - "8083:8083"
     restart: unless-stopped
     networks:
       - webnet
 
-  book-translator-api:
+  book-translator:
     build: .
-    image: local/book-translator-api:latest
-    container_name: book-translator-api
+    image: local/book-translator:latest
+    container_name: book-translator
     environment:
+      # ── Proxy-injection mode ────────────────────────────────────────────
+      # Point at the CWA service; remove this line for API-only mode.
+      - CWA_UPSTREAM=http://calibre-web-automated:8083
+
+      # ── LLM backend ─────────────────────────────────────────────────────
       - LLM_PROVIDER=local
       - LLM_MODEL=gemma4-12b
       - LLM_API_KEY=
@@ -34,10 +45,9 @@ services:
       # always /v1/chat/completions (vLLM, LM Studio, Ollama and Llama.cpp all
       # speak it); only host:PORT changes. Point at the HOST, not this container
       # (host.docker.internal resolves to the host via extra_hosts below).
-      #   vLLM         -> typically :8000   (e.g. http://host.docker.internal:8000/v1/chat/completions)
-      #   LM Studio    -> :1234
-      #   Ollama       -> :11434
-      # Change the port to match YOUR server (e.g. your vLLM on 192.168.0.122:2819).
+      #   vLLM      -> typically :8000
+      #   LM Studio -> :1234
+      #   Ollama    -> :11434
       - BT_LOCAL_URL=http://host.docker.internal:8000/v1/chat/completions
       # Slow local model? Lower concurrency (1-2) is more stable than 3.
       - BT_MAX_CONCURRENT=2
@@ -51,7 +61,10 @@ services:
     volumes:
       - ./config/translator:/app/data
     ports:
-      - "8390:8390"
+      - "8084:8080"   # read CWA (with overlay) here
+      - "8390:8390"   # direct API access (optional; used by bind-mount installs)
+    depends_on:
+      - calibre-web
     restart: unless-stopped
     networks:
       - webnet

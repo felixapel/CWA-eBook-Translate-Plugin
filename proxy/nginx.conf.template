@@ -1,0 +1,58 @@
+# book-translator — proxy-injection mode.
+# Rendered by docker-entrypoint.sh with envsubst; only ${...} vars listed there
+# are substituted, so nginx's own $variables below are safe.
+#
+# Browser ──► :${BT_PROXY_PORT} (this nginx) ──► ${CWA_UPSTREAM} (stock CWA)
+#   /bt-api/*     → the local translation API (same-origin: no CORS needed)
+#   /bt-static/*  → overlay JS/CSS served from this container
+#   everything    → proxied to CWA; HTML gets ONE <script> tag injected
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen ${BT_PROXY_PORT};
+
+    # CWA handles book uploads; don't cap them at nginx's 1m default.
+    client_max_body_size 0;
+
+    # We strip upstream Accept-Encoding so sub_filter can see the HTML;
+    # re-compress on the way out so clients still get gzip.
+    gzip on;
+    gzip_types text/html text/css application/javascript application/json;
+
+    location /bt-api/ {
+        proxy_pass http://127.0.0.1:${PORT}/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Translation calls can legitimately take a while on slow local LLMs.
+        proxy_read_timeout 180s;
+    }
+
+    location /bt-static/ {
+        alias /app/static/;
+        add_header Cache-Control "public, max-age=300";
+    }
+
+    location / {
+        proxy_pass ${CWA_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 300s;
+
+        # The whole plugin injection: one tag before </head> on HTML responses.
+        # loader.js self-guards to /read/ pages, so injecting site-wide is safe
+        # and keeps this config free of assumptions about CWA's routes.
+        proxy_set_header Accept-Encoding "";
+        sub_filter_types text/html;
+        sub_filter '</head>' '<script src="/bt-static/loader.js?v=${BT_UI_VERSION}"></script></head>';
+        sub_filter_once on;
+    }
+}

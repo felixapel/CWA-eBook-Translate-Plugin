@@ -47,5 +47,6 @@ jobs:
         with:
           node-version: "20"
       - run: node -c static/translator.js
+      - run: node -c static/loader.js
       - run: npm install
       - run: npm test

@@ -2,6 +2,9 @@
 
 Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated). Translate ebooks paragraph-by-paragraph while reading, using local LLMs (vLLM, LM Studio, Ollama) or any major Cloud API (OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter).
 
+<!-- TODO before public launch: add a 15-20s GIF of bilingual reading here.
+     For a reader plugin the GIF is the pitch. -->
+
 ## ✨ Features
 
 - 🌐 **Bilingual reading** — original + translation side by side
@@ -9,10 +12,88 @@ Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://gi
 - ⚡ **Visible-First Translation** — prioritizes paragraphs visible on screen for instant rendering
 - 🚀 **Background Prefetching** — translates the rest of the chapter sequentially in the background
 - 🌍 **Multi-Language Support** — built-in language selector and UI localized to browser language
-- 🧠 **Context-Aware Translation** — feeds previous/next paragraphs to the LLM to improve literary quality and character voice
+- 🧠 **Context-Aware Translation** — feeds surrounding paragraphs to the LLM to improve literary quality and character voice
 - 📚 **Deep DOM Parsing** — accurately captures headings, custom title classes, and clickable TOC links
 - 💾 **Persistent Double Cache** — server-side SQLite (SHA-256) + client-side `localStorage` caching ensures you never lose a translation or re-pay API costs
-- 🔒 **Rate limited & Stable** — protects your API keys and GPU from runaway requests, featuring `AbortController` cancellation for perfectly responsive UI buttons
+- 🔒 **Rate limited & Stable** — request-size caps and per-IP rate limiting protect your API keys and GPU from runaway requests, with `AbortController` cancellation for perfectly responsive UI buttons
+- 🔌 **Zero-touch install** — proxy-injection mode overlays a **stock** CWA container: no template mounts, nothing to re-apply when CWA updates
+
+---
+
+## 🚀 Installation
+
+### Recommended: proxy-injection mode (one extra container, stock CWA)
+
+The translator container sits in front of CWA and injects the overlay into
+reader pages on the fly. Your CWA container stays completely untouched.
+
+```text
+Browser ──► book-translator (:8084) ──► Calibre-Web-Automated (:8083, stock)
+                 │ injects overlay on /read/ pages
+                 └─ /bt-api → translation API (same origin, no CORS)
+```
+
+```bash
+git clone <your-repo-url> CWA-translate-plugin
+cd CWA-translate-plugin
+# Edit docker-compose.yml: set BT_LOCAL_URL (or a cloud provider + API key)
+docker compose up -d
+```
+
+Then read your library at **`http://<host>:8084`** — the translator control
+bar appears in the ebook reader. That's the whole install.
+
+Already have CWA running? Add just the translator service to your existing
+compose file and point `CWA_UPSTREAM` at your CWA container/host, e.g.
+`CWA_UPSTREAM=http://calibre-web-automated:8083`.
+
+> Removing the plugin = stop reading through the proxy port. Nothing in your
+> CWA install was modified.
+
+### Option 2: Unraid (community-applications style)
+
+`install_unraid.sh` copies the overlay files into your CWA appdata folder and
+installs an Unraid Docker template for the API (bind-mount method). Review the
+script, then run it **locally** (don't pipe an unreviewed remote script into
+`bash`):
+
+```bash
+git clone <your-repo-url> CWA-translate-plugin
+cd CWA-translate-plugin
+chmod +x install_unraid.sh
+./install_unraid.sh
+```
+
+**Post-Install Steps**:
+1. Go to your Unraid Docker tab and edit your `calibre-web-automated` container.
+2. Add the 3 paths (as instructed by the script) to inject the plugin files.
+3. Deploy the newly added `book-translator-api` container.
+
+`deploy_unraid.sh` / `verify_unraid.sh` are personal SSH-based redeploy/verify
+helpers for an existing install — read them and adapt the host/paths before use.
+
+> Tip: proxy-injection mode also works on Unraid (run the container with
+> `CWA_UPSTREAM` set and browse through its port) and avoids the 3 path
+> mappings entirely.
+
+### Advanced: bind-mount install (development / no proxy)
+
+Mount the overlay files directly into the CWA container — useful when hacking
+on the overlay itself:
+
+```yaml
+volumes:
+  - ./overlay/read.html:/app/calibre-web-automated/cps/templates/read.html:ro
+  - ./static/translator.js:/app/calibre-web-automated/cps/static/js/translator.js:ro
+  - ./static/translator.css:/app/calibre-web-automated/cps/static/css/translator.css:ro
+```
+
+Caveats: `overlay/read.html` is a full template replacement tracked against
+the **pinned CWA version in docker-compose.yml** (`v4.0.6`). A CWA update that
+changes `read.html` can drift from this copy — proxy mode does not have this
+problem. With bind mounts the API is cross-origin, so set `BT_ALLOWED_ORIGINS`
+(or rely on the private-LAN default) and configure `window.BOOK_TRANSLATOR`
+in `overlay/read.html`.
 
 ---
 
@@ -35,74 +116,17 @@ If cold translations feel slow, see `BT_BATCH_SIZE`, `BT_OUTPUT_TOKEN_FACTOR`, a
 
 ---
 
-## 🚀 Installation
-
-> Replace `<your-repo-url>` below with wherever you've cloned/forked this project
-> (GitHub, your own Gitea, etc). This project isn't published as a container image
-> or a hosted installer script — you run it from a local clone.
-
-### Option 1: Docker Compose (recommended)
-
-`docker-compose.yml` spins up Calibre-Web-Automated together with the Translator
-API, pre-wired to inject the plugin files via bind mounts:
-
-```bash
-git clone <your-repo-url> CWA-translate-plugin
-cd CWA-translate-plugin
-docker-compose up -d
-```
-
-Edit the `book-translator-api` service's environment block first (at least
-`BT_LOCAL_URL` if you're using a local LLM) — see [Configuration](#️-configuration).
-
-### Option 2: Unraid (community-applications style)
-
-`install_unraid.sh` copies the overlay files into your CWA appdata folder and
-installs an Unraid Docker template for the API. Review the script, then run it
-**locally** (don't pipe an unreviewed remote script into `bash`):
-
-```bash
-git clone <your-repo-url> CWA-translate-plugin
-cd CWA-translate-plugin
-chmod +x install_unraid.sh
-./install_unraid.sh
-```
-
-**Post-Install Steps**:
-1. Go to your Unraid Docker tab and edit your `calibre-web-automated` container.
-2. Add the 3 paths (as instructed by the script) to inject the plugin files.
-3. Deploy the newly added `book-translator-api` container.
-
-`deploy_unraid.sh` / `verify_unraid.sh` are personal SSH-based redeploy/verify
-helpers for an existing install — read them and adapt the host/paths before use.
-
-### Option 3: Manual Installation
-
-1. Build and run the `book-translator-api` backend container manually.
-2. Inject `translator.js`, `translator.css` and `read.html` into Calibre-Web-Automated (using an overlay volume mount or copying files directly).
-3. Configure your reverse proxy (SWAG, Traefik, NPM) to route `/translate` to the API container. Example for NGINX/SWAG:
-   ```nginx
-   location /translate {
-       include /config/nginx/proxy.conf;
-       include /config/nginx/resolver.conf;
-       set $upstream_app book-translator-api;
-       set $upstream_port 8390;
-       set $upstream_proto http;
-       proxy_pass $upstream_proto://$upstream_app:$upstream_port;
-   }
-   ```
-
----
-
 ## ⚙️ Configuration
 
-Environment variables for the `book-translator-api` container:
+Environment variables for the `book-translator` container:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `CWA_UPSTREAM` | | **Enables proxy-injection mode.** URL of your CWA instance (e.g. `http://calibre-web-automated:8083`). When set, the container also serves CWA with the overlay injected on port `BT_PROXY_PORT`. Unset = API-only (bind-mount installs). |
+| `BT_PROXY_PORT` | `8080` | Container port for the injection proxy (proxy mode only). |
 | `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
 | `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
-| `LLM_API_KEY` | | Your API key for the chosen provider |
+| `LLM_API_KEY` | | Your API key for the chosen provider (the only supported key mechanism since 2.0.0) |
 | `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local`. OpenAI-compatible endpoint — the **path is always `/v1/chat/completions`** (vLLM, LM Studio, Ollama, llama.cpp all speak it); only host:port changes (vLLM `:8000`, LM Studio `:1234`, Ollama `:11434`). **In Docker, `localhost` is the container itself** — use `http://host.docker.internal:<port>/...` or the host IP. |
 | `BT_MAX_CONCURRENT` | `2` | Simultaneous translation requests (batches). For a slow single-GPU local model, `1`–`2` is **more** stable than `3` (avoids timeout cascades). |
 | `BT_BATCH_SIZE` | `5` | Paragraphs translated per LLM call. `>1` is dramatically faster on slow models (one generation instead of one-per-paragraph); if the model's segmented reply can't be parsed it transparently falls back to per-paragraph. Set `1` for legacy one-call-per-paragraph. |
@@ -110,17 +134,22 @@ Environment variables for the `book-translator-api` container:
 | `BT_BATCH_MAX_TOKENS` | `8192` | Same ceiling, but for a **batched** (multi-paragraph) request. |
 | `BT_OUTPUT_TOKEN_FACTOR` | `2.0` | Caps generated `max_tokens` at `input_tokens × FACTOR + FLOOR`, clamped to the ceiling above. Prevents a rambling/stuck local model from generating thousands of tokens for a short paragraph (the main cause of 8–20s and 120s stalls). `2.0` never truncates real translations; lower it (e.g. `1.6`) for a bit more speed at some risk on very expansive target languages. |
 | `BT_OUTPUT_TOKEN_FLOOR` | `256` | Minimum `max_tokens` per request. |
-| `BT_CONTEXT_WINDOW` | `0` | Number of previous/next paragraphs to include as context for the LLM during translation. Set to `1` or `2` for context-aware translations. Context improves literary quality but consumes more tokens per request. |
+| `BT_CONTEXT_WINDOW` | `0` | Number of surrounding paragraphs included as a do-not-translate `[CONTEXT]` block in batch prompts. Set to `1` or `2` for context-aware translations. Improves literary quality but consumes more tokens per request. |
 | `BT_TIMEOUT` | `60` | Seconds before a single translation request is abandoned. Raise it if a slow local model times out on long paragraphs; lower it (with a smaller `BT_BATCH_SIZE`) if you'd rather fail fast under contention. |
 | `LLM_FALLBACK_PROVIDER` | | Optional. A secondary provider used automatically when the primary fails (e.g. `minimax` while `local` is slow/down). |
 | `LLM_FALLBACK_MODEL` | | Model name for the fallback provider. |
 | `LLM_FALLBACK_API_KEY` | | API key for the fallback provider. |
-| `BT_API_TOKEN` | | Optional shared secret. When set, translate endpoints require the `X-BT-Token` header — use it if the API is reachable beyond your LAN. Set the matching `apiToken` in `window.BOOK_TRANSLATOR` (see `read.html`). |
+| `BT_API_TOKEN` | | Optional shared secret. When set, translate endpoints require the `X-BT-Token` header — use it if the API is reachable beyond your LAN. In proxy mode set it per-browser via `localStorage.setItem('bt_token', '<token>')`; in bind-mount installs set `apiToken` in `window.BOOK_TRANSLATOR`. |
+| `BT_MAX_BATCH_PARAGRAPHS` | `50` | Max paragraphs accepted per `/translate/batch` request (oversized requests get `413`). Protects your GPU/API bill from a single runaway request. |
+| `BT_MAX_PARAGRAPH_CHARS` | `8000` | Max characters per paragraph (`413` beyond it). |
 | `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max requests per client IP per 60s window before the API returns `429`. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | Seconds reported in the `Retry-After` header / response body on a `429`. The frontend reads this and backs off automatically. |
+| `BT_TRUST_PROXY` | `false` | When the API sits behind a **trusted** reverse proxy, set `true` to rate-limit by the first `X-Forwarded-For` hop instead of the proxy's own address. |
+| `BT_ALLOWED_ORIGINS` | `http://localhost:8083,http://localhost:8383` | Comma-separated exact origins allowed for CORS (bind-mount installs; irrelevant in proxy mode, which is same-origin). Add your public reader URL here, e.g. `https://books.example.com`. |
+| `BT_ALLOW_PRIVATE_LAN` | `true` | Additionally allow localhost/RFC1918 origins (`10.*`, `192.168.*`, `172.16-31.*`) on any port — the common self-hosted case. Set `false` to allow only `BT_ALLOWED_ORIGINS`. |
+| `BT_CACHE_MAX_ENTRIES` | `0` | Optional hard cap on cached translations (`0` = unlimited). When exceeded, the oldest entries are evicted. |
 | `DB_PATH` | `translations.db` | Path to the SQLite translation cache. In Docker this should point inside the `/app/data` volume (the provided Dockerfile/compose already set it to `/app/data/translations.db`) so the cache survives container recreation. |
-| `PORT` | `8390` | Port the API listens on. If you remap it, also update the `-p`/compose port mapping and any reverse-proxy route — `EXPOSE 8390` in the Dockerfile is documentation only. |
-| `MINIMAX_API_KEY` | | Legacy fallback for `LLM_API_KEY` (only read when `LLM_API_KEY` is unset). Prefer `LLM_API_KEY`. |
+| `PORT` | `8390` | Port the API listens on. If you remap it, also update the `-p`/compose port mapping and any reverse-proxy route — `EXPOSE` in the Dockerfile is documentation only. |
 
 > **Why a single gunicorn worker?** Rate limiting, request metrics, and the health
 > cache are kept in process memory for simplicity. Running more than one worker
@@ -134,25 +163,23 @@ Environment variables for the `book-translator-api` container:
 ## 🏗️ Architecture
 
 ```text
-Unraid Server / Docker Host
-┌────────────────────────┐             ┌────────────────────────────────┐
-│ CWA (:8383)            │   HTTP      │ book-translator-api (:8390)    │
-│ ┌────────────────────┐ │ ─────────►  │ ├─ POST /translate             │
-│ │ Overlay files:     │ │             │ ├─ POST /translate/batch       │
-│ │ translator.js      │ │             │ ├─ GET  /ping (liveness)       │
-│ │ translator.css     │ │             │ ├─ GET  /health (deep probe)   │
-│ │ read.html          │ │             │ ├─ GET  /metrics, /stats       │
-│ └────────────────────┘ │             │ └─ SQLite cache                │
-└───────────┬────────────┘             │ └────────────┬─────────────────┤
-            │                          └──────────────│─────────────────┘
-     NGINX (SWAG)                                     │ HTTP
-     Proxy Route: /translate           ┌──────────────▼─────────────────┐
-                                       │ Providers:                     │
-                                       │ Local, OpenAI, Anthropic,      │
-                                       │ Gemini, Groq, Together, MiniMax│
-                                       │ DeepSeek, OpenRouter           │
-                                       └────────────────────────────────┘
+                       book-translator container
+                 ┌───────────────────────────────────────┐
+Browser ────────►│ nginx (:8080, proxy mode only)        │      ┌──────────────────────┐
+  reads library  │  ├─ /bt-api/*    → gunicorn (below)   │─────►│ CWA (:8083, stock)   │
+  through :8084  │  ├─ /bt-static/* → overlay js/css     │      │ untouched image      │
+                 │  └─ /*           → CWA + injected tag │      └──────────────────────┘
+                 │                                       │
+                 │ gunicorn (:8390, always on)           │      ┌──────────────────────┐
+                 │  ├─ POST /translate, /translate/batch │─────►│ Providers: local,    │
+                 │  ├─ GET  /ping /health /metrics /stats│      │ OpenAI, Anthropic,   │
+                 │  └─ SQLite cache (/app/data)          │      │ Gemini, Groq, ...    │
+                 └───────────────────────────────────────┘      └──────────────────────┘
 ```
+
+In bind-mount installs nginx never starts; the overlay files are mounted into
+CWA and call the API on `:8390` directly (CORS applies — see
+`BT_ALLOWED_ORIGINS`).
 
 ## 📜 License
 

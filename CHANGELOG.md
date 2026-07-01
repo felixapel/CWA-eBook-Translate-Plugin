@@ -7,7 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-02
+
+### Added
+- **Proxy-injection mode** — the recommended install. Set `CWA_UPSTREAM` and the
+  container proxies CWA on `BT_PROXY_PORT` (default `8080`), injecting a single
+  `<script>` tag into reader pages. Stock CWA image, no template mounts, no CORS
+  (same-origin `/bt-api`), survives CWA updates. New files: `static/loader.js`,
+  `proxy/nginx.conf.template`, `docker-entrypoint.sh`.
+- Request-size caps: `BT_MAX_BATCH_PARAGRAPHS` (default 50) and
+  `BT_MAX_PARAGRAPH_CHARS` (default 8000); oversized requests are rejected with
+  `413` instead of triggering unbounded LLM work.
+- Configurable CORS: `BT_ALLOWED_ORIGINS` (comma-separated exact origins) and
+  `BT_ALLOW_PRIVATE_LAN` (default `true`: localhost/RFC1918 origins allowed).
+- `BT_TRUST_PROXY` — opt-in rate limiting by the first `X-Forwarded-For` hop
+  behind a trusted reverse proxy.
+- `BT_CACHE_MAX_ENTRIES` — optional cap on the SQLite cache with oldest-first
+  eviction.
+- `VERSION` file as the single version source; version reported in `/health`.
+- GHCR release workflow (`.github/workflows/release.yml`): multi-arch
+  (amd64/arm64) image published on `v*` tags (GitHub only).
+- 20 new self-contained test assertions (context prompt format, caps, cleanup
+  validation, cache normalization, hit counting, provider attribution, CORS).
+
+### Fixed
+- **Context-aware translation** (`BT_CONTEXT_WINDOW`) was broken: the batch
+  prompt embedded Python list reprs (`['para one', ...]`) between segment
+  markers. Context is now one plain-text `[CONTEXT]` block placed before the
+  first `@@SEG@@` marker.
+- Cache keys are now whitespace-normalized, so the single and batch endpoints
+  share entries — the same paragraph is never translated (and paid for) twice.
+- `hit_count` / `/stats` `total_hits` now reflect real cache hits (previously
+  the count was reset to 1 on every write and never incremented).
+- `/cache/cleanup` validates `days` (integer 1–3650); a negative value
+  previously deleted the entire cache.
+- Batch results now report the provider that actually served each paragraph
+  (the fallback when the primary failed), not the configured primary.
+- `Retry-After` and `X-Request-ID` are exposed to cross-origin JS via
+  `Access-Control-Expose-Headers`.
+
+### Changed
+- `docker-compose.yml` ships proxy-injection mode by default and pins CWA to
+  `v4.0.6` (tested version) instead of `latest`.
+- The container entrypoint supervises gunicorn (+ nginx in proxy mode) and
+  exits if either dies, so the restart policy recovers a half-dead container.
+- Versioning unified to SemVer `2.0.0` across `VERSION`, `package.json`, the
+  UI (`BT_UI_VERSION`), and cache-bust query strings.
+
+### Removed
+- **Breaking:** legacy API-key loading from `auth.json`, `.env` parsing, and
+  the `MINIMAX_API_KEY` fallback. Set `LLM_API_KEY` (and
+  `LLM_FALLBACK_API_KEY`) instead.
+- **Breaking:** hardcoded CORS whitelist entries (a personal domain and the
+  `192.168.0.x` subnet). Use `BT_ALLOWED_ORIGINS` / `BT_ALLOW_PRIVATE_LAN`.
+
 ### Documentation
+- README restructured around the proxy-injection install; bind-mount documented
+  as the advanced/development path with its drift caveat.
 - `docs/DEPLOY_UNRAID.md`: documented running the API as a proper
   **Unraid-managed** container (the `net.unraid.docker.managed=dockerman` label +
   `/var/lib/docker/unraid-autostart` entry + the Docker template), so it's treated
