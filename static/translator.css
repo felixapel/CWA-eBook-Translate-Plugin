@@ -1,0 +1,279 @@
+/**
+ * book-translator — Calibre-Web-Automated reading overlay styles.
+ * The control bar markup is built by translator.js; everything here is
+ * class-driven so the JS stays free of giant inline-style strings and so
+ * translations adapt to the reader's light/dark/sepia theme.
+ */
+
+/* ── Theme tokens ───────────────────────────────────────────────────── */
+:root {
+    --bt-accent: #1a73e8;
+    --bt-accent-2: #1565c0;
+    --bt-bilingual: #0f9d58;
+    --bt-translated: #f4b400;
+    --bt-error: #e2483d;
+    --bt-bar-bg: rgba(32, 33, 36, 0.92);
+    --bt-bar-fg: #ffffff;
+    --bt-tr-color: #1565c0;     /* translation text (light theme) */
+    --bt-tr-border: #90caf9;
+}
+
+/* ── Translation paragraph (bilingual mode) ─────────────────────────── */
+.bt-translation {
+    display: block;
+    margin-top: 6px;
+    padding-left: 12px;
+    border-left: 3px solid var(--bt-tr-border);
+    color: var(--bt-tr-color);
+    font-style: italic;
+    font-weight: normal;
+    line-height: 1.6;
+    opacity: 0;
+    animation: bt-slide-in 0.25s ease forwards;
+    break-inside: avoid;
+    page-break-inside: avoid;
+}
+
+@keyframes bt-slide-in {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 0.95; transform: translateY(0); }
+}
+
+/* Translated-only mode: paragraph text was replaced in place. */
+[data-original-text] { font-style: normal; }
+
+/* ── Theme adaptation (reader is usually inside an iframe; these also
+      apply when CWA sets a theme class/inline bg on the host page) ──── */
+@media (prefers-color-scheme: dark) {
+    :root { --bt-tr-color: #7cb6f7; --bt-tr-border: #1565c0; }
+}
+#main[style*="#000"], #main[style*="#111"], body.dark-theme, body.black-theme {
+    --bt-tr-color: #8ec0f9; --bt-tr-border: #1976d2;
+}
+#main[style*="#f4ecd8"], body.sepia-theme {
+    --bt-tr-color: #6d4c41; --bt-tr-border: #a1887f;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   Control bar (bottom-center)
+   ════════════════════════════════════════════════════════════════════ */
+#bt-bar, #bt-bar * { box-sizing: border-box; }
+
+#bt-bar {
+    position: fixed;
+    left: 50%;
+    bottom: 22px;
+    transform: translateX(-50%);
+    z-index: 2147483000;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: 26px;
+    background: var(--bt-bar-bg);
+    color: var(--bt-bar-fg);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-size: 13px;
+    backdrop-filter: blur(14px) saturate(160%);
+    -webkit-backdrop-filter: blur(14px) saturate(160%);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    user-select: none;
+    overflow: hidden;            /* clip the progress bar to the rounded corners */
+    transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+/* Idle-fade: when off and not hovered, dim so it doesn't distract reading. */
+#bt-bar[data-mode="off"]:not(:hover) { opacity: 0.55; }
+
+#bt-bar button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    border-radius: 16px;
+    padding: 6px 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: background 0.15s;
+    white-space: nowrap;
+}
+#bt-bar button:hover { background: rgba(255, 255, 255, 0.14); }
+#bt-bar button:active { transform: scale(0.96); }
+
+/* Main toggle reflects mode via a left color dot */
+#bt-toggle { font-weight: 600; }
+#bt-toggle .bt-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: #9aa0a6; flex: 0 0 auto;
+    box-shadow: 0 0 0 3px rgba(255,255,255,0.06);
+}
+#bt-bar[data-mode="bilingual"] #bt-toggle .bt-dot { background: var(--bt-bilingual); }
+#bt-bar[data-mode="translated"] #bt-toggle .bt-dot { background: var(--bt-translated); }
+
+/* Language select */
+#bt-lang {
+    appearance: none;
+    background: rgba(255, 255, 255, 0.10);
+    color: #fff;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 14px;
+    padding: 5px 10px;
+    font: inherit;
+    cursor: pointer;
+    outline: none;
+}
+#bt-lang option { color: #000; }
+
+/* ── Status zone (spinner + text) ───────────────────────────────────── */
+/* Fixed width (not max-width): the status text changes length as it cycles
+   through "Translating…" / "Chapter N/M" / "✓ Ready" / etc. A max-width let it
+   shrink-wrap to each string, so the whole pill visibly expanded and contracted
+   every time the text changed. A fixed width reserves constant space; the
+   strings are kept short (see i18n) so 140px is enough for all of them without
+   wasting space, and #bt-status-text ellipsis-truncates any overflow. */
+#bt-status {
+    display: none;               /* shown by JS while working / done / error */
+    align-items: center;
+    gap: 7px;
+    padding: 0 4px;
+    width: 140px;
+    flex: 0 0 auto;
+}
+#bt-bar[data-state="page"] #bt-status,
+#bt-bar[data-state="chapter"] #bt-status,
+#bt-bar[data-state="done"] #bt-status,
+#bt-bar[data-state="error"] #bt-status { display: inline-flex; }
+
+#bt-spinner {
+    width: 15px; height: 15px; flex: 0 0 auto;
+    border: 2px solid rgba(255, 255, 255, 0.30);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: bt-spin 0.8s linear infinite;
+}
+@keyframes bt-spin { to { transform: rotate(360deg); } }
+/* Spinner only while actively working */
+#bt-bar[data-state="done"] #bt-spinner,
+#bt-bar[data-state="error"] #bt-spinner { display: none; }
+
+#bt-status-text { font-size: 12px; font-weight: 500; letter-spacing: 0.1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#bt-bar[data-state="done"] #bt-status-text { color: #8ed99f; }
+#bt-bar[data-state="error"] #bt-status { cursor: pointer; }
+#bt-bar[data-state="error"] #bt-status-text { color: #ff9e96; }
+
+/* ── Progress bar (thin, along the bottom edge of the pill) ─────────── */
+#bt-progress {
+    position: absolute;
+    left: 0; bottom: 0;
+    height: 3px;
+    width: 100%;
+    background: transparent;
+    pointer-events: none;
+}
+#bt-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--bt-accent), #66a6ff);
+    transition: width 0.3s ease;
+    border-radius: 0 3px 3px 0;
+}
+#bt-bar[data-state="error"] #bt-progress-fill { background: var(--bt-error); }
+/* "Translating current page" — duration is unknown, so this is an indeterminate
+   indicator, not real progress. A calm full-width opacity breathe instead of a
+   sliding block: a fixed-width block clipped by the pill's rounded overflow:hidden
+   edge visually shrinks/grows as it slides past the corners, which read as
+   distracting fast "wide/narrow" jitter. Breathing in place has no width or
+   position change at all, so there's nothing to clip or snap. */
+#bt-bar[data-state="page"] #bt-progress-fill {
+    width: 100% !important;
+    animation: bt-breathe 1.8s ease-in-out infinite;
+}
+@keyframes bt-breathe {
+    0%, 100% { opacity: 0.3; }
+    50%      { opacity: 0.85; }
+}
+
+/* ── Settings (gear) button + popover menu ──────────────────────────── */
+#bt-gear { padding: 6px 9px; font-size: 15px; line-height: 1; }
+
+/* Popover lives at body level (not inside the overflow:hidden bar) and is
+   anchored bottom-center just above the pill. */
+#bt-menu {
+    position: fixed;
+    left: 50%;
+    bottom: 74px;
+    transform: translateX(-50%);
+    min-width: 250px;
+    max-width: min(92vw, 340px);
+    background: var(--bt-bar-bg);
+    color: #fff;
+    border-radius: 14px;
+    padding: 8px;
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(14px) saturate(160%);
+    -webkit-backdrop-filter: blur(14px) saturate(160%);
+    z-index: 2147483002;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px;
+}
+#bt-menu.bt-open { display: flex; }
+.bt-menu-header {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+    padding: 6px 10px 8px; font-weight: 600; font-size: 14px;
+}
+.bt-menu-ver { font-size: 10px; font-weight: normal; opacity: 0.6; }
+.bt-menu-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 5px 10px; font-size: 12px; opacity: 0.85;
+}
+.bt-menu-val { font-weight: 600; }
+.bt-menu-item {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: 9px;
+    cursor: pointer;
+    font-size: 13px;
+}
+.bt-menu-item:hover { background: rgba(255, 255, 255, 0.10); }
+.bt-menu-sep { height: 1px; margin: 4px 2px; background: rgba(255, 255, 255, 0.12); }
+.bt-menu-note { padding: 6px 10px; font-size: 11px; opacity: 0.65; }
+.bt-switch {
+    width: 34px; height: 19px; border-radius: 10px; flex: 0 0 auto;
+    background: rgba(255, 255, 255, 0.22); position: relative; transition: background 0.2s;
+}
+.bt-switch::after {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 15px; height: 15px; border-radius: 50%; background: #fff; transition: left 0.2s;
+}
+.bt-switch.bt-on { background: var(--bt-bilingual); }
+.bt-switch.bt-on::after { left: 17px; }
+
+/* ── Toast ──────────────────────────────────────────────────────────── */
+#bt-toast {
+    position: fixed;
+    left: 50%; bottom: 84px;
+    transform: translateX(-50%) translateY(10px);
+    z-index: 2147483001;
+    background: rgba(20, 20, 20, 0.92);
+    color: #fff;
+    padding: 9px 18px;
+    border-radius: 20px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
+    opacity: 0;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    pointer-events: none;
+}
+#bt-toast.bt-toast-visible { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+@media print { #bt-bar, #bt-toast { display: none !important; } }

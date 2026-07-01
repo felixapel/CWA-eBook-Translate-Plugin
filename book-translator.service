@@ -1,0 +1,19 @@
+[Unit]
+Description=book-translator — ebook paragraph translation service (multi-backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/book-translator
+ExecStart=/opt/book-translator/.venv/bin/gunicorn -w 1 --threads 8 -b 0.0.0.0:8390 --timeout 120 server:app
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Environment for MiniMax API
+Environment=HOME=/opt/book-translator
+
+[Install]
+WantedBy=default.target

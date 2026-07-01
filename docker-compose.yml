@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  calibre-web:
+    image: crocodilestick/calibre-web-automated:latest
+    container_name: calibre-web-automated
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - ./config/cwa:/config
+      - ./books:/calibre-library
+      - ./ingest:/cwa-book-ingest
+      # Inject the translator plugin files (JS/CSS live in ./static, page template in ./overlay)
+      - ./overlay/read.html:/app/calibre-web-automated/cps/templates/read.html:ro
+      - ./static/translator.js:/app/calibre-web-automated/cps/static/js/translator.js:ro
+      - ./static/translator.css:/app/calibre-web-automated/cps/static/css/translator.css:ro
+    ports:
+      - "8083:8083"
+    restart: unless-stopped
+    networks:
+      - webnet
+
+  book-translator-api:
+    build: .
+    image: local/book-translator-api:latest
+    container_name: book-translator-api
+    environment:
+      - LLM_PROVIDER=local
+      - LLM_MODEL=gemma4-12b
+      - LLM_API_KEY=
+      # For provider=local: OpenAI-compatible endpoint of your LLM. The PATH is
+      # always /v1/chat/completions (vLLM, LM Studio, Ollama and Llama.cpp all
+      # speak it); only host:PORT changes. Point at the HOST, not this container
+      # (host.docker.internal resolves to the host via extra_hosts below).
+      #   vLLM         -> typically :8000   (e.g. http://host.docker.internal:8000/v1/chat/completions)
+      #   LM Studio    -> :1234
+      #   Ollama       -> :11434
+      # Change the port to match YOUR server (e.g. your vLLM on 192.168.0.122:2819).
+      - BT_LOCAL_URL=http://host.docker.internal:8000/v1/chat/completions
+      # Slow local model? Lower concurrency (1-2) is more stable than 3.
+      - BT_MAX_CONCURRENT=2
+      - BT_TIMEOUT=60
+      # Optional resilience: fall back to a cloud provider when local fails.
+      # - LLM_FALLBACK_PROVIDER=minimax
+      # - LLM_FALLBACK_MODEL=MiniMax-M3
+      # - LLM_FALLBACK_API_KEY=
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./config/translator:/app/data
+    ports:
+      - "8390:8390"
+    restart: unless-stopped
+    networks:
+      - webnet
+
+networks:
+  webnet:
+    driver: bridge

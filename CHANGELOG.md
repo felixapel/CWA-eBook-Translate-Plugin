@@ -1,0 +1,283 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Documentation
+- `docs/DEPLOY_UNRAID.md`: documented running the API as a proper
+  **Unraid-managed** container (the `net.unraid.docker.managed=dockerman` label +
+  `/var/lib/docker/unraid-autostart` entry + the Docker template), so it's treated
+  as a first-class container and starts with the array — instead of a bare
+  `docker run` that Unraid can treat as an orphan and remove. Fixed the
+  "Update the Backend API" steps: `docker restart` does **not** load a rebuilt
+  image, so the container must be recreated (the `/app/data` bind mount keeps the
+  SQLite cache). Reframed the doc's intro as a worked example (substitute your own
+  host/paths) rather than one specific machine.
+- `my-book-translator-api.xml` (Unraid template) now exposes the full env surface
+  (`BT_CONTEXT_WINDOW`, `BT_MAX_TOKENS`, `BT_BATCH_MAX_TOKENS`) so every tunable is
+  editable from the Unraid UI.
+
+## [1.4.0] - 2026-07-01
+UI version marker: `2026-07-01-compact-bar-v1`.
+
+### Changed
+- **More compact control bar + tighter status copy.** With the flicker fixed
+  (1.3.3), the status zone's stability no longer needed a wide fixed reservation:
+  shrank `#bt-status` from a fixed `230px` to `140px` (the status strings are now
+  short enough that this fits every locale without truncating, verified by
+  measuring against the actual font). The bar is ~90px narrower while translating.
+- Shortened and tightened the status strings across all locales: e.g.
+  "Translating current page…" → "Translating…", "Preparing next paragraphs… N/M"
+  → "Chapter N/M" (which is also more precise — it shows exact progress), "⚠ Error
+  — click to retry" → "⚠ Retry", "Rate limited — waiting Ns…" → "Waiting Ns…".
+  Status text is slightly lighter (weight 500) for a cleaner look.
+
+## [1.3.3] - 2026-06-30
+UI version marker: `2026-06-30-bar-flicker-fix-v1`.
+
+### Fixed
+- **Control bar rapidly blinking/flickering while a translation is actively in
+  progress.** Root cause: the position-based page-turn detector polls every
+  350ms for "did the first visible paragraph change" as a proxy for page
+  navigation. Inserting a bilingual translation block under a paragraph
+  increases that paragraph's rendered height, which reflows the layout and can
+  shift which paragraph counts as "first visible" — with no real page turn
+  involved. That false positive forced a full `newGeneration()` reset (hides
+  the status pill) immediately followed by a fresh `translateCurrentPage()`
+  (shows it again) — and because the plugin's own rendering kept shifting the
+  layout throughout an active translation pass, this repeated on essentially
+  every poll tick for as long as work was in progress, i.e. exactly the
+  "blinking fast while a job is running" behavior reported (two rounds of
+  animation/width tuning in 1.3.1/1.3.2 did not touch this — it was a genuine
+  logic bug, not a CSS/timing issue). Fixed by gating the position-based poll
+  on being genuinely idle (`!isTranslating && !isPrefetching`); real
+  navigation while work is in flight is still caught immediately via the
+  epub.js `relocated`/`rendered` hooks, which don't depend on visual position
+  at all. Added a second line of defense: even while idle, a new position must
+  be observed on two consecutive polls (~700ms apart) before being accepted,
+  guarding against any other transient layout blip.
+- Added a regression guard in `test_frontend.js` that locks the fix's source
+  pattern in place (a full behavioral reproduction needs a real layout engine
+  — jsdom does not compute live reflow from DOM changes).
+
+## [1.3.2] - 2026-06-30
+UI version marker: `2026-06-30-status-bar-width-fix-v1`.
+
+### Fixed
+- **Control bar visibly expanding/contracting in width.** `#bt-status` (the
+  spinner+text zone) was sized with `max-width: 230px` — a *cap*, not a fixed
+  size — so it shrink-wrapped to whatever status string was currently showing.
+  Cycling between "Translating current page…", "Preparing next paragraphs… N/M",
+  and "✓ Ready" (different lengths) made the whole pill resize every time the
+  text changed, on top of the 1.3.1 progress-fill fix (a separate issue inside
+  the same bar). Changed to a fixed `width: 230px` — the box now reserves
+  constant space regardless of which status is showing; `#bt-status-text` still
+  ellipsis-truncates anything that doesn't fit, identical to before.
+
+## [1.3.1] - 2026-06-30
+UI version marker: `2026-06-30-progress-bar-fix-v1`.
+
+### Fixed
+- **Jittery "Translating current page…" progress indicator.** The indeterminate
+  state animated a fixed-width (35%) fill block sliding edge-to-edge inside the
+  pill via `margin-left`, clipped by the pill's rounded `overflow: hidden` corners.
+  Because the visible portion of that block shrank/grew as it slid past the
+  corners, and the 1.1s loop snapped hard back to the start each cycle, it read as
+  fast, distracting "wide/narrow" jitter — exactly what was reported. Replaced with
+  a calm full-width opacity breathe (1.8s, no position or width change at all), so
+  there's nothing to clip or snap. Applies to every state that reuses the
+  indeterminate look (translating, retrying after a transient error).
+
+### Changed (production-readiness audit — security, env vars, install, CI, docs)
+- **Security:** scrubbed a committed Gitea PAT from `package.json`'s
+  `repository.url` (was a live credential in git history); `.gitignore` now
+  excludes `.env` / `auth.json` / `*.b64`.
+- **Env vars made to actually work:** `PORT` was declared (Dockerfile `ENV`, docs)
+  but never read anywhere — gunicorn and the dev `app.run()` fallback both
+  hardcoded `8390`. Wired it through both (verified end-to-end on an isolated test
+  container: remapped port, healthcheck followed it, graceful shutdown ~1s).
+  Removed `prefetchPages` — declared in `read.html`'s `window.BOOK_TRANSLATOR` but
+  never read by `translator.js`. Documented 7 previously-undocumented-but-working
+  vars: `BT_MAX_TOKENS`, `BT_BATCH_MAX_TOKENS`, `BT_RATE_LIMIT_PER_MINUTE`,
+  `BT_RATE_LIMIT_RETRY_AFTER`, `DB_PATH`, `PORT`, `MINIMAX_API_KEY`.
+- **Install path fixed:** README + `install_unraid.sh` pointed at a nonexistent
+  `raw.githubusercontent.com/username/...` URL (`curl | bash` to a 404).
+  Re-pointed installation around "clone the repo, then run locally";
+  `install_unraid.sh` now copies its own bundled overlay files instead of trying
+  to download them. `my-book-translator-api.xml` pointed `Repository` at
+  `ghcr.io/username/book-translator-api:latest` — never published, contradicting
+  every other deploy path in the repo (which all build `local/book-translator-api`
+  locally). Fixed, and de-duplicated: `install_unraid.sh` had a second, drifted
+  copy of this XML embedded inline (how the `ghcr.io` bug happened in the first
+  place) — it now copies the one canonical file.
+- **Portability:** `benchmark.py` / `benchmark_realistic.py` / `test_endpoints.py`
+  / `test_ratelimit.py` hardcoded a specific homelab LAN IP; switched to a
+  `BENCHMARK_URL` env var (default `127.0.0.1:8390`). `test_endpoints.py` also
+  called a `/prefetch` route that no longer exists (404) — replaced with `/ping`.
+  `deploy_unraid.sh` / `verify_unraid.sh` labeled as personal example scripts,
+  host/user now overridable via env vars instead of hardcoded.
+- **Docs/metadata:** removed fabricated benchmark numbers from the README,
+  replaced with instructions to run the included benchmark scripts against your
+  own deployment. `package.json` license `ISC` → `MIT` (matches `LICENSE`),
+  version synced, author/copyright name filled in. Added
+  `docs/DEVELOPMENT.md` test-matrix instructions and
+  `.github/workflows/ci.yml` running the existing self-contained suites on
+  push/PR (Gitea Actions is enabled on this repo).
+
+Verified: `py_compile` on every changed `.py`, `node -c`, full backend suite
+(18/18) and the jsdom frontend suite still pass, every shell script passes
+`bash -n`, the XML template parses, and a real isolated Docker build/run/stop
+on the homelab (separate tag/port/container, fully cleaned up) confirmed
+`PORT` + `/ping` + graceful shutdown work end-to-end.
+
+## [1.3.0] - 2026-06-30
+UI version marker: `2026-06-30-speed-profile-v1`.
+
+### Changed
+- **Proportional output-token cap.** `max_tokens` per LLM request is now scaled to
+  the input size (`input_tokens × BT_OUTPUT_TOKEN_FACTOR + BT_OUTPUT_TOKEN_FLOOR`,
+  clamped to the existing ceilings) instead of always sending 4096/8192. This stops
+  a rambling/stuck local model from generating thousands of tokens for a short
+  paragraph — the main driver of the 8–20s cold latencies and 120s vLLM read
+  timeouts — without truncating legitimate translations (factor 2.0 is generous).
+- New env vars `BT_OUTPUT_TOKEN_FACTOR` (default `2.0`) and `BT_OUTPUT_TOKEN_FLOOR`
+  (default `256`). Backend-only change; tests cover the cap (proportional, clamped,
+  floored, monotonic).
+
+### Fixed
+- **False "unhealthy" container.** The Docker healthcheck hit `/health`, which runs a
+  real LLM generation probe; while vLLM is busy that probe queues and exceeds the 4s
+  healthcheck timeout, so the container was flagged unhealthy even though it was
+  serving translations. Added a lightweight `/ping` endpoint (no LLM) and pointed the
+  healthcheck at it; `/health` stays as the deep probe for humans.
+
+### Deployed (Unraid, 2026-06-30)
+- Verified-stable runtime env: `BT_BATCH_SIZE=3`, `BT_BATCH_MAX_TOKENS=1200`,
+  `BT_MAX_TOKENS=640`, `BT_TIMEOUT=60`, `BT_MAX_CONCURRENT=1`, `BT_CONTEXT_WINDOW=1`.
+  These keep each vLLM call short enough to finish within the timeout under ~8-way
+  contention, preventing the "all slots stuck generating to max_tokens" runaway that
+  was making cold translations time out. `deploy_unraid.sh` updated to these values
+  and to the correct repo path (`/mnt/user/appdata/book-translator-api`).
+  Result: cold single-paragraph ~0.3s, 5-paragraph batch ~2.5s server-side.
+
+## [1.2.1] - 2026-06-30
+UI version marker: `2026-06-30-rate-limit-backoff-v1` (backend/frontend rate limit improvements).
+
+### Added
+- **Frontend translation queue**: All translation requests now go through a single scheduler to enforce `BT_CLIENT_MAX_INFLIGHT` (default 1) and pause background prefetching during active page translation.
+- **Graceful Rate Limiting**: Frontend now parses `Retry-After` JSON and headers. If the backend hits the 429 rate limit, the frontend pauses its queue without showing a fatal error, updates the UI status to "Rate limited — waiting Ns...", and resumes seamlessly.
+- **Backend JSON 429 response**: The rate limiter now returns `{"error": "rate_limited", "retry_after": N}` along with `Retry-After` HTTP headers.
+- **Rate Limit Environment Variables**: `BT_RATE_LIMIT_PER_MINUTE` (default 120) and `BT_RATE_LIMIT_RETRY_AFTER` (default 10) configurable limits.
+
+## [1.2.0] - 2026-06-30
+UI version marker: `2026-06-30-ui-polish-v1`.
+
+### Fixed
+- **Settings gear opened no visible menu.** The popover was a child of the control
+  bar, which uses `overflow: hidden` to clip the progress bar — so the menu (drawn
+  above the bar) was clipped away. The menu is now a body-level fixed popover.
+- **Bilingual translation looked "glued" to the original and had no colour.** Parent-page
+  CSS does not cascade into the EPUB.js iframe, so the `.bt-translation` class was unstyled
+  inside the reader. The plugin now injects its translation stylesheet directly into the
+  iframe document (with light/dark/sepia theme detection), restoring clear spacing, a blue
+  tint, a left border, and a subtle background — all theme-safe via CSS variables.
+- **Headings/subtitles** ("Chapter Two", section titles, centered epigraphs/quotes) are now
+  reliably translated and rendered with a dedicated `.bt-heading-translation` style (centered
+  when the original is centered) instead of being glued to the original.
+
+### Changed
+- `getTranslatableElements(doc)` is the canonical selector: adds `blockquote` and
+  `epigraph`/`quote`/`verse` classes, excludes plugin UI (`#bt-bar`/`#bt-menu`/`#bt-toast`,
+  `.bt-translation`, `.bt-loading`), preserves standalone TOC links and their `href`.
+- Settings menu now shows: header + UI version, current mode and target language, a
+  persisted background-prefetch toggle, a "retry current page" action, cache-clear actions,
+  and live debug info (queue length, generation, last trigger reason). Closes on outside
+  click and Escape.
+- Bilingual rendering is idempotent: it restores inline-replaced text before inserting,
+  updates the existing translation child instead of duplicating, and survives 10+ mode
+  cycles / page turns / chapter changes without stacking blocks.
+
+## [1.1.1] - 2026-06-30
+### Fixed
+- **Deployment sync (Unraid):** CWA container was serving the old bundled `translator.js` instead
+  of the overlay files because the container lacked file-level bind mounts. Container recreated
+  with the correct mounts from the Unraid XML template. Overlay and container now serve identical
+  files (verified by SHA-256 hash match).
+- **Version marker bumped to `2026-06-30-opus-deploy-sync-v1`** — a brief toast is shown on load
+  so users can confirm the correct JS version is running without opening DevTools.
+- **Cache-busting query strings** added to `read.html` asset URLs
+  (`?v=2026-06-30-opus-deploy-sync-v1`) so browser caches are bypassed after upgrades.
+
+### Documentation
+- Rewrote `docs/DEPLOY_UNRAID.md` to document the real architecture: file bind mounts via the
+  Unraid XML template, the `/mnt/user/appdata/calibre-web-automated/overlay/` deploy target, and
+  why `docker restart` alone is insufficient if template mounts change.
+- Rewrote `docs/TROUBLESHOOTING.md` with verified steps for every known issue.
+
+## [1.1.0] - 2026-06-30
+### Added
+- **Context-Aware Translation (`BT_CONTEXT_WINDOW`, default 0):** option to send previous/next paragraphs to the LLM to improve literary quality and pronoun accuracy.
+- **Unraid deployment & verification automation:** created `deploy_unraid.sh` and `verify_unraid.sh` for safe script and backend upgrades with automatic backups.
+- **Build/Version indicator:** Version `2026-06-30-chapter-auto-v1` logged to console and displayed in the settings menu.
+
+### Fixed
+- **Chapter-Change Auto-Translation:** Resolved bug where navigating from chapter 1 to chapter 2 sometimes didn't auto-translate. Built a unified `scheduleTranslate` debouncing strategy and iframe document identity tracking.
+- **UI status messages:** Unified and improved status text (`✓ Ready`, `Preparing next text…`) adapting cleanly to dark/sepia themes.
+
+## [Unreleased]
+### Added
+- Multi-provider support directly from environment variables.
+- Integration for OpenRouter and DeepSeek via standard `requests`.
+- `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_API_KEY` environment variables.
+- Optional fallback provider (`LLM_FALLBACK_PROVIDER` / `_MODEL` / `_API_KEY`).
+- Tunables `BT_TIMEOUT` and `BT_MAX_CONCURRENT` (default 2) for slow local models.
+- **Batched-prompt translation (`BT_BATCH_SIZE`, default 5):** several paragraphs
+  are translated in a single LLM call — dramatically faster on slow local models —
+  with a transparent per-paragraph fallback if the segmented reply can't be parsed.
+- **Optional API auth (`BT_API_TOKEN` + `X-BT-Token`)** for setups exposed beyond the LAN.
+- Docker `HEALTHCHECK` hitting `/health`.
+- Self-contained backend test (`test_translation.py`) using a mocked LLM — no live server.
+- Standardized GitHub/Gitea templates and community health files.
+- **Reworked control bar (bottom-center):** live status with spinner, a chapter
+  progress bar + `done/total` counter, a `✓ Done` state, and a clickable
+  `⚠ Error — retry` state.
+- **Settings menu (⚙):** toggle whole-chapter pre-translation, clear this
+  language's cache, clear all cache, and a cached-entry count.
+- **Persistent client cache** in `localStorage` per language (survives page
+  turns and reloads); switching language restores that language's work.
+- `Alt+T` keyboard shortcut to cycle translation mode.
+
+### Changed
+- Refactored `translator.py` architecture to use `requests` over `urllib`.
+- Swapped background `_translate_paragraphs` processing to use concurrent `ThreadPoolExecutor` fetching.
+- Upgraded default Gunicorn execution strategy to `1 worker / 8 threads` to prevent memory drift across application states.
+- **Visible-first translation:** the on-screen page is translated one paragraph
+  at a time and painted progressively; the rest of the chapter fills in afterward
+  as a low-priority, preemptible background pass that pauses for the visible page.
+- Page/chapter turns now preempt stale prefetch and auto-translate the new page.
+- Control-bar styling moved into `translator.css` (class-driven); translation
+  text now inherits the reader's light/dark/sepia theme instead of a hardcoded colour.
+
+### Fixed
+- Translation errors/empties are no longer shown as stuck text nor cached
+  client-side, so transient local-LLM failures retry instead of sticking.
+- Client paragraph hashing upgraded from 32-bit to a 53-bit hash (cyrb53) to
+  avoid collisions showing the wrong cached translation in long books.
+- `getParagraphs()` ancestor de-dup is now O(n) via a Set (was O(n²) — janky on
+  big chapters); `getVisibleParagraphs()` reuses that same canonical set.
+- Cache DB collisions (Database is Locked) resolved by enabling `PRAGMA busy_timeout=5000` and minimizing read locking.
+- Resolved memory leakage in Rate Limiter dictionary by implementing an hourly background cleaner.
+- Mitigated negative JS hash generation limits by enforcing strict unsigned zero-shifted bits.
+- `docker-compose` injected the JS/CSS from `./static` (was a non-existent `./overlay` path);
+  added `host.docker.internal` + `BT_LOCAL_URL` so `provider=local` reaches the host LLM.
+
+## [1.0.0] - 2026-06-25
+### Added
+- Initial bilingual translation overlay release.
+- SQLite SHA-256 fallback cache system.
+- Light/Dark mode integration with CWA internal iframe rendering.
+- `translator.js` client logic for dynamic DOM injection.

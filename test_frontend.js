@@ -1,0 +1,192 @@
+const fs = require('fs');
+const assert = require('assert');
+const jsdom = require("jsdom");
+const { JSDOM } = jsdom;
+
+const code = fs.readFileSync('static/translator.js', 'utf-8');
+
+let fetchCalls = [];
+let fetchResponses = [];
+let activeFetches = 0;
+let maxActiveFetches = 0;
+
+global.fetch = async (url, options) => {
+    activeFetches++;
+    if (activeFetches > maxActiveFetches) {
+        maxActiveFetches = activeFetches;
+    }
+    fetchCalls.push({url, options, time: Date.now()});
+    
+    // Simulate network delay
+    await new Promise(r => setTimeout(r, 50));
+    
+    const nextResp = fetchResponses.shift();
+    activeFetches--;
+    
+    if (nextResp instanceof Error) throw nextResp;
+    if (typeof nextResp === 'function') return nextResp();
+    
+    return {
+        ok: nextResp ? nextResp.status < 400 : false,
+        status: nextResp ? nextResp.status : 500,
+        json: async () => nextResp.body,
+        headers: { get: (k) => nextResp.headers?.[k] }
+    };
+};
+
+const dom = new JSDOM(`
+<!DOCTYPE html>
+<html>
+<body>
+    <div id="viewer">
+        <iframe></iframe>
+    </div>
+</body>
+</html>
+`, {
+    url: "http://localhost/",
+    runScripts: "dangerously"
+});
+
+const iframeDoc = dom.window.document.querySelector("iframe").contentDocument;
+iframeDoc.body.innerHTML = `
+    <p class="calibre1">visible 1</p>
+    <p class="calibre1">visible 2</p>
+    <p class="calibre1">prefetch 1</p>
+    <p class="calibre1">prefetch 2</p>
+    <p class="calibre1">prefetch 3</p>
+    <p class="calibre1">prefetch 4</p>
+`;
+
+iframeDoc.querySelectorAll('p').forEach((p, idx) => {
+    p.getBoundingClientRect = () => ({
+        width: 100, height: 20,
+        left: 0, top: idx < 2 ? 0 : 1000 // First two are visible
+    });
+});
+dom.window.innerWidth = 800;
+dom.window.innerHeight = 600;
+dom.window.localStorage.setItem('bt_mode', 'translated');
+dom.window.localStorage.setItem('bt_prefetch', '1');
+dom.window.localStorage.setItem('bt_lang', 'English');
+
+dom.window.requestAnimationFrame = (cb) => setTimeout(cb, 16);
+dom.window.fetch = global.fetch;
+
+const scriptEl = dom.window.document.createElement("script");
+scriptEl.textContent = code;
+dom.window.document.body.appendChild(scriptEl);
+
+async function wait(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
+async function runTest() {
+    console.log("Starting frontend assertions test...");
+    
+    // 1. Initial page load will trigger visible queue (1 chunk) then prefetch queue (3 chunks).
+    // Let's provide a 429 response first for the visible request.
+    fetchResponses.push({
+        status: 429,
+        body: { error: 'rate_limited', retry_after: 1 } // wait 1s
+    });
+    
+    await wait(800);
+    
+    // Wait for the UI state to update after 429
+    const btBar = dom.window.document.getElementById('bt-bar');
+    const statusText = dom.window.document.getElementById('bt-status-text').textContent;
+    
+    console.log("Status text after 429:", statusText);
+    assert(btBar.dataset.state === 'ratelimit', 'State should be ratelimit');
+    // Copy is intentionally short (see i18n): "Waiting {n}s…". The point of this
+    // assertion is that a 429 shows a benign waiting state, not a fatal error —
+    // matched via the ratelimit state above plus the countdown text below.
+    assert(/waiting/i.test(statusText) && !statusText.includes('Error'), 'Should show a benign waiting message, not a fatal error');
+    assert(maxActiveFetches <= 1, 'Only one fetch active at a time');
+    
+    // Provide a valid response for when it resumes (for visible 1)
+    fetchResponses.push({
+        status: 200,
+        body: { translations: ["Translated visible 1"] }
+    });
+    // Provide a valid response for visible 2
+    fetchResponses.push({
+        status: 200,
+        body: { translations: ["Translated visible 2"] }
+    });
+    
+    // Provide responses for the remaining prefetch blocks
+    fetchResponses.push({
+        status: 200,
+        body: { translations: ["Translated prefetch 1", "Translated prefetch 2", "Translated prefetch 3"] }
+    });
+    fetchResponses.push({
+        status: 200,
+        body: { translations: ["Translated prefetch 4"] }
+    });
+    
+    const timeBeforeResume = Date.now();
+    await wait(3000); // Wait for the 1s retry_after + gap + all fetches to complete
+
+    // The second and third fetch calls should happen AFTER the retry_after delay
+    assert(fetchCalls.length >= 2, 'Queue should resume after 429');
+    
+    const delay = fetchCalls[1].time - fetchCalls[0].time;
+    console.log("Delay before retry (ms):", delay);
+    assert(delay >= 950, 'Retry-After delay should be honored approximately'); // >= 1000ms theoretically
+    
+    // Look at the bodies of the first few fetch calls to ensure visible happens before prefetch
+    const call1Body = JSON.parse(fetchCalls[0].options.body); // was 429
+    const call2Body = JSON.parse(fetchCalls[1].options.body); // visible 1 retry
+    const call3Body = JSON.parse(fetchCalls[2].options.body); // visible 2
+    
+    assert(call1Body.paragraphs[0] === 'visible 1', 'First fetch should be visible 1');
+    assert(call2Body.paragraphs[0] === 'visible 1', 'Second fetch (retry) should be visible 1');
+    assert(call3Body.paragraphs[0] === 'visible 2', 'Third fetch should be visible 2');
+    
+    const allFetchedParagraphs = fetchCalls.map(c => JSON.parse(c.options.body).paragraphs).flat();
+    
+    fetchCalls.forEach((c, i) => {
+        console.log(`Fetch ${i}:`, JSON.parse(c.options.body).paragraphs);
+    });
+    
+    // visible 1, visible 1, visible 2, prefetch 1, prefetch 2, prefetch 3, prefetch 4
+    // We expect 7 paragraphs in total passed to fetch
+    const uniqueParagraphs = new Set(allFetchedParagraphs);
+    console.log("All fetched paragraphs:", allFetchedParagraphs);
+    
+    // Ensure no accidental duplicates beyond the retry
+    const nonRetryParagraphs = allFetchedParagraphs.slice(1);
+    const hasDups = new Set(nonRetryParagraphs).size !== nonRetryParagraphs.length;
+    assert(!hasDups, 'There should be no duplicate translation blocks requested');
+    
+    assert(maxActiveFetches === 1, 'Never exceeded one active fetch');
+
+    // Regression guard for the status-bar flicker bug: the position-based
+    // page-turn poll (every 350ms) used to run unconditionally, including
+    // while a translation pass was actively inserting bilingual blocks --
+    // which changes paragraph heights and can shift which element counts as
+    // "first visible" with no real page turn. That false positive forced a
+    // full newGeneration() reset (hides the status pill) immediately followed
+    // by a fresh translateCurrentPage() (shows it again) on every poll tick
+    // for as long as work was in progress -- visible as the status pill
+    // blinking on/off rapidly. The fix gates that poll on genuinely being
+    // idle; real navigation while work is in flight is still caught
+    // immediately via the epub.js relocated/rendered hooks, which don't
+    // depend on visual position. A full behavioral reproduction needs a
+    // real layout engine (jsdom does not compute live reflow from DOM
+    // changes), so this locks the source-level guard in place instead.
+    assert(
+        /if\s*\(\s*!isTranslating\s*&&\s*!isPrefetching\s*\)\s*\{[\s\S]{0,400}?getVisibleParagraphs/.test(code),
+        'Page-turn poll must be gated on being idle (regression: status-bar flicker while translating)'
+    );
+
+    console.log("All assertions passed.");
+    process.exit(0);
+}
+
+runTest().catch(err => {
+    console.error("Test failed:", err);
+    process.exit(1);
+});

@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>book-translator-api</Name>
+  <Repository>local/book-translator-api:latest</Repository>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Overview>Backend API for the Calibre-Web-Automated Book Translator plugin. Built locally — no published registry image. Run install_unraid.sh (or `docker build -t local/book-translator-api:latest .` from the repo) before deploying this container.</Overview>
+  <Category>Tools:Utilities</Category>
+  <Config Name="Appdata (Database)" Target="/app/data" Default="/mnt/user/appdata/book-translator-api/data" Mode="rw" Description="Holds translations.db SQLite database" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/book-translator-api/data</Config>
+  <Config Name="Port" Target="8390" Default="8390" Mode="tcp" Description="API Port" Type="Port" Display="always" Required="true" Mask="false">8390</Config>
+  <Config Name="LLM Provider" Target="LLM_PROVIDER" Default="local" Mode="" Description="Provider (e.g. local, openai, anthropic, gemini, groq)" Type="Variable" Display="always" Required="false" Mask="false">local</Config>
+  <Config Name="LLM Model" Target="LLM_MODEL" Default="gemma4-12b" Mode="" Description="Model name" Type="Variable" Display="always" Required="false" Mask="false">gemma4-12b</Config>
+  <Config Name="LLM API Key" Target="LLM_API_KEY" Default="" Mode="" Description="API Key" Type="Variable" Display="always" Required="false" Mask="true"></Config>
+  <Config Name="Local LLM URL" Target="BT_LOCAL_URL" Default="http://192.168.1.10:8000/v1/chat/completions" Mode="" Description="OpenAI-compatible endpoint of your local LLM (only when provider=local). Path is always /v1/chat/completions; set host:port to YOUR server. Ports: vLLM 8000, LM Studio 1234, Ollama 11434. Use the host IP, NOT localhost/127.0.0.1." Type="Variable" Display="always" Required="false" Mask="false">http://192.168.1.10:8000/v1/chat/completions</Config>
+  <Config Name="Batch Size" Target="BT_BATCH_SIZE" Default="5" Mode="" Description="Paragraphs translated per LLM call. Lower it (e.g. 3) if a slow/contended local model times out." Type="Variable" Display="always" Required="false" Mask="false">5</Config>
+  <Config Name="Max Concurrent" Target="BT_MAX_CONCURRENT" Default="2" Mode="" Description="Simultaneous translation requests. For a slow local model, 1-2 is more stable than 3." Type="Variable" Display="always" Required="false" Mask="false">2</Config>
+  <Config Name="Request Timeout (s)" Target="BT_TIMEOUT" Default="60" Mode="" Description="Seconds before a single translation request is abandoned." Type="Variable" Display="advanced" Required="false" Mask="false">60</Config>
+  <Config Name="Context Window" Target="BT_CONTEXT_WINDOW" Default="0" Mode="" Description="Previous/next paragraphs given to the LLM as context (0 = off, faster; 1-2 = better literary coherence, more tokens)." Type="Variable" Display="advanced" Required="false" Mask="false">0</Config>
+  <Config Name="Max Tokens (single)" Target="BT_MAX_TOKENS" Default="4096" Mode="" Description="Hard ceiling on generated tokens for a single-paragraph request. Lower it (e.g. 640) to fail fast on a slow/contended model." Type="Variable" Display="advanced" Required="false" Mask="false">4096</Config>
+  <Config Name="Max Tokens (batch)" Target="BT_BATCH_MAX_TOKENS" Default="8192" Mode="" Description="Hard ceiling on generated tokens for a batched request. Lower it (e.g. 1200) to fail fast under contention." Type="Variable" Display="advanced" Required="false" Mask="false">8192</Config>
+</Container>
