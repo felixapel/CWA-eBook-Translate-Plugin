@@ -13,12 +13,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - run: python -m py_compile server.py translator.py cache.py
-      - run: python test_translation.py
+      # actions/setup-python only ships prebuilt interpreters for GitHub's
+      # hosted Ubuntu images; in a minimal Gitea job container it fails with
+      # "version '3.11' ... was not found for this operating system". Use the
+      # platform's own Python instead: already present on GitHub runners,
+      # apt-installed in the container otherwise. Both paths give Python 3.11.
+      - name: Set up Python
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            apt-get update && apt-get install -y --no-install-recommends python3 python3-pip
+          fi
+          python3 --version
+      - name: Install dependencies
+        # Debian's system Python is PEP 668 "externally managed"; the flag is
+        # safe in this ephemeral CI env and is supported by modern pip on both.
+        run: python3 -m pip install --break-system-packages -r requirements.txt
+      - run: python3 -m py_compile server.py translator.py cache.py
+      - run: python3 test_translation.py
 
   frontend:
     runs-on: ubuntu-latest
