@@ -96,7 +96,18 @@ locations pointing directly at CWA):
 The injection proxy forwards your reverse proxy's `X-Forwarded-Proto`, so
 HTTPS sessions and secure cookies keep working.
 
-### Option 2: Unraid (community-applications style)
+### Option 2: Unraid
+
+**Community Applications (recommended once listed):** search for
+**"CWA eBook Translate"** in the Apps tab. Until the listing is approved, add
+the template manually — Docker tab → *Add Container* → *Template repositories*
+→ add `https://github.com/felixapel/unraid-templates`, or download the
+[template XML](https://raw.githubusercontent.com/felixapel/unraid-templates/main/cwa-ebook-translate-plugin.xml)
+into `/boot/config/plugins/dockerMan/templates-user/`. The template installs
+**proxy-injection mode**: set `CWA URL` to your CWA instance and read through
+this container's port — your CWA container stays stock.
+
+#### Legacy: bind-mount installer script
 
 `install_unraid.sh` copies the overlay files into your CWA appdata folder and
 installs an Unraid Docker template for the API (bind-mount method). Review the
@@ -230,6 +241,21 @@ Browser ────────►│ nginx (:8080, proxy mode only)        │
 In bind-mount installs nginx never starts; the overlay files are mounted into
 CWA and call the API on `:8390` directly (CORS applies — see
 `BT_ALLOWED_ORIGINS`).
+
+## ❤️ Support the project
+
+CWA eBook Translate is free, GPL-licensed, and has no telemetry, ads, or
+subscription — if it replaced a paid translation service for you, consider
+funding its development:
+
+- **[GitHub Sponsors](https://github.com/sponsors/felixapel)** — one-time or
+  monthly, 0% platform fees
+- **Ko-fi** — quick one-time tips *(link coming soon)*
+
+Donations fund GPU time for multi-model testing, coverage of the 100+
+language matrix, and maintainer time on issues. Non-monetary support counts
+just as much: ⭐ star the repo, report bugs with reproducible steps, test new
+releases, or bring a translation of the UI strings.
 
 ## 📜 License
 
