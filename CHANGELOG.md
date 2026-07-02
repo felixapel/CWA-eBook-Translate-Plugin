@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.0.0] - 2026-07-02
 
 ### Added
+- **100+ target languages** (was 34), mirroring Gemma 4's pre-training
+  coverage. The picker shows the 10 most-spoken languages first, then all
+  other languages A–Z with native names (endonyms); native select type-to-jump
+  works as search. Browser-language default mapping expanded to ~45 locales.
+  Frontend and backend language sets are test-enforced to stay identical.
+  README documents Gemma 4 as the default/base model and the honest quality
+  tiers (35 first-class languages vs the wider pre-trained set).
 - **Proxy-injection mode** — the recommended install. Set `CWA_UPSTREAM` and the
   container proxies CWA on `BT_PROXY_PORT` (default `8080`), injecting a single
   `<script>` tag into reader pages. Stock CWA image, no template mounts, no CORS

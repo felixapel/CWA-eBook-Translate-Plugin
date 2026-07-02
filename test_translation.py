@@ -221,6 +221,18 @@ def run():
     check("invalid language rejected",
           client.post("/translate", json={"text": "x", "target_lang": "Klingon"}).status_code == 400)
 
+    # Language catalog: frontend picker and backend validation must offer the
+    # exact same set, or the UI could offer a language the API rejects.
+    js = open("static/translator.js", encoding="utf-8").read()
+    block = re.search(r"const TOP_LANGUAGES = \[(.*?)\];.*?const MORE_LANGUAGES = \[(.*?)\];", js, re.S)
+    js_codes = [c.replace("\\'", "'") for c in
+                re.findall(r"code:\s*'((?:[^'\\]|\\.)*)'", block.group(1) + block.group(2))]
+    check("languages: no duplicates in frontend catalog", len(js_codes) == len(set(js_codes)))
+    check("languages: frontend and backend sets identical", set(js_codes) == server.VALID_LANGUAGES)
+    check("languages: catalog covers 100+ languages", len(server.VALID_LANGUAGES) >= 100)
+    check("languages: a wider-tier language accepted end-to-end",
+          client.post("/translate", json={"text": "", "target_lang": "Quechua"}).status_code == 200)
+
     # /ping is an instant liveness probe (no LLM) used by the Docker healthcheck.
     pr = client.get("/ping")
     check("ping returns 200 instantly", pr.status_code == 200 and pr.get_json().get("status") == "ok")

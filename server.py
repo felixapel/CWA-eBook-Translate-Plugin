@@ -49,14 +49,28 @@ log = logging.getLogger("book-translator.server")
 app = Flask(__name__)
 
 # ── Language validation (H7) ────────────────────────────────────────────────
+# The selectable set mirrors Gemma 4's pre-training coverage (top-10 most
+# spoken + Gemma's benchmarked and wider language groups). Must stay in sync
+# with TOP_LANGUAGES/MORE_LANGUAGES in static/translator.js (test-enforced).
 
 VALID_LANGUAGES = {
-    "Arabic", "Bulgarian", "Chinese", "Czech", "Danish", "Dutch", "English",
-    "Estonian", "Finnish", "French", "German", "Greek", "Hebrew", "Hindi",
-    "Hungarian", "Indonesian", "Italian", "Japanese", "Korean", "Latvian",
-    "Lithuanian", "Norwegian", "Polish", "Portuguese", "Romanian", "Russian",
-    "Slovak", "Slovenian", "Spanish", "Swedish", "Thai", "Turkish",
-    "Ukrainian", "Vietnamese",
+    "Afrikaans", "Albanian", "Amharic", "Arabic", "Aymara", "Basque",
+    "Bengali", "Bosnian", "Bulgarian", "Burmese", "Catalan", "Cebuano",
+    "Chewa", "Chinese", "Chinese (Traditional)", "Croatian", "Czech",
+    "Danish", "Dutch", "English", "Esperanto", "Estonian", "Finnish",
+    "French", "Gaelic", "Galician", "Ganda", "German", "Greek", "Guarani",
+    "Gujarati", "Hausa", "Hawaiian", "Hebrew", "Hindi", "Hungarian",
+    "Icelandic", "Igbo", "Indonesian", "Italian", "Japanese", "Javanese",
+    "Kannada", "Kazakh", "Khmer", "Korean", "Kyrgyz", "Lao", "Latin",
+    "Latvian", "Lingala", "Lithuanian", "Macedonian", "Maithili",
+    "Malagasy", "Malay", "Malayalam", "Maori", "Marathi", "Mongolian",
+    "Nahuatl", "Navajo", "Nepali", "Norwegian", "Odia", "Oromo", "Pashto",
+    "Persian", "Polish", "Portuguese", "Punjabi", "Quechua", "Romanian",
+    "Russian", "Samoan", "Serbian", "Shona", "Sindhi", "Sinhala", "Slovak",
+    "Slovenian", "Somali", "Spanish", "Sundanese", "Swahili", "Swedish",
+    "Tagalog", "Tajik", "Tamil", "Telugu", "Thai", "Tibetan", "Turkish",
+    "Turkmen", "Ukrainian", "Urdu", "Uzbek", "Vietnamese", "Welsh",
+    "Xhosa", "Yoruba", "Zulu"
 }
 
 

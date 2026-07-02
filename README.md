@@ -1,22 +1,32 @@
-# CWA Translate Plugin
+# CWA eBook Translate Plugin
 
-Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated). Translate ebooks paragraph-by-paragraph while reading, using local LLMs (vLLM, LM Studio, Ollama) or any major Cloud API (OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter).
+Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated). Translate ebooks paragraph-by-paragraph while reading — in **100+ languages** — using local LLMs (vLLM, LM Studio, Ollama) or any major Cloud API (OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter).
 
-<!-- TODO before public launch: add a 15-20s GIF of bilingual reading here.
-     For a reader plugin the GIF is the pitch. -->
+![Bilingual reading demo](docs/assets/demo.gif)
 
 ## ✨ Features
 
 - 🌐 **Bilingual reading** — original + translation side by side
 - 🔄 **Three modes** — Bilingual / Translation-only / Original
+- 🌍 **100+ target languages** — the picker shows the 10 most-spoken languages first, then every other supported language A–Z (type to jump). Developed and tuned against **Google's Gemma 4** as the default local model; the language set mirrors Gemma's pre-training coverage
 - ⚡ **Visible-First Translation** — prioritizes paragraphs visible on screen for instant rendering
 - 🚀 **Background Prefetching** — translates the rest of the chapter sequentially in the background
-- 🌍 **Multi-Language Support** — built-in language selector and UI localized to browser language
 - 🧠 **Context-Aware Translation** — feeds surrounding paragraphs to the LLM to improve literary quality and character voice
 - 📚 **Deep DOM Parsing** — accurately captures headings, custom title classes, and clickable TOC links
 - 💾 **Persistent Double Cache** — server-side SQLite (SHA-256) + client-side `localStorage` caching ensures you never lose a translation or re-pay API costs
 - 🔒 **Rate limited & Stable** — request-size caps and per-IP rate limiting protect your API keys and GPU from runaway requests, with `AbortController` cancellation for perfectly responsive UI buttons
 - 🔌 **Zero-touch install** — proxy-injection mode overlays a **stock** CWA container: no template mounts, nothing to re-apply when CWA updates
+
+### A note on language quality
+
+The default model, **Gemma 4** (`gemma4-12b`), is pre-trained on 140+ languages
+with ~35 languages receiving first-class, benchmarked support (all major
+European, East Asian, South/Southeast Asian, and Middle Eastern languages).
+The remaining languages in the picker come from Gemma's wider pre-training
+corpus: translation works, but lower-resource languages (e.g. Nahuatl, Chewa,
+Tibetan) can occasionally lose coherence or bleed into a dominant language on
+complex passages. Cloud models (GPT, Claude, Gemini) generally handle the
+lower-resource tier better — switch `LLM_PROVIDER` if a language matters to you.
 
 ---
 
@@ -206,4 +216,7 @@ CWA and call the API on `:8390` directly (CORS applies — see
 
 ## 📜 License
 
-MIT
+GPL-3.0. This project extends [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated)
+(itself GPL-licensed), and the advanced bind-mount install ships a template
+derived from it — so the whole project is licensed under the GNU GPL v3 to
+keep everything clean and compatible. See [LICENSE](LICENSE).

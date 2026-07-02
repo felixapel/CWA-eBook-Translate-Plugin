@@ -1,7 +1,7 @@
 {
-  "name": "book-translator",
+  "name": "cwa-ebook-translate-plugin",
   "version": "2.0.0",
-  "description": "Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated). Translate ebooks paragraph-by-paragraph while reading, using local LLMs (vLLM, LM Studio, Ollama) or any major Cloud API (OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter).",
+  "description": "Bilingual LLM-powered translation overlay for Calibre-Web-Automated. Translate ebooks paragraph-by-paragraph while reading, in 100+ languages, using local LLMs (Gemma 4 via vLLM/LM Studio/Ollama) or any major cloud API.",
   "main": "test_frontend.js",
   "directories": {
     "doc": "docs"
@@ -13,9 +13,14 @@
     "type": "git",
     "url": "git+http://192.168.0.122:3010/felix/CWA-translate-plugin.git"
   },
-  "keywords": ["calibre-web-automated", "epub", "translation", "self-hosted"],
+  "keywords": [
+    "calibre-web-automated",
+    "epub",
+    "translation",
+    "self-hosted"
+  ],
   "author": "Felix",
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "devDependencies": {
     "jsdom": "^29.1.1"
   }

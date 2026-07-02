@@ -13,11 +13,22 @@
         : (window.location.protocol === 'https:' ? '' : `http://${window.location.hostname}:8390`);
     let SOURCE_LANG = cfg.sourceLang || 'English'; // Assume source is English
 
-    // Map browser language to full language name for the backend
+    // Map browser language codes to the full language name the backend expects
+    // (used only to pick a sensible default target on first run).
     const langMap = {
         'es': 'Spanish', 'en': 'English', 'fr': 'French', 'de': 'German',
         'pt': 'Portuguese', 'it': 'Italian', 'ru': 'Russian', 'zh': 'Chinese',
-        'ja': 'Japanese'
+        'ja': 'Japanese', 'hi': 'Hindi', 'ar': 'Arabic', 'bn': 'Bengali',
+        'ur': 'Urdu', 'ko': 'Korean', 'tr': 'Turkish', 'pl': 'Polish',
+        'nl': 'Dutch', 'uk': 'Ukrainian', 'vi': 'Vietnamese', 'th': 'Thai',
+        'id': 'Indonesian', 'fa': 'Persian', 'he': 'Hebrew', 'el': 'Greek',
+        'cs': 'Czech', 'sv': 'Swedish', 'da': 'Danish', 'fi': 'Finnish',
+        'no': 'Norwegian', 'nb': 'Norwegian', 'hu': 'Hungarian',
+        'ro': 'Romanian', 'ms': 'Malay', 'ta': 'Tamil', 'te': 'Telugu',
+        'mr': 'Marathi', 'gu': 'Gujarati', 'pa': 'Punjabi', 'sw': 'Swahili',
+        'tl': 'Tagalog', 'ca': 'Catalan', 'bg': 'Bulgarian', 'sk': 'Slovak',
+        'sr': 'Serbian', 'hr': 'Croatian', 'sl': 'Slovenian', 'lt': 'Lithuanian',
+        'lv': 'Latvian', 'et': 'Estonian'
     };
 
     const browserCode = (navigator.language || 'es').split('-')[0];
@@ -133,7 +144,7 @@
             rateLimited: 'Waiting {n}s…',
             retrying: 'Retrying…',
             restoring: 'Restoring saved translations…',
-            cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', settings: 'Settings',
+            cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', topLanguages: 'Most spoken', allLanguages: 'All languages (A–Z)', settings: 'Settings',
             prefetchWhole: 'Pre-translate whole chapter', clearLang: 'Clear this language\'s cache', clearAll: 'Clear all cache',
             cached: 'Cached', cleared: 'Cache cleared',
             bookTranslator: 'Book Translator', modeLabel: 'Mode', langLabel: 'Language',
@@ -145,7 +156,7 @@
             translatingPage: 'Traduciendo…', translatingChapter: 'Capítulo', done: '✓ Listo', error: '⚠ Reintentar',
             rateLimited: 'Esperando {n}s…',
             retrying: 'Reintentando…',
-            cycleHint: 'Clic para cambiar: Original → Bilingüe → Traducido', langHint: 'Idioma destino', settings: 'Ajustes',
+            cycleHint: 'Clic para cambiar: Original → Bilingüe → Traducido', langHint: 'Idioma destino', topLanguages: 'Más hablados', allLanguages: 'Todos los idiomas (A–Z)', settings: 'Ajustes',
             prefetchWhole: 'Pre-traducir capítulo completo', clearLang: 'Borrar caché de este idioma', clearAll: 'Borrar toda la caché',
             cached: 'En caché', cleared: 'Caché borrada',
             bookTranslator: 'Book Translator', modeLabel: 'Modo', langLabel: 'Idioma',
@@ -155,21 +166,21 @@
         fr: {
             off: 'Original', bilingual: 'Bilingue', translated: 'Traduit',
             translatingPage: 'Traduction…', translatingChapter: 'Chapitre', done: '✓ Terminé', error: '⚠ Réessayer',
-            cycleHint: 'Cliquez pour changer : Original → Bilingue → Traduit', langHint: 'Langue cible', settings: 'Réglages',
+            cycleHint: 'Cliquez pour changer : Original → Bilingue → Traduit', langHint: 'Langue cible', topLanguages: 'Les plus parlées', allLanguages: 'Toutes les langues (A–Z)', settings: 'Réglages',
             prefetchWhole: 'Pré-traduire tout le chapitre', clearLang: 'Vider le cache de cette langue', clearAll: 'Vider tout le cache',
             cached: 'En cache', cleared: 'Cache vidé',
         },
         de: {
             off: 'Original', bilingual: 'Zweisprachig', translated: 'Übersetzt',
             translatingPage: 'Übersetzen…', translatingChapter: 'Kapitel', done: '✓ Fertig', error: '⚠ Erneut',
-            cycleHint: 'Klicken zum Wechseln: Original → Zweisprachig → Übersetzt', langHint: 'Zielsprache', settings: 'Einstellungen',
+            cycleHint: 'Klicken zum Wechseln: Original → Zweisprachig → Übersetzt', langHint: 'Zielsprache', topLanguages: 'Meistgesprochen', allLanguages: 'Alle Sprachen (A–Z)', settings: 'Einstellungen',
             prefetchWhole: 'Ganzes Kapitel vorübersetzen', clearLang: 'Cache dieser Sprache leeren', clearAll: 'Gesamten Cache leeren',
             cached: 'Im Cache', cleared: 'Cache geleert',
         },
         pt: {
             off: 'Original', bilingual: 'Bilíngue', translated: 'Traduzido',
             translatingPage: 'Traduzindo…', translatingChapter: 'Capítulo', done: '✓ Pronto', error: '⚠ Repetir',
-            cycleHint: 'Clique para alternar: Original → Bilíngue → Traduzido', langHint: 'Idioma de destino', settings: 'Ajustes',
+            cycleHint: 'Clique para alternar: Original → Bilíngue → Traduzido', langHint: 'Idioma de destino', topLanguages: 'Mais falados', allLanguages: 'Todos os idiomas (A–Z)', settings: 'Ajustes',
             prefetchWhole: 'Pré-traduzir capítulo inteiro', clearLang: 'Limpar cache deste idioma', clearAll: 'Limpar todo o cache',
             cached: 'Em cache', cleared: 'Cache limpo',
         },
@@ -178,15 +189,122 @@
     // added only to `en` never come out undefined in another language.
     const t = Object.assign({}, strings.en, strings[browserCode] || {});
 
-    const availableLangs = [
-        { code: 'Spanish', name: 'Español' },
+    // Language catalog. `code` is the English language name sent to the API
+    // (and used as the cache key); `name` is the endonym shown in the picker.
+    // The set mirrors the languages Gemma 4 (the default backend model) was
+    // pre-trained on; the top-10 most spoken languages get their own group,
+    // the rest are alphabetical. Native <select> gives type-to-search.
+    // NOTE: must stay in sync with VALID_LANGUAGES in server.py (a test
+    // asserts this).
+    const TOP_LANGUAGES = [
         { code: 'English', name: 'English' },
+        { code: 'Chinese', name: '中文' },
+        { code: 'Hindi', name: 'हिन्दी' },
+        { code: 'Spanish', name: 'Español' },
         { code: 'French', name: 'Français' },
-        { code: 'German', name: 'Deutsch' },
+        { code: 'Arabic', name: 'العربية' },
+        { code: 'Bengali', name: 'বাংলা' },
         { code: 'Portuguese', name: 'Português' },
-        { code: 'Italian', name: 'Italiano' },
-        { code: 'Russian', name: 'Русский' }
+        { code: 'Russian', name: 'Русский' },
+        { code: 'Urdu', name: 'اردو' }
     ];
+
+    const MORE_LANGUAGES = [
+        { code: 'Afrikaans', name: 'Afrikaans' },
+        { code: 'Albanian', name: 'Shqip' },
+        { code: 'Amharic', name: 'አማርኛ' },
+        { code: 'Aymara', name: 'Aymar aru' },
+        { code: 'Basque', name: 'Euskara' },
+        { code: 'Bosnian', name: 'Bosanski' },
+        { code: 'Bulgarian', name: 'Български' },
+        { code: 'Burmese', name: 'မြန်မာ' },
+        { code: 'Catalan', name: 'Català' },
+        { code: 'Cebuano', name: 'Cebuano' },
+        { code: 'Chewa', name: 'Chichewa' },
+        { code: 'Chinese (Traditional)', name: '中文（繁體）' },
+        { code: 'Croatian', name: 'Hrvatski' },
+        { code: 'Czech', name: 'Čeština' },
+        { code: 'Danish', name: 'Dansk' },
+        { code: 'Dutch', name: 'Nederlands' },
+        { code: 'Esperanto', name: 'Esperanto' },
+        { code: 'Estonian', name: 'Eesti' },
+        { code: 'Finnish', name: 'Suomi' },
+        { code: 'Gaelic', name: 'Gàidhlig' },
+        { code: 'Galician', name: 'Galego' },
+        { code: 'Ganda', name: 'Luganda' },
+        { code: 'German', name: 'Deutsch' },
+        { code: 'Greek', name: 'Ελληνικά' },
+        { code: 'Guarani', name: 'Avañe\'ẽ' },
+        { code: 'Gujarati', name: 'ગુજરાતી' },
+        { code: 'Hausa', name: 'Hausa' },
+        { code: 'Hawaiian', name: 'ʻŌlelo Hawaiʻi' },
+        { code: 'Hebrew', name: 'עברית' },
+        { code: 'Hungarian', name: 'Magyar' },
+        { code: 'Icelandic', name: 'Íslenska' },
+        { code: 'Igbo', name: 'Igbo' },
+        { code: 'Indonesian', name: 'Bahasa Indonesia' },
+        { code: 'Italian', name: 'Italiano' },
+        { code: 'Japanese', name: '日本語' },
+        { code: 'Javanese', name: 'Basa Jawa' },
+        { code: 'Kannada', name: 'ಕನ್ನಡ' },
+        { code: 'Kazakh', name: 'Қазақша' },
+        { code: 'Khmer', name: 'ខ្មែរ' },
+        { code: 'Korean', name: '한국어' },
+        { code: 'Kyrgyz', name: 'Кыргызча' },
+        { code: 'Lao', name: 'ລາວ' },
+        { code: 'Latin', name: 'Latina' },
+        { code: 'Latvian', name: 'Latviešu' },
+        { code: 'Lingala', name: 'Lingála' },
+        { code: 'Lithuanian', name: 'Lietuvių' },
+        { code: 'Macedonian', name: 'Македонски' },
+        { code: 'Maithili', name: 'मैथिली' },
+        { code: 'Malagasy', name: 'Malagasy' },
+        { code: 'Malay', name: 'Bahasa Melayu' },
+        { code: 'Malayalam', name: 'മലയാളം' },
+        { code: 'Maori', name: 'Te Reo Māori' },
+        { code: 'Marathi', name: 'मराठी' },
+        { code: 'Mongolian', name: 'Монгол' },
+        { code: 'Nahuatl', name: 'Nāhuatl' },
+        { code: 'Navajo', name: 'Diné bizaad' },
+        { code: 'Nepali', name: 'नेपाली' },
+        { code: 'Norwegian', name: 'Norsk' },
+        { code: 'Odia', name: 'ଓଡ଼ିଆ' },
+        { code: 'Oromo', name: 'Afaan Oromoo' },
+        { code: 'Pashto', name: 'پښتو' },
+        { code: 'Persian', name: 'فارسی' },
+        { code: 'Polish', name: 'Polski' },
+        { code: 'Punjabi', name: 'ਪੰਜਾਬੀ' },
+        { code: 'Quechua', name: 'Runa Simi' },
+        { code: 'Romanian', name: 'Română' },
+        { code: 'Samoan', name: 'Gagana Samoa' },
+        { code: 'Serbian', name: 'Српски' },
+        { code: 'Shona', name: 'chiShona' },
+        { code: 'Sindhi', name: 'سنڌي' },
+        { code: 'Sinhala', name: 'සිංහල' },
+        { code: 'Slovak', name: 'Slovenčina' },
+        { code: 'Slovenian', name: 'Slovenščina' },
+        { code: 'Somali', name: 'Soomaali' },
+        { code: 'Sundanese', name: 'Basa Sunda' },
+        { code: 'Swahili', name: 'Kiswahili' },
+        { code: 'Swedish', name: 'Svenska' },
+        { code: 'Tagalog', name: 'Tagalog' },
+        { code: 'Tajik', name: 'Тоҷикӣ' },
+        { code: 'Tamil', name: 'தமிழ்' },
+        { code: 'Telugu', name: 'తెలుగు' },
+        { code: 'Thai', name: 'ไทย' },
+        { code: 'Tibetan', name: 'བོད་སྐད' },
+        { code: 'Turkish', name: 'Türkçe' },
+        { code: 'Turkmen', name: 'Türkmençe' },
+        { code: 'Ukrainian', name: 'Українська' },
+        { code: 'Uzbek', name: 'Oʻzbekcha' },
+        { code: 'Vietnamese', name: 'Tiếng Việt' },
+        { code: 'Welsh', name: 'Cymraeg' },
+        { code: 'Xhosa', name: 'isiXhosa' },
+        { code: 'Yoruba', name: 'Yorùbá' },
+        { code: 'Zulu', name: 'isiZulu' }
+    ];
+
+    const availableLangs = TOP_LANGUAGES.concat(MORE_LANGUAGES);
 
     // ── UI Components ──────────────────────────────────────────────────
     function setMode(mode, { silent = false } = {}) {
@@ -223,10 +341,14 @@
         bar.dataset.mode = translationMode;
         bar.dataset.state = 'idle';
 
-        // Build the language <option> list once.
-        const langOptions = availableLangs.map(l =>
-            `<option value="${l.code}"${l.code === TARGET_LANG ? ' selected' : ''}>${l.name}</option>`
-        ).join('');
+        // Build the language <option> list once: top-10 most spoken first,
+        // then every other supported language A-Z. Native <select> provides
+        // type-to-search within the open dropdown.
+        const opt = l =>
+            `<option value="${l.code}"${l.code === TARGET_LANG ? ' selected' : ''}>${l.name}</option>`;
+        const langOptions =
+            `<optgroup label="${t.topLanguages}">${TOP_LANGUAGES.map(opt).join('')}</optgroup>` +
+            `<optgroup label="${t.allLanguages}">${MORE_LANGUAGES.map(opt).join('')}</optgroup>`;
 
         bar.innerHTML =
             `<button id="bt-toggle" title="${t.cycleHint}">` +
