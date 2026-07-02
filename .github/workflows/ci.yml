@@ -36,6 +36,10 @@ jobs:
         # Debian's system Python is PEP 668 "externally managed"; the flag is
         # safe in this ephemeral CI env and is supported by modern pip on both.
         run: python3 -m pip install --break-system-packages -r requirements.txt
+      - name: Audit Python deps
+        # pip-audit catches CVEs in pinned transitive deps. Keep it pinned to
+        # the version we run locally to avoid drift.
+        run: python3 -m pip install --break-system-packages 'pip-audit==2.10.1' && python3 -m pip_audit -r requirements.txt --strict
       - run: python3 -m py_compile server.py translator.py cache.py
       - run: python3 test_translation.py
       - run: python3 test_hardening.py
@@ -50,6 +54,7 @@ jobs:
       - run: node -c static/translator.js
       - run: node -c static/loader.js
       - run: npm install
+      - run: npm audit --omit=dev
       - run: npm test
 
   # Smoke test: build the image, run it, hit /ping, expect 200.
