@@ -2,9 +2,12 @@
 # Personal deploy-verification helper for a specific Unraid box, kept here as a
 # worked example. Adapt the paths/host for your own environment, or override
 # via env vars: UNRAID_HOST=10.0.0.5 UNRAID_USER=myuser ./verify_unraid.sh
+# (10.0.0.10 below is an example IP — substitute your Unraid host's LAN
+# address; 192.168.x.x or 10.x.x.x both work as long as the translator
+# container can reach it.)
 set -e
 
-UNRAID_HOST="${UNRAID_HOST:-192.168.0.122}"
+UNRAID_HOST="${UNRAID_HOST:-10.0.0.10}"
 UNRAID_USER="${UNRAID_USER:-root}"
 
 echo "Verifying book-translator-api container health..."

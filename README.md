@@ -86,8 +86,8 @@ locations pointing directly at CWA):
     location / {
         include /config/nginx/proxy.conf;
         include /config/nginx/resolver.conf;
-        set $upstream_app 192.168.0.122;   # docker host
-        set $upstream_port 8084;           # translator proxy port (NOT CWA's)
+        set $upstream_app 10.0.0.10;        # docker host (substitute your own)
+        set $upstream_port 8084;            # translator proxy port (NOT CWA's)
         set $upstream_proto http;
         proxy_pass $upstream_proto://$upstream_app:$upstream_port;
     }
