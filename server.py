@@ -12,8 +12,22 @@ from collections import defaultdict
 from pathlib import Path
 from flask import Flask, request, jsonify
 
-from translator import translate_text, translate_batch, check_backend_health, LLM_MODEL
+from translator import (
+    translate_text, translate_batch, check_backend_health,
+    LLM_MODEL, model_for_provider, cache_lookup_models,
+)
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
+
+
+def _cache_lookup(text: str, source_lang: str, target_lang: str) -> str | None:
+    """Model-scoped cache lookup: primary model first, then the fallback's
+    model (a paragraph translated during a primary outage lives under the
+    fallback key and must not be re-paid once the primary recovers)."""
+    for model in cache_lookup_models():
+        hit = get_cached(text, source_lang, target_lang, model=model)
+        if hit is not None:
+            return hit
+    return None
 
 # Single version source: the VERSION file (also stamped into cache-bust query
 # strings by the proxy). Falls back to "dev" for odd working directories.
@@ -290,7 +304,7 @@ def _translate_paragraphs(
     for i, para in enumerate(paragraphs):
         if not para.strip():
             continue
-        hit = get_cached(para, source_lang, target_lang, model=LLM_MODEL)
+        hit = _cache_lookup(para, source_lang, target_lang)
         if hit is not None:
             translations[i] = hit
             backends[i] = "cache"
@@ -309,7 +323,8 @@ def _translate_paragraphs(
             if not translated.startswith("[TRANSLATION ERROR:"):
                 fresh_count += 1
                 try:
-                    put_cache(paragraphs[idx], source_lang, target_lang, translated, model=LLM_MODEL)
+                    put_cache(paragraphs[idx], source_lang, target_lang, translated,
+                              model=model_for_provider(backend))
                 except Exception:
                     pass
 
@@ -509,7 +524,7 @@ def translate():
         })
 
     # Check cache first
-    cached = get_cached(text, source_lang, target_lang, model=LLM_MODEL)
+    cached = _cache_lookup(text, source_lang, target_lang)
     if cached is not None:
         _record_metric(0, hits=1, misses=0)
         return jsonify({
@@ -534,7 +549,7 @@ def translate():
 
     # Store in cache with correct model name
     try:
-        put_cache(text, source_lang, target_lang, translated, model=LLM_MODEL)
+        put_cache(text, source_lang, target_lang, translated, model=model_for_provider(backend))
     except Exception as e:
         log.exception("Cache write failed (non-fatal)")
 
@@ -685,9 +700,12 @@ def _get_cleanup_token() -> str:
         return _cleanup_token_cache
     try:
         _CLEANUP_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if _CLEANUP_TOKEN_PATH.exists():
-            _cleanup_token_cache = _CLEANUP_TOKEN_PATH.read_text().strip() or _secrets.token_urlsafe(32)
+        existing = _CLEANUP_TOKEN_PATH.read_text().strip() if _CLEANUP_TOKEN_PATH.exists() else ""
+        if existing:
+            _cleanup_token_cache = existing
         else:
+            # Missing OR empty file: generate and PERSIST (an empty file must
+            # not leave the operator with an unrecoverable in-memory token).
             _cleanup_token_cache = _secrets.token_urlsafe(32)
             _CLEANUP_TOKEN_PATH.write_text(_cleanup_token_cache)
             try:

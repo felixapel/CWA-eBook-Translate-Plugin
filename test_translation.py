@@ -206,6 +206,28 @@ def run():
     after_hits = client.get("/stats").get_json()["total_hits"]
     check("stats: cache hit increments total_hits", after_hits == before_hits + 1)
 
+    # Fallback cache scoping: a translation produced by the FALLBACK provider
+    # must be cached under the fallback's model key (caching it under the
+    # primary model would be cross-provider poisoning via the fallback path),
+    # and must still be served from cache after the primary recovers.
+    import cache as cache_mod
+    STATE["local_up"] = False
+    STATE["fallback_up"] = True
+    d = client.post("/translate", json={"text": "fb_scope_para"}).get_json()
+    check("fb-scope: fallback served the fresh translation",
+          d.get("translated") == "[FB] fb_scope_para" and d.get("backend") == "minimax")
+    check("fb-scope: cached under the FALLBACK model key",
+          cache_mod.get_cached("fb_scope_para", "English", "Spanish", model="fake-fallback") == "[FB] fb_scope_para")
+    check("fb-scope: NOT cached under the primary model key",
+          cache_mod.get_cached("fb_scope_para", "English", "Spanish", model="fake-model") is None)
+    STATE["local_up"] = True
+    d = client.post("/translate", json={"text": "fb_scope_para"}).get_json()
+    check("fb-scope: cache hit after primary recovers (no re-pay)",
+          d.get("cached") is True and d.get("translated") == "[FB] fb_scope_para")
+    d = client.post("/translate/batch", json={"paragraphs": ["fb_scope_para"]}).get_json()
+    check("fb-scope: batch lookup also finds the fallback-keyed entry",
+          d.get("cached_count") == 1 and d["translations"][0] == "[FB] fb_scope_para")
+
     # Provider attribution: batch results report the provider that ACTUALLY
     # served them (fallback when local is down), not the configured primary.
     STATE["local_up"] = False

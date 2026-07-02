@@ -262,6 +262,36 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
     raise RuntimeError(f"Translation failed (all providers): {last_error}")
 
 
+def model_for_provider(provider_name: str) -> str:
+    """The model that actually produced a translation, given the provider name
+    reported by translate_text/translate_batch.
+
+    Cache keys are scoped by model (B4). A translation served by the FALLBACK
+    provider must be cached under the fallback's model — caching it under the
+    primary model would be exactly the cross-provider poisoning B4 eliminates,
+    just via the fallback path.
+    """
+    if provider_name and provider_name == LLM_FALLBACK_PROVIDER:
+        return LLM_FALLBACK_MODEL or LLM_MODEL
+    return LLM_MODEL
+
+
+def cache_lookup_models() -> list[str]:
+    """Model keys to probe on cache lookup, primary first.
+
+    When a fallback provider is configured, a paragraph translated during a
+    primary-provider outage lives under the fallback's model key; probing it
+    second means that work is never re-paid once the primary recovers, while
+    primary-model entries still win when both exist.
+    """
+    models = [LLM_MODEL]
+    if LLM_FALLBACK_PROVIDER and LLM_FALLBACK_PROVIDER in PROVIDER_ENDPOINTS:
+        fb_model = LLM_FALLBACK_MODEL or LLM_MODEL
+        if fb_model not in models:
+            models.append(fb_model)
+    return models
+
+
 def translate_text(
     text: str,
     source_lang: str = "English",
