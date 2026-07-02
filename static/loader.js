@@ -16,7 +16,17 @@
     // through untouched.
     if (!/\/read\//.test(window.location.pathname)) { return; }
 
-    var VERSION = '2.0.0';
+    // Inherit the version from our own ?v= query param (stamped by nginx from
+    // the VERSION file). Hardcoding a version here caused a cache-busting bug
+    // (loader busted, assets stale) — this way loader.js is version-free and
+    // the container's VERSION file is the single source of truth.
+    var VERSION = (function () {
+        try {
+            var src = document.currentScript && document.currentScript.src;
+            if (!src) { return 'dev'; }
+            return new URL(src, window.location.href).searchParams.get('v') || 'dev';
+        } catch (e) { return 'dev'; }
+    })();
     var BASE = '/bt-static/';
 
     // Same-origin defaults: the proxy serves the API under /bt-api, so no
