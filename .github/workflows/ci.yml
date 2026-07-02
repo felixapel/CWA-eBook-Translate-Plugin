@@ -53,7 +53,7 @@ jobs:
         # either --no-deps or --require-hashes; both are satisfied here.
         run: |
           set -e
-          python3 -m pip install --break-system-packages 'pip-audit==2.10.1' 'pip-tools==25.3'
+          python3 -m pip install --break-system-packages 'pip-audit==2.10.1' 'pip-tools==7.5.3'
           python3 -m pip install --break-system-packages -r requirements.txt
           # Pin transitive deps for audit. --quiet keeps the log readable.
           python3 -m piptools compile --quiet --output-file=requirements-pinned.txt --no-header --strip-extras requirements.txt
