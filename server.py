@@ -43,9 +43,29 @@ BT_MAX_PARAGRAPH_CHARS = int(os.environ.get("BT_MAX_PARAGRAPH_CHARS", "8000"))
 BT_MAX_CONTENT_LENGTH = int(os.environ.get("BT_MAX_CONTENT_LENGTH", str(2 * 1024 * 1024)))
 
 # Rate-limit key: request.remote_addr by default. Behind a reverse proxy every
-# client shares the proxy's address, so opt in to X-Forwarded-For ONLY when the
-# proxy is trusted to set it (never trust it from direct clients).
+# client shares the proxy's address, so opt in to X-Forwarded-For ONLY when
+# the proxy is trusted to set it (never trust it from direct clients).
+#
+# BT_TRUST_PROXY is a boolean switch: when true, X-Forwarded-For's first hop
+# becomes the rate-limit key. The safer BT_TRUSTED_PROXIES is a comma-
+# separated list of CIDRs/ips that remote_addr must match before X-Forwarded-
+# -For is honored. Set BT_TRUSTED_PROXIES (e.g. "127.0.0.1/32,::1/128" for
+# a local nginx, or "10.0.0.0/8" for a private-network reverse proxy) to
+# prevent spoofing: a client on the LAN can otherwise send an arbitrary
+# X-Forwarded-For header and bypass the rate limiter per request.
+#
+# Precedence:
+#   - BT_TRUSTED_PROXIES is set  -> honor X-Forwarded-For IFF remote_addr is
+#                                   in the list
+#   - BT_TRUST_PROXY=true         -> honor X-Forwarded-For from any peer
+#                                   (legacy / dev only; not safe in prod)
+#   - otherwise                   -> use remote_addr
 BT_TRUST_PROXY = os.environ.get("BT_TRUST_PROXY", "false").lower() in ("1", "true", "yes")
+BT_TRUSTED_PROXIES = {
+    p.strip() for p in os.environ.get("BT_TRUSTED_PROXIES", "").split(",") if p.strip()
+}
+import ipaddress  # local import: used only when BT_TRUSTED_PROXIES is set
+_TRUSTED_PROXY_NETS = [ipaddress.ip_network(c, strict=False) for c in BT_TRUSTED_PROXIES]
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -168,13 +188,35 @@ def _cleanup_rate_limits():
 threading.Thread(target=_cleanup_rate_limits, daemon=True).start()
 
 def _client_ip() -> str:
-    """Rate-limit key. Uses X-Forwarded-For's first hop only when BT_TRUST_PROXY
-    is enabled (i.e. a trusted reverse proxy sets it); otherwise remote_addr."""
-    if BT_TRUST_PROXY:
-        fwd = request.headers.get("X-Forwarded-For", "")
-        if fwd:
-            return fwd.split(",")[0].strip()
-    return request.remote_addr or "unknown"
+    """Rate-limit key. Uses X-Forwarded-For's first hop only when the peer
+    (the IP the WSGI server actually saw, NOT the X-Forwarded-For value) is
+    trusted. That means either BT_TRUSTED_PROXIES matches the peer, or
+    BT_TRUST_PROXY=true is set (legacy / dev only — anyone who can reach
+    the API can spoof X-Forwarded-For in this mode).
+    """
+    peer = request.remote_addr or "unknown"
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        client_ip_from_xff = fwd.split(",")[0].strip()
+    else:
+        client_ip_from_xff = ""
+
+    # BT_TRUSTED_PROXIES path: precise allowlist of peer CIDRs.
+    if BT_TRUSTED_PROXIES and client_ip_from_xff:
+        try:
+            peer_ip = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer  # malformed peer — don't trust the XFF
+        if any(peer_ip in net for net in _TRUSTED_PROXY_NETS):
+            return client_ip_from_xff or peer
+        # Peer not in allowlist: an attacker is forging XFF. Use peer.
+        return peer
+
+    # Legacy BT_TRUST_PROXY=true: trust XFF from any peer.
+    if BT_TRUST_PROXY and client_ip_from_xff:
+        return client_ip_from_xff
+
+    return peer
 
 
 def _check_rate_limit(ip: str) -> bool:

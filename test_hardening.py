@@ -32,6 +32,7 @@ for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_
         pass
 
 import requests
+import ipaddress
 
 # Re-use the same fake_post from test_translation.py.
 import test_translation  # noqa: E402
@@ -149,6 +150,47 @@ def run():
           keys and keys[0] == "5.6.7.8")
     server.BT_TRUST_PROXY = False
     server._rate_limit_store.clear()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # H5: BT_TRUSTED_PROXIES allowlist path (preferred over BT_TRUST_PROXY)
+    # ─────────────────────────────────────────────────────────────────────
+    # When BT_TRUSTED_PROXIES is set, the rate-limit key uses X-Forwarded-For
+    # only if the *peer* (the actual socket source) is in the allowlist.
+    # This is the production-safe path; BT_TRUST_PROXY=true (tested in H4)
+    # is for dev/local only.
+    server._rate_limit_store.clear()
+    server.BT_TRUST_PROXY = False
+    original_trusted = set(server.BT_TRUSTED_PROXIES)
+    original_nets = list(server._TRUSTED_PROXY_NETS)
+    try:
+        # Werkzeug's test client connects from 127.0.0.1. Allowlist it.
+        server.BT_TRUSTED_PROXIES = {"127.0.0.1/32"}
+        server._TRUSTED_PROXY_NETS = [
+            ipaddress.ip_network("127.0.0.1/32", strict=False)
+        ]
+        client.post("/translate", json={"text": "h5_test_a"},
+                    headers={"X-Forwarded-For": "9.9.9.9"})
+        keys = list(server._rate_limit_store.keys())
+        check("BT_TRUSTED_PROXIES: peer in allowlist honors XFF",
+              keys and keys[0] == "9.9.9.9")
+        server._rate_limit_store.clear()
+
+        # Now switch to an allowlist that does NOT match the peer. The
+        # client is still 127.0.0.1, but the allowlist is 10.0.0.0/8. The
+        # XFF must be ignored — the key falls back to the peer.
+        server.BT_TRUSTED_PROXIES = {"10.0.0.0/8"}
+        server._TRUSTED_PROXY_NETS = [
+            ipaddress.ip_network("10.0.0.0/8", strict=False)
+        ]
+        client.post("/translate", json={"text": "h5_test_b"},
+                    headers={"X-Forwarded-For": "9.9.9.9"})
+        keys = list(server._rate_limit_store.keys())
+        check("BT_TRUSTED_PROXIES: peer NOT in allowlist ignores XFF (anti-spoof)",
+              keys and keys[0] != "9.9.9.9")
+    finally:
+        server.BT_TRUSTED_PROXIES = original_trusted
+        server._TRUSTED_PROXY_NETS = original_nets
+        server._rate_limit_store.clear()
 
 
 if __name__ == "__main__":
