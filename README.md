@@ -102,7 +102,7 @@ HTTPS sessions and secure cookies keep working.
 **"CWA eBook Translate"** in the Apps tab. Until the listing is approved, add
 the template manually — Docker tab → *Add Container* → *Template repositories*
 → add `https://github.com/felixapel/unraid-templates`, or download the
-[template XML](https://raw.githubusercontent.com/felixapel/unraid-templates/main/cwa-ebook-translate-plugin.xml)
+[template XML](https://raw.githubusercontent.com/felixapel/unraid-templates/main/templates/cwa-ebook-translate-plugin.xml)
 into `/boot/config/plugins/dockerMan/templates-user/`. The template installs
 **proxy-injection mode**: set `CWA URL` to your CWA instance and read through
 this container's port — your CWA container stays stock.
