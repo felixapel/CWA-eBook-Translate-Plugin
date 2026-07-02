@@ -65,21 +65,32 @@ _put_counter = 0
 _ENFORCE_EVERY = 200  # only run the COUNT/DELETE housekeeping every N writes
 
 
-def compute_cache_key(text: str, source_lang: str, target_lang: str) -> str:
-    """SHA-256 hash of (normalized text + source + target).
+def compute_cache_key(
+    text: str, source_lang: str, target_lang: str, model: str = ""
+) -> str:
+    """SHA-256 hash of (normalized text + source + target + model).
 
-    The text is stripped so the single and batch endpoints (which historically
-    differed in whitespace handling) always agree on the same key — the same
-    paragraph is never translated and paid for twice.
+    Model is part of the key so that switching providers/models never serves
+    a stale translation from the previous backend. Before this change a
+    row cached by ``gemma4-12b`` would silently be served after the operator
+    switched to ``MiniMax-M3``, with no signal that the user was getting the
+    cheaper/worse translation. Including model also lets the operator run
+    a parallel ``gemma4-12b`` + ``MiniMax-M3`` comparison on the same book.
+
+    Existing rows (cached before this change) used a model-less key and will
+    simply miss once the new key is in effect — the cache re-warms gradually
+    on first request, no destructive migration needed.
     """
-    content = f"{text.strip()}|{source_lang}|{target_lang}"
+    content = f"{model}|{text.strip()}|{source_lang}|{target_lang}"
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def get_cached(text: str, source_lang: str, target_lang: str) -> str | None:
+def get_cached(
+    text: str, source_lang: str, target_lang: str, model: str = ""
+) -> str | None:
     """Look up a translation in the cache. Returns None if not found.
     A hit increments hit_count so /stats reflects real cache usage."""
-    cache_key = compute_cache_key(text, source_lang, target_lang)
+    cache_key = compute_cache_key(text, source_lang, target_lang, model=model)
     conn = _get_conn()
     try:
         row = conn.execute(
@@ -87,7 +98,7 @@ def get_cached(text: str, source_lang: str, target_lang: str) -> str | None:
             (cache_key,),
         ).fetchone()
         if row:
-            log.debug("Cache HIT for %d chars %s→%s", len(text), source_lang, target_lang)
+            log.debug("Cache HIT for %d chars %s→%s (model=%s)", len(text), source_lang, target_lang, model or "?")
             try:
                 conn.execute(
                     "UPDATE translations SET hit_count = hit_count + 1 WHERE cache_key = ?",
@@ -108,11 +119,18 @@ def put_cache(
     source_lang: str,
     target_lang: str,
     translated_text: str,
-    model: str = "MiniMax-M3",
+    model: str,
 ):
-    """Store a translation in the cache (upsert; re-puts keep the hit count)."""
+    """Store a translation in the cache (upsert; re-puts keep the hit count).
+
+    ``model`` is required (no default) so that callers always tag which
+    backend produced the translation. Mixing backends under the same key
+    was the root cause of cross-provider cache poisoning.
+    """
+    if not model:
+        raise ValueError("put_cache requires a non-empty model name")
     global _put_counter
-    cache_key = compute_cache_key(text, source_lang, target_lang)
+    cache_key = compute_cache_key(text, source_lang, target_lang, model=model)
     now = datetime.now(timezone.utc).isoformat()
     conn = _get_conn()
     try:
@@ -177,11 +195,31 @@ def get_cache_stats() -> dict:
     return {
         "total_entries": total,
         "total_hits": total_hits,
-        "db_size_mb": round(os.path.getsize(str(DB_PATH)) / (1024 * 1024), 2),
+        "db_size_mb": _db_size_mb(),
         "language_pairs": {
             f"{s}→{t}": c for s, t, c in pairs
         },
     }
+
+
+def _db_size_mb() -> float:
+    """Total bytes occupied by the SQLite file plus its WAL/SHM siblings.
+
+    With ``journal_mode=WAL``, the main ``.db`` file stays small (often empty)
+    while the actual pages live in ``-wal``. Reports that only inspect the
+    main file under-report the real on-disk footprint by an order of
+    magnitude — operators relying on this for backup sizing or cleanup
+    triggers would make decisions on stale data. Sum all three files.
+    """
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        path = str(DB_PATH) + suffix
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            # -shm/-wal may not exist yet on a brand-new database
+            continue
+    return round(total / (1024 * 1024), 2)
 
 
 def cleanup_old_entries(days: int = 30) -> int:

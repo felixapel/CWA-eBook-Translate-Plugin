@@ -279,7 +279,7 @@ def _translate_paragraphs(
     for i, para in enumerate(paragraphs):
         if not para.strip():
             continue
-        cached = get_cached(para, source_lang, target_lang)
+        cached = get_cached(para, source_lang, target_lang, model=LLM_MODEL)
         if cached is not None:
             translations[i] = cached
             cached_count += 1
@@ -317,13 +317,19 @@ def before_request_hook():
     request.request_id = str(uuid.uuid4())
     request.start_time = time.monotonic()
 
-    # Optional shared-secret auth (skip preflight + health so they always work).
+    # Optional shared-secret auth (skip preflight + health/ping so liveness
+    # probes always work. /stats stays under auth so cache contents aren't
+    # leakable on unauthenticated LANs.)
     if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ping"):
         if request.headers.get("X-BT-Token") != API_TOKEN:
             return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
 
-    # Rate limiting (H6) — skip for health/metrics/ping
-    if request.path not in ("/health", "/metrics", "/ping"):
+    # Rate limiting (H6) — exempt observability endpoints so operators can
+    # monitor health/stats even while the per-client budget is exhausted.
+    # /stats is in this set (not the auth set above) deliberately: it must
+    # stay reachable during a rate-limit storm so the operator can see how
+    # badly things are going, but it still requires API_TOKEN if configured.
+    if request.path not in ("/health", "/metrics", "/ping", "/stats"):
         client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
@@ -472,8 +478,22 @@ def translate():
         _record_metric(0, hits=0, misses=1)
         return jsonify({"translated": "", "cached": False, "elapsed_ms": 0, "request_id": req_id})
 
+    # Short-circuit source==target: do NOT spend an LLM call or pollute the
+    # cache with self-pairs (e.g. en->en, es->es). Echoes the source text as
+    # the translation; the frontend already renders this as a passthrough.
+    if source_lang == target_lang:
+        log.info("req=%s short-circuit source==target (%s)", req_id, source_lang)
+        _record_metric(0, hits=0, misses=0)
+        return jsonify({
+            "translated": text,
+            "cached": False,
+            "skipped": "source==target",
+            "elapsed_ms": 0,
+            "request_id": req_id,
+        })
+
     # Check cache first
-    cached = get_cached(text, source_lang, target_lang)
+    cached = get_cached(text, source_lang, target_lang, model=LLM_MODEL)
     if cached is not None:
         _record_metric(0, hits=1, misses=0)
         return jsonify({
@@ -554,6 +574,22 @@ def translate_batch_endpoint():
     lang_error = _validate_languages(source_lang, target_lang)
     if lang_error:
         return jsonify({"error": lang_error}), 400
+
+    # Short-circuit source==target: mirror /translate's behaviour. Echo every
+    # paragraph back unchanged; mark as skipped so the frontend can distinguish
+    # "no translation needed" from "translated and cached".
+    if source_lang == target_lang:
+        req_id = getattr(request, "request_id", None)
+        log.info("req=%s short-circuit batch source==target (%s, %d paragraphs)",
+                 req_id, source_lang, len(paragraphs))
+        return jsonify({
+            "translations": paragraphs,
+            "cached_count": 0,
+            "fresh_count": 0,
+            "skipped": "source==target",
+            "total_elapsed_ms": 0,
+            "request_id": req_id,
+        })
 
     result = _translate_paragraphs(paragraphs, source_lang, target_lang)
     result["request_id"] = getattr(request, "request_id", None)
