@@ -9,9 +9,9 @@
 
 A concrete, worked example of a two-container deployment (translator API +
 Calibre-Web-Automated with the overlay bind-mounts). The hostnames, IPs
-(`192.168.0.122`), and paths below are from one real setup — substitute your
-own. The general shape (API container + 3 overlay bind mounts into CWA) applies
-to any Unraid/Docker host.
+(`10.0.0.10` below is an example), and paths below are from one real setup
+— substitute your own. The general shape (API container + 3 overlay bind
+mounts into CWA) applies to any Unraid/Docker host.
 
 ---
 
@@ -183,7 +183,7 @@ grep -qxF book-translator-api /var/lib/docker/unraid-autostart \
 
 > ⚠️ Do NOT use `localhost` as `BT_LOCAL_URL` inside Docker.
 > `localhost` inside a container refers to the container itself, not the host.
-> Use the host's LAN IP (e.g. `192.168.0.122`) or `host.docker.internal`.
+> Use the host's LAN IP (e.g. `10.0.0.10`) or `host.docker.internal`.
 
 > Note: since v2.0.0 a prebuilt image exists (`ghcr.io/felixapel/cwa-ebook-translate-plugin`),
 > so you can substitute it anywhere below instead of building locally.
@@ -260,7 +260,7 @@ docker restart calibre-web-automated
 
 | Backend | Correct BT_LOCAL_URL |
 |---------|----------------------|
-| vLLM on FelixServer | `http://192.168.0.122:2819/v1/chat/completions` |
-| Ollama on FelixServer | `http://192.168.0.122:11434/v1/chat/completions` |
-| LM Studio (Gaming PC) | `http://192.168.0.89:1234/v1/chat/completions` |
+| vLLM on translation host | `http://10.0.0.10:2819/v1/chat/completions` |
+| Ollama on translation host | `http://10.0.0.10:11434/v1/chat/completions` |
+| LM Studio (separate host) | `http://10.0.0.20:1234/v1/chat/completions` |
 | ❌ Wrong | `http://localhost:2819/...` (broken inside Docker) |

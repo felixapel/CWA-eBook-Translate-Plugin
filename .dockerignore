@@ -1,10 +1,36 @@
+# Reduce image size: drop build artefacts and the dev-only bits that should
+# never end up in a production image.
 .venv
 __pycache__
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.coverage
+htmlcov/
+
+# Live database files (the running container writes to /app/data, which is
+# a named volume; you do NOT want a stale local one baked into the image).
 translations.db
 translations.db-*
+data.db
+data.db-*
+*.sqlite
+*.sqlite3
+
+# Legacy / exploratory bits the image doesn't need.
 overlay
 userscript
-README.md
 benchmark.py
+benchmark_realistic.py
+my-book-translator-api.xml
+
+# Test files: the image bakes the app, not its tests. The CI smoke test
+# brings its own copy of test_translation.py when needed.
 test_*.py
+
+# Local docs and build artefacts.
+docs/assets/demo.gif
+*.log
+.DS_Store

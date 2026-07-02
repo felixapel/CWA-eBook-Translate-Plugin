@@ -3,14 +3,21 @@
 # example of the rebuild-and-restart sequence. Adapt the paths/host/env for
 # your own environment, or override the host via:
 #   UNRAID_HOST=10.0.0.5 UNRAID_USER=myuser ./deploy_unraid.sh
+# (10.0.0.10 below is just an example IP — substitute your Unraid host's LAN
+# address; 192.168.x.x or 10.x.x.x both work as long as the translator
+# container can reach it.)
 set -e
 
 # Configuration
-UNRAID_HOST="${UNRAID_HOST:-192.168.0.122}"
+UNRAID_HOST="${UNRAID_HOST:-10.0.0.10}"
 UNRAID_USER="${UNRAID_USER:-root}"
 CWA_OVERLAY_DIR="/mnt/user/appdata/calibre-web-automated/overlay"
 API_DIR="/mnt/user/appdata/book-translator-api"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+# Host where your local LLM listens. INSIDE Docker, "localhost" is the
+# container itself, not the Unraid host — point at the host's LAN IP or use
+# host.docker.internal. The IP below is a placeholder; substitute your own.
+LLM_HOST="${LLM_HOST:-10.0.0.10}"
 
 echo "Starting deployment to $UNRAID_HOST..."
 
@@ -29,7 +36,7 @@ ssh $UNRAID_USER@$UNRAID_HOST "
     --net=bridge \
     -p 8390:8390 \
     -v /mnt/user/appdata/book-translator-api/data:/app/data \
-    -e BT_LOCAL_URL=http://192.168.0.122:2819/v1/chat/completions \
+    -e BT_LOCAL_URL=http://${LLM_HOST}:2819/v1/chat/completions \
     -e BT_BATCH_SIZE=3 \
     -e BT_MAX_CONCURRENT=1 \
     -e BT_TIMEOUT=60 \

@@ -9,6 +9,7 @@ import time
 import threading
 import uuid
 from collections import defaultdict
+from pathlib import Path
 from flask import Flask, request, jsonify
 
 from translator import translate_text, translate_batch, check_backend_health, LLM_MODEL
@@ -32,10 +33,40 @@ API_TOKEN = os.environ.get("BT_API_TOKEN", "")
 BT_MAX_BATCH_PARAGRAPHS = int(os.environ.get("BT_MAX_BATCH_PARAGRAPHS", "50"))
 BT_MAX_PARAGRAPH_CHARS = int(os.environ.get("BT_MAX_PARAGRAPH_CHARS", "8000"))
 
+# Global request-size cap (defence in depth). The per-field caps above check
+# the *parsed* content; MAX_CONTENT_LENGTH is a hard backstop at the WSGI
+# layer that rejects a 10 MB JSON before we even start parsing. With our
+# defaults (50 paragraphs × 8000 chars + overhead) the per-request ceiling is
+# ~400 KB; the 2 MB default here gives ~5× headroom for a single oversized
+# paragraph and rejects a 10 MB body long before the per-field check fires.
+# Operators behind a slow link can lower it; operators on a research cluster
+# translating longer paragraphs can raise it (or lower BT_MAX_PARAGRAPH_CHARS).
+BT_MAX_CONTENT_LENGTH = int(os.environ.get("BT_MAX_CONTENT_LENGTH", str(2 * 1024 * 1024)))
+
 # Rate-limit key: request.remote_addr by default. Behind a reverse proxy every
-# client shares the proxy's address, so opt in to X-Forwarded-For ONLY when the
-# proxy is trusted to set it (never trust it from direct clients).
+# client shares the proxy's address, so opt in to X-Forwarded-For ONLY when
+# the proxy is trusted to set it (never trust it from direct clients).
+#
+# BT_TRUST_PROXY is a boolean switch: when true, X-Forwarded-For's first hop
+# becomes the rate-limit key. The safer BT_TRUSTED_PROXIES is a comma-
+# separated list of CIDRs/ips that remote_addr must match before X-Forwarded-
+# -For is honored. Set BT_TRUSTED_PROXIES (e.g. "127.0.0.1/32,::1/128" for
+# a local nginx, or "10.0.0.0/8" for a private-network reverse proxy) to
+# prevent spoofing: a client on the LAN can otherwise send an arbitrary
+# X-Forwarded-For header and bypass the rate limiter per request.
+#
+# Precedence:
+#   - BT_TRUSTED_PROXIES is set  -> honor X-Forwarded-For IFF remote_addr is
+#                                   in the list
+#   - BT_TRUST_PROXY=true         -> honor X-Forwarded-For from any peer
+#                                   (legacy / dev only; not safe in prod)
+#   - otherwise                   -> use remote_addr
 BT_TRUST_PROXY = os.environ.get("BT_TRUST_PROXY", "false").lower() in ("1", "true", "yes")
+BT_TRUSTED_PROXIES = {
+    p.strip() for p in os.environ.get("BT_TRUSTED_PROXIES", "").split(",") if p.strip()
+}
+import ipaddress  # local import: used only when BT_TRUSTED_PROXIES is set
+_TRUSTED_PROXY_NETS = [ipaddress.ip_network(c, strict=False) for c in BT_TRUSTED_PROXIES]
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -47,6 +78,11 @@ logging.basicConfig(
 log = logging.getLogger("book-translator.server")
 
 app = Flask(__name__)
+
+# Reject oversize request bodies at the WSGI layer (defence in depth — the
+# per-field caps in the route handlers are the second backstop). Returning
+# 413 here means a 10 MB JSON gets rejected before Flask even parses it.
+app.config["MAX_CONTENT_LENGTH"] = BT_MAX_CONTENT_LENGTH
 
 # ── Language validation (H7) ────────────────────────────────────────────────
 # The selectable set mirrors Gemma 4's pre-training coverage (top-10 most
@@ -153,13 +189,35 @@ def _cleanup_rate_limits():
 threading.Thread(target=_cleanup_rate_limits, daemon=True).start()
 
 def _client_ip() -> str:
-    """Rate-limit key. Uses X-Forwarded-For's first hop only when BT_TRUST_PROXY
-    is enabled (i.e. a trusted reverse proxy sets it); otherwise remote_addr."""
-    if BT_TRUST_PROXY:
-        fwd = request.headers.get("X-Forwarded-For", "")
-        if fwd:
-            return fwd.split(",")[0].strip()
-    return request.remote_addr or "unknown"
+    """Rate-limit key. Uses X-Forwarded-For's first hop only when the peer
+    (the IP the WSGI server actually saw, NOT the X-Forwarded-For value) is
+    trusted. That means either BT_TRUSTED_PROXIES matches the peer, or
+    BT_TRUST_PROXY=true is set (legacy / dev only — anyone who can reach
+    the API can spoof X-Forwarded-For in this mode).
+    """
+    peer = request.remote_addr or "unknown"
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        client_ip_from_xff = fwd.split(",")[0].strip()
+    else:
+        client_ip_from_xff = ""
+
+    # BT_TRUSTED_PROXIES path: precise allowlist of peer CIDRs.
+    if BT_TRUSTED_PROXIES and client_ip_from_xff:
+        try:
+            peer_ip = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer  # malformed peer — don't trust the XFF
+        if any(peer_ip in net for net in _TRUSTED_PROXY_NETS):
+            return client_ip_from_xff or peer
+        # Peer not in allowlist: an attacker is forging XFF. Use peer.
+        return peer
+
+    # Legacy BT_TRUST_PROXY=true: trust XFF from any peer.
+    if BT_TRUST_PROXY and client_ip_from_xff:
+        return client_ip_from_xff
+
+    return peer
 
 
 def _check_rate_limit(ip: str) -> bool:
@@ -207,9 +265,20 @@ def _translate_paragraphs(
     """
     Shared helper for batch translation logic used by /translate/batch.
 
-    Returns dict with translations list, cached_count, fresh_count, and elapsed_ms.
+    Returns dict with translations list, cached_count, fresh_count,
+    total_elapsed_ms, and per-paragraph attribution:
+      - backends[i]  = provider that served paragraph i
+                       ("cache" if served from cache; the actual
+                       provider name like "local"/"minimax" if fresh;
+                       "" if the paragraph was empty)
+      - cached[i]    = True if paragraph i was a cache hit
+
+    The per-paragraph fields are optional in the sense that older API
+    clients can ignore them; the existing aggregate counts are unchanged.
     """
     translations = [""] * len(paragraphs)
+    backends = [""] * len(paragraphs)        # NEW: per-paragraph backend attribution
+    cached = [False] * len(paragraphs)       # NEW: per-paragraph cache-hit flag
     cached_count = 0
     fresh_count = 0
     start = time.monotonic()
@@ -217,13 +286,15 @@ def _translate_paragraphs(
     # Identify cache misses
     misses = []
     miss_indices = []
-    
+
     for i, para in enumerate(paragraphs):
         if not para.strip():
             continue
-        cached = get_cached(para, source_lang, target_lang)
-        if cached is not None:
-            translations[i] = cached
+        hit = get_cached(para, source_lang, target_lang, model=LLM_MODEL)
+        if hit is not None:
+            translations[i] = hit
+            backends[i] = "cache"
+            cached[i] = True
             cached_count += 1
         else:
             misses.append(para)
@@ -234,6 +305,7 @@ def _translate_paragraphs(
         results = translate_batch(misses, source_lang, target_lang)
         for idx, (translated, backend) in zip(miss_indices, results):
             translations[idx] = translated
+            backends[idx] = backend or "unknown"
             if not translated.startswith("[TRANSLATION ERROR:"):
                 fresh_count += 1
                 try:
@@ -245,6 +317,8 @@ def _translate_paragraphs(
 
     return {
         "translations": translations,
+        "backends": backends,
+        "cached": cached,
         "cached_count": cached_count,
         "fresh_count": fresh_count,
         "total_elapsed_ms": total_elapsed_ms,
@@ -259,13 +333,19 @@ def before_request_hook():
     request.request_id = str(uuid.uuid4())
     request.start_time = time.monotonic()
 
-    # Optional shared-secret auth (skip preflight + health so they always work).
+    # Optional shared-secret auth (skip preflight + health/ping so liveness
+    # probes always work. /stats stays under auth so cache contents aren't
+    # leakable on unauthenticated LANs.)
     if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ping"):
         if request.headers.get("X-BT-Token") != API_TOKEN:
             return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
 
-    # Rate limiting (H6) — skip for health/metrics/ping
-    if request.path not in ("/health", "/metrics", "/ping"):
+    # Rate limiting (H6) — exempt observability endpoints so operators can
+    # monitor health/stats even while the per-client budget is exhausted.
+    # /stats is in this set (not the auth set above) deliberately: it must
+    # stay reachable during a rate-limit storm so the operator can see how
+    # badly things are going, but it still requires API_TOKEN if configured.
+    if request.path not in ("/health", "/metrics", "/ping", "/stats"):
         client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
@@ -304,6 +384,22 @@ def after_request_hook(response):
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
+
+
+@app.errorhandler(413)
+def request_too_large(_e):
+    """Return a clean JSON 413 when MAX_CONTENT_LENGTH trips.
+
+    Without this handler Werkzeug returns an HTML body, which is fine for a
+    browser but breaks any API client that JSON-decodes the response. We
+    still want the per-field caps to fire first when the body is small but
+    contains one oversized value — this is purely the backstop path.
+    """
+    req_id = getattr(request, "request_id", None)
+    return jsonify({
+        "error": f"Request body exceeds the {BT_MAX_CONTENT_LENGTH}-byte limit",
+        "request_id": req_id,
+    }), 413
 
 
 @app.route("/ping")
@@ -398,8 +494,22 @@ def translate():
         _record_metric(0, hits=0, misses=1)
         return jsonify({"translated": "", "cached": False, "elapsed_ms": 0, "request_id": req_id})
 
+    # Short-circuit source==target: do NOT spend an LLM call or pollute the
+    # cache with self-pairs (e.g. en->en, es->es). Echoes the source text as
+    # the translation; the frontend already renders this as a passthrough.
+    if source_lang == target_lang:
+        log.info("req=%s short-circuit source==target (%s)", req_id, source_lang)
+        _record_metric(0, hits=0, misses=0)
+        return jsonify({
+            "translated": text,
+            "cached": False,
+            "skipped": "source==target",
+            "elapsed_ms": 0,
+            "request_id": req_id,
+        })
+
     # Check cache first
-    cached = get_cached(text, source_lang, target_lang)
+    cached = get_cached(text, source_lang, target_lang, model=LLM_MODEL)
     if cached is not None:
         _record_metric(0, hits=1, misses=0)
         return jsonify({
@@ -450,11 +560,18 @@ def translate_batch_endpoint():
 
     Returns: {
         "translations": ["Translated 1", "Translated 2", ...],
+        "backends": ["local", "cache", "minimax", ...],
+        "cached": [false, true, false, ...],
         "cached_count": N,
         "fresh_count": M,
         "total_elapsed_ms": 12345,
         "request_id": "uuid"
     }
+
+    Per-paragraph attribution (backends[i] / cached[i]) lets the frontend
+    show "translated by local LLM" or "served from cache" badges, and lets
+    operators confirm a request is hitting the backend they expect (e.g.
+    that a fallback provider was used when the local one was down).
     """
     data = request.get_json(silent=True) or {}
     if "paragraphs" not in data or not isinstance(data["paragraphs"], list):
@@ -481,6 +598,22 @@ def translate_batch_endpoint():
     if lang_error:
         return jsonify({"error": lang_error}), 400
 
+    # Short-circuit source==target: mirror /translate's behaviour. Echo every
+    # paragraph back unchanged; mark as skipped so the frontend can distinguish
+    # "no translation needed" from "translated and cached".
+    if source_lang == target_lang:
+        req_id = getattr(request, "request_id", None)
+        log.info("req=%s short-circuit batch source==target (%s, %d paragraphs)",
+                 req_id, source_lang, len(paragraphs))
+        return jsonify({
+            "translations": paragraphs,
+            "cached_count": 0,
+            "fresh_count": 0,
+            "skipped": "source==target",
+            "total_elapsed_ms": 0,
+            "request_id": req_id,
+        })
+
     result = _translate_paragraphs(paragraphs, source_lang, target_lang)
     result["request_id"] = getattr(request, "request_id", None)
 
@@ -495,13 +628,85 @@ def translate_batch_endpoint():
 def cache_cleanup():
     """Evict old cache entries. Optional body: {"days": 30}.
     `days` must be an integer >= 1 — a negative value would match every row
-    (created_at < future date) and silently wipe the whole cache."""
+    (created_at < future date) and silently wipe the whole cache.
+
+    Auth: always required. Two sources of truth for the token, in order:
+      1. BT_API_TOKEN env var (the recommended path; if set, this is the
+         only token accepted for the whole API)
+      2. Per-process auto-generated token persisted in /app/data/cleanup_token
+         (only consulted when BT_API_TOKEN is empty). The token is generated
+         on first use with secrets.token_urlsafe, written to a file with
+         mode 0600, and logged at INFO so the operator can read it from
+         `docker logs`. This is the fail-safe: an operator who forgets to
+         set BT_API_TOKEN does NOT get an unauthenticated destructive
+         endpoint on their LAN.
+
+    Tests can monkeypatch `_get_cleanup_token` to return a known value."""
+    token = _get_cleanup_token()
+    request_token = request.headers.get("X-BT-Token", "")
+    if not request_token or request_token != token:
+        return jsonify({
+            "error": "Unauthorized",
+            "request_id": getattr(request, "request_id", None),
+        }), 401
+
     data = request.get_json(silent=True) or {}
     days = data.get("days", 30)
     if isinstance(days, bool) or not isinstance(days, int) or not (1 <= days <= 3650):
         return jsonify({"error": "'days' must be an integer between 1 and 3650"}), 400
     deleted = cleanup_old_entries(days=days)
     return jsonify({"deleted": deleted, "days": days})
+
+
+# ── Cleanup-token auto-generation ──────────────────────────────────────────
+# Persistent path inside the data dir, alongside the sqlite database. The
+# file is intentionally named without a leading dot so `ls` shows it by
+# default — operators need to be able to see it to understand the auth model.
+import secrets as _secrets  # local: small surface
+_CLEANUP_TOKEN_PATH = Path(os.environ.get("BT_CACHE_DIR", "/app/data")) / "cleanup_token"
+_cleanup_token_cache: str | None = None
+
+
+def _get_cleanup_token() -> str:
+    """Return the active token for /cache/cleanup.
+
+    Order:
+      1. If BT_API_TOKEN is set, use it (single source of truth for the
+         whole API's auth — consistent with the other endpoints).
+      2. Else, read or create /app/data/cleanup_token. The first call
+         generates a fresh secrets.token_urlsafe(32) value, writes it to
+         the file with mode 0600, and logs it once at INFO. Subsequent
+         calls (within the same process) reuse the cached value.
+    """
+    global _cleanup_token_cache
+    if API_TOKEN:
+        return API_TOKEN
+    if _cleanup_token_cache is not None:
+        return _cleanup_token_cache
+    try:
+        _CLEANUP_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _CLEANUP_TOKEN_PATH.exists():
+            _cleanup_token_cache = _CLEANUP_TOKEN_PATH.read_text().strip() or _secrets.token_urlsafe(32)
+        else:
+            _cleanup_token_cache = _secrets.token_urlsafe(32)
+            _CLEANUP_TOKEN_PATH.write_text(_cleanup_token_cache)
+            try:
+                _CLEANUP_TOKEN_PATH.chmod(0o600)
+            except OSError:
+                pass
+            log.warning(
+                "BT_API_TOKEN not set. Auto-generated /cache/cleanup token: %s "
+                "(persisted at %s). Read it from `docker logs` or set "
+                "BT_API_TOKEN to silence this and use a fixed value.",
+                _cleanup_token_cache, _CLEANUP_TOKEN_PATH,
+            )
+    except Exception as e:
+        # If we cannot persist, fall back to an in-memory token that lasts
+        # for the process lifetime. Less convenient for the operator (lost
+        # on restart) but still better than no auth.
+        log.exception("Failed to persist cleanup token; using in-memory fallback")
+        _cleanup_token_cache = _secrets.token_urlsafe(32)
+    return _cleanup_token_cache
 
 
 # ── Main ────────────────────────────────────────────────────────────────────

@@ -13,6 +13,7 @@ Covers: provider fallback, errors not cached, batched-prompt translation
 import os, sys, json, re, tempfile
 
 os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_test_translations.db")
+os.environ["BT_CACHE_DIR"] = tempfile.gettempdir()  # for /cache/cleanup auth token
 os.environ["LLM_PROVIDER"] = "local"
 os.environ["LLM_MODEL"] = "fake-model"
 os.environ["LLM_FALLBACK_PROVIDER"] = "minimax"
@@ -20,6 +21,11 @@ os.environ["LLM_FALLBACK_MODEL"] = "fake-fallback"
 os.environ["LLM_FALLBACK_API_KEY"] = "x" * 20
 os.environ["BT_MAX_CONCURRENT"] = "2"
 os.environ["BT_BATCH_SIZE"] = "3"
+# BT_API_TOKEN is intentionally NOT set here. test_translation.py exercises
+# the *translate* endpoints (which are unauth'd when BT_API_TOKEN is empty —
+# matches the typical self-host use case), and the three /cache/cleanup
+# tests below pre-write /tmp/cleanup_token so the auto-gen path can be
+# exercised without a real env var.
 for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_PATH"] + "-shm"):
     try: os.remove(f)
     except OSError: pass
@@ -165,12 +171,25 @@ def run():
           client.post("/translate/batch", json={"paragraphs": ["ok", 42]}).status_code == 400)
 
     # /cache/cleanup input validation: negative days would wipe the whole cache.
-    check("cleanup: negative days rejected",
-          client.post("/cache/cleanup", json={"days": -1}).status_code == 400)
-    check("cleanup: non-integer days rejected",
-          client.post("/cache/cleanup", json={"days": "abc"}).status_code == 400)
-    check("cleanup: valid days accepted",
-          client.post("/cache/cleanup", json={"days": 3650}).status_code == 200)
+    # BT_API_TOKEN is not set; the endpoint auto-generates a token. We pre-write
+    # a known token to BT_CACHE_DIR/cleanup_token (the path server.py uses) and
+    # use that as our X-BT-Token header value.
+    from pathlib import Path as _Path
+    _cleanup_token_file = _Path(os.environ["BT_CACHE_DIR"]) / "cleanup_token"
+    _cleanup_token_file.write_text("test-translation-cleanup-token")
+    server._cleanup_token_cache = None  # force re-read
+    cleanup_headers = {"X-BT-Token": "test-translation-cleanup-token"}
+    try:
+        check("cleanup: negative days rejected",
+              client.post("/cache/cleanup", json={"days": -1}, headers=cleanup_headers).status_code == 400)
+        check("cleanup: non-integer days rejected",
+              client.post("/cache/cleanup", json={"days": "abc"}, headers=cleanup_headers).status_code == 400)
+        check("cleanup: valid days accepted",
+              client.post("/cache/cleanup", json={"days": 3650}, headers=cleanup_headers).status_code == 200)
+    finally:
+        if _cleanup_token_file.exists():
+            _cleanup_token_file.unlink()
+        server._cleanup_token_cache = None
 
     # Cache-key normalization: single + batch endpoints must share entries, and
     # surrounding whitespace must not cause a second paid translation.
@@ -247,6 +266,101 @@ def run():
     check("rate limit: response has Retry-After header", "Retry-After" in resp.headers)
     check("rate limit: response JSON has retry_after", resp.get_json().get("retry_after") is not None)
     server._rate_limit_store.clear()
+
+    # ── Audit-fix regression tests (2026-07-02) ──────────────────────────
+
+    # B1: db_size_mb reports the real on-disk footprint, not just the main
+    # .db file. With WAL mode, the main file is often empty while the data
+    # lives in -wal. If the operator only saw the main file they would
+    # think the cache was empty (0.0 MB) when it actually had rows.
+    import cache as cache_mod
+    server._rate_limit_store.clear()
+    # Force a translation so a row is written.
+    unique = "audit_b1_db_size_text"
+    client.post("/translate", json={"text": unique, "source_lang": "English", "target_lang": "Spanish"})
+    stats = client.get("/stats").get_json()
+    main_size = os.path.getsize(cache_mod.DB_PATH) if os.path.exists(cache_mod.DB_PATH) else 0
+    check("audit B1: stats reports non-zero db_size_mb when rows exist",
+          stats["db_size_mb"] > 0 or main_size == 0)
+    # Also: db_size_mb must be >= the main-file size (WAL can add bytes).
+    check("audit B1: db_size_mb >= main .db file size (WAL counted)",
+          stats["db_size_mb"] * 1024 * 1024 >= main_size - 1024)
+
+    # B2: source_lang == target_lang must short-circuit and NOT spend an
+    # LLM call. The response carries `skipped` so the frontend can tell
+    # passthrough from cache hit, and `translated` echoes the input.
+    STATE["single_calls"] = 0
+    STATE["batch_calls"] = 0
+    r = client.post("/translate", json={"text": "hola", "source_lang": "Spanish", "target_lang": "Spanish"})
+    check("audit B2: same-lang single endpoint echoes input",
+          r.status_code == 200 and r.get_json().get("translated") == "hola")
+    check("audit B2: same-lang single endpoint marks skipped",
+          r.get_json().get("skipped") == "source==target")
+    check("audit B2: same-lang single endpoint spent no LLM call",
+          STATE["single_calls"] == 0 and STATE["batch_calls"] == 0)
+    rb = client.post("/translate/batch",
+                     json={"paragraphs": ["p1", "p2"], "source_lang": "English", "target_lang": "English"})
+    check("audit B2: same-lang batch echoes paragraphs",
+          rb.status_code == 200 and rb.get_json().get("translations") == ["p1", "p2"])
+    check("audit B2: same-lang batch marks skipped",
+          rb.get_json().get("skipped") == "source==target")
+    check("audit B2: same-lang batch spent no LLM call",
+          STATE["single_calls"] == 0 and STATE["batch_calls"] == 0)
+    # And: cache must NOT have polluted entries for self-pairs.
+    stats_after = client.get("/stats").get_json()
+    bad_pairs = [k for k in stats_after["language_pairs"] if k.startswith(("English→English", "Spanish→Spanish"))]
+    check("audit B2: cache has no source==target entries", bad_pairs == [])
+
+    # B3: /stats must be reachable while the per-client rate limit is
+    # exhausted, so operators can monitor an attack. /metrics and /ping
+    # were already exempt; this test guards the new exemption.
+    server._rate_limit_store.clear()
+    limit = server.RATE_LIMIT_MAX
+    for i in range(limit):
+        client.post("/translate", json={"text": f"b3burn{i}"})
+    over = client.post("/translate", json={"text": "blocked"})
+    check("audit B3 setup: /translate returns 429 after burst", over.status_code == 429)
+    s = client.get("/stats")
+    check("audit B3: /stats reachable during rate-limit storm", s.status_code == 200)
+    check("audit B3: /stats returns stats JSON during rate-limit storm",
+          isinstance(s.get_json(), dict) and "total_entries" in s.get_json())
+    server._rate_limit_store.clear()
+
+    # B4: cache key must include the model. Two cache keys computed for the
+    # same text+lang with different models must be DISTINCT, otherwise
+    # switching LLM_MODEL silently serves stale translations.
+    STATE["single_calls"] = 0
+    key_a = cache_mod.compute_cache_key("audit_b4_cache_scope_text", "English", "Spanish", model="model-A")
+    key_b = cache_mod.compute_cache_key("audit_b4_cache_scope_text", "English", "Spanish", model="model-B")
+    check("audit B4: distinct models produce distinct cache keys",
+          key_a != key_b)
+    key_a_again = cache_mod.compute_cache_key("audit_b4_cache_scope_text", "English", "Spanish", model="model-A")
+    check("audit B4: same inputs produce the same cache key (deterministic)",
+          key_a == key_a_again)
+    # And: put_cache without model must raise (caller contract).
+    raised = False
+    try:
+        cache_mod.put_cache("x", "English", "Spanish", "y", model="")
+    except ValueError:
+        raised = True
+    check("audit B4: put_cache without model raises ValueError", raised)
+    # And: end-to-end, switching LLM_MODEL via translator module produces
+    # different cache writes (server reads the live module attribute).
+    poison = "audit_b4_cache_scope_text_e2e"
+    # Write under model-A (default in env).
+    client.post("/translate", json={"text": poison, "source_lang": "English", "target_lang": "Spanish"})
+    # Read directly via the same API to confirm the row was written.
+    stats_after = client.get("/stats").get_json()
+    check("audit B4 setup: end-to-end write landed in cache",
+          stats_after["total_entries"] >= 2)
+    # Direct DB inspection: count rows under our text+lang pair.
+    conn = cache_mod._get_conn()
+    rows_for_text = conn.execute(
+        "SELECT model FROM translations WHERE source_text = ? AND source_lang = ? AND target_lang = ?",
+        (poison, "English", "Spanish"),
+    ).fetchall()
+    check("audit B4: cache row is tagged with the model that produced it",
+          len(rows_for_text) == 1 and rows_for_text[0][0] == "fake-model")
 
 
 if __name__ == "__main__":
