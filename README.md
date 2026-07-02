@@ -44,19 +44,32 @@ Browser ──► book-translator (:8084) ──► Calibre-Web-Automated (:8083
 ```
 
 ```bash
-git clone <your-repo-url> CWA-translate-plugin
-cd CWA-translate-plugin
+git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
+cd CWA-eBook-Translate-Plugin
 # Edit docker-compose.yml: set BT_LOCAL_URL (or a cloud provider + API key)
 docker compose up -d
 ```
 
 Then read your library at **`http://<host>:8084`** — the translator control
-bar appears in the ebook reader. That's the whole install.
+bar appears in the ebook reader. That's the whole install. The compose file
+pulls the prebuilt multi-arch image
+(`ghcr.io/felixapel/cwa-ebook-translate-plugin`, amd64 + arm64) — no build
+step needed.
 
 Already have CWA running? Add just the translator service to your existing
-compose file and point `CWA_UPSTREAM` at your CWA container/host, e.g.
-`CWA_UPSTREAM=http://calibre-web-automated:8083`. The host port (`8084` in the
-example) is arbitrary — pick any free port on your machine.
+compose file and point `CWA_UPSTREAM` at your CWA container/host:
+
+```yaml
+  book-translator:
+    image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
+    environment:
+      - CWA_UPSTREAM=http://calibre-web-automated:8083
+      - BT_LOCAL_URL=http://host.docker.internal:11434/v1/chat/completions
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: ["./config/translator:/app/data"]
+    ports: ["8084:8080"]   # read CWA (with overlay) here — any free port works
+    restart: unless-stopped
+```
 
 > Removing the plugin = stop reading through the proxy port. Nothing in your
 > CWA install was modified.
@@ -91,8 +104,8 @@ script, then run it **locally** (don't pipe an unreviewed remote script into
 `bash`):
 
 ```bash
-git clone <your-repo-url> CWA-translate-plugin
-cd CWA-translate-plugin
+git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
+cd CWA-eBook-Translate-Plugin
 chmod +x install_unraid.sh
 ./install_unraid.sh
 ```

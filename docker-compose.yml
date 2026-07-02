@@ -29,8 +29,10 @@ services:
       - webnet
 
   book-translator:
-    build: .
-    image: local/book-translator:latest
+    # Prebuilt multi-arch image (amd64 + arm64). To build from source instead,
+    # comment out `image:` and uncomment `build: .`
+    image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
+    # build: .
     container_name: book-translator
     environment:
       # ── Proxy-injection mode ────────────────────────────────────────────

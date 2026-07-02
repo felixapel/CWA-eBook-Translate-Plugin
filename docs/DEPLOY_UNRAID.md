@@ -185,7 +185,9 @@ grep -qxF book-translator-api /var/lib/docker/unraid-autostart \
 > `localhost` inside a container refers to the container itself, not the host.
 > Use the host's LAN IP (e.g. `192.168.0.122`) or `host.docker.internal`.
 
-> Note: `local/book-translator-api:latest` is built locally, not pulled from a
+> Note: since v2.0.0 a prebuilt image exists (`ghcr.io/felixapel/cwa-ebook-translate-plugin`),
+> so you can substitute it anywhere below instead of building locally.
+> `local/book-translator-api:latest` is built locally, not pulled from a
 > registry. It persists across reboots, but if you ever recreate the Docker
 > image (`docker.img`) you must rebuild it: `cd /mnt/user/appdata/book-translator-api
 > && docker build -t local/book-translator-api:latest .`
