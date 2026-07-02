@@ -265,9 +265,20 @@ def _translate_paragraphs(
     """
     Shared helper for batch translation logic used by /translate/batch.
 
-    Returns dict with translations list, cached_count, fresh_count, and elapsed_ms.
+    Returns dict with translations list, cached_count, fresh_count,
+    total_elapsed_ms, and per-paragraph attribution:
+      - backends[i]  = provider that served paragraph i
+                       ("cache" if served from cache; the actual
+                       provider name like "local"/"minimax" if fresh;
+                       "" if the paragraph was empty)
+      - cached[i]    = True if paragraph i was a cache hit
+
+    The per-paragraph fields are optional in the sense that older API
+    clients can ignore them; the existing aggregate counts are unchanged.
     """
     translations = [""] * len(paragraphs)
+    backends = [""] * len(paragraphs)        # NEW: per-paragraph backend attribution
+    cached = [False] * len(paragraphs)       # NEW: per-paragraph cache-hit flag
     cached_count = 0
     fresh_count = 0
     start = time.monotonic()
@@ -275,13 +286,15 @@ def _translate_paragraphs(
     # Identify cache misses
     misses = []
     miss_indices = []
-    
+
     for i, para in enumerate(paragraphs):
         if not para.strip():
             continue
-        cached = get_cached(para, source_lang, target_lang, model=LLM_MODEL)
-        if cached is not None:
-            translations[i] = cached
+        hit = get_cached(para, source_lang, target_lang, model=LLM_MODEL)
+        if hit is not None:
+            translations[i] = hit
+            backends[i] = "cache"
+            cached[i] = True
             cached_count += 1
         else:
             misses.append(para)
@@ -292,6 +305,7 @@ def _translate_paragraphs(
         results = translate_batch(misses, source_lang, target_lang)
         for idx, (translated, backend) in zip(miss_indices, results):
             translations[idx] = translated
+            backends[idx] = backend or "unknown"
             if not translated.startswith("[TRANSLATION ERROR:"):
                 fresh_count += 1
                 try:
@@ -303,6 +317,8 @@ def _translate_paragraphs(
 
     return {
         "translations": translations,
+        "backends": backends,
+        "cached": cached,
         "cached_count": cached_count,
         "fresh_count": fresh_count,
         "total_elapsed_ms": total_elapsed_ms,
@@ -544,11 +560,18 @@ def translate_batch_endpoint():
 
     Returns: {
         "translations": ["Translated 1", "Translated 2", ...],
+        "backends": ["local", "cache", "minimax", ...],
+        "cached": [false, true, false, ...],
         "cached_count": N,
         "fresh_count": M,
         "total_elapsed_ms": 12345,
         "request_id": "uuid"
     }
+
+    Per-paragraph attribution (backends[i] / cached[i]) lets the frontend
+    show "translated by local LLM" or "served from cache" badges, and lets
+    operators confirm a request is hitting the backend they expect (e.g.
+    that a fallback provider was used when the local one was down).
     """
     data = request.get_json(silent=True) or {}
     if "paragraphs" not in data or not isinstance(data["paragraphs"], list):

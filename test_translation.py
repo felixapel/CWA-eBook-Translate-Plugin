@@ -279,7 +279,6 @@ def run():
     unique = "audit_b1_db_size_text"
     client.post("/translate", json={"text": unique, "source_lang": "English", "target_lang": "Spanish"})
     stats = client.get("/stats").get_json()
-    import os
     main_size = os.path.getsize(cache_mod.DB_PATH) if os.path.exists(cache_mod.DB_PATH) else 0
     check("audit B1: stats reports non-zero db_size_mb when rows exist",
           stats["db_size_mb"] > 0 or main_size == 0)

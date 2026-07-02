@@ -229,6 +229,74 @@ def run():
         server._TRUSTED_PROXY_NETS = original_nets
         server._rate_limit_store.clear()
 
+    # ─────────────────────────────────────────────────────────────────────
+    # H6: /translate/batch per-paragraph attribution
+    # ─────────────────────────────────────────────────────────────────────
+    # The batch endpoint should expose which provider served each paragraph
+    # (and whether it was a cache hit) so the frontend can render per-para
+    # attribution and operators can verify the right backend was used.
+    server._rate_limit_store.clear()
+    # Reset to "local up, fallback up" so the attribution tests are stable.
+    STATE["local_up"] = True
+    STATE["fallback_up"] = True
+    STATE["malform"] = False
+
+    paras_h6 = [
+        "h6_brand_new_para_1",  # fresh: backends[i] should be "local", cached[i]=False
+        "h6_brand_new_para_2",  # fresh
+    ]
+    r1 = client.post("/translate/batch", json={"paragraphs": paras_h6}).get_json()
+    check("H6: batch returns per-paragraph backends array",
+          "backends" in r1 and isinstance(r1["backends"], list)
+          and len(r1["backends"]) == len(paras_h6))
+    check("H6: batch returns per-paragraph cached array",
+          "cached" in r1 and isinstance(r1["cached"], list)
+          and len(r1["cached"]) == len(paras_h6))
+    check("H6: fresh paragraphs have backends != 'cache'",
+          all(b != "cache" for b in r1.get("backends", [])))
+    check("H6: fresh paragraphs have cached[i] == False",
+          all(c is False for c in r1.get("cached", [])))
+
+    # Repeat: this time both should be cache hits.
+    r2 = client.post("/translate/batch", json={"paragraphs": paras_h6}).get_json()
+    check("H6: cache-hit backends[i] == 'cache'",
+          all(b == "cache" for b in r2.get("backends", [])))
+    check("H6: cache-hit cached[i] == True",
+          all(c is True for c in r2.get("cached", [])))
+    check("H6: cache-hit doesn't increment fresh_count",
+          r2.get("fresh_count") == 0 and r2.get("cached_count") == len(paras_h6))
+
+    # Mixed: one new (fresh) + one already cached.
+    mixed = ["h6_mixed_brand_new", paras_h6[0]]
+    r3 = client.post("/translate/batch", json={"paragraphs": mixed}).get_json()
+    check("H6: mixed batch has one fresh + one cache",
+          r3.get("fresh_count") == 1 and r3.get("cached_count") == 1)
+    check("H6: mixed batch per-para backends align correctly",
+          r3["backends"][0] != "cache" and r3["backends"][1] == "cache")
+    check("H6: mixed batch per-para cached align correctly",
+          r3["cached"][0] is False and r3["cached"][1] is True)
+
+    # Backend attribution: with local down, fresh paragraphs should report
+    # the fallback provider.
+    STATE["local_up"] = False
+    STATE["fallback_up"] = True
+    r4 = client.post("/translate/batch",
+                     json={"paragraphs": ["h6_fallback_only_para"]}).get_json()
+    check("H6: fallback provider reported in per-para backends",
+          r4.get("backends") and r4["backends"][0] == "minimax")
+    STATE["local_up"] = True
+
+    # Empty paragraph: backends[i] should be "" (no backend, no cache).
+    r5 = client.post("/translate/batch", json={"paragraphs": [""]}).get_json()
+    check("H6: empty paragraph has backends[i] == '' (no backend)",
+          r5.get("backends") and r5["backends"][0] == "")
+    check("H6: empty paragraph has cached[i] == False",
+          r5.get("cached") and r5["cached"][0] is False)
+
+    # Backward compat: the original aggregate fields are still there.
+    check("H6: backward compat: cached_count still present",
+          "cached_count" in r1 and "fresh_count" in r1)
+
 
 if __name__ == "__main__":
     run()
