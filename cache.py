@@ -177,11 +177,31 @@ def get_cache_stats() -> dict:
     return {
         "total_entries": total,
         "total_hits": total_hits,
-        "db_size_mb": round(os.path.getsize(str(DB_PATH)) / (1024 * 1024), 2),
+        "db_size_mb": _db_size_mb(),
         "language_pairs": {
             f"{s}→{t}": c for s, t, c in pairs
         },
     }
+
+
+def _db_size_mb() -> float:
+    """Total bytes occupied by the SQLite file plus its WAL/SHM siblings.
+
+    With ``journal_mode=WAL``, the main ``.db`` file stays small (often empty)
+    while the actual pages live in ``-wal``. Reports that only inspect the
+    main file under-report the real on-disk footprint by an order of
+    magnitude — operators relying on this for backup sizing or cleanup
+    triggers would make decisions on stale data. Sum all three files.
+    """
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        path = str(DB_PATH) + suffix
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            # -shm/-wal may not exist yet on a brand-new database
+            continue
+    return round(total / (1024 * 1024), 2)
 
 
 def cleanup_old_entries(days: int = 30) -> int:
