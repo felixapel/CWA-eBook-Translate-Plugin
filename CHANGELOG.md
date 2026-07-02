@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-02
+
+Production-hardening release: security audit fixes (Hermes sprint) plus
+review fixes on top.
+
+### Fixed
+- **Container crashed with a root-owned bind-mounted data dir** (every real
+  deployment): the non-root gunicorn could not open the SQLite DB. The
+  entrypoint now chowns `/app/data` before dropping privileges.
+- **Fallback cache poisoning residue**: translations produced by the fallback
+  provider were cached under the primary model's key. Writes now use the
+  model that actually served the text; lookups probe primary then fallback
+  keys, so outage-era work is never re-paid.
+- Cleanup-token auto-generation now persists the token when the token file
+  exists but is empty.
+- `/stats` reported `db_size_mb: 0.0` under WAL (now sums `-wal`/`-shm`).
+- `source_lang == target_lang` no longer spends an LLM call (echo passthrough).
+- Cache keys are scoped by model, so switching `LLM_MODEL`/provider never
+  serves stale translations from the previous backend. Existing cache entries
+  (model-less keys) cold-miss once and re-warm naturally.
+
+### Added
+- Non-root API: gunicorn runs as `appuser` via gosu (nginx keeps root for the
+  listen port); `LLM_API_KEY` is no longer baked as an image ENV.
+- `BT_TRUSTED_PROXIES` CIDR allowlist for X-Forwarded-For (spoof-safe
+  replacement for the dev-only `BT_TRUST_PROXY=true`).
+- `BT_MAX_CONTENT_LENGTH` (default 2 MB) WSGI-level request cap with a JSON
+  413 handler; sized for 50-paragraph CJK batches.
+- `/cache/cleanup` always requires auth; when `BT_API_TOKEN` is unset a token
+  is auto-generated, persisted (0600) and logged once.
+- `/translate/batch` returns per-paragraph `backends[]` and `cached[]`
+  attribution; `/stats` exempt from rate limiting (still behind auth).
+- CI: pip-audit + npm audit dependency gates, Docker build smoke test,
+  `scripts/audit-deps.sh`; `test_hardening.py` suite.
+- Private LAN IPs replaced with placeholders across public docs/scripts.
+
 ## [2.0.0] - 2026-07-02
 
 ### Added
