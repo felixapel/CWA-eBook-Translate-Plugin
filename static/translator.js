@@ -5,7 +5,7 @@
 (function () {
     'use strict';
     // ── Version & Telemetry ──────────────────────────────────────────
-    const BT_UI_VERSION = '2.1.0';
+    const BT_UI_VERSION = '2.1.1';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
@@ -52,7 +52,13 @@
 
     // UI / status state
     let prefetchEnabled = localStorage.getItem('bt_prefetch') !== '0'; // translate whole chapter ahead
-    let chapterTotal = 0;     // paragraphs queued for the current chapter's background fill
+    // Honest chapter progress: `chapterDone` counts paragraphs actually
+    // processed this session (visible AND prefetch), `inflightCount` the ones
+    // currently at the API. The displayed total is computed live as
+    // done + inflight + still-queued, so it stays truthful when queues are
+    // re-filtered (cached/stale items dropped) or re-triggered on page turns.
+    let chapterDone = 0;
+    let inflightCount = 0;
     let errorCount = 0;       // consecutive failed requests (drives the error state)
     let doneHideTimer = null;
     let lastTriggerReason = 'init'; // why translateCurrentPage last ran (shown in the debug menu)
@@ -117,10 +123,19 @@
         activeControllers.clear();
         visibleQueue = [];
         prefetchQueue = [];
+        chapterDone = 0;
+        inflightCount = 0;
         isTranslating = false;
         isPrefetching = false;
         refreshStatus();
         return generation;
+    }
+
+    function chapterProgress() {
+        // done / total for the current chapter session. Total is live:
+        // processed + in flight + still queued — never a stale snapshot.
+        const total = chapterDone + inflightCount + visibleQueue.length + prefetchQueue.length;
+        return { done: chapterDone, total: total };
     }
 
     function isBadTranslation(tr) {
@@ -513,18 +528,25 @@
                 text.textContent = t.error;
             } else if (isTranslating) {
                 state = 'page';
-                text.textContent = t.translatingPage;
+                // Visible-page work: show honest progress when a chapter
+                // session is running (done counts BOTH visible and prefetch
+                // paragraphs, so it never sits at 0 while translating).
+                const p = chapterProgress();
+                text.textContent = p.total > 1
+                    ? `${t.translatingPage} ${Math.min(p.done, p.total)}/${p.total}`
+                    : t.translatingPage;
             } else if (isPrefetching || prefetchQueue.length > 0) {
                 state = 'chapter';
-                const done = Math.max(0, chapterTotal - prefetchQueue.length);
-                if (fill && chapterTotal > 0) fill.style.width = Math.round(done / chapterTotal * 100) + '%';
-                text.textContent = `${t.translatingChapter} ${done}/${chapterTotal}`;
-            } else if (chapterTotal > 0) {
+                const p = chapterProgress();
+                const done = Math.min(p.done, p.total);
+                if (fill && p.total > 0) fill.style.width = Math.round(done / p.total * 100) + '%';
+                text.textContent = `${t.translatingChapter} ${done}/${p.total}`;
+            } else if (chapterDone > 0) {
                 state = 'done';
                 if (fill) fill.style.width = '100%';
                 text.textContent = t.done;
                 doneHideTimer = setTimeout(() => {
-                    chapterTotal = 0;
+                    chapterDone = 0;
                     const b = document.getElementById('bt-bar');
                     if (b && b.dataset.state === 'done') { b.dataset.state = 'idle'; }
                 }, 2500);
@@ -769,36 +791,44 @@
                 
                 isTranslating = isVisible;
                 isPrefetching = !isVisible;
+                inflightCount = batch.length;
                 refreshStatus();
-                
+
                 let data = null;
                 try {
                     data = await postBatch(batch.map(b => b.text));
                 } catch (e) {
-                    if (e.name !== 'AbortError') { 
-                        console.error("Translation request failed:", e); 
-                        errorCount++; 
+                    if (e.name !== 'AbortError') {
+                        console.error("Translation request failed:", e);
+                        errorCount++;
+                        chapterDone += batch.length;   // processed (failed) — keep the counter honest
                     }
+                    inflightCount = 0;
                     lastRequestEnd = Date.now();
                     continue;
                 }
-                
+
+                inflightCount = 0;
                 lastRequestEnd = Date.now();
-                
+
                 if (data && data.error === 'rate_limited') {
                     rateLimitUntil = Date.now() + (data.retry_after * 1000);
                     // Put the batch back at the front of the corresponding queue
+                    // (NOT counted as done — it will be retried).
                     if (isVisible) visibleQueue.unshift(...batch);
                     else prefetchQueue.unshift(...batch);
                     // errorCount not incremented for rate limit
                     continue;
                 }
-                
+
                 if (!data || !Array.isArray(data.translations)) {
                     errorCount++;
+                    chapterDone += batch.length;
                     refreshStatus();
                     continue;
                 }
+
+                chapterDone += batch.length;
                 
                 let stored = false, anyGood = false;
                 data.translations.forEach((tr, idx) => {
@@ -844,8 +874,10 @@
         const visibleSet = new Set(visibleEls);
         const prefetchEls = prefetchEnabled ? getParagraphs().filter(el => !visibleSet.has(el)) : [];
         prefetchQueue = collectUncached(prefetchEls).map(x => ({...x, gen: myGen}));
-        chapterTotal = prefetchQueue.length;
-        
+        // No snapshot total here: refreshStatus derives done/total live from
+        // chapterDone + inflight + queues (see chapterProgress), so re-triggers
+        // on page turns / iframe mutations can only ADD newly-discovered work.
+
         refreshStatus();
         pumpQueue();
     }
