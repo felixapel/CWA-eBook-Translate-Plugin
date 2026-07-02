@@ -189,6 +189,8 @@ Environment variables for the `book-translator` container:
 | `BT_MAX_BATCH_PARAGRAPHS` | `50` | Max paragraphs accepted per `/translate/batch` request (oversized requests get `413`). Protects your GPU/API bill from a single runaway request. |
 | `BT_MAX_PARAGRAPH_CHARS` | `8000` | Max characters per paragraph (`413` beyond it). |
 | `BT_MAX_CONTENT_LENGTH` | `2097152` (2 MB) | Hard cap on the request body (the WSGI-level backstop). Per-field caps (`BT_MAX_BATCH_PARAGRAPHS`, `BT_MAX_PARAGRAPH_CHARS`) check the parsed content; this cap rejects oversize bodies before parsing. Lower it for untrusted networks, raise it for very long paragraphs. |
+| `BT_MAX_UPSTREAM_INFLIGHT` | `0` | Process-wide cap on simultaneous in-flight LLM calls (`0` = unlimited). `BT_MAX_CONCURRENT` bounds concurrency per request; this bounds the TOTAL across all requests — set `2` for a single local GPU to prevent timeout cascades under multi-reader load. |
+| `BT_HEALTH_DETAILS` | `true` | When `false` (and `BT_API_TOKEN` is set), unauthenticated `/health` returns only `{"status":"ok"}` — backend names/latency require the token. Use when the API is reachable beyond a trusted LAN. |
 | `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max requests per client IP per 60s window before the API returns `429`. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | Seconds reported in the `Retry-After` header / response body on a `429`. The frontend reads this and backs off automatically. |
 | `BT_TRUST_PROXY` | `false` | **Legacy/dev only.** When `true`, the API trusts the first `X-Forwarded-For` hop from any peer as the rate-limit key. A client that can reach the API directly can spoof this header and bypass the rate limiter. In production, prefer `BT_TRUSTED_PROXIES` below. |

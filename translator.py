@@ -212,12 +212,29 @@ def _translate_anthropic(p: _Provider, user_content: str, system_prompt: str, ti
     return translated
 
 
+# ── Global upstream concurrency cap ─────────────────────────────────────────
+# BT_MAX_CONCURRENT bounds concurrency *per request*; with gunicorn's 8 threads
+# the worst case is 8 x BT_MAX_CONCURRENT simultaneous LLM calls — enough to
+# start a timeout cascade on a single-GPU local model. BT_MAX_UPSTREAM_INFLIGHT
+# is a PROCESS-WIDE cap on in-flight provider calls (0 = unlimited, the
+# default, preserving previous behavior). For a single local GPU, 2 is a good
+# value; cloud APIs generally don't need it.
+import threading as _threading
+BT_MAX_UPSTREAM_INFLIGHT = int(os.environ.get("BT_MAX_UPSTREAM_INFLIGHT", "0"))
+_UPSTREAM_SEM = _threading.BoundedSemaphore(BT_MAX_UPSTREAM_INFLIGHT) if BT_MAX_UPSTREAM_INFLIGHT > 0 else None
+
+
 def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                    max_retries: int, timeout: int, max_tokens: int) -> str:
     """Call one provider with retry/backoff. Raises on definitive failure."""
     last_error = None
     for attempt in range(max_retries):
         try:
+            if _UPSTREAM_SEM is not None:
+                with _UPSTREAM_SEM:
+                    if p.api_type == "openai":
+                        return _translate_openai(p, user_content, system_prompt, timeout, max_tokens)
+                    return _translate_anthropic(p, user_content, system_prompt, timeout, max_tokens)
             if p.api_type == "openai":
                 return _translate_openai(p, user_content, system_prompt, timeout, max_tokens)
             return _translate_anthropic(p, user_content, system_prompt, timeout, max_tokens)

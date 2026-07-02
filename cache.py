@@ -42,7 +42,7 @@ def init_db():
                 source_lang TEXT NOT NULL,
                 target_lang TEXT NOT NULL,
                 translated_text TEXT NOT NULL,
-                model TEXT NOT NULL DEFAULT 'MiniMax-M3',
+                model TEXT NOT NULL DEFAULT 'unknown',
                 created_at TEXT NOT NULL,
                 hit_count INTEGER NOT NULL DEFAULT 1
             )

@@ -37,7 +37,8 @@ container, request cap, proxy allowlist, cleanup auth fail-safe, IP hygiene).
   (the common self-host case), the endpoint auto-generates a
   `secrets.token_urlsafe(32)` token, persists it to
   `BT_CACHE_DIR/cleanup_token` (mode 0600, owned by `appuser`), and logs
-  it once at WARNING. Operators read it from `docker logs` or set
+  a notice once at WARNING (since 2.1.1 the VALUE is never logged —
+  read it with `docker exec <container> cat /app/data/cleanup_token`) or set
   `BT_API_TOKEN` to silence.
 - New `BT_TRUSTED_PROXIES` env var: a comma-separated allowlist of CIDRs
   or IPs the *peer* must match before `X-Forwarded-For` is honored.
@@ -83,7 +84,7 @@ No data migrations. No breaking changes.
   - `/app/data/cleanup_token` is mode 0600, owned by `appuser`
   - `/cache/cleanup` with no header: 401
   - `/cache/cleanup` with bogus header: 401
-  - `/cache/cleanup` with the auto-gen token from `docker logs`: 200
+  - `/cache/cleanup` with the auto-gen token from the persisted token file: 200
   - 3 MB body to `/translate`: 413 with JSON body
 - `pip-audit -r requirements.txt --strict`: 0 vulnerabilities
 - `npm audit --omit=dev`: 0 vulnerabilities

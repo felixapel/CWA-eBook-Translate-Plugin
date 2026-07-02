@@ -32,6 +32,11 @@ server {
     gzip_types text/css application/javascript application/json;
 
     location /bt-api/ {
+        # The API's own WSGI cap is 2 MB (BT_MAX_CONTENT_LENGTH); 3 MB here
+        # lets Flask return its structured JSON 413 while nginx still stops
+        # grossly oversized bodies before buffering them to the backend.
+        # (The catch-all location keeps 0 = unlimited for CWA book uploads.)
+        client_max_body_size 3m;
         proxy_pass http://127.0.0.1:${PORT}/;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

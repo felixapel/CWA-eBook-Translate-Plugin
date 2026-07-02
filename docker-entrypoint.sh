@@ -25,8 +25,14 @@ export PORT BT_PROXY_PORT BT_UI_VERSION
 # file"). Reproduced with `-v /root-owned-dir:/app/data`; anonymous volumes
 # masked it because they inherit the image's ownership.
 mkdir -p /app/data
-chown -R appuser:appuser /app/data 2>/dev/null || \
-    echo "[entrypoint] WARNING: could not chown /app/data (read-only mount?) — the API may fail to write its cache"
+# Only repair ownership when appuser actually lacks write access, and only on
+# the flat data dir + its immediate files (no -R: recursive chown on a big
+# host appdata tree is slow and mutates host-side ownership more than needed).
+if ! gosu appuser sh -c 'test -w /app/data && { test ! -e /app/data/translations.db || test -w /app/data/translations.db; }'; then
+    chown appuser:appuser /app/data /app/data/* /app/data/.[!.]* 2>/dev/null || true
+    gosu appuser sh -c 'test -w /app/data' || \
+        echo "[entrypoint] WARNING: could not make /app/data writable (read-only mount?) — the API may fail to write its cache"
+fi
 
 # Drop privileges for gunicorn. `gosu` (vs su) does not leak env or fork a
 # tty, and forwards signals (SIGTERM) cleanly to the child process so
