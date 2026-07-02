@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-07-02
+
+Reader-formatting and language-picker fixes from real-world reading reports.
+
+### Fixed
+- **Whole chapter translated as one giant block**: hierarchy de-duplication
+  kept the ANCESTOR when both a chapter wrapper (e.g.
+  `<section class="chapter">`, matched via `[class*="chapter"]`) and its
+  paragraphs were selected. Dedup now keeps the smallest units and drops
+  ancestors; `section`/`article`/`aside` wrappers with block children are
+  excluded outright. Regression-tested with the wrapper shape
+  Calibre-converted epubs actually ship.
+- Oversized elements (>7500 chars — always mis-detected containers) are
+  skipped client-side so they can never 413 an entire batch.
+- **Language dropdown rendered blank rows until hovered/scrolled** (Chromium
+  paint glitch): options inherited the pill's translucent background —
+  explicit opaque colors on `option`/`optgroup` fix it.
+- Language list is now visibly alphabetical: A-Z group labels lead with the
+  English name ("Albanian — Shqip"), so sorting is obvious and native
+  type-to-jump works on latin keyboards; top-10 group keeps endonym-first
+  ("Español — Spanish").
+
 ## [2.1.1] - 2026-07-02
 
 Release-hygiene and UX-truth patch (external deep-audit follow-up).

@@ -5,7 +5,7 @@
 (function () {
     'use strict';
     // ── Version & Telemetry ──────────────────────────────────────────
-    const BT_UI_VERSION = '2.1.1';
+    const BT_UI_VERSION = '2.1.2';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
@@ -357,13 +357,20 @@
         bar.dataset.state = 'idle';
 
         // Build the language <option> list once: top-10 most spoken first,
-        // then every other supported language A-Z. Native <select> provides
-        // type-to-search within the open dropdown.
-        const opt = l =>
-            `<option value="${l.code}"${l.code === TARGET_LANG ? ' selected' : ''}>${l.name}</option>`;
+        // then every other supported language A-Z.
+        // Label format matters for usability:
+        //  - top-10: "Endonym — English" (endonym is the recognizable form there)
+        //  - A-Z group: "English — Endonym", so the VISIBLE text is what the list
+        //    is sorted by (endonym-first looked unsorted) and the native select's
+        //    type-to-jump works with a latin keyboard for every language.
+        const opt = (l, englishFirst) => {
+            const label = l.name === l.code ? l.code
+                : englishFirst ? `${l.code} — ${l.name}` : `${l.name} — ${l.code}`;
+            return `<option value="${l.code}"${l.code === TARGET_LANG ? ' selected' : ''}>${label}</option>`;
+        };
         const langOptions =
-            `<optgroup label="${t.topLanguages}">${TOP_LANGUAGES.map(opt).join('')}</optgroup>` +
-            `<optgroup label="${t.allLanguages}">${MORE_LANGUAGES.map(opt).join('')}</optgroup>`;
+            `<optgroup label="${t.topLanguages}">${TOP_LANGUAGES.map(l => opt(l, false)).join('')}</optgroup>` +
+            `<optgroup label="${t.allLanguages}">${MORE_LANGUAGES.map(l => opt(l, true)).join('')}</optgroup>`;
 
         bar.innerHTML =
             `<button id="bt-toggle" title="${t.cycleHint}">` +
@@ -628,24 +635,31 @@
             // Blocks containing a link: let the link translate itself (keeps it clickable).
             if (['li', 'div', 'td'].includes(tagName) && el.querySelector('a')) return false;
 
-            // Containers holding other block children: translate the children, not the wrapper.
-            if (['div', 'blockquote', 'li', 'td'].includes(tagName)
-                && el.querySelector('p, h1, h2, h3, h4, h5, h6, li, blockquote')) return false;
+            // Containers holding other block children: translate the children, not
+            // the wrapper. `section`/`article` matter: chapter wrappers like
+            // <section class="chapter"> match the [class*="chapter"] selector and,
+            // unfiltered, get translated as ONE mega-block containing the whole
+            // chapter (seen in production with a Calibre-converted epub).
+            if (['div', 'blockquote', 'li', 'td', 'section', 'article', 'aside'].includes(tagName)
+                && el.querySelector('p, h1, h2, h3, h4, h5, h6, li, blockquote, div.calibre1, div.text')) return false;
 
             return true;
         });
 
-        // 2. De-duplicate hierarchy via a Set (O(n)): skip a child if an ancestor is
-        // already selected, so we translate the logical block once.
+        // 2. De-duplicate hierarchy (O(n·depth)): when BOTH a wrapper and its inner
+        // paragraphs are selected, keep the SMALLEST units (leaves) and drop the
+        // ancestor. Keeping the ancestor — the previous behaviour — translated the
+        // whole chapter as one giant block whenever a wrapper slipped through.
         const filteredSet = new Set(filtered);
-        return filtered.filter(el => {
+        const ancestorsToDrop = new Set();
+        for (const el of filtered) {
             let parent = el.parentElement;
             while (parent) {
-                if (filteredSet.has(parent)) return false;
+                if (filteredSet.has(parent)) ancestorsToDrop.add(parent);
                 parent = parent.parentElement;
             }
-            return true;
-        });
+        }
+        return filtered.filter(el => !ancestorsToDrop.has(el));
     }
 
     function getParagraphs() {
@@ -699,12 +713,21 @@
     const PREFETCH_CHUNK = 3;      // paragraphs per request for background fill
     const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
 
+    // Server rejects paragraphs beyond BT_MAX_PARAGRAPH_CHARS (default 8000)
+    // with a 413 that would fail the WHOLE batch. Skip oversized elements
+    // client-side — they are almost always mis-detected wrappers, not prose.
+    const CLIENT_MAX_PARAGRAPH_CHARS = 7500;
+
     function collectUncached(elements) {
         const out = [];
         const seen = new Set();
         for (const el of elements) {
             const text = getParagraphText(el);
             if (!text || text.length < 2) continue;
+            if (text.length > CLIENT_MAX_PARAGRAPH_CHARS) {
+                console.warn(`[BookTranslator] skipping oversized element (${text.length} chars) — likely a container, not a paragraph`);
+                continue;
+            }
             const hash = hashText(text);
             if (translatedParagraphs[hash] || seen.has(hash)) continue;
             seen.add(hash);

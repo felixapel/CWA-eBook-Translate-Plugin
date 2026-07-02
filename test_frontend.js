@@ -49,13 +49,21 @@ const dom = new JSDOM(`
 });
 
 const iframeDoc = dom.window.document.querySelector("iframe").contentDocument;
+// The paragraphs live inside a <section class="chapter"> wrapper — the shape
+// Calibre-converted epubs actually ship. The wrapper matches the
+// [class*="chapter"] candidate selector; a regression here means the whole
+// chapter gets translated as ONE mega-block (seen in production, v2.1.1).
+// The fetch-order assertions below double as the regression test: with the
+// wrapper bug, the first fetched "paragraph" would be the concatenated text.
 iframeDoc.body.innerHTML = `
+  <section class="chapter">
     <p class="calibre1">visible 1</p>
     <p class="calibre1">visible 2</p>
     <p class="calibre1">prefetch 1</p>
     <p class="calibre1">prefetch 2</p>
     <p class="calibre1">prefetch 3</p>
     <p class="calibre1">prefetch 4</p>
+  </section>
 `;
 
 iframeDoc.querySelectorAll('p').forEach((p, idx) => {
@@ -63,6 +71,9 @@ iframeDoc.querySelectorAll('p').forEach((p, idx) => {
         width: 100, height: 20,
         left: 0, top: idx < 2 ? 0 : 1000 // First two are visible
     });
+});
+iframeDoc.querySelector('section').getBoundingClientRect = () => ({
+    width: 100, height: 2000, left: 0, top: 0 // wrapper is "visible" too — worst case
 });
 dom.window.innerWidth = 800;
 dom.window.innerHeight = 600;
