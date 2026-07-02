@@ -122,6 +122,7 @@ docker run -d --name book-translator-api --restart unless-stopped --net bridge \
   -e LLM_PROVIDER=local -e LLM_MODEL=gemma4-12b \
   -e BT_LOCAL_URL=http://<YOUR-HOST-IP>:2819/v1/chat/completions \
   -e BT_BATCH_SIZE=3 -e BT_MAX_CONCURRENT=1 -e BT_TIMEOUT=60 \
+  -e BT_MAX_UPSTREAM_INFLIGHT=2 \
   -e BT_CONTEXT_WINDOW=1 -e BT_MAX_TOKENS=640 -e BT_BATCH_MAX_TOKENS=1200 \
   local/book-translator-api:latest
 
@@ -168,6 +169,7 @@ docker run -d \
   -e BT_LOCAL_URL=http://<YOUR-HOST-IP>:2819/v1/chat/completions \
   -e BT_BATCH_SIZE=3 \
   -e BT_MAX_CONCURRENT=1 \
+  -e BT_MAX_UPSTREAM_INFLIGHT=2 \
   -e BT_TIMEOUT=60 \
   -e BT_CONTEXT_WINDOW=1 \
   -e BT_MAX_TOKENS=640 \
