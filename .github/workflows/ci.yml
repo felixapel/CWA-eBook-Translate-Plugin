@@ -38,6 +38,7 @@ jobs:
         run: python3 -m pip install --break-system-packages -r requirements.txt
       - run: python3 -m py_compile server.py translator.py cache.py
       - run: python3 test_translation.py
+      - run: python3 test_hardening.py
 
   frontend:
     runs-on: ubuntu-latest
@@ -50,3 +51,45 @@ jobs:
       - run: node -c static/loader.js
       - run: npm install
       - run: npm test
+
+  # Smoke test: build the image, run it, hit /ping, expect 200.
+  # Catches Dockerfile regressions (syntax, missing deps, broken entrypoint,
+  # USER appuser) that pure Python tests can't. Skips when Docker isn't
+  # available (e.g. minimal Gitea job containers without dind).
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t bt-audit:ci .
+      - name: Run container
+        run: |
+          docker run -d --name bt-smoke -p 8390:8390 bt-audit:ci
+          # Wait for /ping to come up (the image has start-period=10s in its
+          # HEALTHCHECK, but we don't want to depend on Docker's healthcheck
+          # state for the smoke test — poll the endpoint directly).
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8390/ping >/dev/null 2>&1; then
+              echo "ping ok on try $i"
+              break
+            fi
+            sleep 1
+          done
+          # The actual assertion: /ping returns 200 with {"status":"ok"}.
+          curl -sf http://127.0.0.1:8390/ping | grep -q '"status":"ok"'
+      - name: Verify non-root API process
+        # The /ping endpoint serves from gunicorn. The `appuser` should own
+        # the gunicorn process; the entrypoint (and nginx if it were started)
+        # can stay root.
+        run: |
+          PID=$(docker exec bt-smoke pgrep -f 'gunicorn.*server:app' | head -1)
+          USER=$(docker exec bt-smoke ps -o user= -p "$PID" | tr -d ' ')
+          if [ "$USER" = "appuser" ]; then
+            echo "gunicorn runs as appuser (unprivileged) — OK"
+          else
+            echo "gunicorn runs as $USER, expected appuser"
+            exit 1
+          fi
+      - name: Cleanup
+        if: always()
+        run: docker rm -f bt-smoke 2>/dev/null || true

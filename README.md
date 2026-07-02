@@ -185,9 +185,10 @@ Environment variables for the `book-translator` container:
 | `LLM_FALLBACK_PROVIDER` | | Optional. A secondary provider used automatically when the primary fails (e.g. `minimax` while `local` is slow/down). |
 | `LLM_FALLBACK_MODEL` | | Model name for the fallback provider. |
 | `LLM_FALLBACK_API_KEY` | | API key for the fallback provider. |
-| `BT_API_TOKEN` | | Optional shared secret. When set, translate endpoints require the `X-BT-Token` header — use it if the API is reachable beyond your LAN. In proxy mode set it per-browser via `localStorage.setItem('bt_token', '<token>')`; in bind-mount installs set `apiToken` in `window.BOOK_TRANSLATOR`. |
+| `BT_API_TOKEN` | | Optional shared secret. When set, translate endpoints require the `X-BT-Token` header — use it if the API is reachable beyond your LAN. In proxy mode set it per-browser via `localStorage.setItem('bt_token', '<token>')`; in bind-mount installs set `apiToken` in `window.BOOK_TRANSLATOR`. Also gates `/cache/cleanup` (a destructive endpoint) for the same reason. |
 | `BT_MAX_BATCH_PARAGRAPHS` | `50` | Max paragraphs accepted per `/translate/batch` request (oversized requests get `413`). Protects your GPU/API bill from a single runaway request. |
 | `BT_MAX_PARAGRAPH_CHARS` | `8000` | Max characters per paragraph (`413` beyond it). |
+| `BT_MAX_CONTENT_LENGTH` | `2097152` (2 MB) | Hard cap on the request body (the WSGI-level backstop). Per-field caps (`BT_MAX_BATCH_PARAGRAPHS`, `BT_MAX_PARAGRAPH_CHARS`) check the parsed content; this cap rejects oversize bodies before parsing. Lower it for untrusted networks, raise it for very long paragraphs. |
 | `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max requests per client IP per 60s window before the API returns `429`. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | Seconds reported in the `Retry-After` header / response body on a `429`. The frontend reads this and backs off automatically. |
 | `BT_TRUST_PROXY` | `false` | When the API sits behind a **trusted** reverse proxy, set `true` to rate-limit by the first `X-Forwarded-For` hop instead of the proxy's own address. |
