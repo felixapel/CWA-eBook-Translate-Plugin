@@ -206,6 +206,26 @@ def run():
     after_hits = client.get("/stats").get_json()["total_hits"]
     check("stats: cache hit increments total_hits", after_hits == before_hits + 1)
 
+    # source==target batch short-circuit returns the FULL response contract
+    # (backends[]/cached[] must be present so API clients can index safely).
+    d = client.post("/translate/batch", json={
+        "paragraphs": ["same lang a", "same lang b"],
+        "source_lang": "English", "target_lang": "English"}).get_json()
+    check("same-lang batch: full contract shape",
+          d.get("skipped") == "source==target"
+          and d.get("backends") == ["skipped", "skipped"]
+          and d.get("cached") == [False, False]
+          and d.get("translations") == ["same lang a", "same lang b"])
+
+    # Loader inherits its version from its own ?v= param (no hardcoded version).
+    loader_src = open("static/loader.js", encoding="utf-8").read()
+    check("loader: no hardcoded semver", not re.search(r"VERSION\s*=\s*'\d", loader_src))
+    check("loader: derives version from currentScript", "document.currentScript" in loader_src)
+
+    # The cleanup token value must never be written to logs.
+    check("token hygiene: token value not logged",
+          "cleanup token: %s" not in open("server.py", encoding="utf-8").read())
+
     # Fallback cache scoping: a translation produced by the FALLBACK provider
     # must be cached under the fallback's model key (caching it under the
     # primary model would be cross-provider poisoning via the fallback path),

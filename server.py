@@ -8,6 +8,7 @@ import re
 import time
 import threading
 import uuid
+import hmac
 from collections import defaultdict
 from pathlib import Path
 from flask import Flask, request, jsonify
@@ -202,6 +203,12 @@ def _cleanup_rate_limits():
 
 threading.Thread(target=_cleanup_rate_limits, daemon=True).start()
 
+def _token_matches(provided: str, expected: str) -> bool:
+    """Constant-time token comparison (avoids timing side-channels on the
+    shared-secret checks; hmac.compare_digest is the standard tool)."""
+    return bool(provided) and bool(expected) and hmac.compare_digest(provided, expected)
+
+
 def _client_ip() -> str:
     """Rate-limit key. Uses X-Forwarded-For's first hop only when the peer
     (the IP the WSGI server actually saw, NOT the X-Forwarded-For value) is
@@ -352,7 +359,7 @@ def before_request_hook():
     # probes always work. /stats stays under auth so cache contents aren't
     # leakable on unauthenticated LANs.)
     if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ping"):
-        if request.headers.get("X-BT-Token") != API_TOKEN:
+        if not _token_matches(request.headers.get("X-BT-Token", ""), API_TOKEN):
             return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
 
     # Rate limiting (H6) — exempt observability endpoints so operators can
@@ -425,9 +432,20 @@ def ping():
     return jsonify({"status": "ok"})
 
 
+BT_HEALTH_DETAILS = os.environ.get("BT_HEALTH_DETAILS", "true").lower() in ("1", "true", "yes")
+
+
 @app.route("/health")
 def health():
-    """Health check with backend status (M2)."""
+    """Health check with backend status (M2).
+
+    /health is exempt from auth so liveness probes always work. When the API
+    is exposed beyond a trusted LAN, set BT_HEALTH_DETAILS=false to hide the
+    provider names/latency from unauthenticated callers (a valid X-BT-Token
+    still gets the full body); /ping remains the bare liveness endpoint."""
+    if not BT_HEALTH_DETAILS and API_TOKEN and not _token_matches(request.headers.get("X-BT-Token", ""), API_TOKEN):
+        return jsonify({"status": "ok", "service": "book-translator",
+                        "request_id": getattr(request, "request_id", None)})
     backend_health = check_backend_health()
     overall = "ok" if any(
         b.get("status") == "ok" for b in backend_health.values()
@@ -620,8 +638,11 @@ def translate_batch_endpoint():
         req_id = getattr(request, "request_id", None)
         log.info("req=%s short-circuit batch source==target (%s, %d paragraphs)",
                  req_id, source_lang, len(paragraphs))
+        _record_metric(0, hits=0, misses=0)
         return jsonify({
             "translations": paragraphs,
+            "backends": ["skipped"] * len(paragraphs),
+            "cached": [False] * len(paragraphs),
             "cached_count": 0,
             "fresh_count": 0,
             "skipped": "source==target",
@@ -650,16 +671,16 @@ def cache_cleanup():
          only token accepted for the whole API)
       2. Per-process auto-generated token persisted in /app/data/cleanup_token
          (only consulted when BT_API_TOKEN is empty). The token is generated
-         on first use with secrets.token_urlsafe, written to a file with
-         mode 0600, and logged at INFO so the operator can read it from
-         `docker logs`. This is the fail-safe: an operator who forgets to
-         set BT_API_TOKEN does NOT get an unauthenticated destructive
-         endpoint on their LAN.
+         on first use with secrets.token_urlsafe and written to a file with
+         mode 0600 (the value itself is never logged — read it with
+         `docker exec <container> cat /app/data/cleanup_token`). This is
+         the fail-safe: an operator who forgets to set BT_API_TOKEN does
+         NOT get an unauthenticated destructive endpoint on their LAN.
 
     Tests can monkeypatch `_get_cleanup_token` to return a known value."""
     token = _get_cleanup_token()
     request_token = request.headers.get("X-BT-Token", "")
-    if not request_token or request_token != token:
+    if not _token_matches(request_token, token):
         return jsonify({
             "error": "Unauthorized",
             "request_id": getattr(request, "request_id", None),
@@ -713,10 +734,12 @@ def _get_cleanup_token() -> str:
             except OSError:
                 pass
             log.warning(
-                "BT_API_TOKEN not set. Auto-generated /cache/cleanup token: %s "
-                "(persisted at %s). Read it from `docker logs` or set "
-                "BT_API_TOKEN to silence this and use a fixed value.",
-                _cleanup_token_cache, _CLEANUP_TOKEN_PATH,
+                "BT_API_TOKEN not set. Auto-generated a /cache/cleanup token and "
+                "persisted it at %s (mode 0600). Read it with: "
+                "docker exec <container> cat %s — the value is intentionally "
+                "NOT logged (logs are not secret storage). Set BT_API_TOKEN to "
+                "use a fixed value instead.",
+                _CLEANUP_TOKEN_PATH, _CLEANUP_TOKEN_PATH,
             )
     except Exception as e:
         # If we cannot persist, fall back to an in-memory token that lasts
