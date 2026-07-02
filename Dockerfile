@@ -45,7 +45,10 @@ ENV PORT=8390
 # Provider can be: local, openai, anthropic, gemini, groq, together, minimax, deepseek, openrouter
 ENV LLM_PROVIDER="local"
 ENV LLM_MODEL="gemma4-12b"
-ENV LLM_API_KEY=""
+# LLM_API_KEY is intentionally NOT set as an ENV. Pass it at runtime via
+# `docker run -e LLM_API_KEY=...` or `--env-file`. Baking it into the
+# image (even as an empty default) shows up in `docker inspect` and
+# `docker history`; for a multi-user image this is a footgun.
 
 # Stability tunables (override at runtime). For a slow local model keep
 # concurrency low; BT_LOCAL_URL must point at the host, not the container.
