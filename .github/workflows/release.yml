@@ -15,6 +15,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # secrets are not readable inside step `if:` expressions — surface them
+      # as env so the Docker Hub steps can gate on presence.
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,25 +62,25 @@ jobs:
       # the Hub mirror exists for discoverability and `docker pull` muscle
       # memory. Buildx layer cache makes this second push nearly free.
       - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        if: ${{ env.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Extract Docker Hub metadata
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        if: ${{ env.DOCKERHUB_TOKEN != '' }}
         id: meta_hub
         uses: docker/metadata-action@v5
         with:
-          images: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/cwa-ebook-translate-plugin
+          images: docker.io/${{ env.DOCKERHUB_USERNAME }}/cwa-ebook-translate-plugin
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
       - name: Push to Docker Hub
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        if: ${{ env.DOCKERHUB_TOKEN != '' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -85,11 +90,11 @@ jobs:
           labels: ${{ steps.meta_hub.outputs.labels }}
 
       - name: Sync Docker Hub description
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        if: ${{ env.DOCKERHUB_TOKEN != '' }}
         uses: peter-evans/dockerhub-description@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ secrets.DOCKERHUB_USERNAME }}/cwa-ebook-translate-plugin
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_USERNAME }}/cwa-ebook-translate-plugin
           short-description: "Bilingual ebook translation overlay for Calibre-Web-Automated — 100+ languages, local LLMs or cloud APIs"
           readme-filepath: ./README.md
