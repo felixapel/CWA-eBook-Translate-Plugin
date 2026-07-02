@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-07-02
+
+Release-hygiene and UX-truth patch (external deep-audit follow-up).
+
+### Fixed
+- **Proxy loader cache-busting**: `loader.js` hardcoded `?v=2.0.0` for the
+  CSS/JS assets it loads, so browsers could keep stale UI files across
+  releases. The loader now inherits the version from its own injected `?v=`
+  query param — version-free by construction.
+- **Honest chapter progress in the control bar**: the counter only measured
+  the background-prefetch queue, showing "Chapter 0/91" while the visible
+  page was actively translating. Progress is now derived live from
+  paragraphs processed + in flight + queued (visible AND prefetch), shown in
+  both the page and chapter states; rate-limited batches are re-queued
+  without being counted.
+- `/cache/cleanup` auto-generated token is **no longer logged** — logs show
+  only the persisted path (`docker exec <c> cat /app/data/cleanup_token`).
+- Batch `source_lang == target_lang` short-circuit now returns the full
+  response contract (`backends[]`/`cached[]`).
+- SQLite schema default `'MiniMax-M3'` replaced with `'unknown'` (matches the
+  release-notes claim; writes always pass an explicit model).
+- Release notes renamed `RELEASE_NOTES_2.0.0.md` -> `RELEASE_NOTES_2.1.0.md`
+  (the content describes the 2.1.0 hardening sprint).
+
+### Added
+- `BT_MAX_UPSTREAM_INFLIGHT` — process-wide cap on in-flight LLM calls
+  (default 0 = unlimited). Bounds total GPU/API pressure independently of the
+  per-request `BT_MAX_CONCURRENT` (worst case was 8 threads x 2 = 16 calls).
+- `BT_HEALTH_DETAILS=false` hides backend names/latency from unauthenticated
+  `/health` when a token is configured (`/ping` stays the bare liveness probe).
+- nginx: 3 MB body cap on `/bt-api/` (CWA uploads keep unlimited).
+
+### Changed
+- Token comparisons use `hmac.compare_digest` (constant-time).
+- Entrypoint ownership repair is now conditional and non-recursive (only when
+  appuser lacks write access; no `-R` over host appdata).
+- `docker-compose.yml` no longer publishes the direct API port 8390 by
+  default in proxy mode (same-origin `/bt-api` is the supported path).
+- CI `npm audit` covers dev dependencies (jsdom is the only dependency and
+  `--omit=dev` audited nothing).
+
 ## [2.1.0] - 2026-07-02
 
 Production-hardening release: security audit fixes (Hermes sprint) plus
