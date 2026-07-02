@@ -32,6 +32,16 @@ API_TOKEN = os.environ.get("BT_API_TOKEN", "")
 BT_MAX_BATCH_PARAGRAPHS = int(os.environ.get("BT_MAX_BATCH_PARAGRAPHS", "50"))
 BT_MAX_PARAGRAPH_CHARS = int(os.environ.get("BT_MAX_PARAGRAPH_CHARS", "8000"))
 
+# Global request-size cap (defence in depth). The per-field caps above check
+# the *parsed* content; MAX_CONTENT_LENGTH is a hard backstop at the WSGI
+# layer that rejects a 10 MB JSON before we even start parsing. With our
+# defaults (50 paragraphs × 8000 chars + overhead) the per-request ceiling is
+# ~400 KB; the 2 MB default here gives ~5× headroom for a single oversized
+# paragraph and rejects a 10 MB body long before the per-field check fires.
+# Operators behind a slow link can lower it; operators on a research cluster
+# translating longer paragraphs can raise it (or lower BT_MAX_PARAGRAPH_CHARS).
+BT_MAX_CONTENT_LENGTH = int(os.environ.get("BT_MAX_CONTENT_LENGTH", str(2 * 1024 * 1024)))
+
 # Rate-limit key: request.remote_addr by default. Behind a reverse proxy every
 # client shares the proxy's address, so opt in to X-Forwarded-For ONLY when the
 # proxy is trusted to set it (never trust it from direct clients).
@@ -47,6 +57,11 @@ logging.basicConfig(
 log = logging.getLogger("book-translator.server")
 
 app = Flask(__name__)
+
+# Reject oversize request bodies at the WSGI layer (defence in depth — the
+# per-field caps in the route handlers are the second backstop). Returning
+# 413 here means a 10 MB JSON gets rejected before Flask even parses it.
+app.config["MAX_CONTENT_LENGTH"] = BT_MAX_CONTENT_LENGTH
 
 # ── Language validation (H7) ────────────────────────────────────────────────
 # The selectable set mirrors Gemma 4's pre-training coverage (top-10 most
@@ -306,6 +321,22 @@ def after_request_hook(response):
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 
+@app.errorhandler(413)
+def request_too_large(_e):
+    """Return a clean JSON 413 when MAX_CONTENT_LENGTH trips.
+
+    Without this handler Werkzeug returns an HTML body, which is fine for a
+    browser but breaks any API client that JSON-decodes the response. We
+    still want the per-field caps to fire first when the body is small but
+    contains one oversized value — this is purely the backstop path.
+    """
+    req_id = getattr(request, "request_id", None)
+    return jsonify({
+        "error": f"Request body exceeds the {BT_MAX_CONTENT_LENGTH}-byte limit",
+        "request_id": req_id,
+    }), 413
+
+
 @app.route("/ping")
 def ping():
     """Liveness probe — instant, never touches the LLM. Used by the Docker
@@ -495,7 +526,24 @@ def translate_batch_endpoint():
 def cache_cleanup():
     """Evict old cache entries. Optional body: {"days": 30}.
     `days` must be an integer >= 1 — a negative value would match every row
-    (created_at < future date) and silently wipe the whole cache."""
+    (created_at < future date) and silently wipe the whole cache.
+
+    Auth: when BT_API_TOKEN is set, requires the matching X-BT-Token header.
+    Cache cleanup is destructive — without auth, anyone on the LAN could
+    wipe the entire cache. (The other translate endpoints are auth-gated
+    the same way in before_request_hook; this one is gated here so the
+    route's auth requirement is visible at the definition site rather
+    than scattered across middleware.)"""
+    # Auth check, mirroring the before_request pattern. OPTIONS/health/ping
+    # exemptions are not relevant for this method/route.
+    if API_TOKEN:
+        token = request.headers.get("X-BT-Token", "")
+        if token != API_TOKEN:
+            return jsonify({
+                "error": "Unauthorized",
+                "request_id": getattr(request, "request_id", None),
+            }), 401
+
     data = request.get_json(silent=True) or {}
     days = data.get("days", 30)
     if isinstance(days, bool) or not isinstance(days, int) or not (1 <= days <= 3650):
