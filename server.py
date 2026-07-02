@@ -221,7 +221,7 @@ def _translate_paragraphs(
     for i, para in enumerate(paragraphs):
         if not para.strip():
             continue
-        cached = get_cached(para, source_lang, target_lang)
+        cached = get_cached(para, source_lang, target_lang, model=LLM_MODEL)
         if cached is not None:
             translations[i] = cached
             cached_count += 1
@@ -419,7 +419,7 @@ def translate():
         })
 
     # Check cache first
-    cached = get_cached(text, source_lang, target_lang)
+    cached = get_cached(text, source_lang, target_lang, model=LLM_MODEL)
     if cached is not None:
         _record_metric(0, hits=1, misses=0)
         return jsonify({
