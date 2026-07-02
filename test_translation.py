@@ -13,6 +13,7 @@ Covers: provider fallback, errors not cached, batched-prompt translation
 import os, sys, json, re, tempfile
 
 os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_test_translations.db")
+os.environ["BT_CACHE_DIR"] = tempfile.gettempdir()  # for /cache/cleanup auth token
 os.environ["LLM_PROVIDER"] = "local"
 os.environ["LLM_MODEL"] = "fake-model"
 os.environ["LLM_FALLBACK_PROVIDER"] = "minimax"
@@ -20,6 +21,11 @@ os.environ["LLM_FALLBACK_MODEL"] = "fake-fallback"
 os.environ["LLM_FALLBACK_API_KEY"] = "x" * 20
 os.environ["BT_MAX_CONCURRENT"] = "2"
 os.environ["BT_BATCH_SIZE"] = "3"
+# BT_API_TOKEN is intentionally NOT set here. test_translation.py exercises
+# the *translate* endpoints (which are unauth'd when BT_API_TOKEN is empty —
+# matches the typical self-host use case), and the three /cache/cleanup
+# tests below pre-write /tmp/cleanup_token so the auto-gen path can be
+# exercised without a real env var.
 for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_PATH"] + "-shm"):
     try: os.remove(f)
     except OSError: pass
@@ -165,12 +171,25 @@ def run():
           client.post("/translate/batch", json={"paragraphs": ["ok", 42]}).status_code == 400)
 
     # /cache/cleanup input validation: negative days would wipe the whole cache.
-    check("cleanup: negative days rejected",
-          client.post("/cache/cleanup", json={"days": -1}).status_code == 400)
-    check("cleanup: non-integer days rejected",
-          client.post("/cache/cleanup", json={"days": "abc"}).status_code == 400)
-    check("cleanup: valid days accepted",
-          client.post("/cache/cleanup", json={"days": 3650}).status_code == 200)
+    # BT_API_TOKEN is not set; the endpoint auto-generates a token. We pre-write
+    # a known token to BT_CACHE_DIR/cleanup_token (the path server.py uses) and
+    # use that as our X-BT-Token header value.
+    from pathlib import Path as _Path
+    _cleanup_token_file = _Path(os.environ["BT_CACHE_DIR"]) / "cleanup_token"
+    _cleanup_token_file.write_text("test-translation-cleanup-token")
+    server._cleanup_token_cache = None  # force re-read
+    cleanup_headers = {"X-BT-Token": "test-translation-cleanup-token"}
+    try:
+        check("cleanup: negative days rejected",
+              client.post("/cache/cleanup", json={"days": -1}, headers=cleanup_headers).status_code == 400)
+        check("cleanup: non-integer days rejected",
+              client.post("/cache/cleanup", json={"days": "abc"}, headers=cleanup_headers).status_code == 400)
+        check("cleanup: valid days accepted",
+              client.post("/cache/cleanup", json={"days": 3650}, headers=cleanup_headers).status_code == 200)
+    finally:
+        if _cleanup_token_file.exists():
+            _cleanup_token_file.unlink()
+        server._cleanup_token_cache = None
 
     # Cache-key normalization: single + batch endpoints must share entries, and
     # surrounding whitespace must not cause a second paid translation.

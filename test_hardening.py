@@ -19,6 +19,7 @@ from pathlib import Path
 
 # Same env-var contract as test_translation.py.
 os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_test_translations.db")
+os.environ["BT_CACHE_DIR"] = tempfile.gettempdir()  # for /cache/cleanup auth token
 os.environ["LLM_PROVIDER"] = "local"
 os.environ["LLM_MODEL"] = "fake-model"
 os.environ["LLM_FALLBACK_PROVIDER"] = "minimax"
