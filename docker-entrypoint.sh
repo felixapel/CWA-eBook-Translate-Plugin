@@ -18,6 +18,16 @@ BT_PROXY_PORT="${BT_PROXY_PORT:-8080}"
 BT_UI_VERSION="$(cat /app/VERSION 2>/dev/null || echo dev)"
 export PORT BT_PROXY_PORT BT_UI_VERSION
 
+# The data dir is almost always a BIND MOUNT owned by the host (root, or an
+# appdata user) — the build-time chown only covers the image's own layer, so
+# without this runtime chown gunicorn (running as appuser) cannot open the
+# SQLite database and the worker dies at boot ("unable to open database
+# file"). Reproduced with `-v /root-owned-dir:/app/data`; anonymous volumes
+# masked it because they inherit the image's ownership.
+mkdir -p /app/data
+chown -R appuser:appuser /app/data 2>/dev/null || \
+    echo "[entrypoint] WARNING: could not chown /app/data (read-only mount?) — the API may fail to write its cache"
+
 # Drop privileges for gunicorn. `gosu` (vs su) does not leak env or fork a
 # tty, and forwards signals (SIGTERM) cleanly to the child process so
 # `docker stop` reaches gunicorn directly.
