@@ -9,6 +9,7 @@ import time
 import threading
 import uuid
 from collections import defaultdict
+from pathlib import Path
 from flask import Flask, request, jsonify
 
 from translator import translate_text, translate_batch, check_backend_health, LLM_MODEL
@@ -570,21 +571,25 @@ def cache_cleanup():
     `days` must be an integer >= 1 — a negative value would match every row
     (created_at < future date) and silently wipe the whole cache.
 
-    Auth: when BT_API_TOKEN is set, requires the matching X-BT-Token header.
-    Cache cleanup is destructive — without auth, anyone on the LAN could
-    wipe the entire cache. (The other translate endpoints are auth-gated
-    the same way in before_request_hook; this one is gated here so the
-    route's auth requirement is visible at the definition site rather
-    than scattered across middleware.)"""
-    # Auth check, mirroring the before_request pattern. OPTIONS/health/ping
-    # exemptions are not relevant for this method/route.
-    if API_TOKEN:
-        token = request.headers.get("X-BT-Token", "")
-        if token != API_TOKEN:
-            return jsonify({
-                "error": "Unauthorized",
-                "request_id": getattr(request, "request_id", None),
-            }), 401
+    Auth: always required. Two sources of truth for the token, in order:
+      1. BT_API_TOKEN env var (the recommended path; if set, this is the
+         only token accepted for the whole API)
+      2. Per-process auto-generated token persisted in /app/data/cleanup_token
+         (only consulted when BT_API_TOKEN is empty). The token is generated
+         on first use with secrets.token_urlsafe, written to a file with
+         mode 0600, and logged at INFO so the operator can read it from
+         `docker logs`. This is the fail-safe: an operator who forgets to
+         set BT_API_TOKEN does NOT get an unauthenticated destructive
+         endpoint on their LAN.
+
+    Tests can monkeypatch `_get_cleanup_token` to return a known value."""
+    token = _get_cleanup_token()
+    request_token = request.headers.get("X-BT-Token", "")
+    if not request_token or request_token != token:
+        return jsonify({
+            "error": "Unauthorized",
+            "request_id": getattr(request, "request_id", None),
+        }), 401
 
     data = request.get_json(silent=True) or {}
     days = data.get("days", 30)
@@ -592,6 +597,57 @@ def cache_cleanup():
         return jsonify({"error": "'days' must be an integer between 1 and 3650"}), 400
     deleted = cleanup_old_entries(days=days)
     return jsonify({"deleted": deleted, "days": days})
+
+
+# ── Cleanup-token auto-generation ──────────────────────────────────────────
+# Persistent path inside the data dir, alongside the sqlite database. The
+# file is intentionally named without a leading dot so `ls` shows it by
+# default — operators need to be able to see it to understand the auth model.
+import secrets as _secrets  # local: small surface
+_CLEANUP_TOKEN_PATH = Path(os.environ.get("BT_CACHE_DIR", "/app/data")) / "cleanup_token"
+_cleanup_token_cache: str | None = None
+
+
+def _get_cleanup_token() -> str:
+    """Return the active token for /cache/cleanup.
+
+    Order:
+      1. If BT_API_TOKEN is set, use it (single source of truth for the
+         whole API's auth — consistent with the other endpoints).
+      2. Else, read or create /app/data/cleanup_token. The first call
+         generates a fresh secrets.token_urlsafe(32) value, writes it to
+         the file with mode 0600, and logs it once at INFO. Subsequent
+         calls (within the same process) reuse the cached value.
+    """
+    global _cleanup_token_cache
+    if API_TOKEN:
+        return API_TOKEN
+    if _cleanup_token_cache is not None:
+        return _cleanup_token_cache
+    try:
+        _CLEANUP_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _CLEANUP_TOKEN_PATH.exists():
+            _cleanup_token_cache = _CLEANUP_TOKEN_PATH.read_text().strip() or _secrets.token_urlsafe(32)
+        else:
+            _cleanup_token_cache = _secrets.token_urlsafe(32)
+            _CLEANUP_TOKEN_PATH.write_text(_cleanup_token_cache)
+            try:
+                _CLEANUP_TOKEN_PATH.chmod(0o600)
+            except OSError:
+                pass
+            log.warning(
+                "BT_API_TOKEN not set. Auto-generated /cache/cleanup token: %s "
+                "(persisted at %s). Read it from `docker logs` or set "
+                "BT_API_TOKEN to silence this and use a fixed value.",
+                _cleanup_token_cache, _CLEANUP_TOKEN_PATH,
+            )
+    except Exception as e:
+        # If we cannot persist, fall back to an in-memory token that lasts
+        # for the process lifetime. Less convenient for the operator (lost
+        # on restart) but still better than no auth.
+        log.exception("Failed to persist cleanup token; using in-memory fallback")
+        _cleanup_token_cache = _secrets.token_urlsafe(32)
+    return _cleanup_token_cache
 
 
 # ── Main ────────────────────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ Covers:
 Run with: python3 test_hardening.py
 """
 import os, sys, json, tempfile
+from pathlib import Path
 
 # Same env-var contract as test_translation.py.
 os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_test_translations.db")
@@ -80,10 +81,19 @@ def run():
     server.app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
     # ─────────────────────────────────────────────────────────────────────
-    # H2: /cache/cleanup requires API_TOKEN when BT_API_TOKEN is set
+    # H2: /cache/cleanup always requires auth (fail-safe)
     # ─────────────────────────────────────────────────────────────────────
+    # Three sources of truth for the token, in order:
+    #   1. BT_API_TOKEN (set by operator for the whole API)
+    #   2. Auto-generated /app/data/cleanup_token (fail-safe when #1 is unset)
+    # The endpoint is NEVER open, even when the operator forgets to set
+    # BT_API_TOKEN — that's the whole point of the auto-gen path.
+
+    # Path 1: BT_API_TOKEN is set — that token is the only one accepted.
     original_token = server.API_TOKEN
+    original_cached = server._cleanup_token_cache
     server.API_TOKEN = "test-secret-token-please-rotate"
+    server._cleanup_token_cache = None
     try:
         r = client.post("/cache/cleanup", json={"days": 1})
         check("/cache/cleanup: unauthenticated rejected with 401",
@@ -92,7 +102,7 @@ def run():
         r = client.post("/cache/cleanup",
                         json={"days": 30},
                         headers={"X-BT-Token": "test-secret-token-please-rotate"})
-        check("/cache/cleanup: authenticated call accepted",
+        check("/cache/cleanup: authenticated call accepted (BT_API_TOKEN)",
               r.status_code == 200 and "deleted" in r.get_json())
 
         r = client.post("/cache/cleanup",
@@ -102,13 +112,39 @@ def run():
               r.status_code == 401)
     finally:
         server.API_TOKEN = original_token
+        server._cleanup_token_cache = original_cached
 
-    # When API_TOKEN is empty, /cache/cleanup is open (as before). Confirm we
-    # didn't break the original no-token path.
+    # Path 2: BT_API_TOKEN unset. The endpoint must STILL require auth
+    # via the auto-generated /app/data/cleanup_token (or in-memory fallback
+    # if the file system refuses writes). In the test environment, the
+    # data dir is /tmp/bt_test_translations.db's dir, which is writable.
+    # We monkeypatch the token to a known value so we can assert behaviour.
     server.API_TOKEN = ""
-    r = client.post("/cache/cleanup", json={"days": 3650})
-    check("/cache/cleanup: open when BT_API_TOKEN unset",
+    server._cleanup_token_cache = None
+    server._CLEANUP_TOKEN_PATH = Path(tempfile.gettempdir()) / "bt_test_cleanup_token"
+    if server._CLEANUP_TOKEN_PATH.exists():
+        server._CLEANUP_TOKEN_PATH.unlink()
+    # Set a known token by writing the file directly. This simulates a
+    # previous process run that already created the file.
+    server._CLEANUP_TOKEN_PATH.write_text("test-autogen-token-abc")
+
+    r = client.post("/cache/cleanup", json={"days": 1})
+    check("/cache/cleanup: no BT_API_TOKEN, no header -> 401",
+          r.status_code == 401)
+
+    r = client.post("/cache/cleanup",
+                    json={"days": 1},
+                    headers={"X-BT-Token": "test-autogen-token-abc"})
+    check("/cache/cleanup: no BT_API_TOKEN, file token works -> 200",
           r.status_code == 200)
+
+    r = client.post("/cache/cleanup",
+                    json={"days": 1},
+                    headers={"X-BT-Token": "wrong"})
+    check("/cache/cleanup: no BT_API_TOKEN, wrong file token -> 401",
+          r.status_code == 401)
+    server._CLEANUP_TOKEN_PATH.unlink()
+    server._cleanup_token_cache = None
 
     # ─────────────────────────────────────────────────────────────────────
     # H3: /metrics Prometheus-friendly counters
