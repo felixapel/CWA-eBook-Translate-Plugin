@@ -122,12 +122,14 @@ jobs:
         # can stay root.
         if: steps.docker.outputs.available == 'true'
         run: |
-          PID=$(docker exec bt-smoke pgrep -f 'gunicorn.*server:app' | head -1)
-          USER=$(docker exec bt-smoke ps -o user= -p "$PID" | tr -d ' ')
+          # BusyBox `ps` (Alpine) has no -p flag — list user+args and grep the
+          # gunicorn master instead. [g]unicorn avoids matching the grep itself.
+          USER=$(docker exec bt-smoke ps -o user,args | grep '[g]unicorn' | head -1 | awk '{print $1}')
           if [ "$USER" = "appuser" ]; then
             echo "gunicorn runs as appuser (unprivileged) — OK"
           else
-            echo "gunicorn runs as $USER, expected appuser"
+            echo "gunicorn runs as '$USER', expected appuser"
+            docker exec bt-smoke ps -o user,args | head -10
             exit 1
           fi
       - name: Cleanup
