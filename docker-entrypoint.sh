@@ -6,6 +6,11 @@
 # A monitor loop exits the container if either process dies, so the
 # orchestrator's restart policy can do its job instead of the container
 # lingering half-alive.
+#
+# gunicorn runs as `appuser` (unprivileged) via gosu. nginx runs as root
+# because it needs to bind the listen port and write to /run/nginx +
+# /var/log/nginx. If you only need the API (no proxy), set CWA_UPSTREAM=""
+# and nginx won't be started; the API still runs unprivileged.
 set -eu
 
 PORT="${PORT:-8390}"
@@ -13,7 +18,10 @@ BT_PROXY_PORT="${BT_PROXY_PORT:-8080}"
 BT_UI_VERSION="$(cat /app/VERSION 2>/dev/null || echo dev)"
 export PORT BT_PROXY_PORT BT_UI_VERSION
 
-gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 --timeout 120 server:app &
+# Drop privileges for gunicorn. `gosu` (vs su) does not leak env or fork a
+# tty, and forwards signals (SIGTERM) cleanly to the child process so
+# `docker stop` reaches gunicorn directly.
+gosu appuser gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 --timeout 120 server:app &
 API_PID=$!
 
 NGINX_PID=""

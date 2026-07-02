@@ -4,7 +4,9 @@ WORKDIR /app
 
 # nginx powers the optional proxy-injection mode (enabled by setting
 # CWA_UPSTREAM); gettext provides envsubst for rendering its config template.
-RUN apk add --no-cache nginx gettext
+# shadow provides the `adduser`/`addgroup` helpers we use to drop privileges
+# below (the python:3.11-alpine base ships with no user-management tools).
+RUN apk add --no-cache nginx gettext shadow
 
 # Copy requirements and install
 COPY requirements.txt .
@@ -20,6 +22,21 @@ RUN chmod +x docker-entrypoint.sh
 
 # Create a volume for the sqlite database
 VOLUME ["/app/data"]
+
+# Drop privileges: a writable-by-everyone /app is a host-credential leak
+# waiting to happen. `appuser` owns the data dir (needed for the sqlite
+# WAL files the translator writes); /app itself is read-only for the user
+# (sources ship baked in the image; the user only writes to /app/data).
+# The container does NOT set USER here because the entrypoint needs root
+# for nginx in proxy mode (writes /run/nginx, /var/log/nginx, binds :80);
+# the entrypoint itself uses `gosu` to drop to `appuser` for the gunicorn
+# process so the API runs unprivileged. nginx keeps root because it
+# legitimately requires it for the listen port and log paths.
+RUN addgroup -S appuser && adduser -S -G appuser -h /app -s /sbin/nologin appuser \
+ && apk add --no-cache gosu \
+ && mkdir -p /app/data \
+ && chown -R appuser:appuser /app/data \
+ && chmod 755 /app
 
 # Set environment variables for the database path and LLM configuration
 ENV DB_PATH="/app/data/translations.db"
@@ -52,5 +69,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # The entrypoint runs gunicorn (1 worker so the in-memory rate-limit/metrics
 # stay coherent — see README "Why a single worker") and, in proxy mode, nginx.
 # It forwards SIGTERM to both and exits if either dies, so `docker stop` stays
-# fast and the restart policy can recover a half-dead container.
+# fast and the restart policy can recover a half-dead container. It uses
+# `gosu` to drop gunicorn to `appuser`; nginx keeps root because it needs
+# the listen port + log dirs.
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
