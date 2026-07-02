@@ -144,7 +144,7 @@ locally (`local/book-translator-api:latest`) and isn't in a registry, so the
 cleanest path is:
 
 1. Run `install_unraid.sh` from a clone of the repo — it builds the image and
-   installs the Unraid template (`my-book-translator-api.xml`) into
+   installs the Unraid template (from `my-book-translator-api.xml.tmpl`) into
    `/boot/config/plugins/dockerMan/templates-user/`.
 2. In the Unraid **Docker** tab → *Add Container* → pick `book-translator-api`
    from the Template dropdown → set your `BT_LOCAL_URL` → **Apply**.

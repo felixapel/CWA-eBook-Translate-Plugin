@@ -9,7 +9,7 @@ echo "=========================================================="
 echo ""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-for f in "$SCRIPT_DIR/overlay/read.html" "$SCRIPT_DIR/static/translator.js" "$SCRIPT_DIR/static/translator.css" "$SCRIPT_DIR/my-book-translator-api.xml"; do
+for f in "$SCRIPT_DIR/overlay/read.html" "$SCRIPT_DIR/static/translator.js" "$SCRIPT_DIR/static/translator.css" "$SCRIPT_DIR/my-book-translator-api.xml.tmpl"; do
     if [ ! -f "$f" ]; then
         echo "❌ Error: $f not found. Run this script from inside a clone of the repo"
         echo "   (it copies the overlay + template files that live next to install_unraid.sh)."
@@ -35,21 +35,24 @@ cp "$SCRIPT_DIR/overlay/read.html" "$CWA_PATH/overlay/read.html"
 cp "$SCRIPT_DIR/static/translator.js" "$CWA_PATH/overlay/translator.js"
 cp "$SCRIPT_DIR/static/translator.css" "$CWA_PATH/overlay/translator.css"
 
-# 3. Build the backend image locally (no published registry image — see README)
-echo "🔨 Building the book-translator-api image locally..."
+# 3. Pull the published multi-arch image (build locally only if you want to
+#    hack on the backend: docker build -t ghcr.io/felixapel/cwa-ebook-translate-plugin:latest .)
+echo "📦 Pulling the translator image from GHCR..."
 if command -v docker >/dev/null 2>&1; then
-    (cd "$SCRIPT_DIR" && docker build -t local/book-translator-api:latest .)
+    docker pull ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
 else
-    echo "⚠️  docker not found on this shell; build it yourself:"
-    echo "    cd $SCRIPT_DIR && docker build -t local/book-translator-api:latest ."
+    echo "⚠️  docker not found on this shell; pull it yourself:"
+    echo "    docker pull ghcr.io/felixapel/cwa-ebook-translate-plugin:latest"
 fi
 
-# 4. Install the Unraid Docker Template for the API container (kept in sync as
-#    the single source of truth in my-book-translator-api.xml — no inline copy).
+# 4. Install the Unraid Docker Template for the API container. The source of
+#    truth ships as .xml.tmpl (non-.xml so Community Applications' repository
+#    scanner never mistakes this legacy template for the CA listing, which
+#    lives at github.com/felixapel/unraid-templates).
 echo "📥 Installing Unraid Docker Template for Translator API..."
 TEMPLATE_DIR="/boot/config/plugins/dockerMan/templates-user"
 mkdir -p "$TEMPLATE_DIR"
-cp "$SCRIPT_DIR/my-book-translator-api.xml" "$TEMPLATE_DIR/my-book-translator-api.xml"
+cp "$SCRIPT_DIR/my-book-translator-api.xml.tmpl" "$TEMPLATE_DIR/my-book-translator-api.xml"
 
 echo "=========================================================="
 echo "🎉 Installation almost complete!"
