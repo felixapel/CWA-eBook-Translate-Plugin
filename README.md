@@ -45,10 +45,33 @@ bar appears in the ebook reader. That's the whole install.
 
 Already have CWA running? Add just the translator service to your existing
 compose file and point `CWA_UPSTREAM` at your CWA container/host, e.g.
-`CWA_UPSTREAM=http://calibre-web-automated:8083`.
+`CWA_UPSTREAM=http://calibre-web-automated:8083`. The host port (`8084` in the
+example) is arbitrary — pick any free port on your machine.
 
 > Removing the plugin = stop reading through the proxy port. Nothing in your
 > CWA install was modified.
+
+### Behind a reverse proxy (SWAG / Traefik / NPM / Cloudflare)
+
+If you already expose CWA on a domain, point your reverse proxy's **main
+location at the translator's proxy port instead of CWA's port** — the overlay
+then works on your domain with the API same-origin (no CORS, no extra routes).
+Verified SWAG example (only the main location changes; keep OPDS/Kobo sync
+locations pointing directly at CWA):
+
+```nginx
+    location / {
+        include /config/nginx/proxy.conf;
+        include /config/nginx/resolver.conf;
+        set $upstream_app 192.168.0.122;   # docker host
+        set $upstream_port 8084;           # translator proxy port (NOT CWA's)
+        set $upstream_proto http;
+        proxy_pass $upstream_proto://$upstream_app:$upstream_port;
+    }
+```
+
+The injection proxy forwards your reverse proxy's `X-Forwarded-Proto`, so
+HTTPS sessions and secure cookies keep working.
 
 ### Option 2: Unraid (community-applications style)
 

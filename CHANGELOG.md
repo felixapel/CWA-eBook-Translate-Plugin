@@ -45,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the fallback when the primary failed), not the configured primary.
 - `Retry-After` and `X-Request-ID` are exposed to cross-origin JS via
   `Access-Control-Expose-Headers`.
+- Proxy mode passes through the upstream `X-Forwarded-Proto` (map with
+  `$scheme` fallback), so HTTPS sessions behind SWAG/Traefik/NPM keep secure
+  cookies working. Verified against a real SWAG + Cloudflare deployment.
 
 ### Changed
 - `docker-compose.yml` ships proxy-injection mode by default and pins CWA to

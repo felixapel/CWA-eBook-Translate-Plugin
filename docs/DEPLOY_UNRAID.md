@@ -1,5 +1,12 @@
 # Deploying to Unraid
 
+> **v2.0.0+: proxy-injection mode is the recommended Unraid install** and needs
+> none of the bind-mounts below. Run the container with `CWA_UPSTREAM` set to
+> your CWA container URL, map a free host port to container port `8080`, and
+> read your library through that port — stock CWA, no template edits, survives
+> CWA updates. The rest of this document describes the classic bind-mount
+> deployment, kept for existing installs and development.
+
 A concrete, worked example of a two-container deployment (translator API +
 Calibre-Web-Automated with the overlay bind-mounts). The hostnames, IPs
 (`192.168.0.122`), and paths below are from one real setup — substitute your

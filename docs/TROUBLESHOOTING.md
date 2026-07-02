@@ -2,6 +2,41 @@
 
 ---
 
+## "XML Parsing Error: not well-formed" with garbage characters on every page
+
+The book is **DRM-protected** (usually Adobe ADEPT). Check the epub for a
+`META-INF/encryption.xml` entry:
+
+```bash
+unzip -l "book.epub" | grep encryption.xml
+```
+
+If present, the chapter files inside the epub are encrypted; CWA's web reader
+(and therefore this plugin) cannot display them — the browser receives
+ciphertext and fails to parse it. This is a property of the file, not a plugin
+bug. Only DRM-free epubs are supported.
+
+---
+
+## Control bar missing after switching to proxy-injection mode
+
+1. Make sure you're reading through the **proxy port** (or a domain/reverse
+   proxy that points at it) — CWA's own port serves stock CWA with no overlay.
+2. Hard-refresh once (`Ctrl+Shift+R`) to drop the previously cached reader page.
+3. Confirm injection: `curl -s http://<host>:<proxy-port>/login | grep loader.js`
+   should print the loader tag with the current version.
+
+---
+
+## 502 through the proxy after restarting only the CWA container
+
+nginx resolves the `CWA_UPSTREAM` hostname when the translator container
+starts. If you recreate CWA and its container IP changes, restart
+`book-translator` too. (Restarting both, or `docker compose restart`, avoids
+this entirely.)
+
+---
+
 ## How to confirm the right frontend version is running
 
 Open browser DevTools (F12), go to **Console** tab, then:
