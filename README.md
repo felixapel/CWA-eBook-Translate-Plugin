@@ -248,9 +248,8 @@ CWA eBook Translate is free, GPL-licensed, and has no telemetry, ads, or
 subscription — if it replaced a paid translation service for you, consider
 funding its development:
 
-- **[GitHub Sponsors](https://github.com/sponsors/felixapel)** — one-time or
-  monthly, 0% platform fees
-- **Ko-fi** — quick one-time tips *(link coming soon)*
+- **[Ko-fi](https://ko-fi.com/felixapel)** — quick one-time tips, 0% platform fees
+- **GitHub Sponsors** — monthly support *(enrollment in progress)*
 
 Donations fund GPU time for multi-model testing, coverage of the 100+
 language matrix, and maintainer time on issues. Non-monetary support counts
@@ -263,3 +262,7 @@ GPL-3.0. This project extends [Calibre-Web-Automated](https://github.com/crocodi
 (itself GPL-licensed), and the advanced bind-mount install ships a template
 derived from it — so the whole project is licensed under the GNU GPL v3 to
 keep everything clean and compatible. See [LICENSE](LICENSE).
+
+This project is not affiliated with, endorsed by, or sponsored by
+Calibre-Web, Calibre-Web-Automated, Calibre, Google (Gemma), or any LLM
+provider. All names are used nominatively to describe compatibility.
