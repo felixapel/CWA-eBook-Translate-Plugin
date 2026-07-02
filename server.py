@@ -259,13 +259,19 @@ def before_request_hook():
     request.request_id = str(uuid.uuid4())
     request.start_time = time.monotonic()
 
-    # Optional shared-secret auth (skip preflight + health so they always work).
+    # Optional shared-secret auth (skip preflight + health/ping so liveness
+    # probes always work. /stats stays under auth so cache contents aren't
+    # leakable on unauthenticated LANs.)
     if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ping"):
         if request.headers.get("X-BT-Token") != API_TOKEN:
             return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
 
-    # Rate limiting (H6) — skip for health/metrics/ping
-    if request.path not in ("/health", "/metrics", "/ping"):
+    # Rate limiting (H6) — exempt observability endpoints so operators can
+    # monitor health/stats even while the per-client budget is exhausted.
+    # /stats is in this set (not the auth set above) deliberately: it must
+    # stay reachable during a rate-limit storm so the operator can see how
+    # badly things are going, but it still requires API_TOKEN if configured.
+    if request.path not in ("/health", "/metrics", "/ping", "/stats"):
         client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
