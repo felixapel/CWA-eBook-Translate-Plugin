@@ -53,9 +53,24 @@ BT_OUTPUT_TOKEN_FLOOR = int(os.environ.get("BT_OUTPUT_TOKEN_FLOOR", "256"))
 BT_CONTEXT_WINDOW = int(os.environ.get("BT_CONTEXT_WINDOW", "0"))
 
 
+# CJK scripts tokenize much denser than Latin (~1-2 chars/token vs ~3.5), so a
+# flat chars/3.5 estimate under-budgets Chinese/Japanese/Korean source text ~3x
+# and the proportional output cap could truncate those translations.
+_CJK_RE = re.compile(
+    "[　-〿"   # CJK punctuation
+    "぀-ヿ"    # hiragana + katakana
+    "㐀-鿿"    # CJK unified ideographs (incl. ext A)
+    "가-힯"    # hangul syllables
+    "豈-﫿"    # CJK compatibility ideographs
+    "ｦ-ﾟ]"   # halfwidth katakana
+)
+
+
 def _estimate_tokens(text: str) -> int:
-    """Rough chars→tokens estimate (~3.5 chars/token for mixed Latin text)."""
-    return max(1, int(len(text) / 3.5))
+    """Rough chars→tokens estimate (~3.5 chars/token Latin, ~1.5 for CJK)."""
+    cjk = len(_CJK_RE.findall(text))
+    other = len(text) - cjk
+    return max(1, int(cjk / 1.5 + other / 3.5))
 
 
 def _output_cap(input_text: str, ceiling: int) -> int:
@@ -242,11 +257,16 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
             status_code = getattr(e.response, "status_code", 0)
             error_body = getattr(e.response, "text", str(e))[:300]
             log.warning("%s HTTP %s (attempt %d/%d): %s", p.name, status_code, attempt + 1, max_retries, error_body)
-            last_error = f"HTTP {status_code}"
+            last_error = f"HTTP {status_code}" if status_code else str(e)
             if status_code == 429:
                 time.sleep(2 ** attempt)
             elif status_code and status_code >= 500:
                 time.sleep(1)
+            elif status_code == 0:
+                # No HTTP response at all (timeout / connection refused): often a
+                # transient blip on a busy local LLM — retry with a short pause
+                # instead of burning the provider on the first hiccup.
+                time.sleep(0.5)
             else:
                 break  # 4xx (other than 429): retrying won't help, bail to fallback
         except Exception as e:

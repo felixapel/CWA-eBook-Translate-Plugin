@@ -367,7 +367,10 @@ def before_request_hook():
     # /stats is in this set (not the auth set above) deliberately: it must
     # stay reachable during a rate-limit storm so the operator can see how
     # badly things are going, but it still requires API_TOKEN if configured.
-    if request.path not in ("/health", "/metrics", "/ping", "/stats"):
+    # Skip CORS preflights too: an OPTIONS would otherwise burn 2x budget per
+    # real cross-origin request, and a 429 on a preflight surfaces as a cryptic
+    # CORS error in the browser instead of a rate limit the frontend can honor.
+    if request.method != "OPTIONS" and request.path not in ("/health", "/metrics", "/ping", "/stats"):
         client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)

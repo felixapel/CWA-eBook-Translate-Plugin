@@ -193,6 +193,34 @@ async function runTest() {
         'Page-turn poll must be gated on being idle (regression: status-bar flicker while translating)'
     );
 
+    // Regression guard: "Translated" mode used to store only PLAIN TEXT of the
+    // original and restore via textContent, permanently stripping the
+    // paragraph's markup (italics/bold/links) when toggling back. The fix
+    // keeps the original innerHTML in a WeakMap and restores from it.
+    assert(
+        /const originalHtml = new WeakMap\(\)/.test(code)
+            && /function restoreOriginal\(el\)/.test(code)
+            && /originalHtml\.set\(el,\s*clone\.innerHTML\)/.test(code)
+            && /el\.innerHTML = html/.test(code),
+        'Inline mode must preserve and restore the original markup (regression: italics/links lost)'
+    );
+
+    // Regression guard: failed batches used to be silently dropped while the
+    // status bar said "Retrying…". They must be re-queued with a bounded
+    // attempt counter instead.
+    assert(
+        /requeueForRetry/.test(code) && /attempts = \(x\.attempts \|\| 0\) \+ 1\) < 3/.test(code),
+        'Failed batches must re-queue for a bounded retry (regression: silent drop)'
+    );
+
+    // Regression guard: the client safety-net timeout must be distinguishable
+    // from a deliberate abort (mode/language/page change), so timeouts retry
+    // while deliberate aborts just discard stale work.
+    assert(
+        /btTimedOut/.test(code) && /'timeout'/.test(code) && /'aborted'/.test(code),
+        'Timeout aborts must be distinguished from deliberate aborts'
+    );
+
     console.log("All assertions passed.");
     process.exit(0);
 }

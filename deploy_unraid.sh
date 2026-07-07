@@ -45,8 +45,15 @@ ssh $UNRAID_USER@$UNRAID_HOST "
     -e BT_BATCH_MAX_TOKENS=1200 \
     -e LLM_PROVIDER=local \
     -e LLM_MODEL=gemma4-12b \
+    -l net.unraid.docker.managed=dockerman \
     --restart=unless-stopped \
     local/book-translator-api:latest
+  # Unraid-managed + autostart: without the dockerman label and the autostart
+  # entry Unraid treats a hand-run container as an orphan and may remove it
+  # (see docs/DEPLOY_UNRAID.md — this exact omission caused a vanished
+  # container once).
+  grep -qxF book-translator-api /var/lib/docker/unraid-autostart 2>/dev/null \
+    || echo book-translator-api >> /var/lib/docker/unraid-autostart
 "
 # NOTE: BT_BATCH_SIZE=3 + BT_BATCH_MAX_TOKENS=1200 + BT_TIMEOUT=60 keep each vLLM
 # call short enough to finish within the timeout even under ~8-way contention,

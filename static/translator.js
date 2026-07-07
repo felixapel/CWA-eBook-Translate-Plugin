@@ -5,7 +5,7 @@
 (function () {
     'use strict';
     // ── Version & Telemetry ──────────────────────────────────────────
-    const BT_UI_VERSION = '2.1.2';
+    const BT_UI_VERSION = '2.1.3';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
@@ -739,7 +739,10 @@
     async function postBatch(texts) {
         const controller = new AbortController();
         activeControllers.add(controller);
-        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        // Distinguish OUR safety-net timeout from a deliberate abort
+        // (newGeneration on mode/language/page change): a timeout is a failure
+        // that should be retried; a deliberate abort means the work is stale.
+        const timer = setTimeout(() => { controller.btTimedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
         try {
             const headers = { 'Content-Type': 'application/json' };
             if (cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken; // optional shared secret
@@ -759,6 +762,11 @@
                 return null;
             }
             return await resp.json();
+        } catch (e) {
+            if (e.name === 'AbortError') {
+                return { error: controller.btTimedOut ? 'timeout' : 'aborted' };
+            }
+            throw e;
         } finally {
             clearTimeout(timer);
             activeControllers.delete(controller);
@@ -817,15 +825,25 @@
                 inflightCount = batch.length;
                 refreshStatus();
 
+                // Bounded retry: failed batches go BACK to the front of their
+                // queue (previously they were silently dropped while the status
+                // bar claimed "Retrying…"). Items give up after 3 attempts so a
+                // persistent failure can't spin forever. Only items dropped for
+                // good count as "done" (failed) — retried ones stay pending.
+                const requeueForRetry = (items) => {
+                    const keep = items.filter(x => (x.attempts = (x.attempts || 0) + 1) < 3);
+                    chapterDone += items.length - keep.length;
+                    if (isVisible) visibleQueue.unshift(...keep);
+                    else prefetchQueue.unshift(...keep);
+                };
+
                 let data = null;
                 try {
                     data = await postBatch(batch.map(b => b.text));
                 } catch (e) {
-                    if (e.name !== 'AbortError') {
-                        console.error("Translation request failed:", e);
-                        errorCount++;
-                        chapterDone += batch.length;   // processed (failed) — keep the counter honest
-                    }
+                    console.error("Translation request failed:", e);
+                    errorCount++;
+                    requeueForRetry(batch);
                     inflightCount = 0;
                     lastRequestEnd = Date.now();
                     continue;
@@ -833,6 +851,12 @@
 
                 inflightCount = 0;
                 lastRequestEnd = Date.now();
+
+                if (data && data.error === 'aborted') {
+                    // Deliberate cancel (mode/language/page change) — the items
+                    // belong to a stale generation and get filtered next pass.
+                    continue;
+                }
 
                 if (data && data.error === 'rate_limited') {
                     rateLimitUntil = Date.now() + (data.retry_after * 1000);
@@ -844,25 +868,32 @@
                     continue;
                 }
 
-                if (!data || !Array.isArray(data.translations)) {
+                if (!data || data.error === 'timeout' || !Array.isArray(data.translations)) {
                     errorCount++;
-                    chapterDone += batch.length;
+                    requeueForRetry(batch);
                     refreshStatus();
                     continue;
                 }
 
-                chapterDone += batch.length;
-                
                 let stored = false, anyGood = false;
                 data.translations.forEach((tr, idx) => {
-                    if (!isBadTranslation(tr)) { 
-                        translatedParagraphs[batch[idx].hash] = tr; 
-                        stored = true; 
-                        anyGood = true; 
+                    if (idx >= batch.length) return; // defensive: never trust response length
+                    if (!isBadTranslation(tr)) {
+                        translatedParagraphs[batch[idx].hash] = tr;
+                        stored = true;
+                        anyGood = true;
                     }
                 });
-                
+
                 errorCount = anyGood ? 0 : errorCount + 1;
+
+                // Split the batch into translated vs failed (backend error
+                // markers / empty): successes count as done, failures get the
+                // same bounded retry as transport errors.
+                const succeeded = batch.filter(b => translatedParagraphs[b.hash]);
+                chapterDone += succeeded.length;
+                const failed = batch.filter(b => !translatedParagraphs[b.hash]);
+                if (failed.length) requeueForRetry(failed);
                 refreshStatus();
                 
                 if (stored) {
@@ -949,6 +980,21 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     // ── Rendering ──────────────────────────────────────────────────────
+    // Original inner HTML of inline-replaced elements. dataset.originalText
+    // (plain text) remains the marker + hash source, but restoring from it
+    // would permanently strip the paragraph's markup (italics, bold, links…) —
+    // so the real markup is kept here and used for restoration.
+    const originalHtml = new WeakMap();
+
+    function restoreOriginal(el) {
+        if (el.dataset.originalText === undefined) return;
+        const html = originalHtml.get(el);
+        if (html !== undefined) el.innerHTML = html;
+        else el.textContent = el.dataset.originalText; // fallback (pre-fix entries)
+        originalHtml.delete(el);
+        delete el.dataset.originalText;
+    }
+
     function showTranslationsBilingual(paragraphs) {
         paragraphs.forEach((el) => {
             const text = getParagraphText(el);
@@ -958,11 +1004,9 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
             if (isBadTranslation(translated) || translated === text) return;
 
             // If this element was previously inline-translated, restore the clean
-            // original first so we never stack a bilingual block onto replaced text.
-            if (el.dataset.originalText !== undefined) {
-                el.textContent = el.dataset.originalText;
-                delete el.dataset.originalText;
-            }
+            // original (with its markup) first so we never stack a bilingual
+            // block onto replaced text.
+            restoreOriginal(el);
 
             // Idempotent: update the existing direct-child translation instead of duplicating.
             let transEl = el.querySelector(':scope > .bt-translation');
@@ -985,10 +1029,14 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
             const translated = translatedParagraphs[hash];
             if (isBadTranslation(translated)) return;
 
-            // Store the CLEAN original (getParagraphText strips any bt spans) so
-            // toggling back off restores correctly even after bilingual rendering.
+            // Store the CLEAN original so toggling back restores correctly even
+            // after bilingual rendering: plain text in dataset (marker + hash
+            // source) and the real markup in the WeakMap (see restoreOriginal).
             if (!el.dataset.originalText) {
                 el.dataset.originalText = text;
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('.bt-translation, .bt-loading').forEach(n => n.remove());
+                originalHtml.set(el, clone.innerHTML);
             }
             // Remove any bilingual/loading spans before replacing the text.
             el.querySelectorAll('.bt-translation, .bt-loading').forEach(n => n.remove());
@@ -1005,10 +1053,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         }
 
         const restoreIn = (root) => {
-            root.querySelectorAll('[data-original-text]').forEach(el => {
-                el.textContent = el.dataset.originalText;
-                delete el.dataset.originalText;
-            });
+            root.querySelectorAll('[data-original-text]').forEach(restoreOriginal);
         };
         restoreIn(document);
         if (iframe && iframe.contentDocument) restoreIn(iframe.contentDocument);
@@ -1084,6 +1129,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
                         if (idoc.body) {
                             ensureIframeStyles(idoc);   // inject our CSS into the new chapter doc
                             applyIframeTheme(idoc);
+                            attachIframeShortcut(idoc); // Alt+T works with reader focus too
                             iframeObserver.observe(idoc.body, { childList: true, subtree: true });
                             scheduleTranslate('new_document', { immediate: true, forceRediscover: true });
                         }
@@ -1151,16 +1197,29 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     // ── Start ──────────────────────────────────────────────────────────
-    function setupKeyboardShortcut() {
+    function onShortcutKeydown(e) {
         // Alt+T cycles the mode (Ctrl/Cmd+T is reserved by the browser for new tabs).
-        document.addEventListener('keydown', (e) => {
-            if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === 't' || e.key === 'T')) {
-                e.preventDefault();
-                const next = translationMode === 'off' ? 'bilingual'
-                    : translationMode === 'bilingual' ? 'translated' : 'off';
-                setMode(next);
-            }
-        });
+        if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === 't' || e.key === 'T')) {
+            e.preventDefault();
+            const next = translationMode === 'off' ? 'bilingual'
+                : translationMode === 'bilingual' ? 'translated' : 'off';
+            setMode(next);
+        }
+    }
+
+    function setupKeyboardShortcut() {
+        document.addEventListener('keydown', onShortcutKeydown);
+    }
+
+    // The reader iframe swallows key events when it has focus (which it almost
+    // always does while reading) — attach the same shortcut inside each new
+    // chapter document so Alt+T works regardless of focus.
+    function attachIframeShortcut(idoc) {
+        try {
+            if (!idoc || idoc.btShortcutAttached) return;
+            idoc.btShortcutAttached = true;
+            idoc.addEventListener('keydown', onShortcutKeydown);
+        } catch (e) { /* cross-origin — ignore */ }
     }
 
     function init() {

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.3] - 2026-07-07
+
+Deep-audit follow-up: content fidelity and retry robustness.
+
+### Fixed
+- **"Translated" mode permanently stripped the paragraph's markup** (italics,
+  bold, links) when toggling back to Original/Bilingual, because restoration
+  used plain text. The original inner HTML is now preserved (WeakMap) and
+  restored intact; the plain text in `dataset.originalText` stays the hash
+  source so cache keys are unchanged.
+- **Failed translation batches were silently dropped** while the status bar
+  claimed "Retrying…". Transport errors, timeouts and backend error markers
+  now re-queue the affected paragraphs for a bounded retry (3 attempts per
+  item; drops count toward the honest chapter counter, retries stay pending).
+- The client's 90s safety-net timeout was indistinguishable from a deliberate
+  abort (mode/language/page change): a genuinely hung request was treated as
+  stale work and lost. Timeouts now retry; deliberate aborts just discard.
+- **Connection errors never retried**: a single timeout/refused connection
+  burned the provider on the first attempt. Transient no-response failures now
+  retry once with a short pause before deferring to the fallback provider.
+- CJK source text (Chinese/Japanese/Korean) was under-budgeted ~3x by the
+  proportional output-token cap (flat 3.5 chars/token estimate) and could
+  truncate those translations; token estimation is now script-aware
+  (~1.5 chars/token for CJK ranges).
+- CORS preflight (`OPTIONS`) requests no longer consume rate-limit budget —
+  previously every cross-origin request cost 2x, and a 429 on a preflight
+  surfaced as a cryptic CORS error instead of a rate limit the frontend can
+  honor.
+- A malformed backend response with more translations than requested could
+  crash the frontend pump (defensive length guard added).
+- `deploy_unraid.sh` recreated the API container without the
+  `net.unraid.docker.managed=dockerman` label or autostart entry — the exact
+  omission that once caused the container to vanish as an "orphan" (see
+  `docs/DEPLOY_UNRAID.md`). The script now matches the doc.
+
+### Changed
+- **Alt+T** now also works while the reader iframe has focus (the shortcut is
+  attached inside each chapter document).
+
+### Tests
+- New checks: CJK token budgeting, OPTIONS rate-limit exemption, and frontend
+  regression guards for markup preservation, bounded batch retry, and
+  timeout-vs-abort distinction.
+
 ## [2.1.2] - 2026-07-02
 
 Reader-formatting and language-picker fixes from real-world reading reports.

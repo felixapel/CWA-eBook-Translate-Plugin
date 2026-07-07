@@ -278,6 +278,10 @@ def run():
           translator._output_cap("", 4096) >= translator.BT_OUTPUT_TOKEN_FLOOR)
     check("output cap: monotonic in input size",
           translator._output_cap("x" * 50, 4096) <= translator._output_cap("x" * 5000, 4096))
+    # CJK tokenizes ~2-3x denser than Latin; a flat chars/3.5 estimate would
+    # under-budget Chinese/Japanese/Korean sources and truncate translations.
+    check("output cap: CJK source gets a bigger budget than same-length Latin",
+          translator._output_cap("日本語" * 200, 8192) > translator._output_cap("abc" * 200, 8192))
 
     check("invalid language rejected",
           client.post("/translate", json={"text": "x", "target_lang": "Klingon"}).status_code == 400)
@@ -307,6 +311,12 @@ def run():
     check("rate limit: returns status 429", resp.status_code == 429)
     check("rate limit: response has Retry-After header", "Retry-After" in resp.headers)
     check("rate limit: response JSON has retry_after", resp.get_json().get("retry_after") is not None)
+    # CORS preflights must NOT burn rate-limit budget: a 429 on an OPTIONS
+    # surfaces as a cryptic CORS error in the browser, and every real request
+    # would cost 2x. Even while fully rate-limited, OPTIONS sails through.
+    check("rate limit: OPTIONS preflight exempt while rate-limited",
+          client.options("/translate/batch",
+                         headers={"Origin": "http://192.168.1.2:8083"}).status_code != 429)
     server._rate_limit_store.clear()
 
     # ── Audit-fix regression tests (2026-07-02) ──────────────────────────
