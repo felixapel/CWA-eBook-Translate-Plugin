@@ -183,8 +183,11 @@ def run():
     client.post("/translate", json={"text": "h4_test_b"},
                 headers={"X-Forwarded-For": "5.6.7.8, 10.0.0.1"})
     keys = list(server._rate_limit_store.keys())
-    check("rate-limit: with BT_TRUST_PROXY, X-Forwarded-For first hop is key",
-          keys and keys[0] == "5.6.7.8")
+    # LAST hop, not first: standard proxies APPEND the address they saw, so
+    # the final entry is the only one a client cannot forge. Keying on the
+    # first hop let clients bypass the limiter with a made-up header.
+    check("rate-limit: with BT_TRUST_PROXY, X-Forwarded-For LAST hop is key",
+          keys and keys[0] == "10.0.0.1")
     server.BT_TRUST_PROXY = False
     server._rate_limit_store.clear()
 
@@ -210,6 +213,17 @@ def run():
         keys = list(server._rate_limit_store.keys())
         check("BT_TRUSTED_PROXIES: peer in allowlist honors XFF",
               keys and keys[0] == "9.9.9.9")
+        server._rate_limit_store.clear()
+
+        # Anti-spoof within the trusted path: a client that FORGES an XFF
+        # entry gets it appended-to by the trusted proxy ("forged, real").
+        # The limiter must key on the appended (real) address — otherwise a
+        # client rotates forged first hops and gets unlimited fresh buckets.
+        client.post("/translate", json={"text": "h5_test_spoof"},
+                    headers={"X-Forwarded-For": "6.6.6.6, 192.168.1.42"})
+        keys = list(server._rate_limit_store.keys())
+        check("BT_TRUSTED_PROXIES: forged first hop ignored (keys on last hop)",
+              keys and keys[0] == "192.168.1.42")
         server._rate_limit_store.clear()
 
         # Now switch to an allowlist that does NOT match the peer. The

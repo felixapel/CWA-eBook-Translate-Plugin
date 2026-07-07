@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Rate-limit bypass via forged `X-Forwarded-For`**: the limiter keyed on the
+  FIRST XFF hop, which is client-controlled (standard proxies *append* the
+  address they saw — they don't overwrite). In the trusted-proxy
+  configurations meant to be production-safe, any client could rotate forged
+  first hops and get unlimited fresh rate-limit buckets. The key is now the
+  LAST hop — the one entry appended by the trusted proxy that a client cannot
+  forge.
+- **Proxy mode now defaults `BT_TRUSTED_PROXIES=127.0.0.1/32`**: all API
+  traffic arrives via the in-container nginx, so the API previously saw every
+  reader as `127.0.0.1` — one shared rate-limit bucket for the whole
+  household, where a single aggressive client starved everyone. The
+  in-container proxy is trustworthy by construction; per-client limiting now
+  works out of the box (override by setting `BT_TRUSTED_PROXIES` explicitly).
+
+### Fixed
+- CORS private-LAN matcher now also accepts `127.x.x.x` (beyond `127.0.0.1`)
+  and IPv6 `[::1]` origins.
+
 ## [2.1.3] - 2026-07-07
 
 Deep-audit follow-up: content fidelity and retry robustness.

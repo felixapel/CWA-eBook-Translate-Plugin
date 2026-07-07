@@ -154,7 +154,7 @@ ALLOWED_ORIGINS = {
 BT_ALLOW_PRIVATE_LAN = os.environ.get("BT_ALLOW_PRIVATE_LAN", "true").lower() in ("1", "true", "yes")
 _PRIVATE_ORIGIN_RE = re.compile(
     r"^https?://("
-    r"localhost|127\.0\.0\.1|"
+    r"localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]|"
     r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
     r"192\.168\.\d{1,3}\.\d{1,3}|"
     r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
@@ -210,16 +210,24 @@ def _token_matches(provided: str, expected: str) -> bool:
 
 
 def _client_ip() -> str:
-    """Rate-limit key. Uses X-Forwarded-For's first hop only when the peer
+    """Rate-limit key. Uses X-Forwarded-For's LAST hop only when the peer
     (the IP the WSGI server actually saw, NOT the X-Forwarded-For value) is
     trusted. That means either BT_TRUSTED_PROXIES matches the peer, or
     BT_TRUST_PROXY=true is set (legacy / dev only — anyone who can reach
     the API can spoof X-Forwarded-For in this mode).
+
+    Why the LAST hop: standard proxies (nginx `$proxy_add_x_forwarded_for`,
+    SWAG, Traefik) APPEND the address they saw to any incoming header, so the
+    only entry a client cannot forge is the final one — the address observed
+    by our trusted proxy. Taking the FIRST hop (the previous behaviour) let
+    any client bypass the rate limiter entirely by sending a made-up
+    `X-Forwarded-For: <random>` header per request, precisely in the
+    "trusted proxy" configurations meant to be production-safe.
     """
     peer = request.remote_addr or "unknown"
     fwd = request.headers.get("X-Forwarded-For", "")
     if fwd:
-        client_ip_from_xff = fwd.split(",")[0].strip()
+        client_ip_from_xff = fwd.split(",")[-1].strip()
     else:
         client_ip_from_xff = ""
 
