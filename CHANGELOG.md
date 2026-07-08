@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.4] - 2026-07-08
+
+Security follow-up to the deep re-audit (rate-limit hardening for proxy/
+reverse-proxy deployments).
+
 ### Security
 - **Rate-limit bypass via forged `X-Forwarded-For`**: the limiter keyed on the
   FIRST XFF hop, which is client-controlled (standard proxies *append* the
