@@ -249,7 +249,7 @@ subscription — if it replaced a paid translation service for you, consider
 funding its development:
 
 - **[Ko-fi](https://ko-fi.com/felixapel)** — quick one-time tips, 0% platform fees
-- **GitHub Sponsors** — monthly support *(enrollment in progress)*
+- **[GitHub Sponsors](https://github.com/sponsors/felixapel)** — monthly support
 
 Donations fund GPU time for multi-model testing, coverage of the 100+
 language matrix, and maintainer time on issues. Non-monetary support counts
