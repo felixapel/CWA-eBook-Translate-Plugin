@@ -14,7 +14,7 @@ Covers:
 
 Run with: python3 test_hardening.py
 """
-import os, sys, json, tempfile
+import os, sys, json, subprocess, tempfile
 from pathlib import Path
 
 # Same env-var contract as test_translation.py.
@@ -202,6 +202,7 @@ def run():
     server.BT_TRUST_PROXY = False
     original_trusted = set(server.BT_TRUSTED_PROXIES)
     original_nets = list(server._TRUSTED_PROXY_NETS)
+    original_limit = server.RATE_LIMIT_MAX
     try:
         # Werkzeug's test client connects from 127.0.0.1. Allowlist it.
         server.BT_TRUSTED_PROXIES = {"127.0.0.1/32"}
@@ -238,10 +239,61 @@ def run():
         keys = list(server._rate_limit_store.keys())
         check("BT_TRUSTED_PROXIES: peer NOT in allowlist ignores XFF (anti-spoof)",
               keys and keys[0] != "9.9.9.9")
+
+        # Route-level isolation contract: exhausting client A's bucket behind
+        # the trusted in-container proxy must not consume client B's budget.
+        server.BT_TRUSTED_PROXIES = {"127.0.0.1/32"}
+        server._TRUSTED_PROXY_NETS = [
+            ipaddress.ip_network("127.0.0.1/32", strict=False)
+        ]
+        server.RATE_LIMIT_MAX = 1
+        server._rate_limit_store.clear()
+        payload = {
+            "text": "proxy bucket probe",
+            "source_lang": "English",
+            "target_lang": "English",
+        }
+        a_first = client.post("/translate", json=payload,
+                              headers={"X-Forwarded-For": "192.0.2.10"})
+        a_second = client.post("/translate", json=payload,
+                               headers={"X-Forwarded-For": "192.0.2.10"})
+        b_first = client.post("/translate", json=payload,
+                              headers={"X-Forwarded-For": "192.0.2.11"})
+        check("trusted proxy: exhausted client A does not block client B",
+              a_first.status_code == 200
+              and a_second.status_code == 429
+              and b_first.status_code == 200)
+        server.RATE_LIMIT_MAX = original_limit
     finally:
         server.BT_TRUSTED_PROXIES = original_trusted
         server._TRUSTED_PROXY_NETS = original_nets
+        server.RATE_LIMIT_MAX = original_limit
         server._rate_limit_store.clear()
+
+    # The entrypoint must export the proxy trust boundary before Gunicorn
+    # imports server.py. Import-time configuration set later is ineffective.
+    entrypoint = (Path(__file__).parent / "docker-entrypoint.sh").read_text()
+    trust_export = entrypoint.find('export BT_TRUSTED_PROXIES=')
+    gunicorn_start = entrypoint.find('gosu appuser gunicorn')
+    check("entrypoint: trusted proxy config is exported before Gunicorn",
+          trust_export >= 0 and gunicorn_start >= 0 and trust_export < gunicorn_start)
+
+    # A typo in the trust allowlist must fail startup, never degrade silently
+    # to trusting or grouping the wrong clients.
+    invalid_env = os.environ.copy()
+    invalid_env["BT_TRUSTED_PROXIES"] = "definitely-not-a-cidr"
+    invalid_env["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_invalid_proxy.db")
+    invalid_proxy = subprocess.run(
+        [sys.executable, "-c", "import server"],
+        cwd=Path(__file__).parent,
+        env=invalid_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check("BT_TRUSTED_PROXIES: invalid CIDR fails startup",
+          invalid_proxy.returncode != 0
+          and "definitely-not-a-cidr" in (invalid_proxy.stdout + invalid_proxy.stderr))
 
     # ─────────────────────────────────────────────────────────────────────
     # H6: /translate/batch per-paragraph attribution

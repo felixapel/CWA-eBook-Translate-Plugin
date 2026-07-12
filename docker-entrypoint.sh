@@ -18,6 +18,15 @@ BT_PROXY_PORT="${BT_PROXY_PORT:-8080}"
 BT_UI_VERSION="$(cat /app/VERSION 2>/dev/null || echo dev)"
 export PORT BT_PROXY_PORT BT_UI_VERSION
 
+# server.py reads the trusted-proxy allowlist at import time, so proxy-mode
+# defaults must exist before Gunicorn imports the application. Every API
+# request in this mode arrives from the in-container nginx on loopback; trust
+# only that peer and key rate limits on the last X-Forwarded-For hop nginx
+# observed. An explicitly supplied allowlist still takes precedence.
+if [ -n "${CWA_UPSTREAM:-}" ]; then
+    export BT_TRUSTED_PROXIES="${BT_TRUSTED_PROXIES:-127.0.0.1/32}"
+fi
+
 # The data dir is almost always a BIND MOUNT owned by the host (root, or an
 # appdata user) — the build-time chown only covers the image's own layer, so
 # without this runtime chown gunicorn (running as appuser) cannot open the
@@ -43,15 +52,6 @@ API_PID=$!
 NGINX_PID=""
 if [ -n "${CWA_UPSTREAM:-}" ]; then
     echo "[entrypoint] proxy mode: :${BT_PROXY_PORT} -> ${CWA_UPSTREAM} (overlay injected)"
-    # In proxy mode every API request arrives via the in-container nginx, so
-    # the API's peer is always 127.0.0.1 — without trusting that proxy, ALL
-    # readers share one rate-limit bucket and a single aggressive client can
-    # starve everyone. The in-container nginx is trustworthy by construction
-    # (same image), so default the allowlist to loopback; the API then keys
-    # rate limits on X-Forwarded-For's LAST hop (the address nginx actually
-    # saw — the one entry a client cannot forge). Operators can still
-    # override or disable by setting BT_TRUSTED_PROXIES explicitly.
-    export BT_TRUSTED_PROXIES="${BT_TRUSTED_PROXIES:-127.0.0.1/32}"
     mkdir -p /run/nginx
     # Substitute ONLY our variables; nginx's own $vars must survive verbatim.
     envsubst '${CWA_UPSTREAM} ${PORT} ${BT_PROXY_PORT} ${BT_UI_VERSION}' \
