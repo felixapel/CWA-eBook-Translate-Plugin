@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run this from inside a clone of the repo (it copies the overlay files that
 # live alongside this script — it does not download anything from the network).
-set -e
+set -euo pipefail
 
 echo "=========================================================="
 echo "   📖 Calibre-Web-Automated Book Translator Installer"
@@ -18,7 +18,7 @@ for f in "$SCRIPT_DIR/overlay/read.html" "$SCRIPT_DIR/static/translator.js" "$SC
 done
 
 # 1. Ask for CWA appdata path
-read -p "Enter your Calibre-Web-Automated appdata path [default: /mnt/user/appdata/calibre-web-automated]: " CWA_PATH
+read -r -p "Enter your Calibre-Web-Automated appdata path [default: /mnt/user/appdata/calibre-web-automated]: " CWA_PATH
 CWA_PATH=${CWA_PATH:-/mnt/user/appdata/calibre-web-automated}
 
 if [ ! -d "$CWA_PATH" ]; then

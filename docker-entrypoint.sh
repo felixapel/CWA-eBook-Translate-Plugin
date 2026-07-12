@@ -54,6 +54,8 @@ if [ -n "${CWA_UPSTREAM:-}" ]; then
     echo "[entrypoint] proxy mode: :${BT_PROXY_PORT} -> ${CWA_UPSTREAM} (overlay injected)"
     mkdir -p /run/nginx
     # Substitute ONLY our variables; nginx's own $vars must survive verbatim.
+    # Literal ${...} names below are envsubst's allowlist, not shell expansion.
+    # shellcheck disable=SC2016
     envsubst '${CWA_UPSTREAM} ${PORT} ${BT_PROXY_PORT} ${BT_UI_VERSION}' \
         < /app/proxy/nginx.conf.template > /etc/nginx/http.d/default.conf
     nginx -t
