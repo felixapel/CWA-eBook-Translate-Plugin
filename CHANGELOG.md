@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Python dependencies, audit/compiler tooling, npm artifacts, the Python base
   image, direct/transitive Alpine packages, Node.js, and third-party Actions are
   pinned to reviewed versions, hashes, digests, or commits.
+- The published image now declares its stable non-root user; API and nginx run
+  as independent roles with read-only root filesystems, zero capabilities, and
+  no root ownership-repair supervisor in the recommended Compose topology.
 
 ### Added
 
@@ -36,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a fail-closed release runbook.
 - Reproducible Python lock generation on Python 3.11 plus committed runtime,
   auditor, and compiler hash locks.
+- A shared container smoke harness that proves role isolation, proxy routing,
+  immutable root filesystems, exact runtime identity, and clean shutdown.
 
 ### Changed
 
@@ -44,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and GitHub CI definitions remain byte-identical by contract.
 - `/ping`, `/health`, and `/ready` are cheap local probes; `/health/deep` is the
   explicit authenticated provider diagnostic.
+- Deployment helpers use strict shell mode, safe remote argument serialization,
+  fail-closed health/hash checks, and the same non-root sandbox as CI.
 
 ## [2.1.4] - 2026-07-08
 

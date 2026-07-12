@@ -42,11 +42,18 @@ docker build -t local/book-translator-api:latest .
 
 echo "Recreating container with correct environment variables..."
 docker rm -f book-translator-api >/dev/null 2>&1 || true
+install -d -m 0750 -o 101 -g 102 \
+  /mnt/user/appdata/book-translator-api/data
 docker run -d \
   --name=book-translator-api \
   --net=bridge \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges:true \
   -p 8390:8390 \
   -v /mnt/user/appdata/book-translator-api/data:/app/data \
+  -e BT_ROLE=api \
   -e "BT_LOCAL_URL=http://${llm_host}:2819/v1/chat/completions" \
   -e BT_BATCH_SIZE=3 \
   -e BT_MAX_CONCURRENT=1 \

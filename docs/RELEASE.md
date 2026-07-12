@@ -61,7 +61,7 @@ the validator from trusted `main` and requires all of the following:
 - GitHub to expose the exact same annotated tag object and peeled commit.
 
 Backend tests and dependency audit, frontend syntax/tests/audit, and the
-container proxy/API/non-root smoke test run only after preflight. `publish`
+split-role proxy/API sandbox smoke test run only after preflight. `publish`
 depends on every gate, builds amd64 and arm64 once, and supplies that one build
 to every enabled registry. Stable releases move the immutable full version,
 `MAJOR.MINOR`, and `latest`; prereleases publish only their immutable full
@@ -78,7 +78,7 @@ version. The build also requests OCI provenance and an SBOM.
    - both `?v=` values in `overlay/read.html`
    - move the Changelog entries from `Unreleased` into a dated version section
 3. Run the deterministic local gate. Protected CI independently repeats it and
-   adds dependency audits plus the proxy/API/non-root container smoke test:
+   adds dependency audits plus the split-role non-root container smoke test:
 
    ```bash
    .venv/bin/python -m py_compile \

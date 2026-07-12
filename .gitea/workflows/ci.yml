@@ -48,7 +48,7 @@ jobs:
       - run: python3 -m py_compile server.py translator.py cache.py work_budget.py
       - run: python3 test_translation.py
       - run: python3 test_hardening.py
-      - run: python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_cleanup_token test_api_schema test_error_privacy
+      - run: python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy
 
   frontend:
     runs-on: ubuntu-latest
@@ -83,42 +83,5 @@ jobs:
         run: docker version
       - name: Build image
         run: docker build -t "$SMOKE_IMAGE" .
-      - name: Run container
-        run: |
-          docker run -d --name "$SMOKE_CONTAINER" \
-            -e CWA_UPSTREAM=http://127.0.0.1:8390 \
-            -p 127.0.0.1::8390 -p 127.0.0.1::8080 "$SMOKE_IMAGE"
-          API_PORT=$(docker port "$SMOKE_CONTAINER" 8390/tcp | sed 's/.*://')
-          PROXY_PORT=$(docker port "$SMOKE_CONTAINER" 8080/tcp | sed 's/.*://')
-          test -n "$API_PORT" && test -n "$PROXY_PORT"
-          # Poll the browser-facing proxy route, not only the internal API.
-          # This proves nginx rendered and started in the shipped image.
-          for i in $(seq 1 30); do
-            if curl -sf "http://127.0.0.1:${PROXY_PORT}/bt-api/ping" >/dev/null 2>&1; then
-              echo "proxy ping ok on try $i"
-              break
-            fi
-            sleep 1
-          done
-          # Assert both process paths. The proxy response exercises nginx;
-          # direct loopback confirms Gunicorn independently for diagnosis.
-          curl -sf "http://127.0.0.1:${PROXY_PORT}/bt-api/ping" | grep -q '"status":"ok"'
-          curl -sf "http://127.0.0.1:${API_PORT}/ping" | grep -q '"status":"ok"'
-      - name: Verify non-root API process
-        # The /ping endpoint serves from gunicorn. The `appuser` should own
-        # the gunicorn process; the entrypoint (and nginx if it were started)
-        # can stay root.
-        run: |
-          # BusyBox `ps` (Alpine) has no -p flag — list user+args and grep the
-          # gunicorn master instead. [g]unicorn avoids matching the grep itself.
-          USER=$(docker exec "$SMOKE_CONTAINER" ps -o user,args | grep '[g]unicorn' | head -1 | awk '{print $1}')
-          if [ "$USER" = "appuser" ]; then
-            echo "gunicorn runs as appuser (unprivileged) — OK"
-          else
-            echo "gunicorn runs as '$USER', expected appuser"
-            docker exec "$SMOKE_CONTAINER" ps -o user,args | head -10
-            exit 1
-          fi
-      - name: Cleanup
-        if: always()
-        run: docker rm -f "$SMOKE_CONTAINER" 2>/dev/null || true
+      - name: Exercise independent hardened roles
+        run: ./scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"

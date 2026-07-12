@@ -28,12 +28,11 @@ bug. Only DRM-free epubs are supported.
 
 ---
 
-## 502 through the proxy after restarting only the CWA container
+## 502/504 through the proxy after restarting only the CWA container
 
-nginx resolves the `CWA_UPSTREAM` hostname when the translator container
-starts. If you recreate CWA and its container IP changes, restart
-`book-translator` too. (Restarting both, or `docker compose restart`, avoids
-this entirely.)
+nginx resolves `CWA_UPSTREAM` when the proxy role starts. If you recreate CWA
+and its container IP changes, restart `book-translator-proxy` too. Restarting
+the Compose project also refreshes both endpoints.
 
 ---
 

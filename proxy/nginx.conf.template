@@ -37,10 +37,11 @@ server {
         # grossly oversized bodies before buffering them to the backend.
         # (The catch-all location keeps 0 = unlimited for CWA book uploads.)
         client_max_body_size 3m;
-        proxy_pass http://127.0.0.1:${PORT}/;
+        proxy_pass ${BT_API_UPSTREAM}/;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $bt_fwd_proto;
+        proxy_connect_timeout 2s;
         # Translation calls can legitimately take a while on slow local LLMs.
         proxy_read_timeout 180s;
     }
@@ -58,13 +59,13 @@ server {
         proxy_set_header X-Forwarded-Proto $bt_fwd_proto;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
+        proxy_connect_timeout 2s;
         proxy_read_timeout 300s;
 
         # The whole plugin injection: one tag before </head> on HTML responses.
         # loader.js self-guards to /read/ pages, so injecting site-wide is safe
         # and keeps this config free of assumptions about CWA's routes.
         proxy_set_header Accept-Encoding "";
-        sub_filter_types text/html;
         sub_filter '</head>' '<script src="/bt-static/loader.js?v=${BT_UI_VERSION}"></script></head>';
         sub_filter_once on;
     }
