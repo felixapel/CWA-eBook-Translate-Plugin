@@ -159,6 +159,7 @@
 }
 #bt-bar[data-state="page"] #bt-status,
 #bt-bar[data-state="chapter"] #bt-status,
+#bt-bar[data-state="ratelimit"] #bt-status,
 #bt-bar[data-state="done"] #bt-status,
 #bt-bar[data-state="error"] #bt-status { display: inline-flex; }
 

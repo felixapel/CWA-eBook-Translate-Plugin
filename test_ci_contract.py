@@ -9,6 +9,10 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 DOCKER_NAMES = ROOT / "scripts" / "ci-docker-names.sh"
+FRONTEND_WORKFLOWS = (
+    CI,
+    ROOT / ".gitea" / "workflows" / "release.yml",
+)
 
 
 class CIContractTests(unittest.TestCase):
@@ -31,6 +35,16 @@ class CIContractTests(unittest.TestCase):
         self.assertRegex(
             self.workflow, r"(?m)^\s*- run: npm audit --audit-level=high\s*$")
         self.assertNotIn("npm audit --omit=dev", self.workflow)
+
+    def test_frontend_browser_gate_is_required(self):
+        for workflow in FRONTEND_WORKFLOWS:
+            source = workflow.read_text()
+            self.assertRegex(
+                source,
+                r"(?m)^\s*- run: npx playwright install --with-deps --only-shell chromium\s*$",
+            )
+            self.assertRegex(source, r"(?m)^\s*- run: npm run test:e2e\s*$")
+            self.assertNotIn("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", source)
 
     def test_docker_gate_cannot_report_success_when_docker_is_missing(self):
         self.assertNotIn("Detect Docker", self.workflow)

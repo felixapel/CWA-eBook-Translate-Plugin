@@ -60,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A required real-Chromium E2E gate verifies reader-route loader isolation,
+  DOM rendering, API payloads, explicit cloud consent, console/network health,
+  screenshots, and the accessibility tree in both CI and release workflows.
 - Request work-budget and global upstream-cap contracts with concurrency,
   cancellation, deadline, fallback, and response-size regression tests.
 - Gitea-authoritative release preflight, exact annotated GitHub mirror-tag
@@ -78,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reader controls now expose a named toolbar, live status, honest progress,
+  keyboard-operable settings actions, synchronized popover/switch state, and
+  a visible non-fatal wait message while the API is rate limiting requests.
 - CI and release gates now run every backend contract suite, the complete locked
   npm tree audit, and a required proxy/API/non-root container smoke test. Gitea
   and GitHub CI definitions remain byte-identical by contract.

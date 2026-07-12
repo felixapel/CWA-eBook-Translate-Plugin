@@ -386,6 +386,8 @@
         bar.id = 'bt-bar';
         bar.dataset.mode = translationMode;
         bar.dataset.state = 'idle';
+        bar.setAttribute('role', 'toolbar');
+        bar.setAttribute('aria-label', t.bookTranslator);
 
         // Build the language <option> list once: top-10 most spoken first,
         // then every other supported language A-Z.
@@ -404,17 +406,17 @@
             `<optgroup label="${t.allLanguages}">${MORE_LANGUAGES.map(l => opt(l, true)).join('')}</optgroup>`;
 
         bar.innerHTML =
-            `<button id="bt-toggle" title="${t.cycleHint}">` +
+            `<button type="button" id="bt-toggle" title="${t.cycleHint}">` +
                 `<span class="bt-dot"></span>` +
                 `<span id="bt-toggle-label">${translationMode === 'bilingual' ? t.bilingual : translationMode === 'translated' ? t.translated : t.off}</span>` +
             `</button>` +
-            `<select id="bt-lang" title="${t.langHint}">${langOptions}</select>` +
-            `<div id="bt-status">` +
+            `<select id="bt-lang" title="${t.langHint}" aria-label="${t.langHint}">${langOptions}</select>` +
+            `<div id="bt-status" role="status" aria-live="polite" aria-atomic="true">` +
                 `<span id="bt-spinner"></span>` +
                 `<span id="bt-status-text"></span>` +
             `</div>` +
-            `<button id="bt-gear" title="${t.settings}" aria-label="${t.settings}">⚙</button>` +
-            `<div id="bt-progress"><div id="bt-progress-fill"></div></div>`;
+            `<button type="button" id="bt-gear" title="${t.settings}" aria-label="${t.settings}" aria-haspopup="dialog" aria-controls="bt-menu" aria-expanded="false">⚙</button>` +
+            `<div id="bt-progress" role="progressbar" aria-label="${t.translatingChapter}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="bt-progress-fill"></div></div>`;
 
         document.body.appendChild(bar);
 
@@ -423,6 +425,9 @@
         // a child popover — that's why the gear "did nothing" before.
         const menu = document.createElement('div');
         menu.id = 'bt-menu';
+        menu.setAttribute('role', 'dialog');
+        menu.setAttribute('aria-label', t.settings);
+        menu.setAttribute('aria-hidden', 'true');
         document.body.appendChild(menu);
 
         document.getElementById('bt-toggle').onclick = () => {
@@ -482,18 +487,18 @@
             `<div class="bt-menu-row"><span>${t.modeLabel}</span><span class="bt-menu-val">${modeLabel}</span></div>` +
             `<div class="bt-menu-row"><span>${t.langLabel}</span><span class="bt-menu-val">${TARGET_LANG}</span></div>` +
             `<div class="bt-menu-sep"></div>` +
-            `<div class="bt-menu-item" data-action="prefetch">` +
+            `<button type="button" class="bt-menu-item" data-action="prefetch" role="switch" aria-checked="${prefetchEnabled}">` +
                 `<span>${t.prefetchWhole}</span>` +
-                `<span class="bt-switch${prefetchEnabled ? ' bt-on' : ''}"></span>` +
-            `</div>` +
+                `<span class="bt-switch${prefetchEnabled ? ' bt-on' : ''}" aria-hidden="true"></span>` +
+            `</button>` +
             `<button type="button" class="bt-menu-item" data-action="cloud-fallback" role="switch" aria-checked="${allowCloudFallback}">` +
                 `<span>${t.cloudFallback}</span>` +
                 `<span class="bt-switch${allowCloudFallback ? ' bt-on' : ''}" aria-hidden="true"></span>` +
             `</button>` +
             `<div class="bt-menu-note bt-menu-warning">${t.cloudPrivacy}</div>` +
-            `<div class="bt-menu-item" data-action="retry"><span>↻ ${t.retryPage}</span></div>` +
-            `<div class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></div>` +
-            `<div class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></div>` +
+            `<button type="button" class="bt-menu-item" data-action="retry"><span>↻ ${t.retryPage}</span></button>` +
+            `<button type="button" class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></button>` +
+            `<button type="button" class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></button>` +
             `<div class="bt-menu-sep"></div>` +
             `<div class="bt-menu-note">${t.cached}: ${entryCount} · ${esc(TARGET_LANG)}</div>` +
             `<div class="bt-menu-note">${t.debug}: ${t.dbgQueue} ${prefetchQueue.length} · ${t.dbgGen} ${generation} · ${t.dbgTrigger} ${esc(lastTriggerReason)}</div>`;
@@ -537,7 +542,12 @@
 
     function closeMenu() {
         const menu = document.getElementById('bt-menu');
-        if (menu) menu.classList.remove('bt-open');
+        const gear = document.getElementById('bt-gear');
+        if (menu) {
+            menu.classList.remove('bt-open');
+            menu.setAttribute('aria-hidden', 'true');
+        }
+        if (gear) gear.setAttribute('aria-expanded', 'false');
     }
 
     function toggleMenu() {
@@ -545,18 +555,24 @@
         if (!menu) return;
         if (!menu.classList.contains('bt-open')) buildMenu(); // refresh snapshot (mode/queue/gen)
         menu.classList.toggle('bt-open');
+        const isOpen = menu.classList.contains('bt-open');
+        menu.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+        const gear = document.getElementById('bt-gear');
+        if (gear) gear.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
     }
 
     // Single source of truth for the status zone: derives display from state.
     function refreshStatus() {
         const bar = document.getElementById('bt-bar');
         const text = document.getElementById('bt-status-text');
+        const progress = document.getElementById('bt-progress');
         const fill = document.getElementById('bt-progress-fill');
         if (!bar || !text) return;
 
         if (doneHideTimer) { clearTimeout(doneHideTimer); doneHideTimer = null; }
 
         let state = 'idle';
+        let progressValue = 0;
         if (translationMode !== 'off') {
             const now = Date.now();
             if (rateLimitUntil > now) {
@@ -586,10 +602,12 @@
                 state = 'chapter';
                 const p = chapterProgress();
                 const done = Math.min(p.done, p.total);
-                if (fill && p.total > 0) fill.style.width = Math.round(done / p.total * 100) + '%';
+                progressValue = p.total > 0 ? Math.round(done / p.total * 100) : 0;
+                if (fill) fill.style.width = progressValue + '%';
                 text.textContent = `${t.translatingChapter} ${done}/${p.total}`;
             } else if (chapterDone > 0) {
                 state = 'done';
+                progressValue = 100;
                 if (fill) fill.style.width = '100%';
                 text.textContent = t.done;
                 doneHideTimer = setTimeout(() => {
@@ -600,6 +618,15 @@
             }
         }
         bar.dataset.state = state;
+        if (progress) {
+            if (state === 'page') {
+                progress.removeAttribute('aria-valuenow');
+                progress.setAttribute('aria-valuetext', text.textContent || t.translatingPage);
+            } else {
+                progress.setAttribute('aria-valuenow', String(progressValue));
+                progress.removeAttribute('aria-valuetext');
+            }
+        }
         if (fill && (state === 'idle' || state === 'page')) {
             // page state uses an indeterminate CSS animation; reset width otherwise
             if (state === 'idle') fill.style.width = '0%';

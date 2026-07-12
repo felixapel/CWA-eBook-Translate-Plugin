@@ -56,7 +56,15 @@ The frontend consists of `static/translator.js`, `static/translator.css`, and
 node -c static/translator.js   # syntax check
 npm ci                         # exact package-lock.json dependency tree
 npm test                       # runs test_frontend.js against a mocked reader/iframe
+npx playwright install --with-deps --only-shell chromium
+npm run test:e2e               # real Chromium: loader, DOM, network, a11y, consent
 ```
+
+The browser suite starts a localhost-only CWA reader fixture, intercepts only
+its `/bt-api/translate/batch` route, and fails on browser console errors,
+warnings, page exceptions, or failed requests. To reuse a compatible local
+Chromium instead of Playwright's managed headless shell, set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/absolute/path/to/chromium`.
 
 ## Updating Dependency Locks
 
@@ -83,7 +91,11 @@ then run `./scripts/audit-deps.sh`.
 
 ### Manual Testing
 
-The DOM-injection logic only fully exercises against the real EPUB.js reader.
+The automated Chromium gate covers loader isolation, the reader iframe,
+translation rendering, cloud-fallback consent, and the control accessibility
+tree. CWA/EPUB.js compatibility and theme integration still require the real
+application.
+
 After any change to `getTranslatableElements`, paragraph detection, or
 rendering, manually verify in a browser: open an EPUB in CWA, cycle
 Original → Bilingual → Translated, change chapters/pages, and check Light /

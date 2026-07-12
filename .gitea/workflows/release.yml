@@ -91,6 +91,8 @@ jobs:
       - run: npm ci
       - run: npm audit --audit-level=high
       - run: npm test
+      - run: npx playwright install --with-deps --only-shell chromium
+      - run: npm run test:e2e
 
   docker-smoke:
     needs: preflight
