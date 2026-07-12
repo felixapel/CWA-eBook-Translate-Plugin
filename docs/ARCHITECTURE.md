@@ -2,6 +2,10 @@
 
 This document details the architecture of the `book-translator` plugin.
 
+## Architecture decisions
+
+- [ADR-001: Use Gitea as the sole release authority](decisions/ADR-001-gitea-release-authority.md)
+
 ## Overview
 
 The plugin operates as a decoupled overlay integrated into Calibre-Web-Automated (CWA).

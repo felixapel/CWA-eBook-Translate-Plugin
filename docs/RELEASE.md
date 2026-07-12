@@ -3,6 +3,8 @@
 Gitea is the release authority for this project. GitHub is a public source and
 container-registry mirror; GitHub Actions runs CI only and never publishes an
 image. The authoritative workflow is `.gitea/workflows/release.yml`.
+The rationale and rejected alternatives are recorded in
+[ADR-001](decisions/ADR-001-gitea-release-authority.md).
 
 ## Remote prerequisites
 

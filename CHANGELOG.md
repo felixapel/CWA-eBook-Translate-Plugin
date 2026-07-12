@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Translation endpoints now reject non-object JSON and invalid Unicode before
+  provider dispatch. Batched provider responses use unpredictable segment IDs
+  and a strict, bounded response envelope so prompt output cannot be mistaken
+  for another paragraph.
+- Every request has atomic limits for provider attempts, input bytes, output
+  tokens, and wall time; a process-wide upstream gate prevents concurrent
+  requests from bypassing those budgets. Streaming provider responses are cut
+  off before oversized JSON is materialized.
+- Cleanup credentials are created atomically across workers with mode `0600`;
+  persistence failures disable the privileged endpoint instead of falling back
+  to a logged or process-local secret.
+- Provider failures, framework errors, and deep health results return stable
+  sanitized envelopes. The provider-touching health probe requires an API token;
+  liveness and readiness remain shallow and never spend provider capacity.
+- Python dependencies, audit/compiler tooling, npm artifacts, the Python base
+  image, direct/transitive Alpine packages, Node.js, and third-party Actions are
+  pinned to reviewed versions, hashes, digests, or commits.
+
+### Added
+
+- Request work-budget and global upstream-cap contracts with concurrency,
+  cancellation, deadline, fallback, and response-size regression tests.
+- Gitea-authoritative release preflight, exact annotated GitHub mirror-tag
+  verification, multi-registry image publishing, OCI provenance, SBOM output,
+  and a fail-closed release runbook.
+- Reproducible Python lock generation on Python 3.11 plus committed runtime,
+  auditor, and compiler hash locks.
+
+### Changed
+
+- CI and release gates now run every backend contract suite, the complete locked
+  npm tree audit, and a required proxy/API/non-root container smoke test. Gitea
+  and GitHub CI definitions remain byte-identical by contract.
+- `/ping`, `/health`, and `/ready` are cheap local probes; `/health/deep` is the
+  explicit authenticated provider diagnostic.
+
 ## [2.1.4] - 2026-07-08
 
 Security follow-up to the deep re-audit (rate-limit hardening for proxy/
@@ -461,7 +499,7 @@ UI version marker: `2026-06-30-ui-polish-v1`.
 - **Chapter-Change Auto-Translation:** Resolved bug where navigating from chapter 1 to chapter 2 sometimes didn't auto-translate. Built a unified `scheduleTranslate` debouncing strategy and iframe document identity tracking.
 - **UI status messages:** Unified and improved status text (`✓ Ready`, `Preparing next text…`) adapting cleanly to dark/sepia themes.
 
-## [Unreleased]
+## Legacy notes retained from the initial 1.x development log
 ### Added
 - Multi-provider support directly from environment variables.
 - Integration for OpenRouter and DeepSeek via standard `requests`.
