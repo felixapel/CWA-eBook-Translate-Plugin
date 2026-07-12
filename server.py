@@ -463,17 +463,53 @@ def _check_auth_rate_limit(ip: str) -> bool:
 # ── Metrics (M5) ────────────────────────────────────────────────────────────
 
 _metrics_lock = threading.Lock()
-_metrics = {
-    "total_requests": 0,
-    "total_latency_ms": 0.0,
-    "cache_hits": 0,
-    "cache_misses": 0,
-    "errors": 0,
-}
+_HTTP_RESPONSE_CLASSES = ("2xx", "3xx", "4xx", "5xx")
+_METRIC_OUTCOMES = (
+    "auth_rejected",
+    "auth_unavailable",
+    "auth_rate_limited",
+    "api_rate_limited",
+    "work_budget_exhausted",
+    "provider_unavailable",
+    "invalid_provider_response",
+    "translation_failed",
+    "internal_error",
+    "batch_partial_failure_requests",
+)
+_WORK_BUDGET_REASONS = (
+    "attempts",
+    "input_bytes",
+    "output_tokens",
+    "deadline",
+    "queue",
+    "cancelled",
+    "unknown",
+)
+
+
+def _empty_metrics() -> dict:
+    """Create the complete fixed-cardinality in-process metric schema."""
+    return {
+        # Backward-compatible translation/cache aggregates.
+        "total_requests": 0,
+        "total_latency_ms": 0.0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "errors": 0,
+        # No route, identity, book, provider URL, or error string is ever a
+        # metric key. Every dimension below is owned by this module.
+        "http_responses": {name: 0 for name in _HTTP_RESPONSE_CLASSES},
+        "outcomes": {name: 0 for name in _METRIC_OUTCOMES},
+        "work_budget_reasons": {name: 0 for name in _WORK_BUDGET_REASONS},
+        "batch_partial_failure_segments": 0,
+    }
+
+
+_metrics = _empty_metrics()
 
 
 def _record_metric(latency_ms: float, hits: int = 0, misses: int = 0, error: bool = False):
-    """Record request metrics (thread-safe)."""
+    """Record backward-compatible translation/cache aggregates."""
     with _metrics_lock:
         _metrics["total_requests"] += 1
         _metrics["total_latency_ms"] += latency_ms
@@ -483,8 +519,50 @@ def _record_metric(latency_ms: float, hits: int = 0, misses: int = 0, error: boo
             _metrics["errors"] += 1
 
 
+def _record_http_response(status_code: int) -> None:
+    """Count a response by its fixed HTTP class, including middleware exits."""
+    response_class = f"{int(status_code) // 100}xx"
+    if response_class not in _HTTP_RESPONSE_CLASSES:
+        return
+    with _metrics_lock:
+        _metrics["http_responses"][response_class] += 1
+
+
+def _record_outcome(name: str) -> None:
+    """Count one server-owned semantic outcome; dynamic labels are forbidden."""
+    if name not in _METRIC_OUTCOMES:
+        raise ValueError("unknown metric outcome")
+    with _metrics_lock:
+        _metrics["outcomes"][name] += 1
+
+
+def _record_work_budget_exhaustion(reason: str) -> None:
+    """Count a bounded work rejection without exposing arbitrary reasons."""
+    bounded_reason = reason if reason in _WORK_BUDGET_REASONS else "unknown"
+    with _metrics_lock:
+        _metrics["outcomes"]["work_budget_exhausted"] += 1
+        _metrics["work_budget_reasons"][bounded_reason] += 1
+
+
+def _record_batch_partial_failure(segment_count: int) -> None:
+    """Count one partial batch plus its failed segments, without content labels."""
+    if isinstance(segment_count, bool) or not isinstance(segment_count, int) or segment_count <= 0:
+        raise ValueError("segment_count must be a positive integer")
+    with _metrics_lock:
+        _metrics["outcomes"]["batch_partial_failure_requests"] += 1
+        _metrics["batch_partial_failure_segments"] += segment_count
+
+
+def _reset_metrics_for_tests() -> None:
+    """Restore the metric schema atomically for deterministic contract tests."""
+    with _metrics_lock:
+        _metrics.clear()
+        _metrics.update(_empty_metrics())
+
+
 def _work_budget_response(exc: WorkBudgetExceeded):
     """Map internal admission limits to a stable, non-sensitive 503."""
+    _record_work_budget_exhaustion(exc.reason)
     request_id = getattr(request, "request_id", None)
     log.warning("req=%s upstream work rejected reason=%s", request_id, exc.reason)
     response = jsonify({
@@ -670,6 +748,7 @@ def before_request_hook():
     if protected:
         client_ip = _client_ip()
         if not _check_auth_rate_limit(client_ip):
+            _record_outcome("auth_rate_limited")
             response = jsonify({
                 "error": "rate_limited",
                 "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
@@ -680,12 +759,14 @@ def before_request_hook():
         try:
             identity = AUTHENTICATOR.authenticate(request.headers, request.remote_addr)
         except AuthRejected:
+            _record_outcome("auth_rejected")
             log.warning("req=%s authentication rejected", request.request_id)
             return jsonify({
                 "error": "unauthorized",
                 "request_id": request.request_id,
             }), 401
         except AuthUnavailable:
+            _record_outcome("auth_unavailable")
             log.warning("req=%s authentication authority unavailable", request.request_id)
             return jsonify({
                 "error": "authentication_unavailable",
@@ -705,6 +786,7 @@ def before_request_hook():
     if request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/metrics", "/ping", "/stats"):
         client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
+            _record_outcome("api_rate_limited")
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
             response = jsonify({
                 "error": "rate_limited",
@@ -718,6 +800,7 @@ def before_request_hook():
 @app.after_request
 def after_request_hook(response):
     """Log timing, add CORS headers, add request ID header."""
+    _record_http_response(response.status_code)
     # Timing (M5)
     elapsed_ms = int((time.monotonic() - getattr(request, "start_time", time.monotonic())) * 1000)
     req_id = getattr(request, "request_id", "unknown")
@@ -769,6 +852,7 @@ def http_error(exc: HTTPException):
 @app.errorhandler(Exception)
 def unhandled_error(exc: Exception):
     """Fail closed without returning or logging private exception strings."""
+    _record_outcome("internal_error")
     request_id = getattr(request, "request_id", None)
     log.error(
         "req=%s unhandled request error type=%s",
@@ -862,9 +946,12 @@ def stats():
 
 @app.route("/metrics")
 def metrics():
-    """Return request metrics (M5)."""
+    """Return fixed-cardinality, content-free request metrics (M5)."""
     with _metrics_lock:
-        snapshot = dict(_metrics)
+        snapshot = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in _metrics.items()
+        }
     total = snapshot["total_requests"]
     avg_latency = round(snapshot["total_latency_ms"] / total, 1) if total > 0 else 0
     total_cache = snapshot["cache_hits"] + snapshot["cache_misses"]
@@ -876,6 +963,13 @@ def metrics():
         "cache_hits": snapshot["cache_hits"],
         "cache_misses": snapshot["cache_misses"],
         "errors": snapshot["errors"],
+        "http_responses_total": sum(snapshot["http_responses"].values()),
+        "http_responses": snapshot["http_responses"],
+        "outcomes": snapshot["outcomes"],
+        "work_budget_reasons": snapshot["work_budget_reasons"],
+        "batch_partial_failure_segments": snapshot[
+            "batch_partial_failure_segments"
+        ],
         "singleflight": singleflight_stats(),
     })
 
@@ -993,6 +1087,7 @@ def translate():
     except ProviderUnavailableError:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+        _record_outcome("provider_unavailable")
         log.warning("req=%s translation provider unavailable", req_id)
         return jsonify({
             "error": "provider_unavailable",
@@ -1001,6 +1096,7 @@ def translate():
     except Exception as e:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+        _record_outcome("translation_failed")
         log.error(
             "req=%s translation failed error_type=%s",
             req_id, type(e).__name__,
@@ -1159,6 +1255,7 @@ def translate_batch_endpoint():
         return _work_budget_response(exc)
     except SegmentProtocolError:
         _record_metric(0, hits=0, misses=1, error=True)
+        _record_outcome("invalid_provider_response")
         log.warning("req=%s provider returned an invalid segment envelope",
                     getattr(request, "request_id", None))
         return jsonify({
@@ -1167,6 +1264,7 @@ def translate_batch_endpoint():
         }), 502
     except ProviderUnavailableError:
         _record_metric(0, hits=0, misses=1, error=True)
+        _record_outcome("provider_unavailable")
         log.warning(
             "req=%s batch provider unavailable",
             getattr(request, "request_id", None),
@@ -1177,6 +1275,7 @@ def translate_batch_endpoint():
         }), 502
     except Exception as exc:
         _record_metric(0, hits=0, misses=1, error=True)
+        _record_outcome("translation_failed")
         log.error(
             "req=%s batch translation failed error_type=%s",
             getattr(request, "request_id", None), type(exc).__name__,
@@ -1188,6 +1287,12 @@ def translate_batch_endpoint():
     result["request_id"] = getattr(request, "request_id", None)
 
     _record_metric(result["total_elapsed_ms"], hits=result["cached_count"], misses=result["fresh_count"])
+    partial_failures = sum(
+        isinstance(value, str) and value.startswith("[TRANSLATION ERROR:")
+        for value in result["translations"]
+    )
+    if partial_failures:
+        _record_batch_partial_failure(partial_failures)
 
     return jsonify(result)
 

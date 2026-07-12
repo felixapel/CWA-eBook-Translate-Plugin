@@ -63,7 +63,9 @@ Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
   mode.
 - **Flask Server (`server.py`)**: Exposes translation endpoints `/translate`
   and `/translate/batch` along with metrics and health probes. Only shallow
-  liveness/readiness routes bypass authentication.
+  liveness/readiness routes bypass authentication. Observability uses a fixed
+  schema for HTTP classes and bounded auth, admission, provider, deadline, and
+  partial-batch outcomes; it never creates labels from request or book data.
 - **SQLite Cache (`cache.py`)**: Schema v2 keys include tenant, book, chapter,
   provider, model, prompt/protocol fingerprint, group context, languages, and
   source hash. Source paragraphs and raw tenant/book/chapter identifiers are not
