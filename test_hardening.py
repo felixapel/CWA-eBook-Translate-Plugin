@@ -358,7 +358,10 @@ def run():
     STATE["local_up"] = False
     STATE["fallback_up"] = True
     r4 = client.post("/translate/batch",
-                     json={"paragraphs": ["h6_fallback_only_para"]}).get_json()
+                     json={
+                         "paragraphs": ["h6_fallback_only_para"],
+                         "allow_cloud_fallback": True,
+                     }).get_json()
     check("H6: fallback provider reported in per-para backends",
           r4.get("backends") and r4["backends"][0] == "minimax")
     STATE["local_up"] = True

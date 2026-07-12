@@ -296,9 +296,13 @@ operator-only and uses the same request budget and global provider gate as a
 translation. Authenticate it with `X-BT-Token`: this is `BT_API_TOKEN` when
 configured, otherwise the persisted `/app/data/cleanup_token` value.
 
-`/metrics` reports request/cache counters plus bounded singleflight activity
-(`active_entries`, shared results, follower timeouts, and capacity rejections),
-so duplicate-work pressure is visible without exposing book text or cache keys.
+`/metrics` reports request/cache counters, fixed HTTP status classes, bounded
+authentication/rate-limit/provider/work-budget outcomes, partial-batch segment
+failures, and bounded singleflight activity (`active_entries`, shared results,
+follower timeouts, and capacity rejections). Metric dimensions are defined by
+the server: routes, identities, book metadata, provider URLs, exception strings,
+source text, and cache keys are never labels. Counters are process-local, which
+is another reason the shipped runtime intentionally uses one gunicorn worker.
 
 Authentication-derived tenant behavior is intentional:
 

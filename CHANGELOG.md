@@ -67,6 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tenant, book, chapter, context, language, protocol, migration, and retention.
 - Bounded singleflight coalescing for identical active translation operations,
   with tenant/context isolation and pressure counters in `/metrics`.
+- Fixed-cardinality HTTP, authentication, rate-limit, work-budget, provider,
+  and partial-batch failure counters without content-derived metric labels.
 
 ### Changed
 
