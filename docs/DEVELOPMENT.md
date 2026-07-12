@@ -44,6 +44,28 @@ python3 server.py &
 BENCHMARK_URL=http://127.0.0.1:8390 python3 test_endpoints.py
 ```
 
+The rate-limit probe requires a fresh limiter window and valid authentication.
+It sends same-language requests, so it exercises authentication and admission
+without calling the configured translation provider. Its default 130 probes
+cover the default limit of 120; raise `--requests` if your deployment uses a
+higher `BT_RATE_LIMIT_PER_MINUTE`:
+
+```bash
+BT_API_TOKEN='<token>' python3 test_ratelimit.py \
+  --url http://127.0.0.1:8390 --requests 130 --timeout 5
+```
+
+For the recommended CWA-session proxy, pass the browser cookie through an
+environment variable rather than the command line:
+
+```bash
+BT_RATE_LIMIT_TEST_COOKIE='session=<opaque-value>' \
+  python3 test_ratelimit.py --url http://127.0.0.1:8080/bt-api
+```
+
+It exits nonzero on connection/authentication errors, unexpected statuses, or
+if it does not observe both an admitted request and a `429` response.
+
 ## Frontend Development
 
 The frontend consists of `static/translator.js`, `static/translator.css`, and
