@@ -83,6 +83,7 @@ def fake_post(
 import translator  # noqa: E402
 translator._provider_post = fake_post
 import server  # noqa: E402
+import translator  # noqa: E402
 client = server.app.test_client()
 
 failed = []
@@ -119,9 +120,17 @@ def run():
     check("segment protocol: malformed group triggers no per-paragraph fanout",
           STATE["single_calls"] == 0)
     import cache as segment_cache
+    malformed_paragraphs = [f"a{i}" for i in range(3)]
+    malformed_contract = translator.batch_cache_contract(
+        malformed_paragraphs, [0, 1, 2], "English", "Spanish")
+    malformed_scope = server._cache_scope(
+        tenant="legacy-anonymous", book_id="unscoped", chapter_id="unscoped",
+        context_hash=malformed_contract.context_hash, provider="local",
+        model="fake-model", prompt_hash=malformed_contract.prompt_hash,
+        protocol_version=malformed_contract.protocol_version)
     check("segment protocol: malformed group writes nothing to cache",
           all(segment_cache.get_cached(
-              f"a{i}", "English", "Spanish", model="fake-model") is None
+              f"a{i}", "English", "Spanish", scope=malformed_scope) is None
               for i in range(3)))
     STATE["malform"] = False
 
@@ -135,7 +144,6 @@ def run():
 
     # Strict JSON response envelope: exact version, exact ordered IDs, no
     # duplicate keys, missing/extra/reordered items, or surrounding prose.
-    import translator
     parser = getattr(translator, "_parse_segment_envelope", None)
     check("segment protocol: strict JSON parser is available", callable(parser))
     if parser:
@@ -303,10 +311,21 @@ def run():
     d = client.post("/translate", json={"text": "fb_scope_para"}).get_json()
     check("fb-scope: fallback served the fresh translation",
           d.get("translated") == "[FB] fb_scope_para" and d.get("backend") == "minimax")
+    fb_contract = translator.single_cache_contract("English", "Spanish")
+    fb_scope = server._cache_scope(
+        tenant="legacy-anonymous", book_id="unscoped", chapter_id="unscoped",
+        context_hash=fb_contract.context_hash, provider="minimax",
+        model="fake-fallback", prompt_hash=fb_contract.prompt_hash,
+        protocol_version=fb_contract.protocol_version)
+    primary_scope = server._cache_scope(
+        tenant="legacy-anonymous", book_id="unscoped", chapter_id="unscoped",
+        context_hash=fb_contract.context_hash, provider="local",
+        model="fake-model", prompt_hash=fb_contract.prompt_hash,
+        protocol_version=fb_contract.protocol_version)
     check("fb-scope: cached under the FALLBACK model key",
-          cache_mod.get_cached("fb_scope_para", "English", "Spanish", model="fake-fallback") == "[FB] fb_scope_para")
+          cache_mod.get_cached("fb_scope_para", "English", "Spanish", scope=fb_scope) == "[FB] fb_scope_para")
     check("fb-scope: NOT cached under the primary model key",
-          cache_mod.get_cached("fb_scope_para", "English", "Spanish", model="fake-model") is None)
+          cache_mod.get_cached("fb_scope_para", "English", "Spanish", scope=primary_scope) is None)
     STATE["local_up"] = True
     d = client.post("/translate", json={"text": "fb_scope_para"}).get_json()
     check("fb-scope: cache hit after primary recovers (no re-pay)",
@@ -336,7 +355,6 @@ def run():
 
     # Output token cap is proportional to input and clamped to the ceiling, so a
     # rambling model can't burn thousands of tokens on a short paragraph.
-    import translator
     check("output cap: short input stays small (no runaway generation)",
           translator._output_cap("A short sentence.", 4096) < 1000)
     check("output cap: long input clamps to the ceiling",
@@ -476,8 +494,14 @@ def run():
     # does not persist source_text, so tests must not reintroduce that privacy
     # leak merely to locate a row.
     conn = cache_mod._get_conn()
+    poison_contract = translator.single_cache_contract("English", "Spanish")
+    poison_scope = server._cache_scope(
+        tenant="legacy-anonymous", book_id="unscoped", chapter_id="unscoped",
+        context_hash=poison_contract.context_hash, provider="local",
+        model="fake-model", prompt_hash=poison_contract.prompt_hash,
+        protocol_version=poison_contract.protocol_version)
     poison_key = cache_mod.compute_cache_key(
-        poison, "English", "Spanish", model="fake-model")
+        poison, "English", "Spanish", scope=poison_scope)
     rows_for_text = conn.execute(
         "SELECT model FROM translations WHERE cache_key = ?",
         (poison_key,),

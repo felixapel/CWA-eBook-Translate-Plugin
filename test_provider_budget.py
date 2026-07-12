@@ -32,6 +32,20 @@ class ProviderBudgetTests(unittest.TestCase):
         self.original_queue_timeout = getattr(
             translator, "BT_UPSTREAM_QUEUE_TIMEOUT", None)
         self.original_response_limit = translator.BT_MAX_UPSTREAM_RESPONSE_BYTES
+        self.original_provider_config = (
+            translator.LLM_PROVIDER,
+            translator.LLM_MODEL,
+            translator.LLM_FALLBACK_PROVIDER,
+            translator.LLM_FALLBACK_MODEL,
+            translator.LLM_FALLBACK_API_KEY,
+        )
+        # Keep this module deterministic even when another test imported the
+        # translator before the environment variables above were applied.
+        translator.LLM_PROVIDER = "local"
+        translator.LLM_MODEL = "fake-model"
+        translator.LLM_FALLBACK_PROVIDER = "minimax"
+        translator.LLM_FALLBACK_MODEL = "fake-fallback"
+        translator.LLM_FALLBACK_API_KEY = "x" * 20
         translator._primary_provider = None
         translator._fallback_provider = "unset"
 
@@ -45,6 +59,13 @@ class ProviderBudgetTests(unittest.TestCase):
         if self.original_queue_timeout is not None:
             translator.BT_UPSTREAM_QUEUE_TIMEOUT = self.original_queue_timeout
         translator.BT_MAX_UPSTREAM_RESPONSE_BYTES = self.original_response_limit
+        (
+            translator.LLM_PROVIDER,
+            translator.LLM_MODEL,
+            translator.LLM_FALLBACK_PROVIDER,
+            translator.LLM_FALLBACK_MODEL,
+            translator.LLM_FALLBACK_API_KEY,
+        ) = self.original_provider_config
 
     @staticmethod
     def budget(max_attempts=20, deadline_seconds=60):

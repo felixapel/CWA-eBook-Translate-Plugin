@@ -28,11 +28,12 @@ The backend test suite is self-contained — it mocks the LLM and the database
 file, so it needs no running server, no API key, and no network access:
 ```bash
 .venv/bin/python3 test_translation.py
+.venv/bin/python3 -m unittest -v test_cache_v2 test_context_cache test_singleflight
 ```
 
 Always also check syntax/compile before committing:
 ```bash
-python3 -m py_compile server.py translator.py cache.py work_budget.py
+python3 -m py_compile server.py translator.py cache.py singleflight.py work_budget.py
 ```
 
 `test_endpoints.py`, `test_ratelimit.py`, `benchmark.py`, and

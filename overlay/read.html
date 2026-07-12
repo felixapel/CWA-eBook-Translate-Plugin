@@ -28,14 +28,16 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/translator.css') }}?v=2.1.4">
     <script>
         // book-translator configuration.
-        // Leave apiUrl empty to auto-resolve to http://<current-host>:8390 — this
-        // keeps the overlay working over the LAN (a hardcoded localhost would only
-        // work when the browser runs on the server itself). Set it only if the API
-        // lives on a different host/port.
+        // On plain HTTP, an empty apiUrl resolves to http://<current-host>:8390.
+        // HTTPS deployments must set a same-origin/TLS API path (normally
+        // '/bt-api' through the injection proxy); the client fails closed
+        // instead of attempting mixed content.
         window.BOOK_TRANSLATOR = {
             apiUrl: '',
             sourceLang: 'English',
             targetLang: 'Spanish',
+            bookId: {{ bookid | tojson }},
+            persistCache: false,
             apiToken: ''   // set this to match the API's BT_API_TOKEN if you enabled auth
         };
     </script>

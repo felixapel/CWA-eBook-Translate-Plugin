@@ -10,6 +10,7 @@ output use a versioned JSON envelope with server-generated IDs; a malformed
 response fails the whole group rather than risking cross-segment corruption.
 """
 import json
+import hashlib
 import math
 import os
 import re
@@ -20,11 +21,15 @@ import time
 import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from requests.adapters import HTTPAdapter
 from typing import Optional
 from urllib3 import PoolManager, ProxyManager
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from singleflight import (
+    SingleFlight, SingleFlightCapacityError, SingleFlightTimeout,
+)
 from work_budget import WorkBudget, WorkBudgetExceeded
 
 log = logging.getLogger("book-translator.translator")
@@ -61,6 +66,8 @@ BT_BATCH_MAX_TOKENS = int(os.environ.get("BT_BATCH_MAX_TOKENS", "8192"))
 BT_OUTPUT_TOKEN_FACTOR = float(os.environ.get("BT_OUTPUT_TOKEN_FACTOR", "2.0"))
 BT_OUTPUT_TOKEN_FLOOR = int(os.environ.get("BT_OUTPUT_TOKEN_FLOOR", "256"))
 BT_CONTEXT_WINDOW = int(os.environ.get("BT_CONTEXT_WINDOW", "0"))
+BT_SINGLEFLIGHT_MAX_ENTRIES = int(os.environ.get(
+    "BT_SINGLEFLIGHT_MAX_ENTRIES", "1024"))
 
 
 # CJK scripts tokenize much denser than Latin (~1-2 chars/token vs ~3.5), so a
@@ -405,6 +412,23 @@ Rules:
 6. Output JSON only: no Markdown fences, commentary, notes, or extra keys."""
 
 SEGMENT_PROTOCOL = "cwa-translate-segments/v1"
+TRANSLATION_CONTRACT_VERSION = "cwa-translate-contract/v2"
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationCacheContract:
+    """Fingerprint of every prompt-side input outside one paragraph's text."""
+
+    prompt_hash: str
+    protocol_version: str
+    context_hash: str
+
+
+def _contract_hash(value) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class SegmentProtocolError(RuntimeError):
@@ -624,12 +648,24 @@ for _name, _value in {
     "BT_REQUEST_MAX_OUTPUT_TOKENS": BT_REQUEST_MAX_OUTPUT_TOKENS,
     "BT_REQUEST_DEADLINE_SECONDS": BT_REQUEST_DEADLINE_SECONDS,
     "BT_MAX_UPSTREAM_RESPONSE_BYTES": BT_MAX_UPSTREAM_RESPONSE_BYTES,
+    "BT_SINGLEFLIGHT_MAX_ENTRIES": BT_SINGLEFLIGHT_MAX_ENTRIES,
 }.items():
     if ((isinstance(_value, float) and not math.isfinite(_value))
             or _value <= 0):
         raise ValueError(f"{_name} must be greater than zero")
 
 _UPSTREAM_SEM = _threading.BoundedSemaphore(BT_MAX_UPSTREAM_INFLIGHT)
+_TRANSLATION_SINGLEFLIGHT = SingleFlight(
+    max_entries=BT_SINGLEFLIGHT_MAX_ENTRIES,
+    # Share only active provider work. Retaining completed values would bypass
+    # the authoritative SQLite TTL/cache contract and could replay a transient
+    # provider failure after recovery.
+    result_ttl_seconds=0,
+)
+
+
+def singleflight_stats() -> dict[str, int]:
+    return _TRANSLATION_SINGLEFLIGHT.stats()
 
 
 def create_work_budget() -> WorkBudget:
@@ -771,6 +807,19 @@ def model_for_provider(provider_name: str) -> str:
     return LLM_MODEL
 
 
+def cache_lookup_backends() -> list[tuple[str, str]]:
+    """Configured provider/model identities to probe, in failover order."""
+    backends = [(LLM_PROVIDER, LLM_MODEL)]
+    if LLM_FALLBACK_PROVIDER and LLM_FALLBACK_PROVIDER in PROVIDER_ENDPOINTS:
+        fallback = (
+            LLM_FALLBACK_PROVIDER,
+            LLM_FALLBACK_MODEL or LLM_MODEL,
+        )
+        if fallback not in backends:
+            backends.append(fallback)
+    return backends
+
+
 def cache_lookup_models() -> list[str]:
     """Model keys to probe on cache lookup, primary first.
 
@@ -779,12 +828,69 @@ def cache_lookup_models() -> list[str]:
     second means that work is never re-paid once the primary recovers, while
     primary-model entries still win when both exist.
     """
-    models = [LLM_MODEL]
-    if LLM_FALLBACK_PROVIDER and LLM_FALLBACK_PROVIDER in PROVIDER_ENDPOINTS:
-        fb_model = LLM_FALLBACK_MODEL or LLM_MODEL
-        if fb_model not in models:
-            models.append(fb_model)
+    models = []
+    for _provider, model in cache_lookup_backends():
+        if model not in models:
+            models.append(model)
     return models
+
+
+def single_cache_contract(
+    source_lang: str, target_lang: str
+) -> TranslationCacheContract:
+    system_prompt = SYSTEM_PROMPT.format(
+        source_lang=source_lang, target_lang=target_lang
+    )
+    return TranslationCacheContract(
+        prompt_hash=_contract_hash(
+            [TRANSLATION_CONTRACT_VERSION, "single", system_prompt]
+        ),
+        protocol_version="cwa-translate-single/v1",
+        context_hash=_contract_hash(
+            [TRANSLATION_CONTRACT_VERSION, "no-context"]
+        ),
+    )
+
+
+def _validate_operation_namespace(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("operation_namespace must be a non-empty string")
+    if len(value) > 4096:
+        raise ValueError("operation_namespace is too long")
+    return value.strip()
+
+
+def _backend_operation_identity() -> list[tuple[str, str, str, str]]:
+    identities = []
+    for provider, model in cache_lookup_backends():
+        url, api_type = PROVIDER_ENDPOINTS[provider]
+        identities.append((provider, model, url, api_type))
+    return identities
+
+
+def _single_operation_key(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    *,
+    operation_namespace: str,
+    max_retries: int,
+    timeout: int,
+) -> str:
+    contract = single_cache_contract(source_lang, target_lang)
+    return _contract_hash([
+        TRANSLATION_CONTRACT_VERSION,
+        "singleflight-single",
+        _validate_operation_namespace(operation_namespace),
+        _backend_operation_identity(),
+        contract.prompt_hash,
+        contract.protocol_version,
+        contract.context_hash,
+        text.strip(),
+        max_retries,
+        timeout,
+        _output_cap(text, BT_MAX_TOKENS),
+    ])
 
 
 def translate_text(
@@ -795,19 +901,41 @@ def translate_text(
     timeout: Optional[int] = None,
     prefer_local: bool = True,  # Ignored, preserved for backward compatibility
     budget: Optional[WorkBudget] = None,
+    *,
+    operation_namespace: str = "legacy",
 ) -> tuple[str, str]:
     """Translate a single text. Returns (translated_text, provider_name)."""
     if budget is None:
         budget = create_work_budget()
+    budget.ensure_active()
+    resolved_timeout = BT_TIMEOUT if timeout is None else timeout
     system = SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
-    translated, provider = _complete(
+    key = _single_operation_key(
         text,
-        system,
-        max_retries,
-        timeout,
-        _output_cap(text, BT_MAX_TOKENS),
-        budget,
+        source_lang,
+        target_lang,
+        operation_namespace=operation_namespace,
+        max_retries=max_retries,
+        timeout=resolved_timeout,
     )
+    try:
+        flight = _TRANSLATION_SINGLEFLIGHT.run(
+            key,
+            lambda: _complete(
+                text,
+                system,
+                max_retries,
+                resolved_timeout,
+                _output_cap(text, BT_MAX_TOKENS),
+                budget,
+            ),
+            timeout=budget.remaining_seconds(),
+        )
+    except SingleFlightTimeout as exc:
+        raise WorkBudgetExceeded("deadline") from exc
+    except SingleFlightCapacityError as exc:
+        raise WorkBudgetExceeded("queue") from exc
+    translated, provider = flight.value
     log.debug("Translated %d chars %s→%s via %s", len(text), source_lang, target_lang, provider)
     return translated, provider
 
@@ -896,8 +1024,72 @@ def _build_context_block(all_texts: list[str], idxs: list[int]) -> Optional[str]
     return "[CONTEXT] Surrounding story context — do NOT translate:\n" + "\n\n".join(sections)
 
 
-def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str,
-                     target_lang: str, budget: WorkBudget) -> list[tuple[str, str]]:
+def translation_groups(
+    texts: list[str], batch_size: int | None = None
+) -> list[list[int]]:
+    """Return stable non-empty paragraph groups using original indices."""
+    size = BT_BATCH_SIZE if batch_size is None else batch_size
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    work = [index for index, text in enumerate(texts) if text.strip()]
+    return [work[offset:offset + size] for offset in range(0, len(work), size)]
+
+
+def batch_cache_contract(
+    all_texts: list[str],
+    idxs: list[int],
+    source_lang: str,
+    target_lang: str,
+) -> TranslationCacheContract:
+    """Fingerprint the deterministic semantics of one provider batch.
+
+    Random opaque segment IDs are intentionally excluded: they protect the
+    response envelope but do not change the text or context the model sees.
+    Every segment in the group and the exact context block are included so a
+    partial cache hit can never silently change the prompt for the remaining
+    paragraphs.
+    """
+    if len(idxs) == 1 and BT_CONTEXT_WINDOW == 0:
+        return single_cache_contract(source_lang, target_lang)
+    if not idxs:
+        raise ValueError("batch cache contract requires at least one index")
+    if any(
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 0
+        or index >= len(all_texts)
+        for index in idxs
+    ):
+        raise ValueError("batch cache contract contains an invalid index")
+
+    system_prompt = BATCH_SYSTEM_PROMPT.format(
+        source_lang=source_lang, target_lang=target_lang
+    )
+    context_block = _build_context_block(all_texts, idxs)
+    semantic_context = {
+        "segments": [all_texts[index].strip() for index in idxs],
+        "context": context_block or "",
+        "context_window": BT_CONTEXT_WINDOW,
+    }
+    return TranslationCacheContract(
+        prompt_hash=_contract_hash(
+            [TRANSLATION_CONTRACT_VERSION, "batch", system_prompt]
+        ),
+        protocol_version=SEGMENT_PROTOCOL,
+        context_hash=_contract_hash(
+            [TRANSLATION_CONTRACT_VERSION, semantic_context]
+        ),
+    )
+
+
+def _translate_group_operation(
+    all_texts: list[str],
+    idxs: list[int],
+    source_lang: str,
+    target_lang: str,
+    budget: WorkBudget,
+    operation_namespace: str,
+) -> list[tuple[str, str]]:
     """
     Translate a group of paragraphs in ONE LLM call. A malformed protocol
     response fails the group atomically; it never triggers unbounded
@@ -909,7 +1101,8 @@ def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str,
     if len(group_texts) == 1 and BT_CONTEXT_WINDOW == 0:
         return [translate_text(
             group_texts[0], source_lang, target_lang,
-            max_retries=1, budget=budget)]
+            max_retries=1, budget=budget,
+            operation_namespace=operation_namespace)]
 
     segment_ids = []
     while len(segment_ids) < len(idxs):
@@ -943,6 +1136,72 @@ def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str,
     return [(seg, provider) for seg in parsed]
 
 
+def _batch_operation_key(
+    all_texts: list[str],
+    idxs: list[int],
+    source_lang: str,
+    target_lang: str,
+    operation_namespace: str,
+) -> str:
+    contract = batch_cache_contract(
+        all_texts, idxs, source_lang, target_lang
+    )
+    return _contract_hash([
+        TRANSLATION_CONTRACT_VERSION,
+        "singleflight-batch",
+        _validate_operation_namespace(operation_namespace),
+        _backend_operation_identity(),
+        contract.prompt_hash,
+        contract.protocol_version,
+        contract.context_hash,
+        BT_BATCH_MAX_TOKENS,
+        BT_OUTPUT_TOKEN_FACTOR,
+        BT_OUTPUT_TOKEN_FLOOR,
+    ])
+
+
+def _translate_group(
+    all_texts: list[str],
+    idxs: list[int],
+    source_lang: str,
+    target_lang: str,
+    budget: WorkBudget,
+    operation_namespace: str,
+) -> list[tuple[str, str]]:
+    if len(idxs) == 1 and BT_CONTEXT_WINDOW == 0:
+        return [translate_text(
+            all_texts[idxs[0]],
+            source_lang,
+            target_lang,
+            max_retries=1,
+            budget=budget,
+            operation_namespace=operation_namespace,
+        )]
+
+    budget.ensure_active()
+    key = _batch_operation_key(
+        all_texts, idxs, source_lang, target_lang, operation_namespace
+    )
+    try:
+        flight = _TRANSLATION_SINGLEFLIGHT.run(
+            key,
+            lambda: _translate_group_operation(
+                all_texts,
+                idxs,
+                source_lang,
+                target_lang,
+                budget,
+                operation_namespace,
+            ),
+            timeout=budget.remaining_seconds(),
+        )
+    except SingleFlightTimeout as exc:
+        raise WorkBudgetExceeded("deadline") from exc
+    except SingleFlightCapacityError as exc:
+        raise WorkBudgetExceeded("queue") from exc
+    return flight.value
+
+
 
 def translate_batch(
     texts: list[str],
@@ -950,6 +1209,9 @@ def translate_batch(
     target_lang: str = "Spanish",
     max_concurrent: Optional[int] = None,
     budget: Optional[WorkBudget] = None,
+    *,
+    selected_groups: Optional[list[list[int]]] = None,
+    operation_namespace: str = "legacy",
 ) -> list[tuple[str, str]]:
     """
     Translate multiple texts. Non-empty texts are grouped into batches of
@@ -961,25 +1223,45 @@ def translate_batch(
     if budget is None:
         budget = create_work_budget()
     max_concurrent = max(1, max_concurrent)
-    batch_size = max(1, BT_BATCH_SIZE)
-
     results: list[tuple[str, str]] = [("", "")] * len(texts)
-    work = [(i, t) for i, t in enumerate(texts) if t.strip()]
-    if not work:
+    if selected_groups is None:
+        groups = translation_groups(texts)
+    else:
+        groups = [list(group) for group in selected_groups]
+        flattened = [index for group in groups for index in group]
+        valid = (
+            all(groups)
+            and len(flattened) == len(set(flattened))
+            and all(
+                not isinstance(index, bool)
+                and isinstance(index, int)
+                and 0 <= index < len(texts)
+                and texts[index].strip()
+                for index in flattened
+            )
+            and all(group == sorted(group) for group in groups)
+            and all(len(group) <= max(1, BT_BATCH_SIZE) for group in groups)
+            and flattened == sorted(flattened)
+        )
+        if groups and not valid:
+            raise ValueError("selected_groups must contain unique ordered non-empty indices")
+    if not groups:
         return results
-
-    # Split the work into groups of batch_size, preserving original indices.
-    groups = [work[k:k + batch_size] for k in range(0, len(work), batch_size)]
 
     fatal_lock = _threading.Lock()
     fatal_protocol_error: list[SegmentProtocolError | None] = [None]
 
-    def _do_group(group):
-        idxs = [i for i, _ in group]
+    def _do_group(idxs):
         try:
             budget.ensure_active()
             translations = _translate_group(
-                texts, idxs, source_lang, target_lang, budget)
+                texts,
+                idxs,
+                source_lang,
+                target_lang,
+                budget,
+                operation_namespace,
+            )
         except SegmentProtocolError as exc:
             # Publish the semantic failure before cancelling the shared budget.
             # Other workers may observe "cancelled" first; the caller still

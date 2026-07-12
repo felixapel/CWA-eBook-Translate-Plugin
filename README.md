@@ -13,7 +13,7 @@ Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://gi
 - 🚀 **Background Prefetching** — translates the rest of the chapter sequentially in the background
 - 🧠 **Context-Aware Translation** — feeds surrounding paragraphs to the LLM to improve literary quality and character voice
 - 📚 **Deep DOM Parsing** — accurately captures headings, custom title classes, and clickable TOC links
-- 💾 **Persistent Double Cache** — server-side SQLite (SHA-256) + client-side `localStorage` caching ensures you never lose a translation or re-pay API costs
+- 💾 **Private Bounded Cache** — durable server-side SQLite uses scoped SHA-256 keys, mandatory TTL/cap, and private file modes; browser persistence is opt-in on trusted single-user devices
 - 🔒 **Rate limited & Stable** — request-size caps and per-IP rate limiting protect your API keys and GPU from runaway requests, with `AbortController` cancellation for perfectly responsive UI buttons
 - 🔌 **Zero-touch install** — proxy-injection mode overlays a **stock** CWA container: no template mounts, nothing to re-apply when CWA updates
 
@@ -198,6 +198,7 @@ them):
 | `BT_MAX_CONTENT_LENGTH` | `2097152` (2 MB) | Hard cap on the request body (the WSGI-level backstop). Per-field caps (`BT_MAX_BATCH_PARAGRAPHS`, `BT_MAX_PARAGRAPH_CHARS`) check the parsed content; this cap rejects oversize bodies before parsing. Lower it for untrusted networks, raise it for very long paragraphs. |
 | `BT_MAX_UPSTREAM_INFLIGHT` | `2` | Process-wide cap on simultaneous in-flight LLM calls across all readers. `BT_MAX_CONCURRENT` only bounds one batch request; this cap prevents multi-reader timeout cascades. Must be greater than zero. |
 | `BT_UPSTREAM_QUEUE_TIMEOUT` | `2` | Maximum seconds to wait for a global upstream slot. A full queue returns `503` with `Retry-After` without starting a provider call. |
+| `BT_SINGLEFLIGHT_MAX_ENTRIES` | `1024` | Process-wide bound on distinct active translation operations. Concurrent requests with the same tenant/book/chapter and exact prompt contract share one provider call; completed results are never retained here and must pass through the scoped SQLite cache. |
 | `BT_REQUEST_MAX_ATTEMPTS` | `20` | Maximum provider calls across groups, primary, and fallback for one API request. Batch groups use one attempt per provider, so the default exactly covers 50 paragraphs at batch size 5 when the primary fails and a healthy fallback succeeds. The single-text endpoint retains two attempts per provider. Attempts are reserved atomically before network I/O. |
 | `BT_REQUEST_MAX_INPUT_BYTES` | `5000000` | Maximum cumulative UTF-8 prompt bytes reserved across every provider attempt in one API request. The default covers two passes over the largest valid default batch, including four-byte Unicode and protocol overhead. |
 | `BT_REQUEST_MAX_OUTPUT_TOKENS` | `163840` | Maximum cumulative `max_tokens` reserved across every provider attempt in one API request, sized for the same bounded 20-call batch path. |
@@ -209,7 +210,10 @@ them):
 | `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** rate-limit-key source. Comma-separated CIDRs/IPs of peers allowed to set `X-Forwarded-For`. The reference Compose network gives the proxy a fixed address and trusts only that `/32`. Combined compatibility mode defaults to loopback. |
 | `BT_ALLOWED_ORIGINS` | `http://localhost:8083,http://localhost:8383` | Comma-separated exact origins allowed for CORS (bind-mount installs; irrelevant in proxy mode, which is same-origin). Add your public reader URL here, e.g. `https://books.example.com`. |
 | `BT_ALLOW_PRIVATE_LAN` | `true` | Additionally allow localhost/RFC1918 origins (`10.*`, `192.168.*`, `172.16-31.*`) on any port — the common self-hosted case. Set `false` to allow only `BT_ALLOWED_ORIGINS`. |
-| `BT_CACHE_MAX_ENTRIES` | `0` | Optional hard cap on cached translations (`0` = unlimited). When exceeded, the oldest entries are evicted. |
+| `BT_CACHE_TTL_DAYS` | `90` | Mandatory maximum age for cached translations. Expired rows are never served and are removed during normal writes/stats/cleanup. Must be greater than zero. |
+| `BT_CACHE_MAX_ENTRIES` | `100000` | Mandatory hard cap on schema-v2 rows. The least-recently-accessed rows are evicted in the same transaction as a write. Must be greater than zero. |
+| `BT_CACHE_HIT_FLUSH_THRESHOLD` | `100` | Number of cache-hit counters batched before SQLite is updated. Translation hits stay read-only between flushes, reducing WAL contention. |
+| `BT_CACHE_HARDEN_EXISTING_DIR` | `false` (`true` in image) | Change an existing cache directory to mode `0700`. New directories and all DB/WAL/SHM files are always created private; the container enables this fail-closed check. |
 | `DB_PATH` | `translations.db` | Path to the SQLite translation cache. In Docker this should point inside the `/app/data` volume (the provided Dockerfile/compose already set it to `/app/data/translations.db`) so the cache survives container recreation. |
 | `PORT` | `8390` | Port the API listens on. If you remap it, also update the `-p`/compose port mapping and any reverse-proxy route — `EXPOSE` in the Dockerfile is documentation only. |
 
@@ -219,6 +223,15 @@ them):
 > value). The `--threads 8` setting already gives plenty of request concurrency
 > within that one worker — don't raise `--workers` without moving that state to
 > something shared (e.g. SQLite, like the translation cache already is).
+
+Cache schema v2 intentionally preserves an existing v1 table as
+`translations_v1` but never serves those unscoped rows. The cache re-warms
+without a destructive migration. V2 stores no source paragraph and hashes
+tenant/book/chapter identifiers before persistence. Browser translations stay
+in memory unless `window.BOOK_TRANSLATOR.persistCache = true` is explicitly set;
+opt-in keys also include stable DOM position to separate repeated text in
+different contexts. Legacy `bt_cache_v2_*` localStorage entries are removed on
+upgrade.
 
 ---
 
@@ -247,6 +260,10 @@ checks; none contacts an LLM. The provider-backed `/health/deep` endpoint is
 operator-only and uses the same request budget and global provider gate as a
 translation. Authenticate it with `X-BT-Token`: this is `BT_API_TOKEN` when
 configured, otherwise the persisted `/app/data/cleanup_token` value.
+
+`/metrics` reports request/cache counters plus bounded singleflight activity
+(`active_entries`, shared results, follower timeouts, and capacity rejections),
+so duplicate-work pressure is visible without exposing book text or cache keys.
 
 Release operators should follow the [Gitea-authoritative release
 runbook](docs/RELEASE.md); GitHub is a mirror and does not publish images.

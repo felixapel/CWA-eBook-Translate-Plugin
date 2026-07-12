@@ -82,12 +82,13 @@ version. The build also requests OCI provenance and an SBOM.
 
    ```bash
    .venv/bin/python -m py_compile \
-     server.py translator.py cache.py work_budget.py \
+     server.py translator.py cache.py singleflight.py work_budget.py \
      scripts/release_preflight.py scripts/release_image_tags.py
    .venv/bin/python test_translation.py
    .venv/bin/python test_hardening.py
    .venv/bin/python -m unittest -v \
-     test_work_budget test_provider_budget test_ci_contract \
+     test_work_budget test_provider_budget test_cache_v2 \
+     test_context_cache test_singleflight test_ci_contract \
      test_release_contract test_supply_chain_contract \
      test_shell_contract test_cleanup_token test_api_schema \
      test_error_privacy
