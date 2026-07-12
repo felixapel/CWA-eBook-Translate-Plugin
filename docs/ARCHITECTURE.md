@@ -8,6 +8,8 @@ This document details the architecture of the `book-translator` plugin.
 - [ADR-002: Split API and proxy into non-root runtime roles](decisions/ADR-002-split-non-root-runtime-roles.md)
 - [ADR-003: Use an atomically scoped private cache](decisions/ADR-003-scoped-private-cache.md)
 - [ADR-004: Authenticate before deriving cache tenants](decisions/ADR-004-authentication-boundaries.md)
+- [ADR-005: Require request consent for cloud fallback](decisions/ADR-005-cloud-fallback-consent.md)
+- [ADR-006: Make proxy authority and forwarding explicit](decisions/ADR-006-explicit-proxy-authority.md)
 
 ## Overview
 
@@ -27,7 +29,10 @@ There are two integration methods:
    `proxy/nginx.conf.template` and `docker-entrypoint.sh`. The proxy passes the
    browser's HttpOnly CWA cookie to the API; the API validates only configured
    cookie names against CWA's authenticated JSON probe and derives an opaque
-   per-session tenant.
+   per-session tenant. `BT_PUBLIC_ORIGIN` fixes the forwarded host/scheme;
+   inbound forwarding headers are discarded, the observed peer becomes the
+   only forwarded client hop, and CWA uploads have an operator-configurable
+   finite body cap.
 2. **Bind-mount mode (advanced/development).** `overlay/read.html` plus the
    JS/CSS are mounted into the CWA container; the overlay calls the API on
    `:8390` cross-origin. The template copy is tracked against the CWA version

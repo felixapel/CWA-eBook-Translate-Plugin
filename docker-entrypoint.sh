@@ -88,7 +88,8 @@ configure_proxy() {
         exit 64
     fi
     BT_API_UPSTREAM="${BT_API_UPSTREAM:-http://127.0.0.1:${PORT}}"
-    export BT_API_UPSTREAM
+    BT_CWA_MAX_BODY_SIZE="${BT_CWA_MAX_BODY_SIZE:-2g}"
+    export BT_API_UPSTREAM BT_CWA_MAX_BODY_SIZE
 
     mkdir -p \
         /tmp/nginx/client_temp \
@@ -96,10 +97,8 @@ configure_proxy() {
         /tmp/nginx/fastcgi_temp \
         /tmp/nginx/uwsgi_temp \
         /tmp/nginx/scgi_temp
-    # Literal ${...} names below are envsubst's allowlist.
-    # shellcheck disable=SC2016
-    envsubst '${CWA_UPSTREAM} ${BT_API_UPSTREAM} ${BT_PROXY_PORT} ${BT_UI_VERSION}' \
-        < /app/proxy/nginx.conf.template > /tmp/nginx/proxy.conf
+    python /app/proxy/render_config.py \
+        /app/proxy/nginx.conf.template /tmp/nginx/proxy.conf
     nginx -t -c /app/proxy/nginx-main.conf -e /dev/stderr
 }
 

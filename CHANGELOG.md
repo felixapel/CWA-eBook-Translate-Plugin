@@ -51,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hashes tenant/book/chapter identifiers, and enforces private files plus
   mandatory TTL/cap. Browser persistence is opt-in and legacy unscoped browser
   entries are purged on upgrade.
+- Proxy startup now validates exact upstream URLs and a required public origin.
+  nginx forwards only that fixed host/scheme, replaces spoofable forwarding
+  chains with its observed peer, emits relative self-generated redirects, and
+  enforces a finite configurable CWA upload cap.
 
 ### Added
 
@@ -79,6 +83,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit authenticated provider diagnostic.
 - Deployment helpers use strict shell mode, safe remote argument serialization,
   fail-closed health/hash checks, and the same non-root sandbox as CI.
+- The proxy renderer is a standard-library validator with atomic private output;
+  gettext/envsubst and their Alpine dependency surface were removed.
 - The browser retries only bounded `429` admission rejections. Ambiguous
   timeouts, network failures, and invalid responses require an explicit user
   retry so they cannot duplicate provider work still running server-side.
