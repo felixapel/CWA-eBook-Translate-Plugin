@@ -45,12 +45,18 @@
         // used by multiple CWA accounts. The scoped server-side cache is
         // persistent regardless of this setting.
         persistCache: existing.persistCache === true,
-        // Optional shared secret (BT_API_TOKEN); readable from localStorage so
-        // it can be set per-browser without editing any server file:
-        //   localStorage.setItem('bt_token', '<token>')
-        apiToken: existing.apiToken || (function () {
-            try { return localStorage.getItem('bt_token') || ''; } catch (e) { return ''; }
-        })()
+        // Cross-origin CWA-session deployments must opt in to cookie-bearing
+        // fetches and enumerate the exact reader origin server-side. Proxy
+        // mode is same-origin and sends its HttpOnly CWA cookie by default.
+        sendCredentials: existing.sendCredentials === true,
+        // Make credential transport explicit. A configured compatibility
+        // token opts into token mode; otherwise the supported proxy topology
+        // validates the existing CWA session cookie.
+        authMode: existing.authMode || (existing.apiToken ? 'token' : 'cwa_session'),
+        // Compatibility mode only. Never persist this JavaScript-readable
+        // shared secret in localStorage; configure it in the trusted overlay
+        // bootstrap or prefer cwa_session/forwarded authentication.
+        apiToken: existing.apiToken || ''
     };
 
     var link = document.createElement('link');

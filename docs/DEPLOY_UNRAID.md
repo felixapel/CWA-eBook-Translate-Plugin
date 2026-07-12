@@ -6,6 +6,19 @@
 > `BT_ROLE=auto`, while the rest of this document covers the classic API plus
 > bind-mounted overlay deployment.
 
+The image no longer starts an anonymous production API. The recommended proxy
+topology uses `BT_AUTH_MODE=cwa_session` and validates the browser's existing
+HttpOnly CWA session. For the legacy cross-origin bind-mount topology in this
+document, the shipped overlay and `deploy_unraid.sh` intentionally support the
+same mode only, with an exact **HTTP** CWA origin. The helper exposes `:8390`
+without TLS, so it rejects HTTPS reader origins that browsers would block as
+mixed content. HTTPS readers must use the recommended same-origin injection
+proxy (or a separately reviewed TLS API route and matching custom `apiUrl`).
+`overlay/read.html` opts into cookie-bearing fetches; CORS still rejects every
+origin except the exact configured value. Token/forwarded deployments require
+a separately reviewed custom bootstrap and routing contract; the helper will
+refuse them.
+
 A concrete, worked example of a two-container deployment (translator API +
 Calibre-Web-Automated with the overlay bind-mounts). The hostnames, IPs
 (`10.0.0.10` below is an example), and paths below are from one real setup
@@ -126,6 +139,10 @@ docker run -d --name book-translator-api --restart unless-stopped --net bridge \
   -p 8390:8390 -v /mnt/user/appdata/book-translator-api/data:/app/data \
   -l net.unraid.docker.managed=dockerman \
   -e BT_ROLE=api \
+  -e BT_AUTH_MODE=cwa_session \
+  -e BT_CWA_AUTH_URL=http://<YOUR-HOST-IP>:8383/ajax/emailstat \
+  -e BT_ALLOWED_ORIGINS=http://<YOUR-HOST-IP>:8383 \
+  -e BT_ALLOW_PRIVATE_LAN=false \
   -e LLM_PROVIDER=local -e LLM_MODEL=gemma4-12b \
   -e BT_LOCAL_URL=http://<YOUR-HOST-IP>:2819/v1/chat/completions \
   -e BT_BATCH_SIZE=3 -e BT_MAX_CONCURRENT=1 -e BT_TIMEOUT=60 \
@@ -137,9 +154,11 @@ docker run -d --name book-translator-api --restart unless-stopped --net bridge \
 curl -s http://127.0.0.1:8390/ping
 curl -s http://127.0.0.1:8390/health
 
-# Optional provider-backed operator probe. Set this to BT_API_TOKEN. If that
-# variable is not configured, read the generated shared operator token instead:
-TOKEN="$(docker exec book-translator-api cat /app/data/cleanup_token)"
+# Optional provider-backed operator probe. BT_API_TOKEN remains the preferred
+# separately-provisioned operator credential even in cwa_session mode. Without
+# one, create/read the private persisted credential inside the container:
+TOKEN="$(docker exec book-translator-api python -c \
+  'import server; print(server._get_cleanup_token())')"
 curl -s -H "X-BT-Token: $TOKEN" http://127.0.0.1:8390/health/deep
 ```
 
@@ -160,7 +179,14 @@ published image and installs a hardened API template; building
    `my-book-translator-api.xml.tmpl`) into
    `/boot/config/plugins/dockerMan/templates-user/`.
 2. In the Unraid **Docker** tab → *Add Container* → pick `book-translator-api`
-   from the Template dropdown → set your `BT_LOCAL_URL` → **Apply**.
+   from the Template dropdown → set your `BT_LOCAL_URL` and an authentication
+   contract → **Apply**. For `cwa_session`, set `CWA Auth URL` to the full
+   reachable `http(s)://.../ajax/emailstat` URL, set `Exact CWA Origin` to the
+   browser-visible scheme/host/port with no path, and keep broad private-LAN
+   CORS disabled. The supplied bind-mount overlay is CWA-session-only. A manual
+   compatibility-token deployment must customize `authMode`, omit browser
+   cookies, provision its long random secret out of band, and never store that
+   secret in `localStorage`; `deploy_unraid.sh` deliberately will not do this.
 
 Applying via the UI gives the container the `net.unraid.docker.managed=dockerman`
 label and an autostart entry, so Unraid treats it as a first-class managed
@@ -182,6 +208,10 @@ docker run -d \
   --security-opt=no-new-privileges:true \
   -p 8390:8390 \
   -e BT_ROLE=api \
+  -e BT_AUTH_MODE=cwa_session \
+  -e BT_CWA_AUTH_URL=http://<YOUR-HOST-IP>:8383/ajax/emailstat \
+  -e BT_ALLOWED_ORIGINS=http://<YOUR-HOST-IP>:8383 \
+  -e BT_ALLOW_PRIVATE_LAN=false \
   -e LLM_PROVIDER=local \
   -e LLM_MODEL=gemma4-12b \
   -e BT_LOCAL_URL=http://<YOUR-HOST-IP>:2819/v1/chat/completions \

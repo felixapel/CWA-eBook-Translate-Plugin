@@ -10,6 +10,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+os.environ.setdefault("BT_AUTH_MODE", "disabled")
+os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
+
 import server
 
 

@@ -53,7 +53,11 @@ docker compose up -d
 
 Then read your library at **`http://<host>:8084`** — the translator control
 bar appears in the ebook reader. That's the whole install. The compose file
-pulls the prebuilt multi-arch image
+validates the browser's existing HttpOnly CWA session for every protected API
+request; it does not put a translator credential in JavaScript or
+`localStorage`. The API is attached to the CWA network only so it can call the
+authenticated `/ajax/emailstat` probe and remains unpublished to the host.
+The compose file pulls the prebuilt multi-arch image
 (`ghcr.io/felixapel/cwa-ebook-translate-plugin`, amd64 + arm64) — no build
 step needed. For an unattended production deployment, replace `latest` in the
 Compose file with the immutable digest reported by the release workflow.
@@ -141,9 +145,13 @@ volumes:
 Caveats: `overlay/read.html` is a full template replacement tracked against
 the **pinned CWA version in docker-compose.yml** (`v4.0.6`). A CWA update that
 changes `read.html` can drift from this copy — proxy mode does not have this
-problem. With bind mounts the API is cross-origin, so set `BT_ALLOWED_ORIGINS`
-(or rely on the private-LAN default) and configure `window.BOOK_TRANSLATOR`
-in `overlay/read.html`.
+problem. The shipped bind-mount overlay uses `cwa_session`; because its API is
+cross-origin, set one exact `BT_ALLOWED_ORIGINS` value, keep
+`BT_ALLOW_PRIVATE_LAN=false`, and configure the exact CWA auth URL. The helper
+does not place a shared API secret in browser JavaScript. Its direct `:8390`
+API route is HTTP-only, so the helper accepts only an `http://` reader origin;
+for an HTTPS reader, use the recommended same-origin proxy or provide a
+separately reviewed TLS API route and custom `apiUrl`.
 
 ---
 
@@ -177,6 +185,18 @@ them):
 | `CWA_UPSTREAM` | | Required by the proxy role. URL of the stock CWA instance (e.g. `http://calibre-web:8083`). |
 | `BT_API_UPSTREAM` | `http://127.0.0.1:$PORT` | Translation API URL used by the proxy role. The split Compose topology sets `http://book-translator-api:8390`. |
 | `BT_PROXY_PORT` | `8080` | Container port for the injection proxy (proxy mode only). |
+| `BT_AUTH_MODE` | `token` | Authentication authority: `cwa_session` (recommended proxy topology), `forwarded` (identity-aware reverse proxy), `token` (shared-secret compatibility), or development-only `disabled`. The default fails startup unless `BT_API_TOKEN` is present. Disabled mode additionally requires `BT_ALLOW_INSECURE_AUTH=true`. `/ping`, `/health`, and `/ready` stay unauthenticated; every other route is protected. |
+| `BT_ALLOW_INSECURE_AUTH` | `false` | Required second acknowledgement for `BT_AUTH_MODE=disabled`. Never enable it in production. |
+| `BT_CWA_AUTH_URL` | | Required for `cwa_session`, e.g. `http://calibre-web:8083/ajax/emailstat`. Only that exact path is accepted. The API forwards selected cookies, refuses redirects, and requires CWA's bounded JSON task-list response; it returns `503` when the authority cannot be evaluated. |
+| `BT_CWA_AUTH_COOKIE_NAMES` | `session,remember_token` | CWA cookie names allowed to leave the API for the configured auth probe. All other browser cookies are dropped. |
+| `BT_CWA_AUTH_TIMEOUT_SECONDS` | `2` | Bounded CWA session-probe timeout. |
+| `BT_CWA_AUTH_CACHE_TTL_SECONDS` | `15` | Short positive/negative validation-cache TTL. Keys are one-way session hashes; raw cookies are never cached or logged. |
+| `BT_CWA_AUTH_CACHE_MAX_ENTRIES` | `10000` | Maximum cached session-validation decisions. Oldest entries are evicted. |
+| `BT_CWA_AUTH_MAX_INFLIGHT` | `8` | Maximum distinct CWA probes active at once; concurrent checks of the same session are coalesced. Saturation fails closed with `503`. |
+| `BT_CWA_AUTH_MAX_RESPONSE_BYTES` | `262144` | Maximum decompressed bytes read from the CWA auth probe before JSON parsing. Oversized responses fail closed with `503`. |
+| `BT_IDENTITY_TRUSTED_PROXIES` | | Required for `forwarded`. Comma-separated CIDRs/IPs allowed to set `X-BT-Subject` and optional `X-BT-Roles`; direct client headers are rejected. The subject is hashed before use as a tenant. The identity proxy must strip client-supplied copies before setting its own and be the API's immediate peer. The bundled injection proxy deliberately strips these headers and is not an identity authority; route `/bt-api` directly through the allowlisted identity proxy with no public bypass. |
+| `BT_AUTH_RATE_LIMIT_PER_MINUTE` | `300` | Separate per-client limit for protected-route authentication attempts, including rejected credentials and observability endpoints. |
+| `BT_RATE_LIMIT_MAX_CLIENTS` | `10000` | Maximum active client buckets in each in-memory limiter. Under saturated active cardinality, unseen clients fail closed with `429` instead of growing process memory or receiving a fresh allowance. |
 | `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
 | `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
 | `LLM_API_KEY` | | Your API key for the chosen provider (the only supported key mechanism since 2.0.0) |
@@ -192,7 +212,7 @@ them):
 | `LLM_FALLBACK_PROVIDER` | | Optional. A secondary provider used automatically when the primary fails (e.g. `minimax` while `local` is slow/down). |
 | `LLM_FALLBACK_MODEL` | | Model name for the fallback provider. |
 | `LLM_FALLBACK_API_KEY` | | API key for the fallback provider. |
-| `BT_API_TOKEN` | | Optional shared secret. When set, translate endpoints require the `X-BT-Token` header — use it if the API is reachable beyond your LAN. In proxy mode set it per-browser via `localStorage.setItem('bt_token', '<token>')`; in bind-mount installs set `apiToken` in `window.BOOK_TRANSLATOR`. Also gates `/cache/cleanup` and the provider-backed `/health/deep` probe. |
+| `BT_API_TOKEN` | | Required when `BT_AUTH_MODE=token`; send it as `X-BT-Token`. This compatibility mode gives every caller one shared tenant and the secret is JavaScript-readable if placed in `window.BOOK_TRANSLATOR`, so prefer `cwa_session` or `forwarded`. It is also the operator credential for `/cache/cleanup` and `/health/deep`; without it those two routes use the private persisted cleanup token in `/app/data`. The proxy loader never reads a token from `localStorage`. |
 | `BT_MAX_BATCH_PARAGRAPHS` | `50` | Max paragraphs accepted per `/translate/batch` request (oversized requests get `413`). Protects your GPU/API bill from a single runaway request. |
 | `BT_MAX_PARAGRAPH_CHARS` | `8000` | Max characters per paragraph (`413` beyond it). |
 | `BT_MAX_CONTENT_LENGTH` | `2097152` (2 MB) | Hard cap on the request body (the WSGI-level backstop). Per-field caps (`BT_MAX_BATCH_PARAGRAPHS`, `BT_MAX_PARAGRAPH_CHARS`) check the parsed content; this cap rejects oversize bodies before parsing. Lower it for untrusted networks, raise it for very long paragraphs. |
@@ -209,7 +229,7 @@ them):
 | `BT_TRUST_PROXY` | `false` | **Legacy/dev only.** When `true`, the API uses the **last** `X-Forwarded-For` hop from any peer as the rate-limit key. A client that can reach the API directly can still spoof this header, so don't rely on it in production — prefer `BT_TRUSTED_PROXIES` below. |
 | `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** rate-limit-key source. Comma-separated CIDRs/IPs of peers allowed to set `X-Forwarded-For`. The reference Compose network gives the proxy a fixed address and trusts only that `/32`. Combined compatibility mode defaults to loopback. |
 | `BT_ALLOWED_ORIGINS` | `http://localhost:8083,http://localhost:8383` | Comma-separated exact origins allowed for CORS (bind-mount installs; irrelevant in proxy mode, which is same-origin). Add your public reader URL here, e.g. `https://books.example.com`. |
-| `BT_ALLOW_PRIVATE_LAN` | `true` | Additionally allow localhost/RFC1918 origins (`10.*`, `192.168.*`, `172.16-31.*`) on any port — the common self-hosted case. Set `false` to allow only `BT_ALLOWED_ORIGINS`. |
+| `BT_ALLOW_PRIVATE_LAN` | `true` | Additionally allow localhost/RFC1918 origins (`10.*`, `192.168.*`, `172.16-31.*`) on any port for non-cookie modes. `cwa_session` always ignores this broad grant: credentialed cross-origin requests require an exact `BT_ALLOWED_ORIGINS` entry and receive `Access-Control-Allow-Credentials: true`. Same-origin proxy mode needs neither. |
 | `BT_CACHE_TTL_DAYS` | `90` | Mandatory maximum age for cached translations. Expired rows are never served and are removed during normal writes/stats/cleanup. Must be greater than zero. |
 | `BT_CACHE_MAX_ENTRIES` | `100000` | Mandatory hard cap on schema-v2 rows. The least-recently-accessed rows are evicted in the same transaction as a write. Must be greater than zero. |
 | `BT_CACHE_HIT_FLUSH_THRESHOLD` | `100` | Number of cache-hit counters batched before SQLite is updated. Translation hits stay read-only between flushes, reducing WAL contention. |
@@ -248,7 +268,13 @@ Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
 
 In bind-mount installs nginx never starts; the overlay files are mounted into
 CWA and call the API on `:8390` directly (CORS applies — see
-`BT_ALLOWED_ORIGINS`).
+`BT_ALLOWED_ORIGINS`). The shipped helper exposes that port over HTTP and
+therefore rejects HTTPS reader origins rather than creating a browser-blocked
+mixed-content deployment. For cross-origin `cwa_session`, set
+`authMode: 'cwa_session'` and `sendCredentials: true` in
+`window.BOOK_TRANSLATOR`, disable `BT_ALLOW_PRIVATE_LAN`, and list the one exact
+CWA reader origin. In `token` and `forwarded` modes the frontend uses
+`credentials: 'omit'`, so CWA cookies are not disclosed to the API origin.
 
 Both image roles declare `appuser` (`101:102`), run with zero capabilities, and
 support a read-only root filesystem. If you replace the Compose named volume
@@ -264,6 +290,16 @@ configured, otherwise the persisted `/app/data/cleanup_token` value.
 `/metrics` reports request/cache counters plus bounded singleflight activity
 (`active_entries`, shared results, follower timeouts, and capacity rejections),
 so duplicate-work pressure is visible without exposing book text or cache keys.
+
+Authentication-derived tenant behavior is intentional:
+
+- `cwa_session` isolates by the current session hash. Logging out/re-authenticating
+  creates a cold tenant because CWA v4.0.6 does not expose a stable supported
+  current-user JSON identity at this boundary.
+- `forwarded` isolates by the stable subject asserted by an allowlisted identity
+  proxy and is the mode to use when cache continuity across sessions matters.
+- `token` is one shared tenant. `disabled` is one anonymous tenant and must not
+  be used for production.
 
 Release operators should follow the [Gitea-authoritative release
 runbook](docs/RELEASE.md); GitHub is a mirror and does not publish images.

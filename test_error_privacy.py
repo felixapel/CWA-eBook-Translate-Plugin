@@ -1,10 +1,14 @@
 """No provider body, URL, or exception detail may cross public/log boundaries."""
+import os
 import unittest
 import uuid
 import threading
 from unittest import mock
 
 import requests
+
+os.environ.setdefault("BT_AUTH_MODE", "disabled")
+os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
 
 import server
 import translator

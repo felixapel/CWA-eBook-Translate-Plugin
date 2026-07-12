@@ -47,6 +47,41 @@ check_data_dir() {
     rm -f "$probe"
 }
 
+validate_api_auth() {
+    mode="${BT_AUTH_MODE:-token}"
+    case "$mode" in
+        token)
+            if [ -z "${BT_API_TOKEN:-}" ]; then
+                echo "[entrypoint] ERROR: BT_API_TOKEN is required when BT_AUTH_MODE=token" >&2
+                exit 78
+            fi
+            ;;
+        cwa_session)
+            if [ -z "${BT_CWA_AUTH_URL:-}" ]; then
+                echo "[entrypoint] ERROR: BT_CWA_AUTH_URL is required when BT_AUTH_MODE=cwa_session" >&2
+                exit 78
+            fi
+            ;;
+        forwarded)
+            if [ -z "${BT_IDENTITY_TRUSTED_PROXIES:-}" ]; then
+                echo "[entrypoint] ERROR: BT_IDENTITY_TRUSTED_PROXIES is required when BT_AUTH_MODE=forwarded" >&2
+                exit 78
+            fi
+            ;;
+        disabled)
+            if [ "${BT_ALLOW_INSECURE_AUTH:-false}" != "true" ]; then
+                echo "[entrypoint] ERROR: disabled auth requires BT_ALLOW_INSECURE_AUTH=true" >&2
+                exit 78
+            fi
+            echo "[entrypoint] WARNING: authentication disabled; development only" >&2
+            ;;
+        *)
+            echo "[entrypoint] ERROR: unsupported BT_AUTH_MODE: $mode" >&2
+            exit 78
+            ;;
+    esac
+}
+
 configure_proxy() {
     if [ -z "${CWA_UPSTREAM:-}" ]; then
         echo "[entrypoint] ERROR: CWA_UPSTREAM is required for the proxy role" >&2
@@ -80,6 +115,7 @@ start_proxy() {
 case "$BT_ROLE" in
     api)
         check_data_dir
+        validate_api_auth
         echo "[entrypoint] API role on :${PORT}"
         exec gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 \
             --timeout 120 server:app
@@ -95,6 +131,7 @@ esac
 # topology uses two role-specific containers so each has its own health and
 # restart lifecycle.
 check_data_dir
+validate_api_auth
 configure_proxy
 echo "[entrypoint] combined role: API :${PORT}, proxy :${BT_PROXY_PORT}"
 start_api &

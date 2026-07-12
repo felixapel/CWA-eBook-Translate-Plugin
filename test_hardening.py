@@ -27,6 +27,8 @@ os.environ["LLM_FALLBACK_MODEL"] = "fake-fallback"
 os.environ["LLM_FALLBACK_API_KEY"] = "x" * 20
 os.environ["BT_MAX_CONCURRENT"] = "2"
 os.environ["BT_BATCH_SIZE"] = "3"
+os.environ["BT_AUTH_MODE"] = "disabled"
+os.environ["BT_ALLOW_INSECURE_AUTH"] = "true"
 for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_PATH"] + "-shm"):
     try:
         os.remove(f)
@@ -86,7 +88,7 @@ def run():
     # H2: /cache/cleanup always requires auth (fail-safe)
     # ─────────────────────────────────────────────────────────────────────
     # Three sources of truth for the token, in order:
-    #   1. BT_API_TOKEN (set by operator for the whole API)
+    #   1. BT_API_TOKEN (the explicit operator/token-mode credential)
     #   2. Auto-generated /app/data/cleanup_token (fail-safe when #1 is unset)
     # The endpoint is NEVER open, even when the operator forgets to set
     # BT_API_TOKEN — that's the whole point of the auto-gen path.

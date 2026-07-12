@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Authentication now fails closed before cache/provider work. The recommended
+  proxy topology validates the existing HttpOnly CWA session with bounded,
+  coalesced probes; trusted forwarded identity and shared-token compatibility
+  are explicit alternatives, while anonymous mode is development-only.
+- Browser loaders no longer recover API credentials from `localStorage`.
+  Credentialed CORS accepts exact origins only, identity headers are honored
+  only from allowlisted proxy CIDRs, and rejected auth attempts have a separate
+  rate limit.
+- CWA-session probes now require the exact authenticated endpoint and a bounded
+  JSON task-list response. The Unraid overlay helper is CWA-session-only, and
+  token/forwarded browser requests omit CWA cookies. Its legacy direct-port
+  topology also rejects HTTPS reader origins because its API route is HTTP-only.
+- Both request limiters cap active client buckets and reject unseen identities
+  under saturated cardinality instead of allowing source-IP churn to grow
+  process memory without bound.
 - Translation endpoints now reject non-object JSON and invalid Unicode before
   provider dispatch. Batched provider responses use unpredictable segment IDs
   and a strict, bounded response envelope so prompt output cannot be mistaken
