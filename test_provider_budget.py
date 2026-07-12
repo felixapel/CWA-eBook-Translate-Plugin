@@ -464,8 +464,12 @@ class ProviderBudgetTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("BT_MAX_UPSTREAM_INFLIGHT", result.stderr)
 
-    def test_non_finite_time_limits_fail_at_import(self):
+    def test_invalid_numeric_limits_fail_at_import(self):
         for name, value in (
+            ("BT_OUTPUT_TOKEN_FACTOR", "0"),
+            ("BT_OUTPUT_TOKEN_FACTOR", "-1"),
+            ("BT_OUTPUT_TOKEN_FACTOR", "inf"),
+            ("BT_OUTPUT_TOKEN_FACTOR", "nan"),
             ("BT_REQUEST_DEADLINE_SECONDS", "inf"),
             ("BT_REQUEST_DEADLINE_SECONDS", "nan"),
             ("BT_UPSTREAM_QUEUE_TIMEOUT", "inf"),

@@ -89,6 +89,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI and release gates now run every backend contract suite, the complete locked
   npm tree audit, and a required proxy/API/non-root container smoke test. Gitea
   and GitHub CI definitions remain byte-identical by contract.
+- The live rate-limit probe is import-safe, authenticated, timeout-bounded, and
+  fails closed while using same-language requests that never call a provider.
+  Output-token scaling also rejects non-finite or non-positive startup values.
 - `/ping`, `/health`, and `/ready` are cheap local probes; `/health/deep` is the
   explicit authenticated provider diagnostic.
 - Deployment helpers use strict shell mode, safe remote argument serialization,
