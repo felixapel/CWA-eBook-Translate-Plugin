@@ -69,4 +69,7 @@ Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
   source hash. Source paragraphs and raw tenant/book/chapter identifiers are not
   stored. TTL/cap are mandatory and group hits are atomic, so cached paragraphs
   cannot alter the context seen by a later provider call.
-- **LLM Client (`translator.py`)**: Multi-provider wrapper that supports batch translation prompts with dynamic context windows (`BT_CONTEXT_WINDOW`).
+- **LLM Client (`translator.py`)**: Multi-provider wrapper that supports batch
+  translation prompts with dynamic context windows (`BT_CONTEXT_WINDOW`).
+  Remote fallback providers require explicit consent on each request; requests
+  with different consent policies never share cache lookup or in-flight work.

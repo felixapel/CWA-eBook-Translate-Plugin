@@ -104,12 +104,13 @@ async function wait(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
-async function captureAuthTransport(config) {
+async function captureAuthTransport(config, enableCloudFallback = false) {
     const authDom = new JSDOM(`
 <!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>
 `, { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' });
     authDom.window.BOOK_TRANSLATOR = Object.assign({ apiUrl: '/bt-api' }, config);
-    authDom.window.localStorage.setItem('bt_mode', 'translated');
+    authDom.window.localStorage.setItem(
+        'bt_mode', enableCloudFallback ? 'off' : 'translated');
     authDom.window.localStorage.setItem('bt_prefetch', '0');
     authDom.window.localStorage.setItem('bt_lang', 'Spanish');
     authDom.window.requestAnimationFrame = (cb) => setTimeout(cb, 0);
@@ -135,6 +136,18 @@ async function captureAuthTransport(config) {
     const authScript = authDom.window.document.createElement('script');
     authScript.textContent = code;
     authDom.window.document.body.appendChild(authScript);
+    if (enableCloudFallback) {
+        const controlDeadline = Date.now() + 2000;
+        while (
+            !authDom.window.document.querySelector('[data-action="cloud-fallback"]')
+            && Date.now() < controlDeadline
+        ) await wait(20);
+        const toggle = authDom.window.document.querySelector(
+            '[data-action="cloud-fallback"]');
+        assert(toggle, 'Cloud fallback must have an explicit reader control');
+        toggle.click();
+        authDom.window.document.getElementById('bt-toggle').click();
+    }
     const deadline = Date.now() + 2000;
     while (!captured && Date.now() < deadline) await wait(20);
     authDom.window.close();
@@ -220,6 +233,8 @@ async function runTest() {
             'Every translation request must carry a bounded chapter cache scope');
         assert.strictEqual(c.options.credentials, 'same-origin',
             'Cookie credentials must not be sent cross-origin without explicit opt-in');
+        assert.strictEqual(body.allow_cloud_fallback, false,
+            'Cloud fallback consent must be false unless the reader explicitly opts in');
     });
     
     // visible 1, visible 1, visible 2, prefetch 1, prefetch 2, prefetch 3, prefetch 4
@@ -311,10 +326,11 @@ async function runTest() {
         'Persistent browser caching must be opt-in and keys must be context-scoped'
     );
 
-    const [tokenTransport, forwardedTransport, cwaTransport] = await Promise.all([
+    const [tokenTransport, forwardedTransport, cwaTransport, consentedTransport] = await Promise.all([
         captureAuthTransport({ authMode: 'token', apiToken: 'browser-token' }),
         captureAuthTransport({ authMode: 'forwarded', apiToken: 'must-not-leak' }),
-        captureAuthTransport({ authMode: 'cwa_session', sendCredentials: true })
+        captureAuthTransport({ authMode: 'cwa_session', sendCredentials: true }),
+        captureAuthTransport({ authMode: 'cwa_session' }, true)
     ]);
     assert.strictEqual(tokenTransport.credentials, 'omit',
         'Token mode must omit CWA cookies');
@@ -328,6 +344,12 @@ async function runTest() {
         'Explicit cross-origin CWA-session mode must include its HttpOnly cookie');
     assert(!('X-BT-Token' in cwaTransport.headers),
         'CWA-session mode must not send a compatibility token');
+    assert.strictEqual(JSON.parse(tokenTransport.body).allow_cloud_fallback, false,
+        'A fresh reader must not consent to cloud fallback');
+    assert.strictEqual(JSON.parse(consentedTransport.body).allow_cloud_fallback, true,
+        'The explicit privacy control must consent only subsequent requests');
+    assert(!/localStorage\.(?:getItem|setItem)\([^)]*cloud/i.test(code),
+        'Cloud fallback consent must never persist across reader sessions');
 
     console.log("All assertions passed.");
     process.exit(0);
