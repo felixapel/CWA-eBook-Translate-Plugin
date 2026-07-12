@@ -99,6 +99,12 @@ class WorkBudgetUnitTests(unittest.TestCase):
         self.assertCountEqual(outcomes, ["allowed", "attempts"])
         self.assertEqual(budget.snapshot()["attempts"], 1)
 
+    def test_deadline_must_be_a_finite_positive_number(self):
+        for invalid in (True, 0, -1, float("nan"), float("inf"), "5"):
+            with self.subTest(deadline_seconds=invalid):
+                with self.assertRaises(ValueError):
+                    self.make_budget(deadline_seconds=invalid)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,6 +1,7 @@
 """Thread-safe, request-scoped limits for upstream translation work."""
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -34,8 +35,11 @@ class WorkBudget:
         for name, value in limits.items():
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        if isinstance(deadline_seconds, bool) or deadline_seconds <= 0:
-            raise ValueError("deadline_seconds must be positive")
+        if (isinstance(deadline_seconds, bool)
+                or not isinstance(deadline_seconds, (int, float))
+                or not math.isfinite(deadline_seconds)
+                or deadline_seconds <= 0):
+            raise ValueError("deadline_seconds must be a finite positive number")
 
         self.max_attempts = max_attempts
         self.max_input_bytes = max_input_bytes
