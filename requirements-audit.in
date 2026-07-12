@@ -1,0 +1,2 @@
+# Dependency auditor used by CI and maintainers. Production does not install it.
+pip-audit==2.10.1

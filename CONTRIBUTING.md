@@ -10,7 +10,7 @@ Thank you for your interest in contributing to the Book Translator plugin for Ca
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
-   pip install -r requirements.txt
+   python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
    ```
 4. Install a local LLM or obtain an API key for your preferred cloud provider.
 5. Create a `.env` file to store your API keys.
@@ -22,6 +22,10 @@ Thank you for your interest in contributing to the Book Translator plugin for Ca
 3. Test your changes locally to ensure translation latency and DOM injection are stable.
 4. If modifying the frontend (`translator.js`), test on various ebook formats and themes (Light, Dark, Sepia, Black).
 5. Submit a pull request detailing the changes and the rationale.
+
+Dependency updates must change the relevant `requirements*.in` file, regenerate
+the committed hash lock with `scripts/compile-requirements.sh`, and include the
+reviewed lock diff. See `docs/DEVELOPMENT.md` for the pinned compiler workflow.
 
 ## Code Style Guide
 

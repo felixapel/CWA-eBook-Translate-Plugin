@@ -84,15 +84,25 @@ version. The build also requests OCI provenance and an SBOM.
    .venv/bin/python test_hardening.py
    .venv/bin/python -m unittest -v \
      test_work_budget test_provider_budget test_ci_contract \
-     test_release_contract test_cleanup_token test_api_schema \
+     test_release_contract test_supply_chain_contract \
+     test_cleanup_token test_api_schema \
      test_error_privacy
    node -c static/translator.js
    node -c static/loader.js
    npm ci
    npm audit --audit-level=high
    npm test
+   .venv/bin/python -m pip install \
+     --require-hashes --only-binary=:all: -r requirements-audit.txt
+   PATH="$PWD/.venv/bin:$PATH" ./scripts/audit-deps.sh
    docker build -t cwa-translate-release-candidate .
    ```
+
+The base image digest, Alpine package versions, third-party Action commits, and
+Python/npm locks are release inputs. Update them only in a reviewed change that
+regenerates the relevant lock/contract and proves the container build. Exact APK
+pins intentionally fail closed when an Alpine repository stops serving an
+approved version; select and review the replacement instead of loosening pins.
 
 4. Merge through Gitea and wait for all required `main` checks.
 5. Mirror the exact `main` commit to GitHub and verify both remotes resolve to

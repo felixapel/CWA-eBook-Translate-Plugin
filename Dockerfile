@@ -1,16 +1,32 @@
-FROM python:3.11-alpine
+FROM python:3.11-alpine@sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4
 
 WORKDIR /app
 
 # nginx powers the optional proxy-injection mode (enabled by setting
 # CWA_UPSTREAM); gettext provides envsubst for rendering its config template.
-# shadow provides the `adduser`/`addgroup` helpers we use to drop privileges
-# below (the python:3.11-alpine base ships with no user-management tools).
-RUN apk add --no-cache nginx gettext shadow
+# shadow provides the `adduser`/`addgroup` helpers we use to drop privileges;
+# gosu drops only the API process to appuser. Direct and transitive versions
+# are pinned so an Alpine repository update cannot silently change the artifact.
+RUN apk add --no-cache \
+    gettext=1.0-r0 \
+    gettext-envsubst=1.0-r0 \
+    gettext-libs=1.0-r0 \
+    gosu=1.19-r4 \
+    libbsd=0.12.2-r0 \
+    libgomp=15.2.0-r5 \
+    libmd=1.2.0-r0 \
+    libunistring=1.4.2-r0 \
+    libxml2=2.13.9-r2 \
+    linux-pam=1.7.1-r2 \
+    nginx=1.30.3-r0 \
+    pcre2=10.47-r1 \
+    shadow=4.18.0-r1 \
+    skalibs-libs=2.15.0.0-r0 \
+    utmps-libs=0.1.3.3-r0
 
 # Copy requirements and install
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt
 
 # Copy source code and runtime assets
 COPY *.py ./
@@ -33,7 +49,6 @@ VOLUME ["/app/data"]
 # process so the API runs unprivileged. nginx keeps root because it
 # legitimately requires it for the listen port and log paths.
 RUN addgroup -S appuser && adduser -S -G appuser -h /app -s /sbin/nologin appuser \
- && apk add --no-cache gosu \
  && mkdir -p /app/data \
  && chown -R appuser:appuser /app/data \
  && chmod 755 /app

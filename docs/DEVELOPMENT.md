@@ -15,7 +15,7 @@ The backend is a Flask application running in python.
    ```
 2. Install dependencies:
    ```bash
-   pip install -r requirements.txt
+   python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
    ```
 3. Run the development server:
    ```bash
@@ -32,7 +32,7 @@ file, so it needs no running server, no API key, and no network access:
 
 Always also check syntax/compile before committing:
 ```bash
-python3 -m py_compile server.py translator.py cache.py
+python3 -m py_compile server.py translator.py cache.py work_budget.py
 ```
 
 `test_endpoints.py`, `test_ratelimit.py`, `benchmark.py`, and
@@ -46,15 +46,39 @@ BENCHMARK_URL=http://127.0.0.1:8390 python3 test_endpoints.py
 ## Frontend Development
 
 The frontend consists of `static/translator.js`, `static/translator.css`, and
-`overlay/read.html`.
+`overlay/read.html`. CI reads the exact supported LTS release from
+`.node-version`; use the same version locally.
 
 ### Syntax Validation & Tests
 
 ```bash
 node -c static/translator.js   # syntax check
-npm install                    # pulls jsdom (devDependency)
+npm ci                         # exact package-lock.json dependency tree
 npm test                       # runs test_frontend.js against a mocked reader/iframe
 ```
+
+## Updating Dependency Locks
+
+`requirements.in` records runtime intent. `requirements.txt` is the reviewed
+production lock; every direct and transitive dependency is version-pinned and
+hashed. The auditor and lock compiler have independent locks so CI does not
+resolve mutable tooling at runtime.
+
+Regenerate all three locks with the currently approved compiler:
+
+```bash
+python3.11 -m venv /tmp/cwa-lock-tools
+/tmp/cwa-lock-tools/bin/python -m pip install \
+  --require-hashes --only-binary=:all: -r requirements-compile.txt
+LOCK_PYTHON=/tmp/cwa-lock-tools/bin/python \
+  ./scripts/compile-requirements.sh
+git diff -- requirements.txt requirements-audit.txt requirements-compile.txt
+```
+
+Review every version and hash change, run the complete test/container gate, and
+commit the `.in` file and its generated lock together. To run dependency audits
+locally, install `requirements-audit.txt` with the same two pip safety flags and
+then run `./scripts/audit-deps.sh`.
 
 ### Manual Testing
 

@@ -1,0 +1,5 @@
+# Runtime dependency intent. Regenerate requirements.txt after review with
+# pip-compile 7.5.3; production installs only the pinned, hashed lock.
+flask>=3.0,<4.0
+gunicorn>=21.2,<23.0
+requests>=2.31.0,<3.0

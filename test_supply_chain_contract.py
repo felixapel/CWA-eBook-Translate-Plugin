@@ -1,4 +1,5 @@
 """Fail-closed contracts for immutable third-party build inputs."""
+import json
 import re
 import unittest
 from pathlib import Path
@@ -32,6 +33,29 @@ PINNED_ACTIONS = {
         "10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
         "v6.19.2",
     ),
+}
+
+BASE_IMAGE = (
+    "python:3.11-alpine@"
+    "sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4"
+)
+NODE_VERSION = "24.18.0"
+APK_PACKAGES = {
+    "gettext": "1.0-r0",
+    "gettext-envsubst": "1.0-r0",
+    "gettext-libs": "1.0-r0",
+    "gosu": "1.19-r4",
+    "libbsd": "0.12.2-r0",
+    "libgomp": "15.2.0-r5",
+    "libmd": "1.2.0-r0",
+    "libunistring": "1.4.2-r0",
+    "libxml2": "2.13.9-r2",
+    "linux-pam": "1.7.1-r2",
+    "nginx": "1.30.3-r0",
+    "pcre2": "10.47-r1",
+    "shadow": "4.18.0-r1",
+    "skalibs-libs": "2.15.0.0-r0",
+    "utmps-libs": "0.1.3.3-r0",
 }
 
 USES_LINE = re.compile(
@@ -73,6 +97,118 @@ class SupplyChainContractTests(unittest.TestCase):
                 workflow.read_text(),
                 f"{workflow}: supply-chain assertions must run in CI",
             )
+
+    def test_container_base_and_operating_system_packages_are_immutable(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertEqual(dockerfile.splitlines()[0], f"FROM {BASE_IMAGE}")
+        self.assertEqual(dockerfile.count("apk add"), 1)
+        flattened = dockerfile.replace("\\\n", " ")
+        apk_add = re.search(r"RUN apk add --no-cache\s+([^\n]+)", flattened)
+        self.assertIsNotNone(apk_add)
+        installed = dict(token.split("=", 1) for token in apk_add.group(1).split())
+        self.assertEqual(installed, APK_PACKAGES)
+
+    def test_python_installs_require_the_reviewed_hashes_and_wheels(self):
+        expected_install = (
+            "python3 -m pip install --break-system-packages "
+            "--require-hashes --only-binary=:all: -r requirements.txt"
+        )
+        expected_tools = (
+            "python3 -m pip install --break-system-packages "
+            "--require-hashes --only-binary=:all: -r requirements-audit.txt"
+        )
+        for workflow in WORKFLOWS:
+            source = workflow.read_text()
+            self.assertIn(expected_install, source)
+            self.assertIn(expected_tools, source)
+            self.assertIn(
+                "python3 -m pip_audit -r requirements.txt "
+                "--strict --disable-pip --no-deps",
+                source,
+            )
+            self.assertNotIn("piptools compile", source)
+            self.assertNotIn("requirements-pinned.txt", source)
+
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("COPY requirements.txt .", dockerfile)
+        self.assertIn(
+            "pip install --no-cache-dir --require-hashes "
+            "--only-binary=:all: -r requirements.txt",
+            dockerfile,
+        )
+
+    def test_python_lock_files_pin_and_hash_every_dependency(self):
+        for name in (
+            "requirements.txt",
+            "requirements-audit.txt",
+            "requirements-compile.txt",
+        ):
+            lock = (ROOT / name).read_text()
+            logical_lock = lock.replace("\\\n", " ")
+            requirements = re.findall(
+                r"(?m)^([a-z0-9][a-z0-9_.-]*)==([^\s]+)([^\n]*)",
+                logical_lock,
+            )
+            self.assertGreater(len(requirements), 2, f"{name}: lock is unexpectedly small")
+            for package, _version, options in requirements:
+                self.assertIn(
+                    "--hash=sha256:", options, f"{name}: {package} has no sha256 hash"
+                )
+            self.assertNotRegex(lock, r"(?m)^[a-z0-9_.-]+\s*(?:[<>~!]=?|===)")
+            self.assertNotIn("--extra-index-url", lock)
+            self.assertNotIn("--trusted-host", lock)
+            self.assertNotRegex(lock, r"(?m)^[a-z0-9_.-]+\s*@\s*")
+
+    def test_lock_regeneration_is_pinned_and_uses_public_pypi(self):
+        compiler = (ROOT / "scripts" / "compile-requirements.sh").read_text()
+        self.assertIn('EXPECTED_PYTHON="3.11"', compiler)
+        self.assertIn('EXPECTED_PIP_COMPILE="7.5.3"', compiler)
+        self.assertIn("PIP_CONFIG_FILE=/dev/null", compiler)
+        self.assertIn("PIP_INDEX_URL=https://pypi.org/simple", compiler)
+        for option in (
+            "--generate-hashes",
+            "--resolver=backtracking",
+            "--no-emit-index-url",
+            "--no-emit-trusted-host",
+        ):
+            self.assertIn(option, compiler)
+        self.assertIn("requirements.in", compiler)
+        self.assertIn("requirements-audit.in", compiler)
+        self.assertIn("requirements-compile.in", compiler)
+
+    def test_local_dependency_audit_uses_the_same_complete_locks(self):
+        audit_path = ROOT / "scripts" / "audit-deps.sh"
+        audit = audit_path.read_text()
+        self.assertIn(
+            "pip-audit -r requirements.txt --strict --disable-pip --no-deps",
+            audit,
+        )
+        self.assertIn("npm audit --audit-level=high", audit)
+        self.assertNotIn("--omit=dev", audit)
+        self.assertTrue(audit_path.stat().st_mode & 0o111)
+
+        compiler_path = ROOT / "scripts" / "compile-requirements.sh"
+        self.assertTrue(compiler_path.stat().st_mode & 0o111)
+
+    def test_npm_lock_has_integrity_for_every_registry_artifact(self):
+        lock = json.loads((ROOT / "package-lock.json").read_text())
+        self.assertGreaterEqual(lock["lockfileVersion"], 3)
+        for path, package in lock["packages"].items():
+            if not path or package.get("link"):
+                continue
+            if package.get("resolved", "").startswith("https://registry.npmjs.org/"):
+                self.assertRegex(
+                    package.get("integrity", ""),
+                    r"^sha512-[A-Za-z0-9+/]+={0,2}$",
+                    f"{path}: registry artifact lacks a sha512 integrity pin",
+                )
+
+    def test_frontend_ci_uses_one_exact_supported_node_release(self):
+        self.assertEqual((ROOT / ".node-version").read_text().strip(), NODE_VERSION)
+        for workflow in WORKFLOWS:
+            source = workflow.read_text()
+            self.assertIn('node-version-file: ".node-version"', source)
+            self.assertNotRegex(source, r"(?m)^\s*node-version:\s*")
 
 
 if __name__ == "__main__":
