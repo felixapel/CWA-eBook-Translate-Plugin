@@ -44,6 +44,7 @@ requests.post = fake_post
 
 # Import server after fake_post is installed.
 import server  # noqa: E402
+from work_budget import WorkBudgetExceeded  # noqa: E402
 client = server.app.test_client()
 
 failed = []
@@ -383,6 +384,54 @@ def run():
               response.status_code == 400
               and isinstance(body, dict)
               and isinstance(body.get("error"), str))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # H8: work-budget exhaustion has a stable, retry-safe HTTP contract
+    # ────────────────────────────────────────────────────────────────────
+    original_translate_text = server.translate_text
+    original_translate_batch = server.translate_batch
+    try:
+        def exhaust_single(*args, **kwargs):
+            raise WorkBudgetExceeded("attempts")
+
+        server.translate_text = exhaust_single
+        server._rate_limit_store.clear()
+        response = client.post(
+            "/translate", json={"text": "h8 unique single budget miss"})
+        body = response.get_json(silent=True)
+        check("work budget: single exhaustion returns stable 503 JSON",
+              response.status_code == 503
+              and body.get("error") == "work_budget_exhausted"
+              and body.get("reason") == "attempts")
+
+        def exhaust_batch(*args, **kwargs):
+            raise WorkBudgetExceeded("deadline")
+
+        server.translate_batch = exhaust_batch
+        server._rate_limit_store.clear()
+        response = client.post("/translate/batch", json={
+            "paragraphs": ["h8 unique batch budget miss"],
+        })
+        body = response.get_json(silent=True)
+        check("work budget: batch exhaustion returns stable 503 JSON",
+              response.status_code == 503
+              and body.get("error") == "work_budget_exhausted"
+              and body.get("reason") == "deadline")
+
+        def queue_full(*args, **kwargs):
+            raise WorkBudgetExceeded("queue")
+
+        server.translate_text = queue_full
+        server._rate_limit_store.clear()
+        response = client.post(
+            "/translate", json={"text": "h8 unique queue miss"})
+        check("work budget: transient queue rejection exposes Retry-After",
+              response.status_code == 503
+              and response.headers.get("Retry-After") is not None)
+    finally:
+        server.translate_text = original_translate_text
+        server.translate_batch = original_translate_batch
+        server._rate_limit_store.clear()
 
 
 if __name__ == "__main__":

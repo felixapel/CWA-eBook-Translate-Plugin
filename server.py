@@ -3,6 +3,7 @@ book-translator — Flask microservice for ebook paragraph translation.
 Runs on port 8390. Frontend (CWA overlay) calls this service.
 """
 import logging
+import math
 import os
 import re
 import time
@@ -15,8 +16,10 @@ from flask import Flask, request, jsonify
 
 from translator import (
     translate_text, translate_batch, check_backend_health,
-    LLM_MODEL, SegmentProtocolError, model_for_provider, cache_lookup_models,
+    LLM_MODEL, BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
+    create_work_budget, model_for_provider, cache_lookup_models,
 )
+from work_budget import WorkBudget, WorkBudgetExceeded
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
 
 
@@ -289,10 +292,25 @@ def _record_metric(latency_ms: float, hits: int = 0, misses: int = 0, error: boo
             _metrics["errors"] += 1
 
 
+def _work_budget_response(exc: WorkBudgetExceeded):
+    """Map internal admission limits to a stable, non-sensitive 503."""
+    request_id = getattr(request, "request_id", None)
+    log.warning("req=%s upstream work rejected reason=%s", request_id, exc.reason)
+    response = jsonify({
+        "error": "work_budget_exhausted",
+        "reason": exc.reason,
+        "request_id": request_id,
+    })
+    if exc.reason == "queue":
+        response.headers["Retry-After"] = str(
+            max(1, math.ceil(BT_UPSTREAM_QUEUE_TIMEOUT)))
+    return response, 503
+
+
 # ── Shared batch helper (M3) ───────────────────────────────────────────────
 
 def _translate_paragraphs(
-    paragraphs: list[str], source_lang: str, target_lang: str
+    paragraphs: list[str], source_lang: str, target_lang: str, budget: WorkBudget
 ) -> dict:
     """
     Shared helper for batch translation logic used by /translate/batch.
@@ -334,7 +352,8 @@ def _translate_paragraphs(
 
     # Translate misses concurrently (concurrency controlled by BT_MAX_CONCURRENT)
     if misses:
-        results = translate_batch(misses, source_lang, target_lang)
+        results = translate_batch(
+            misses, source_lang, target_lang, budget=budget)
         for idx, (translated, backend) in zip(miss_indices, results):
             translations[idx] = translated
             backends[idx] = backend or "unknown"
@@ -537,6 +556,8 @@ def translate():
     if lang_error:
         return jsonify({"error": lang_error}), 400
 
+    budget = create_work_budget()
+
     req_id = getattr(request, "request_id", None)
 
     if not text:
@@ -571,7 +592,12 @@ def translate():
     # Translate via best available backend
     start = time.monotonic()
     try:
-        translated, backend = translate_text(text, source_lang, target_lang)
+        translated, backend = translate_text(
+            text, source_lang, target_lang, budget=budget)
+    except WorkBudgetExceeded as exc:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+        return _work_budget_response(exc)
     except Exception as e:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
@@ -649,6 +675,8 @@ def translate_batch_endpoint():
     if lang_error:
         return jsonify({"error": lang_error}), 400
 
+    budget = create_work_budget()
+
     # Short-circuit source==target: mirror /translate's behaviour. Echo every
     # paragraph back unchanged; mark as skipped so the frontend can distinguish
     # "no translation needed" from "translated and cached".
@@ -669,7 +697,11 @@ def translate_batch_endpoint():
         })
 
     try:
-        result = _translate_paragraphs(paragraphs, source_lang, target_lang)
+        result = _translate_paragraphs(
+            paragraphs, source_lang, target_lang, budget)
+    except WorkBudgetExceeded as exc:
+        _record_metric(0, hits=0, misses=1, error=True)
+        return _work_budget_response(exc)
     except SegmentProtocolError:
         _record_metric(0, hits=0, misses=1, error=True)
         log.warning("req=%s provider returned an invalid segment envelope",

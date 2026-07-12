@@ -18,6 +18,7 @@ import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+from work_budget import WorkBudget, WorkBudgetExceeded
 
 log = logging.getLogger("book-translator.translator")
 
@@ -238,28 +239,74 @@ def _translate_anthropic(p: _Provider, user_content: str, system_prompt: str, ti
 # BT_MAX_CONCURRENT bounds concurrency *per request*; with gunicorn's 8 threads
 # the worst case is 8 x BT_MAX_CONCURRENT simultaneous LLM calls — enough to
 # start a timeout cascade on a single-GPU local model. BT_MAX_UPSTREAM_INFLIGHT
-# is a PROCESS-WIDE cap on in-flight provider calls (0 = unlimited, the
-# default, preserving previous behavior). For a single local GPU, 2 is a good
-# value; cloud APIs generally don't need it.
+# is a PROCESS-WIDE cap on in-flight provider calls. Production defaults are
+# intentionally finite; zero/negative values fail startup instead of silently
+# disabling the control.
 import threading as _threading
-BT_MAX_UPSTREAM_INFLIGHT = int(os.environ.get("BT_MAX_UPSTREAM_INFLIGHT", "0"))
-_UPSTREAM_SEM = _threading.BoundedSemaphore(BT_MAX_UPSTREAM_INFLIGHT) if BT_MAX_UPSTREAM_INFLIGHT > 0 else None
+BT_MAX_UPSTREAM_INFLIGHT = int(os.environ.get("BT_MAX_UPSTREAM_INFLIGHT", "2"))
+BT_UPSTREAM_QUEUE_TIMEOUT = float(os.environ.get("BT_UPSTREAM_QUEUE_TIMEOUT", "2"))
+BT_REQUEST_MAX_ATTEMPTS = int(os.environ.get("BT_REQUEST_MAX_ATTEMPTS", "20"))
+BT_REQUEST_MAX_INPUT_BYTES = int(os.environ.get("BT_REQUEST_MAX_INPUT_BYTES", "2000000"))
+BT_REQUEST_MAX_OUTPUT_TOKENS = int(os.environ.get("BT_REQUEST_MAX_OUTPUT_TOKENS", "163840"))
+BT_REQUEST_DEADLINE_SECONDS = float(os.environ.get("BT_REQUEST_DEADLINE_SECONDS", "90"))
+
+for _name, _value in {
+    "BT_MAX_UPSTREAM_INFLIGHT": BT_MAX_UPSTREAM_INFLIGHT,
+    "BT_UPSTREAM_QUEUE_TIMEOUT": BT_UPSTREAM_QUEUE_TIMEOUT,
+    "BT_REQUEST_MAX_ATTEMPTS": BT_REQUEST_MAX_ATTEMPTS,
+    "BT_REQUEST_MAX_INPUT_BYTES": BT_REQUEST_MAX_INPUT_BYTES,
+    "BT_REQUEST_MAX_OUTPUT_TOKENS": BT_REQUEST_MAX_OUTPUT_TOKENS,
+    "BT_REQUEST_DEADLINE_SECONDS": BT_REQUEST_DEADLINE_SECONDS,
+}.items():
+    if _value <= 0:
+        raise ValueError(f"{_name} must be greater than zero")
+
+_UPSTREAM_SEM = _threading.BoundedSemaphore(BT_MAX_UPSTREAM_INFLIGHT)
+
+
+def create_work_budget() -> WorkBudget:
+    """Create one budget shared by every provider call for an API request."""
+    return WorkBudget(
+        max_attempts=BT_REQUEST_MAX_ATTEMPTS,
+        max_input_bytes=BT_REQUEST_MAX_INPUT_BYTES,
+        max_output_tokens=BT_REQUEST_MAX_OUTPUT_TOKENS,
+        deadline_seconds=BT_REQUEST_DEADLINE_SECONDS,
+    )
+
+
+def _acquire_upstream_slot(budget: WorkBudget) -> None:
+    """Acquire the process-wide provider slot within queue/deadline limits."""
+    remaining = budget.remaining_seconds()
+    if remaining <= 0:
+        raise WorkBudgetExceeded("deadline")
+    wait_seconds = min(BT_UPSTREAM_QUEUE_TIMEOUT, remaining)
+    if not _UPSTREAM_SEM.acquire(timeout=wait_seconds):
+        reason = "deadline" if budget.remaining_seconds() <= 0 else "queue"
+        raise WorkBudgetExceeded(reason)
 
 
 def _call_provider(p: _Provider, user_content: str, system_prompt: str,
-                   max_retries: int, timeout: int, max_tokens: int) -> str:
+                   max_retries: int, timeout: int, max_tokens: int,
+                   budget: WorkBudget) -> str:
     """Call one provider with retry/backoff. Raises on definitive failure."""
     last_error = None
     for attempt in range(max_retries):
         try:
-            if _UPSTREAM_SEM is not None:
-                with _UPSTREAM_SEM:
-                    if p.api_type == "openai":
-                        return _translate_openai(p, user_content, system_prompt, timeout, max_tokens)
-                    return _translate_anthropic(p, user_content, system_prompt, timeout, max_tokens)
-            if p.api_type == "openai":
-                return _translate_openai(p, user_content, system_prompt, timeout, max_tokens)
-            return _translate_anthropic(p, user_content, system_prompt, timeout, max_tokens)
+            _acquire_upstream_slot(budget)
+            try:
+                budget.reserve_attempt(user_content + system_prompt, max_tokens)
+                call_timeout = min(float(timeout), budget.remaining_seconds())
+                if call_timeout <= 0:
+                    raise WorkBudgetExceeded("deadline")
+                if p.api_type == "openai":
+                    return _translate_openai(
+                        p, user_content, system_prompt, call_timeout, max_tokens)
+                return _translate_anthropic(
+                    p, user_content, system_prompt, call_timeout, max_tokens)
+            finally:
+                _UPSTREAM_SEM.release()
+        except WorkBudgetExceeded:
+            raise
         except requests.exceptions.RequestException as e:
             status_code = getattr(e.response, "status_code", 0)
             error_body = getattr(e.response, "text", str(e))[:300]
@@ -284,10 +331,13 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
 
 
 def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
-              timeout: Optional[int] = None, max_tokens: int = BT_MAX_TOKENS) -> tuple[str, str]:
+              timeout: Optional[int] = None, max_tokens: int = BT_MAX_TOKENS,
+              budget: Optional[WorkBudget] = None) -> tuple[str, str]:
     """Run a completion through the primary provider, falling back to the secondary."""
     if timeout is None:
         timeout = BT_TIMEOUT
+    if budget is None:
+        budget = create_work_budget()
 
     providers = [_get_primary()]
     fb = _get_fallback()
@@ -297,8 +347,11 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
     last_error = None
     for p in providers:
         try:
-            out = _call_provider(p, user_content, system_prompt, max_retries, timeout, max_tokens)
+            out = _call_provider(
+                p, user_content, system_prompt, max_retries, timeout, max_tokens, budget)
             return out, p.name
+        except WorkBudgetExceeded:
+            raise
         except Exception as e:
             last_error = f"{p.name}: {e}"
             log.warning("Provider %s exhausted: %s", p.name, e)
@@ -343,10 +396,20 @@ def translate_text(
     max_retries: int = 2,
     timeout: Optional[int] = None,
     prefer_local: bool = True,  # Ignored, preserved for backward compatibility
+    budget: Optional[WorkBudget] = None,
 ) -> tuple[str, str]:
     """Translate a single text. Returns (translated_text, provider_name)."""
+    if budget is None:
+        budget = create_work_budget()
     system = SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
-    translated, provider = _complete(text, system, max_retries, timeout, _output_cap(text, BT_MAX_TOKENS))
+    translated, provider = _complete(
+        text,
+        system,
+        max_retries,
+        timeout,
+        _output_cap(text, BT_MAX_TOKENS),
+        budget,
+    )
     log.debug("Translated %d chars %s→%s via %s", len(text), source_lang, target_lang, provider)
     return translated, provider
 
@@ -426,7 +489,8 @@ def _build_context_block(all_texts: list[str], idxs: list[int]) -> Optional[str]
     return "[CONTEXT] Surrounding story context — do NOT translate:\n" + "\n\n".join(sections)
 
 
-def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str, target_lang: str) -> list[tuple[str, str]]:
+def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str,
+                     target_lang: str, budget: WorkBudget) -> list[tuple[str, str]]:
     """
     Translate a group of paragraphs in ONE LLM call. A malformed protocol
     response fails the group atomically; it never triggers unbounded
@@ -436,7 +500,8 @@ def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str, ta
     """
     group_texts = [all_texts[i] for i in idxs]
     if len(group_texts) == 1 and BT_CONTEXT_WINDOW == 0:
-        return [translate_text(group_texts[0], source_lang, target_lang)]
+        return [translate_text(
+            group_texts[0], source_lang, target_lang, budget=budget)]
 
     segment_ids = []
     while len(segment_ids) < len(idxs):
@@ -462,6 +527,7 @@ def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str, ta
         system,
         max_retries=2,
         max_tokens=_output_cap(combined, BT_BATCH_MAX_TOKENS),
+        budget=budget,
     )
     parsed = _parse_segment_envelope(output, segment_ids)
     if parsed is None:
@@ -475,6 +541,7 @@ def translate_batch(
     source_lang: str = "English",
     target_lang: str = "Spanish",
     max_concurrent: Optional[int] = None,
+    budget: Optional[WorkBudget] = None,
 ) -> list[tuple[str, str]]:
     """
     Translate multiple texts. Non-empty texts are grouped into batches of
@@ -483,6 +550,8 @@ def translate_batch(
     """
     if max_concurrent is None:
         max_concurrent = BT_MAX_CONCURRENT
+    if budget is None:
+        budget = create_work_budget()
     max_concurrent = max(1, max_concurrent)
     batch_size = max(1, BT_BATCH_SIZE)
 
@@ -497,8 +566,9 @@ def translate_batch(
     def _do_group(group):
         idxs = [i for i, _ in group]
         try:
-            translations = _translate_group(texts, idxs, source_lang, target_lang)
-        except SegmentProtocolError:
+            translations = _translate_group(
+                texts, idxs, source_lang, target_lang, budget)
+        except (SegmentProtocolError, WorkBudgetExceeded):
             raise
         except Exception as e:
             log.error("Group translation failed: %s", e)
@@ -507,13 +577,17 @@ def translate_batch(
 
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
         futures = [executor.submit(_do_group, g) for g in groups]
-        for future in as_completed(futures):
-            idxs, translations = future.result()
-            for j, idx in enumerate(idxs):
-                # Each entry carries the provider that ACTUALLY served it (the
-                # fallback provider when the primary failed), not the configured
-                # primary — so logs and debugging reflect reality.
-                results[idx] = translations[j] if j < len(translations) else ("[TRANSLATION ERROR: missing segment]", "")
+        try:
+            for future in as_completed(futures):
+                idxs, translations = future.result()
+                for j, idx in enumerate(idxs):
+                    # Each entry carries the provider that ACTUALLY served it
+                    # (the fallback provider when the primary failed).
+                    results[idx] = translations[j] if j < len(translations) else ("[TRANSLATION ERROR: missing segment]", "")
+        except WorkBudgetExceeded:
+            for future in futures:
+                future.cancel()
+            raise
 
     return results
 
