@@ -728,7 +728,7 @@ def cache_cleanup():
     Auth: always required. Two sources of truth for the token, in order:
       1. BT_API_TOKEN env var (the recommended path; if set, this is the
          only token accepted for the whole API)
-      2. Per-process auto-generated token persisted in /app/data/cleanup_token
+      2. Auto-generated deployment token persisted in /app/data/cleanup_token
          (only consulted when BT_API_TOKEN is empty). The token is generated
          on first use with secrets.token_urlsafe and written to a file with
          mode 0600 (the value itself is never logged — read it with
@@ -745,7 +745,13 @@ def cache_cleanup():
             "request_id": getattr(request, "request_id", None),
         }), 401
 
-    data = request.get_json(silent=True) or {}
+    raw_body = request.get_data(cache=True)
+    if not raw_body:
+        data = {}
+    else:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Request body must be a JSON object"}), 400
     days = data.get("days", 30)
     if isinstance(days, bool) or not isinstance(days, int) or not (1 <= days <= 3650):
         return jsonify({"error": "'days' must be an integer between 1 and 3650"}), 400
@@ -757,9 +763,82 @@ def cache_cleanup():
 # Persistent path inside the data dir, alongside the sqlite database. The
 # file is intentionally named without a leading dot so `ls` shows it by
 # default — operators need to be able to see it to understand the auth model.
+import fcntl as _fcntl  # Linux/Alpine process lock for the persisted secret
 import secrets as _secrets  # local: small surface
+import tempfile as _tempfile
 _CLEANUP_TOKEN_PATH = Path(os.environ.get("BT_CACHE_DIR", "/app/data")) / "cleanup_token"
 _cleanup_token_cache: str | None = None
+_cleanup_token_lock = threading.Lock()
+
+
+def _read_cleanup_token_file() -> str:
+    """Read the persisted token without following symlinks, repairing mode."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(_CLEANUP_TOKEN_PATH, flags)
+    except FileNotFoundError:
+        return ""
+
+    with os.fdopen(fd, "r", encoding="utf-8") as token_file:
+        os.fchmod(token_file.fileno(), 0o600)
+        # A generated token is ~43 bytes. Refuse an unexpectedly large file
+        # rather than letting a corrupted data volume consume unbounded RAM.
+        value = token_file.read(4097)
+    if len(value) > 4096:
+        raise OSError("cleanup token file exceeds 4096 bytes")
+    return value.strip()
+
+
+def _persist_cleanup_token() -> tuple[str, bool]:
+    """Read or atomically create the shared token under an OS file lock."""
+    _CLEANUP_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _CLEANUP_TOKEN_PATH.with_name(
+        f"{_CLEANUP_TOKEN_PATH.name}.lock")
+    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    lock_fd = os.open(lock_path, lock_flags, 0o600)
+
+    with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_file:
+        os.fchmod(lock_file.fileno(), 0o600)
+        _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+
+        existing = _read_cleanup_token_file()
+        if existing:
+            return existing, False
+
+        token = _secrets.token_urlsafe(32)
+        temp_fd, temp_name = _tempfile.mkstemp(
+            prefix=f".{_CLEANUP_TOKEN_PATH.name}.",
+            dir=_CLEANUP_TOKEN_PATH.parent,
+        )
+        try:
+            os.fchmod(temp_fd, 0o600)
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file:
+                temp_fd = -1  # fdopen owns and closes it from this point.
+                temp_file.write(token)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_name, _CLEANUP_TOKEN_PATH)
+            temp_name = ""
+
+            # Persist the rename itself before releasing the inter-process
+            # lock, so a host crash cannot expose a partially-created secret.
+            directory_fd = os.open(
+                _CLEANUP_TOKEN_PATH.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
+        return token, True
 
 
 def _get_cleanup_token() -> str:
@@ -768,45 +847,34 @@ def _get_cleanup_token() -> str:
     Order:
       1. If BT_API_TOKEN is set, use it (single source of truth for the
          whole API's auth — consistent with the other endpoints).
-      2. Else, read or create /app/data/cleanup_token. The first call
-         generates a fresh secrets.token_urlsafe(32) value, writes it to
-         the file with mode 0600, and logs it once at INFO. Subsequent
-         calls (within the same process) reuse the cached value.
+      2. Else, read or create /app/data/cleanup_token. Creation is serialized
+         across threads and processes, then atomically persisted with mode
+         0600. Subsequent calls reuse the in-process cached value.
     """
     global _cleanup_token_cache
     if API_TOKEN:
         return API_TOKEN
-    if _cleanup_token_cache is not None:
-        return _cleanup_token_cache
-    try:
-        _CLEANUP_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        existing = _CLEANUP_TOKEN_PATH.read_text().strip() if _CLEANUP_TOKEN_PATH.exists() else ""
-        if existing:
-            _cleanup_token_cache = existing
-        else:
-            # Missing OR empty file: generate and PERSIST (an empty file must
-            # not leave the operator with an unrecoverable in-memory token).
+    with _cleanup_token_lock:
+        if _cleanup_token_cache is not None:
+            return _cleanup_token_cache
+        try:
+            _cleanup_token_cache, generated = _persist_cleanup_token()
+            if generated:
+                log.warning(
+                    "BT_API_TOKEN not set. Auto-generated a /cache/cleanup token and "
+                    "persisted it at %s (mode 0600). Read it with: "
+                    "docker exec <container> cat %s — the value is intentionally "
+                    "NOT logged (logs are not secret storage). Set BT_API_TOKEN to "
+                    "use a fixed value instead.",
+                    _CLEANUP_TOKEN_PATH, _CLEANUP_TOKEN_PATH,
+                )
+        except Exception:
+            # If we cannot persist, fall back to an in-memory token that lasts
+            # for the process lifetime. Less convenient for the operator (lost
+            # on restart) but still better than no auth.
+            log.exception("Failed to persist cleanup token; using in-memory fallback")
             _cleanup_token_cache = _secrets.token_urlsafe(32)
-            _CLEANUP_TOKEN_PATH.write_text(_cleanup_token_cache)
-            try:
-                _CLEANUP_TOKEN_PATH.chmod(0o600)
-            except OSError:
-                pass
-            log.warning(
-                "BT_API_TOKEN not set. Auto-generated a /cache/cleanup token and "
-                "persisted it at %s (mode 0600). Read it with: "
-                "docker exec <container> cat %s — the value is intentionally "
-                "NOT logged (logs are not secret storage). Set BT_API_TOKEN to "
-                "use a fixed value instead.",
-                _CLEANUP_TOKEN_PATH, _CLEANUP_TOKEN_PATH,
-            )
-    except Exception as e:
-        # If we cannot persist, fall back to an in-memory token that lasts
-        # for the process lifetime. Less convenient for the operator (lost
-        # on restart) but still better than no auth.
-        log.exception("Failed to persist cleanup token; using in-memory fallback")
-        _cleanup_token_cache = _secrets.token_urlsafe(32)
-    return _cleanup_token_cache
+        return _cleanup_token_cache
 
 
 # ── Main ────────────────────────────────────────────────────────────────────

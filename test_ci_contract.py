@@ -16,7 +16,7 @@ class CIContractTests(unittest.TestCase):
         for command in (
             "python3 test_translation.py",
             "python3 test_hardening.py",
-            "python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract",
+            "python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_cleanup_token",
         ):
             self.assertIn(command, self.workflow)
 
