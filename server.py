@@ -13,11 +13,13 @@ import hmac
 from collections import defaultdict
 from pathlib import Path
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import HTTPException
 
 from translator import (
     translate_text, translate_batch, check_backend_health,
     LLM_MODEL, BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
-    create_work_budget, model_for_provider, cache_lookup_models,
+    ProviderUnavailableError, create_work_budget, model_for_provider,
+    cache_lookup_models,
 )
 from work_budget import WorkBudget, WorkBudgetExceeded
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
@@ -141,6 +143,15 @@ def _validate_languages(source_lang: str, target_lang: str):
     if invalid:
         return f"Invalid language(s): {', '.join(invalid)}. Valid: {sorted(VALID_LANGUAGES)}"
     return None
+
+
+def _has_invalid_unicode(value: str) -> bool:
+    """JSON can decode lone UTF-16 surrogates that UTF-8 cannot represent."""
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return True
+    return False
 
 
 # ── CORS whitelist (H5) ─────────────────────────────────────────────────────
@@ -388,7 +399,7 @@ def before_request_hook():
     # Optional shared-secret auth (skip preflight + health/ping so liveness
     # probes always work. /stats stays under auth so cache contents aren't
     # leakable on unauthenticated LANs.)
-    if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ping"):
+    if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/ping"):
         if not _token_matches(request.headers.get("X-BT-Token", ""), API_TOKEN):
             return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
 
@@ -400,7 +411,7 @@ def before_request_hook():
     # Skip CORS preflights too: an OPTIONS would otherwise burn 2x budget per
     # real cross-origin request, and a 429 on a preflight surfaces as a cryptic
     # CORS error in the browser instead of a rate limit the frontend can honor.
-    if request.method != "OPTIONS" and request.path not in ("/health", "/metrics", "/ping", "/stats"):
+    if request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/metrics", "/ping", "/stats"):
         client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
@@ -441,6 +452,40 @@ def after_request_hook(response):
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 
+@app.errorhandler(HTTPException)
+def http_error(exc: HTTPException):
+    """Keep framework-generated failures on the public JSON API contract."""
+    error_codes = {
+        400: "bad_request",
+        401: "unauthorized",
+        403: "forbidden",
+        404: "not_found",
+        405: "method_not_allowed",
+        413: "request_too_large",
+        415: "unsupported_media_type",
+        429: "rate_limited",
+    }
+    status_code = int(exc.code or 500)
+    return jsonify({
+        "error": error_codes.get(status_code, "http_error"),
+        "request_id": getattr(request, "request_id", None),
+    }), status_code
+
+
+@app.errorhandler(Exception)
+def unhandled_error(exc: Exception):
+    """Fail closed without returning or logging private exception strings."""
+    request_id = getattr(request, "request_id", None)
+    log.error(
+        "req=%s unhandled request error type=%s",
+        request_id, type(exc).__name__,
+    )
+    return jsonify({
+        "error": "internal_error",
+        "request_id": request_id,
+    }), 500
+
+
 @app.errorhandler(413)
 def request_too_large(_e):
     """Return a clean JSON 413 when MAX_CONTENT_LENGTH trips.
@@ -461,25 +506,48 @@ def request_too_large(_e):
 def ping():
     """Liveness probe — instant, never touches the LLM. Used by the Docker
     HEALTHCHECK so a busy/slow vLLM can't mark the container unhealthy while it
-    is in fact serving translations. /health (below) remains the deep probe."""
+    is in fact serving translations. /health is shallow; /health/deep probes
+    providers only for an authenticated operator."""
     return jsonify({"status": "ok"})
 
 
-BT_HEALTH_DETAILS = os.environ.get("BT_HEALTH_DETAILS", "true").lower() in ("1", "true", "yes")
-
-
 @app.route("/health")
+@app.route("/ready")
 def health():
-    """Health check with backend status (M2).
+    """Shallow readiness: process/config loaded, with no provider network I/O."""
+    return jsonify({
+        "status": "ok",
+        "service": "book-translator",
+        "version": __version__,
+        "request_id": getattr(request, "request_id", None),
+    })
 
-    /health is exempt from auth so liveness probes always work. When the API
-    is exposed beyond a trusted LAN, set BT_HEALTH_DETAILS=false to hide the
-    provider names/latency from unauthenticated callers (a valid X-BT-Token
-    still gets the full body); /ping remains the bare liveness endpoint."""
-    if not BT_HEALTH_DETAILS and API_TOKEN and not _token_matches(request.headers.get("X-BT-Token", ""), API_TOKEN):
-        return jsonify({"status": "ok", "service": "book-translator",
-                        "request_id": getattr(request, "request_id", None)})
-    backend_health = check_backend_health()
+
+@app.route("/health/deep")
+def deep_health():
+    """Operator-only provider probe using normal work and concurrency caps."""
+    provided_token = request.headers.get("X-BT-Token", "")
+    if API_TOKEN:
+        authorized = _token_matches(provided_token, API_TOKEN)
+    else:
+        try:
+            operator_token = _get_cleanup_token()
+        except CleanupCredentialUnavailable:
+            return jsonify({
+                "error": "operator_credential_unavailable",
+                "request_id": getattr(request, "request_id", None),
+            }), 503
+        authorized = _token_matches(provided_token, operator_token)
+    if not authorized:
+        return jsonify({
+            "error": "Unauthorized",
+            "request_id": getattr(request, "request_id", None),
+        }), 401
+
+    try:
+        backend_health = check_backend_health(create_work_budget())
+    except WorkBudgetExceeded as exc:
+        return _work_budget_response(exc)
     overall = "ok" if any(
         b.get("status") == "ok" for b in backend_health.values()
     ) else "degraded"
@@ -543,6 +611,8 @@ def translate():
         return jsonify({"error": "Missing or invalid 'text' field"}), 400
 
     text = data["text"].strip()
+    if _has_invalid_unicode(text):
+        return jsonify({"error": "'text' contains invalid Unicode"}), 400
     if len(text) > BT_MAX_PARAGRAPH_CHARS:
         return jsonify({
             "error": f"'text' exceeds the {BT_MAX_PARAGRAPH_CHARS}-character limit"
@@ -598,11 +668,25 @@ def translate():
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
         return _work_budget_response(exc)
+    except ProviderUnavailableError:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+        log.warning("req=%s translation provider unavailable", req_id)
+        return jsonify({
+            "error": "provider_unavailable",
+            "request_id": req_id,
+        }), 502
     except Exception as e:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
-        log.exception("Translation failed")
-        return jsonify({"error": str(e), "request_id": req_id}), 500
+        log.error(
+            "req=%s translation failed error_type=%s",
+            req_id, type(e).__name__,
+        )
+        return jsonify({
+            "error": "translation_failed",
+            "request_id": req_id,
+        }), 500
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
     _record_metric(elapsed_ms, hits=0, misses=1)
@@ -611,7 +695,7 @@ def translate():
     try:
         put_cache(text, source_lang, target_lang, translated, model=model_for_provider(backend))
     except Exception as e:
-        log.exception("Cache write failed (non-fatal)")
+        log.error("Cache write failed (non-fatal) error_type=%s", type(e).__name__)
 
     return jsonify({
         "translated": translated,
@@ -661,6 +745,15 @@ def translate_batch_endpoint():
         }), 413
     if not all(isinstance(p, str) for p in paragraphs):
         return jsonify({"error": "All 'paragraphs' entries must be strings"}), 400
+    invalid_unicode = next(
+        (i for i, paragraph in enumerate(paragraphs)
+         if _has_invalid_unicode(paragraph)),
+        None,
+    )
+    if invalid_unicode is not None:
+        return jsonify({
+            "error": f"Paragraph {invalid_unicode} contains invalid Unicode"
+        }), 400
     oversized = next((i for i, p in enumerate(paragraphs) if len(p) > BT_MAX_PARAGRAPH_CHARS), None)
     if oversized is not None:
         return jsonify({
@@ -710,6 +803,26 @@ def translate_batch_endpoint():
             "error": "invalid_provider_response",
             "request_id": getattr(request, "request_id", None),
         }), 502
+    except ProviderUnavailableError:
+        _record_metric(0, hits=0, misses=1, error=True)
+        log.warning(
+            "req=%s batch provider unavailable",
+            getattr(request, "request_id", None),
+        )
+        return jsonify({
+            "error": "provider_unavailable",
+            "request_id": getattr(request, "request_id", None),
+        }), 502
+    except Exception as exc:
+        _record_metric(0, hits=0, misses=1, error=True)
+        log.error(
+            "req=%s batch translation failed error_type=%s",
+            getattr(request, "request_id", None), type(exc).__name__,
+        )
+        return jsonify({
+            "error": "translation_failed",
+            "request_id": getattr(request, "request_id", None),
+        }), 500
     result["request_id"] = getattr(request, "request_id", None)
 
     _record_metric(result["total_elapsed_ms"], hits=result["cached_count"], misses=result["fresh_count"])
@@ -717,6 +830,10 @@ def translate_batch_endpoint():
     return jsonify(result)
 
 
+
+
+class CleanupCredentialUnavailable(RuntimeError):
+    """The destructive endpoint cannot establish a shared credential."""
 
 
 @app.route("/cache/cleanup", methods=["POST"])
@@ -737,7 +854,13 @@ def cache_cleanup():
          NOT get an unauthenticated destructive endpoint on their LAN.
 
     Tests can monkeypatch `_get_cleanup_token` to return a known value."""
-    token = _get_cleanup_token()
+    try:
+        token = _get_cleanup_token()
+    except CleanupCredentialUnavailable:
+        return jsonify({
+            "error": "cleanup_credential_unavailable",
+            "request_id": getattr(request, "request_id", None),
+        }), 503
     request_token = request.headers.get("X-BT-Token", "")
     if not _token_matches(request_token, token):
         return jsonify({
@@ -765,6 +888,7 @@ def cache_cleanup():
 # default — operators need to be able to see it to understand the auth model.
 import fcntl as _fcntl  # Linux/Alpine process lock for the persisted secret
 import secrets as _secrets  # local: small surface
+import stat as _stat
 import tempfile as _tempfile
 _CLEANUP_TOKEN_PATH = Path(os.environ.get("BT_CACHE_DIR", "/app/data")) / "cleanup_token"
 _cleanup_token_cache: str | None = None
@@ -773,17 +897,25 @@ _cleanup_token_lock = threading.Lock()
 
 def _read_cleanup_token_file() -> str:
     """Read the persisted token without following symlinks, repairing mode."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
     try:
         fd = os.open(_CLEANUP_TOKEN_PATH, flags)
     except FileNotFoundError:
         return ""
 
-    with os.fdopen(fd, "r", encoding="utf-8") as token_file:
-        os.fchmod(token_file.fileno(), 0o600)
-        # A generated token is ~43 bytes. Refuse an unexpectedly large file
-        # rather than letting a corrupted data volume consume unbounded RAM.
-        value = token_file.read(4097)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("cleanup token path is not a regular file")
+        with os.fdopen(fd, "r", encoding="utf-8") as token_file:
+            fd = -1  # fdopen owns and closes it from this point.
+            os.fchmod(token_file.fileno(), 0o600)
+            # A generated token is ~43 bytes. Refuse an unexpectedly large
+            # file rather than letting a corrupt volume consume unbounded RAM.
+            value = token_file.read(4097)
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if len(value) > 4096:
         raise OSError("cleanup token file exceeds 4096 bytes")
     return value.strip()
@@ -794,8 +926,13 @@ def _persist_cleanup_token() -> tuple[str, bool]:
     _CLEANUP_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     lock_path = _CLEANUP_TOKEN_PATH.with_name(
         f"{_CLEANUP_TOKEN_PATH.name}.lock")
-    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    lock_flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_NONBLOCK", 0))
     lock_fd = os.open(lock_path, lock_flags, 0o600)
+
+    if not _stat.S_ISREG(os.fstat(lock_fd).st_mode):
+        os.close(lock_fd)
+        raise OSError("cleanup token lock path is not a regular file")
 
     with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_file:
         os.fchmod(lock_file.fileno(), 0o600)
@@ -868,12 +1005,15 @@ def _get_cleanup_token() -> str:
                     "use a fixed value instead.",
                     _CLEANUP_TOKEN_PATH, _CLEANUP_TOKEN_PATH,
                 )
-        except Exception:
-            # If we cannot persist, fall back to an in-memory token that lasts
-            # for the process lifetime. Less convenient for the operator (lost
-            # on restart) but still better than no auth.
-            log.exception("Failed to persist cleanup token; using in-memory fallback")
-            _cleanup_token_cache = _secrets.token_urlsafe(32)
+        except Exception as exc:
+            # A per-process fallback would create different credentials across
+            # Gunicorn workers and make a destructive endpoint nondeterministic.
+            # Fail closed until the shared data volume is writable again.
+            log.error(
+                "Cleanup credential persistence failed type=%s; endpoint disabled",
+                type(exc).__name__,
+            )
+            raise CleanupCredentialUnavailable from exc
         return _cleanup_token_cache
 
 

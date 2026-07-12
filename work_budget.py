@@ -50,6 +50,23 @@ class WorkBudget:
         self._attempts = 0
         self._input_bytes = 0
         self._output_tokens = 0
+        self._cancel_reason: str | None = None
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        """Prevent any new provider work; an in-flight HTTP call may finish."""
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("cancel reason must be a non-empty string")
+        with self._lock:
+            if self._cancel_reason is None:
+                self._cancel_reason = reason
+
+    def ensure_active(self) -> None:
+        """Raise if cancellation or the absolute deadline forbids new work."""
+        with self._lock:
+            if self._cancel_reason is not None:
+                raise WorkBudgetExceeded(self._cancel_reason)
+            if self._clock() >= self._deadline:
+                raise WorkBudgetExceeded("deadline")
 
     def remaining_seconds(self) -> float:
         """Seconds until the absolute request deadline, clamped at zero."""
@@ -66,6 +83,8 @@ class WorkBudget:
         input_bytes = len(input_text.encode("utf-8"))
 
         with self._lock:
+            if self._cancel_reason is not None:
+                raise WorkBudgetExceeded(self._cancel_reason)
             if self._clock() >= self._deadline:
                 raise WorkBudgetExceeded("deadline")
             if self._attempts + 1 > self.max_attempts:

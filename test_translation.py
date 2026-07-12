@@ -45,7 +45,7 @@ class FakeResp:
             err = requests.exceptions.HTTPError(f"HTTP {self.status_code}"); err.response = self; raise err
 
 
-def fake_post(url, headers=None, json=None, timeout=None):
+def fake_post(url, headers=None, json=None, timeout=None, stream=False):
     is_local = "1234" in url or "localhost" in url
     if is_local and not STATE["local_up"]:
         raise requests.exceptions.ConnectionError("local refused")
@@ -187,10 +187,10 @@ def run():
     # Capture the exact prompt the LLM receives to verify the context block.
     received_prompts = []
     original_post = requests.post
-    def context_check_post(url, headers=None, json=None, timeout=None):
+    def context_check_post(url, headers=None, json=None, timeout=None, stream=False):
         user_text = json["messages"][-1]["content"]
         received_prompts.append(user_text)
-        return fake_post(url, headers, json, timeout)
+        return fake_post(url, headers, json, timeout, stream)
 
     requests.post = context_check_post
     # 4 paragraphs at BT_BATCH_SIZE=3 -> group 1 covers indices 0..2 (context

@@ -1,6 +1,8 @@
 """Security contracts for the destructive cache-cleanup credential."""
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -78,6 +80,40 @@ class CleanupTokenTests(unittest.TestCase):
         mode = stat.S_IMODE(server._CLEANUP_TOKEN_PATH.stat().st_mode)
         self.assertEqual(mode, 0o600)
 
+    def test_concurrent_processes_share_the_same_persisted_secret(self):
+        start_file = Path(self.tempdir.name) / "start"
+        child_code = (
+            "import os,sys,time; "
+            "start=sys.argv[1]; "
+            "exec('while not os.path.exists(start):\\n time.sleep(0.001)'); "
+            "import server; print(server._get_cleanup_token())"
+        )
+        processes = []
+        for index in range(8):
+            env = os.environ.copy()
+            env["BT_API_TOKEN"] = ""
+            env["BT_CACHE_DIR"] = self.tempdir.name
+            env["DB_PATH"] = str(Path(self.tempdir.name) / f"child-{index}.db")
+            processes.append(subprocess.Popen(
+                [sys.executable, "-c", child_code, str(start_file)],
+                cwd=Path(__file__).parent,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ))
+
+        start_file.write_text("go")
+        outputs = [process.communicate(timeout=10) for process in processes]
+        for process, (_stdout, stderr) in zip(processes, outputs):
+            self.assertEqual(process.returncode, 0, stderr)
+
+        tokens = [stdout.strip() for stdout, _stderr in outputs]
+        self.assertEqual(len(set(tokens)), 1)
+        self.assertEqual(server._CLEANUP_TOKEN_PATH.read_text(), tokens[0])
+        mode = stat.S_IMODE(server._CLEANUP_TOKEN_PATH.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
     def test_cleanup_rejects_non_object_json(self):
         server.API_TOKEN = "operator-token"
         response = server.app.test_client().post(
@@ -90,6 +126,68 @@ class CleanupTokenTests(unittest.TestCase):
         self.assertEqual(
             response.get_json(), {"error": "Request body must be a JSON object"}
         )
+
+    def test_cleanup_rejects_malformed_json_without_deleting(self):
+        server.API_TOKEN = "operator-token"
+        with mock.patch.object(server, "cleanup_old_entries") as cleanup:
+            response = server.app.test_client().post(
+                "/cache/cleanup",
+                data=b'{"days":',
+                content_type="application/json",
+                headers={"X-BT-Token": "operator-token"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIsInstance(response.get_json().get("error"), str)
+        cleanup.assert_not_called()
+
+    def test_persistence_failure_is_fail_closed_and_stable(self):
+        with mock.patch.object(
+            server,
+            "_persist_cleanup_token",
+            side_effect=OSError("synthetic persistence failure"),
+        ):
+            response = server.app.test_client().post(
+                "/cache/cleanup",
+                json={"days": 30},
+                headers={"X-BT-Token": "any-value"},
+            )
+
+        body = response.get_json()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(body["error"], "cleanup_credential_unavailable")
+        self.assertIsNone(server._cleanup_token_cache)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO support")
+    def test_non_regular_token_path_fails_closed_without_blocking(self):
+        os.mkfifo(server._CLEANUP_TOKEN_PATH, 0o600)
+        env = os.environ.copy()
+        env["BT_API_TOKEN"] = ""
+        env["BT_CACHE_DIR"] = self.tempdir.name
+        env["DB_PATH"] = str(Path(self.tempdir.name) / "fifo-child.db")
+        child_code = (
+            "import server; "
+            "\ntry: server._get_cleanup_token()"
+            "\nexcept server.CleanupCredentialUnavailable: print('disabled')"
+            "\nelse: raise SystemExit('credential unexpectedly available')"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            cwd=Path(__file__).parent,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            self.fail("cleanup token read blocked on a FIFO")
+
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(stdout.strip(), "disabled")
 
 
 if __name__ == "__main__":

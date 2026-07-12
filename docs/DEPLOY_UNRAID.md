@@ -126,9 +126,14 @@ docker run -d --name book-translator-api --restart unless-stopped --net bridge \
   -e BT_CONTEXT_WINDOW=1 -e BT_MAX_TOKENS=640 -e BT_BATCH_MAX_TOKENS=1200 \
   local/book-translator-api:latest
 
-# Verify (ping = fast liveness, health = deep probe incl. the LLM)
+# Verify process liveness and shallow readiness (neither contacts the LLM)
 curl -s http://127.0.0.1:8390/ping
 curl -s http://127.0.0.1:8390/health
+
+# Optional provider-backed operator probe. Set this to BT_API_TOKEN. If that
+# variable is not configured, read the generated shared operator token instead:
+TOKEN="$(docker exec book-translator-api cat /app/data/cleanup_token)"
+curl -s -H "X-BT-Token: $TOKEN" http://127.0.0.1:8390/health/deep
 ```
 
 ---
@@ -234,7 +239,7 @@ docker exec calibre-web-automated grep -n "BT_UI_VERSION" /app/calibre-web-autom
 sha256sum /mnt/user/appdata/calibre-web-automated/overlay/translator.js
 docker exec calibre-web-automated sha256sum /app/calibre-web-automated/cps/static/js/translator.js
 
-# Backend health
+# Backend shallow readiness (no provider call)
 curl -s http://127.0.0.1:8390/health
 ```
 

@@ -105,6 +105,20 @@ class WorkBudgetUnitTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.make_budget(deadline_seconds=invalid)
 
+    def test_cancellation_prevents_new_work_without_consuming_counters(self):
+        budget = self.make_budget()
+        budget.cancel()
+
+        with self.assertRaises(WorkBudgetExceeded) as raised:
+            budget.reserve_attempt("never sent", 1)
+
+        self.assertEqual(raised.exception.reason, "cancelled")
+        self.assertEqual(budget.snapshot(), {
+            "attempts": 0,
+            "input_bytes": 0,
+            "output_tokens": 0,
+        })
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

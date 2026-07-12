@@ -10,6 +10,7 @@ output use a versioned JSON envelope with server-generated IDs; a malformed
 response fails the whole group rather than risking cross-segment corruption.
 """
 import json
+import math
 import os
 import re
 import secrets
@@ -77,9 +78,9 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _output_cap(input_text: str, ceiling: int) -> int:
-    """max_tokens proportional to input size, clamped to [FLOOR, ceiling]."""
+    """max_tokens proportional to input size without exceeding ``ceiling``."""
     budget = int(_estimate_tokens(input_text) * BT_OUTPUT_TOKEN_FACTOR) + BT_OUTPUT_TOKEN_FLOOR
-    return max(BT_OUTPUT_TOKEN_FLOOR, min(ceiling, budget))
+    return min(ceiling, max(1, BT_OUTPUT_TOKEN_FLOOR, budget))
 
 LOCAL_BACKEND_URL = os.environ.get("BT_LOCAL_URL", "http://localhost:1234/v1/chat/completions")
 
@@ -121,6 +122,24 @@ class _Provider:
         self.url, self.api_type = endpoint
         self.model = model
         self.api_key = api_key
+
+
+class ProviderUnavailableError(RuntimeError):
+    """No configured provider completed a translation request."""
+
+
+class _ProviderCallError(RuntimeError):
+    """Sanitized provider failure retained only for retry decisions/logging."""
+
+    def __init__(self, provider: str, status_code: int, error_type: str):
+        self.provider = provider
+        self.status_code = status_code
+        self.error_type = error_type
+        super().__init__("provider call failed")
+
+
+class _ProviderResponseTooLarge(RuntimeError):
+    """A provider response crossed the configured in-memory boundary."""
 
 
 _primary_provider: Optional[_Provider] = None
@@ -183,6 +202,61 @@ class SegmentProtocolError(RuntimeError):
 
 # ── Per-provider request helpers ─────────────────────────────────────────────
 
+def _read_capped_json_response(response) -> object:
+    """Decode one provider response without buffering more than the byte cap.
+
+    Real ``requests.Response`` objects expose ``iter_content``. The ``json``
+    fallback keeps the project's small in-memory test doubles compatible while
+    applying the same cap to their serialized payload.
+    """
+    try:
+        response.raise_for_status()
+        headers = getattr(response, "headers", {}) or {}
+        try:
+            declared_size = int(headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            declared_size = 0
+        if declared_size > BT_MAX_UPSTREAM_RESPONSE_BYTES:
+            raise _ProviderResponseTooLarge("provider response exceeds byte cap")
+
+        iter_content = getattr(response, "iter_content", None)
+        if callable(iter_content):
+            payload = bytearray()
+            for chunk in iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                if not isinstance(chunk, bytes):
+                    raise ValueError("provider returned a non-bytes response chunk")
+                if len(payload) + len(chunk) > BT_MAX_UPSTREAM_RESPONSE_BYTES:
+                    raise _ProviderResponseTooLarge(
+                        "provider response exceeds byte cap")
+                payload.extend(chunk)
+            return json.loads(payload.decode("utf-8", errors="strict"))
+
+        body = response.json()
+        encoded = json.dumps(
+            body, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8", errors="strict")
+        if len(encoded) > BT_MAX_UPSTREAM_RESPONSE_BYTES:
+            raise _ProviderResponseTooLarge("provider response exceeds byte cap")
+        return body
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+
+def _validate_provider_text(value: object) -> str:
+    """Return stripped provider text only when it fits the response boundary."""
+    if not isinstance(value, str):
+        raise ValueError("provider response text must be a string")
+    translated = value.strip()
+    if not translated:
+        raise ValueError("provider response text is empty")
+    if len(translated.encode("utf-8", errors="strict")) > BT_MAX_UPSTREAM_RESPONSE_BYTES:
+        raise _ProviderResponseTooLarge("provider translation exceeds byte cap")
+    return translated
+
 def _translate_openai(p: _Provider, user_content: str, system_prompt: str, timeout: int, max_tokens: int) -> str:
     headers = {"Content-Type": "application/json"}
     if p.api_key:
@@ -198,14 +272,12 @@ def _translate_openai(p: _Provider, user_content: str, system_prompt: str, timeo
         ],
     }
 
-    resp = requests.post(p.url, headers=headers, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    body = resp.json()
+    resp = requests.post(
+        p.url, headers=headers, json=payload, timeout=timeout, stream=True)
+    body = _read_capped_json_response(resp)
 
-    translated = body.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    if not translated:
-        raise RuntimeError("Empty response from API")
-    return translated
+    content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return _validate_provider_text(content)
 
 
 def _translate_anthropic(p: _Provider, user_content: str, system_prompt: str, timeout: int, max_tokens: int) -> str:
@@ -224,15 +296,17 @@ def _translate_anthropic(p: _Provider, user_content: str, system_prompt: str, ti
         "messages": [{"role": "user", "content": user_content}],
     }
 
-    resp = requests.post(p.url, headers=headers, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    body = resp.json()
+    resp = requests.post(
+        p.url, headers=headers, json=payload, timeout=timeout, stream=True)
+    body = _read_capped_json_response(resp)
 
     content = body.get("content", [])
-    translated = "".join(block.get("text", "") for block in content if block.get("type") == "text").strip()
-    if not translated:
-        raise RuntimeError("Empty response from Anthropic API")
-    return translated
+    translated = "".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    return _validate_provider_text(translated)
 
 
 # ── Global upstream concurrency cap ─────────────────────────────────────────
@@ -246,9 +320,11 @@ import threading as _threading
 BT_MAX_UPSTREAM_INFLIGHT = int(os.environ.get("BT_MAX_UPSTREAM_INFLIGHT", "2"))
 BT_UPSTREAM_QUEUE_TIMEOUT = float(os.environ.get("BT_UPSTREAM_QUEUE_TIMEOUT", "2"))
 BT_REQUEST_MAX_ATTEMPTS = int(os.environ.get("BT_REQUEST_MAX_ATTEMPTS", "20"))
-BT_REQUEST_MAX_INPUT_BYTES = int(os.environ.get("BT_REQUEST_MAX_INPUT_BYTES", "2000000"))
+BT_REQUEST_MAX_INPUT_BYTES = int(os.environ.get("BT_REQUEST_MAX_INPUT_BYTES", "5000000"))
 BT_REQUEST_MAX_OUTPUT_TOKENS = int(os.environ.get("BT_REQUEST_MAX_OUTPUT_TOKENS", "163840"))
 BT_REQUEST_DEADLINE_SECONDS = float(os.environ.get("BT_REQUEST_DEADLINE_SECONDS", "90"))
+BT_MAX_UPSTREAM_RESPONSE_BYTES = int(os.environ.get(
+    "BT_MAX_UPSTREAM_RESPONSE_BYTES", "1048576"))
 
 for _name, _value in {
     "BT_MAX_UPSTREAM_INFLIGHT": BT_MAX_UPSTREAM_INFLIGHT,
@@ -257,8 +333,10 @@ for _name, _value in {
     "BT_REQUEST_MAX_INPUT_BYTES": BT_REQUEST_MAX_INPUT_BYTES,
     "BT_REQUEST_MAX_OUTPUT_TOKENS": BT_REQUEST_MAX_OUTPUT_TOKENS,
     "BT_REQUEST_DEADLINE_SECONDS": BT_REQUEST_DEADLINE_SECONDS,
+    "BT_MAX_UPSTREAM_RESPONSE_BYTES": BT_MAX_UPSTREAM_RESPONSE_BYTES,
 }.items():
-    if _value <= 0:
+    if ((isinstance(_value, float) and not math.isfinite(_value))
+            or _value <= 0):
         raise ValueError(f"{_name} must be greater than zero")
 
 _UPSTREAM_SEM = _threading.BoundedSemaphore(BT_MAX_UPSTREAM_INFLIGHT)
@@ -276,6 +354,7 @@ def create_work_budget() -> WorkBudget:
 
 def _acquire_upstream_slot(budget: WorkBudget) -> None:
     """Acquire the process-wide provider slot within queue/deadline limits."""
+    budget.ensure_active()
     remaining = budget.remaining_seconds()
     if remaining <= 0:
         raise WorkBudgetExceeded("deadline")
@@ -285,11 +364,25 @@ def _acquire_upstream_slot(budget: WorkBudget) -> None:
         raise WorkBudgetExceeded(reason)
 
 
+def _sleep_before_retry(
+    budget: WorkBudget, delay_seconds: float, attempt: int, max_retries: int
+) -> None:
+    """Sleep only between attempts and never beyond the request deadline."""
+    if attempt + 1 >= max_retries:
+        return
+    budget.ensure_active()
+    remaining = budget.remaining_seconds()
+    if remaining <= 0:
+        raise WorkBudgetExceeded("deadline")
+    time.sleep(min(delay_seconds, remaining))
+    budget.ensure_active()
+
+
 def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                    max_retries: int, timeout: int, max_tokens: int,
                    budget: WorkBudget) -> str:
     """Call one provider with retry/backoff. Raises on definitive failure."""
-    last_error = None
+    last_error: _ProviderCallError | None = None
     for attempt in range(max_retries):
         try:
             _acquire_upstream_slot(budget)
@@ -308,26 +401,35 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
         except WorkBudgetExceeded:
             raise
         except requests.exceptions.RequestException as e:
-            status_code = getattr(e.response, "status_code", 0)
-            error_body = getattr(e.response, "text", str(e))[:300]
-            log.warning("%s HTTP %s (attempt %d/%d): %s", p.name, status_code, attempt + 1, max_retries, error_body)
-            last_error = f"HTTP {status_code}" if status_code else str(e)
+            response = getattr(e, "response", None)
+            status_code = getattr(response, "status_code", 0) or 0
+            error_type = type(e).__name__
+            log.warning(
+                "provider=%s status=%s attempt=%d/%d error_type=%s",
+                p.name, status_code, attempt + 1, max_retries, error_type,
+            )
+            last_error = _ProviderCallError(
+                p.name, status_code, error_type)
             if status_code == 429:
-                time.sleep(2 ** attempt)
+                _sleep_before_retry(budget, 2 ** attempt, attempt, max_retries)
             elif status_code and status_code >= 500:
-                time.sleep(1)
+                _sleep_before_retry(budget, 1, attempt, max_retries)
             elif status_code == 0:
                 # No HTTP response at all (timeout / connection refused): often a
                 # transient blip on a busy local LLM — retry with a short pause
                 # instead of burning the provider on the first hiccup.
-                time.sleep(0.5)
+                _sleep_before_retry(budget, 0.5, attempt, max_retries)
             else:
                 break  # 4xx (other than 429): retrying won't help, bail to fallback
         except Exception as e:
-            log.warning("%s failed (attempt %d): %s", p.name, attempt + 1, e)
-            last_error = str(e)
-            time.sleep(0.5)
-    raise RuntimeError(last_error or "unknown error")
+            error_type = type(e).__name__
+            log.warning(
+                "provider=%s status=0 attempt=%d/%d error_type=%s",
+                p.name, attempt + 1, max_retries, error_type,
+            )
+            last_error = _ProviderCallError(p.name, 0, error_type)
+            _sleep_before_retry(budget, 0.5, attempt, max_retries)
+    raise last_error or _ProviderCallError(p.name, 0, "UnknownError")
 
 
 def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
@@ -344,7 +446,6 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
     if fb is not None:
         providers.append(fb)
 
-    last_error = None
     for p in providers:
         try:
             out = _call_provider(
@@ -353,10 +454,15 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
         except WorkBudgetExceeded:
             raise
         except Exception as e:
-            last_error = f"{p.name}: {e}"
-            log.warning("Provider %s exhausted: %s", p.name, e)
+            status_code = getattr(e, "status_code", 0)
+            error_type = getattr(e, "error_type", type(e).__name__)
+            log.warning(
+                "provider=%s exhausted status=%s error_type=%s",
+                p.name, status_code, error_type,
+            )
 
-    raise RuntimeError(f"Translation failed (all providers): {last_error}")
+    raise ProviderUnavailableError(
+        "No configured provider completed the translation")
 
 
 def model_for_provider(provider_name: str) -> str:
@@ -434,8 +540,10 @@ def _parse_segment_envelope(output: str, expected_ids: list[str]) -> Optional[li
     mismatches invalidate the entire group.
     """
     try:
+        if len(output.encode("utf-8", errors="strict")) > BT_MAX_UPSTREAM_RESPONSE_BYTES:
+            return None
         body = json.loads(output, object_pairs_hook=_reject_duplicate_json_keys)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, UnicodeEncodeError):
         return None
 
     if len(set(expected_ids)) != len(expected_ids):
@@ -450,6 +558,7 @@ def _parse_segment_envelope(output: str, expected_ids: list[str]) -> Optional[li
         return None
 
     parsed = []
+    translated_bytes = 0
     for expected_id, item in zip(expected_ids, translations):
         if not isinstance(item, dict) or set(item) != {"id", "text"}:
             return None
@@ -459,6 +568,12 @@ def _parse_segment_envelope(output: str, expected_ids: list[str]) -> Optional[li
             return None
         translated = item["text"].strip()
         if not translated:
+            return None
+        try:
+            translated_bytes += len(translated.encode("utf-8", errors="strict"))
+        except UnicodeEncodeError:
+            return None
+        if translated_bytes > BT_MAX_UPSTREAM_RESPONSE_BYTES:
             return None
         parsed.append(translated)
     return parsed
@@ -501,7 +616,8 @@ def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str,
     group_texts = [all_texts[i] for i in idxs]
     if len(group_texts) == 1 and BT_CONTEXT_WINDOW == 0:
         return [translate_text(
-            group_texts[0], source_lang, target_lang, budget=budget)]
+            group_texts[0], source_lang, target_lang,
+            max_retries=1, budget=budget)]
 
     segment_ids = []
     while len(segment_ids) < len(idxs):
@@ -525,7 +641,7 @@ def _translate_group(all_texts: list[str], idxs: list[int], source_lang: str,
     output, provider = _complete(
         combined,
         system,
-        max_retries=2,
+        max_retries=1,
         max_tokens=_output_cap(combined, BT_BATCH_MAX_TOKENS),
         budget=budget,
     )
@@ -563,31 +679,67 @@ def translate_batch(
     # Split the work into groups of batch_size, preserving original indices.
     groups = [work[k:k + batch_size] for k in range(0, len(work), batch_size)]
 
+    fatal_lock = _threading.Lock()
+    fatal_protocol_error: list[SegmentProtocolError | None] = [None]
+
     def _do_group(group):
         idxs = [i for i, _ in group]
         try:
+            budget.ensure_active()
             translations = _translate_group(
                 texts, idxs, source_lang, target_lang, budget)
-        except (SegmentProtocolError, WorkBudgetExceeded):
+        except SegmentProtocolError as exc:
+            # Publish the semantic failure before cancelling the shared budget.
+            # Other workers may observe "cancelled" first; the caller still
+            # needs the original 502-worthy protocol error, not a generic 503.
+            with fatal_lock:
+                if fatal_protocol_error[0] is None:
+                    fatal_protocol_error[0] = exc
+            budget.cancel()
+            raise
+        except WorkBudgetExceeded as exc:
+            budget.cancel(exc.reason)
             raise
         except Exception as e:
-            log.error("Group translation failed: %s", e)
-            translations = [(f"[TRANSLATION ERROR: {e}]", "")] * len(idxs)
+            error_code = (
+                "provider_unavailable"
+                if isinstance(e, ProviderUnavailableError)
+                else "translation_failed"
+            )
+            log.error(
+                "Group translation failed error_type=%s", type(e).__name__)
+            translations = [
+                (f"[TRANSLATION ERROR: {error_code}]", "")
+            ] * len(idxs)
         return idxs, translations
 
-    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-        futures = [executor.submit(_do_group, g) for g in groups]
-        try:
-            for future in as_completed(futures):
+    executor = ThreadPoolExecutor(max_workers=max_concurrent)
+    futures = [executor.submit(_do_group, g) for g in groups]
+    try:
+        for future in as_completed(futures):
+            try:
                 idxs, translations = future.result()
-                for j, idx in enumerate(idxs):
-                    # Each entry carries the provider that ACTUALLY served it
-                    # (the fallback provider when the primary failed).
-                    results[idx] = translations[j] if j < len(translations) else ("[TRANSLATION ERROR: missing segment]", "")
-        except WorkBudgetExceeded:
-            for future in futures:
-                future.cancel()
-            raise
+            except WorkBudgetExceeded as exc:
+                if exc.reason == "cancelled":
+                    with fatal_lock:
+                        protocol_error = fatal_protocol_error[0]
+                    if protocol_error is not None:
+                        raise protocol_error
+                raise
+            for j, idx in enumerate(idxs):
+                # Each entry carries the provider that ACTUALLY served it
+                # (the fallback provider when the primary failed).
+                results[idx] = translations[j] if j < len(translations) else ("[TRANSLATION ERROR: missing segment]", "")
+    except (SegmentProtocolError, WorkBudgetExceeded):
+        for future in futures:
+            future.cancel()
+        # Do not hold the HTTP response open for provider calls already in
+        # flight. They cannot be force-killed safely, but the cancelled shared
+        # budget prevents every retry and queued group from starting new I/O.
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
 
     return results
 
@@ -598,43 +750,64 @@ _health_cache: dict = {"ts": 0.0, "data": None}
 _HEALTH_TTL = 15.0  # seconds
 
 
-def _probe(p: _Provider) -> dict:
+def _probe(p: _Provider, budget: WorkBudget) -> dict:
     try:
         start = time.monotonic()
-        headers = {"Content-Type": "application/json"}
-        payload = {"model": p.model, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 1}
-        if p.api_type == "openai":
-            if p.api_key:
-                headers["Authorization"] = f"Bearer {p.api_key}"
-        else:
-            if "minimax" in p.url:
-                headers["Authorization"] = f"Bearer {p.api_key}"
-            else:
-                headers["x-api-key"] = p.api_key
-                headers["anthropic-version"] = "2023-06-01"
-        resp = requests.post(p.url, headers=headers, json=payload, timeout=5)
-        resp.raise_for_status()
+        _call_provider(
+            p,
+            "healthcheck",
+            "Reply with OK only.",
+            max_retries=1,
+            timeout=5,
+            max_tokens=1,
+            budget=budget,
+        )
         latency = int((time.monotonic() - start) * 1000)
         return {"status": "ok", "latency_ms": latency, "error": None}
+    except WorkBudgetExceeded:
+        raise
     except Exception as e:
-        return {"status": "error", "latency_ms": -1, "error": str(e)}
+        response = getattr(e, "response", None)
+        status_code = getattr(response, "status_code", 0) or 0
+        log.warning(
+            "provider=%s health_probe_failed status=%s error_type=%s",
+            p.name, status_code, type(e).__name__,
+        )
+        return {
+            "status": "error",
+            "latency_ms": -1,
+            "error": "provider_unavailable",
+        }
 
 
-def check_backend_health() -> dict:
+def check_backend_health(budget: Optional[WorkBudget] = None) -> dict:
     now = time.monotonic()
     cached = _health_cache.get("data")
     if cached is not None and (now - _health_cache["ts"]) < _HEALTH_TTL:
         return cached
+    if budget is None:
+        budget = create_work_budget()
 
     health = {}
     try:
-        health[_get_primary().name + " (primary)"] = _probe(_get_primary())
+        health[_get_primary().name + " (primary)"] = _probe(
+            _get_primary(), budget)
+    except WorkBudgetExceeded:
+        raise
     except Exception as e:
-        health["primary"] = {"status": "error", "latency_ms": -1, "error": str(e)}
+        log.warning(
+            "primary health configuration failed error_type=%s",
+            type(e).__name__,
+        )
+        health["primary"] = {
+            "status": "error",
+            "latency_ms": -1,
+            "error": "provider_unavailable",
+        }
 
     fb = _get_fallback()
     if fb is not None:
-        health[fb.name + " (fallback)"] = _probe(fb)
+        health[fb.name + " (fallback)"] = _probe(fb, budget)
 
     _health_cache["data"] = health
     _health_cache["ts"] = now
