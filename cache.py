@@ -1,117 +1,613 @@
+"""Private, bounded SQLite cache for translated paragraphs.
+
+Schema v2 deliberately does not reuse v1 rows.  A translation is only valid
+inside the exact tenant/book/chapter/provider/prompt/protocol/context scope that
+produced it; treating a v1 row as equivalent would recreate the cross-context
+cache poisoning this schema fixes.
 """
-Translation cache backed by SQLite. Content-addressed (SHA-256 hash of
-text + language pair), never re-translates the same paragraph.
-"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
 import os
 import sqlite3
-import hashlib
-import logging
 import threading
+from collections import Counter
+from dataclasses import dataclass, fields
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from typing import Callable
 
 log = logging.getLogger("book-translator.cache")
 
+CACHE_SCHEMA_VERSION = 2
+CACHE_KEY_VERSION = "cwa-translate-cache/v2"
 DB_PATH = Path(os.getenv("DB_PATH", "translations.db"))
 
-# ── Thread-local connection pool (M1) ──────────────────────────────────────
-_thread_local = threading.local()
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
-def _get_conn() -> sqlite3.Connection:
-    """Get a thread-local connection, creating one if needed (M1: connection pool)."""
-    conn = getattr(_thread_local, "conn", None)
-    if conn is None:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(DB_PATH))
+CACHE_TTL_DAYS = _positive_int_env("BT_CACHE_TTL_DAYS", 90)
+CACHE_MAX_ENTRIES = _positive_int_env("BT_CACHE_MAX_ENTRIES", 100_000)
+CACHE_HIT_FLUSH_THRESHOLD = _positive_int_env("BT_CACHE_HIT_FLUSH_THRESHOLD", 100)
+
+
+@dataclass(frozen=True, slots=True)
+class CacheScope:
+    """Every semantic dimension that can change a translation result.
+
+    Raw tenant/book/chapter identifiers are used only while hashing the key.
+    The database stores one-way hashes for those identifiers, not their values.
+    """
+
+    tenant: str
+    book_id: str
+    chapter_id: str
+    context_hash: str
+    provider: str
+    model: str
+    prompt_hash: str
+    protocol_version: str
+
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"cache scope {field.name} must be a non-empty string")
+            if len(value) > 1024:
+                raise ValueError(f"cache scope {field.name} is too long")
+            object.__setattr__(self, field.name, value.strip())
+
+    @classmethod
+    def legacy(cls, model: str, provider: str = "legacy") -> "CacheScope":
+        """Compatibility scope for direct callers predating schema v2.
+
+        The HTTP API never uses this scope; it supplies request metadata and a
+        translation-contract fingerprint explicitly.  Keeping this adapter
+        avoids an abrupt Python API break for local maintenance scripts.
+        """
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("cache model must be a non-empty string")
+        return cls(
+            tenant="legacy",
+            book_id="legacy",
+            chapter_id="legacy",
+            context_hash="legacy",
+            provider=provider or "legacy",
+            model=model,
+            prompt_hash="legacy",
+            protocol_version="legacy",
+        )
+
+
+class CacheStore:
+    """Thread-safe cache facade with one SQLite connection per worker thread."""
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        ttl_days: int,
+        max_entries: int,
+        hit_flush_threshold: int = 100,
+        now: Callable[[], datetime] | None = None,
+        harden_existing_directory: bool = False,
+    ) -> None:
+        for name, value in (
+            ("ttl_days", ttl_days),
+            ("max_entries", max_entries),
+            ("hit_flush_threshold", hit_flush_threshold),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+        self.db_path = Path(db_path)
+        self.ttl_days = ttl_days
+        self.max_entries = max_entries
+        self.hit_flush_threshold = hit_flush_threshold
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._harden_existing_directory = harden_existing_directory
+        self._thread_local = threading.local()
+        self._connections_lock = threading.Lock()
+        self._connections: set[sqlite3.Connection] = set()
+        self._pending_hits: Counter[str] = Counter()
+        self._pending_hits_total = 0
+        self._pending_lock = threading.Lock()
+        self._flush_lock = threading.Lock()
+        self._init_lock = threading.Lock()
+        self._initialized = False
+        self._prepare_directory()
+        self.init()
+
+    def _prepare_directory(self) -> None:
+        parent = self.db_path.parent
+        created = not parent.exists()
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if created or self._harden_existing_directory:
+            os.chmod(parent, 0o700)
+        else:
+            mode = parent.stat().st_mode & 0o777
+            if mode & 0o077:
+                log.warning(
+                    "Cache directory %s is mode %03o; use a dedicated 0700 "
+                    "directory or set BT_CACHE_HARDEN_EXISTING_DIR=true",
+                    parent,
+                    mode,
+                )
+
+    def _secure_files(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(str(self.db_path) + suffix)
+            try:
+                os.chmod(path, 0o600)
+            except FileNotFoundError:
+                continue
+
+    def _new_connection(self) -> sqlite3.Connection:
+        # A connection remains owned by one worker thread during normal use.
+        # Disabling SQLite's Python-side thread check only lets shutdown close
+        # every registered connection from the main thread without leaking
+        # descriptors; query access is still thread-local.
+        conn = sqlite3.connect(
+            str(self.db_path), timeout=5.0, check_same_thread=False
+        )
+        self._secure_files()
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
-        _thread_local.conn = conn
-    return conn
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
+        self._secure_files()
+        with self._connections_lock:
+            self._connections.add(conn)
+        return conn
 
+    def connection(self) -> sqlite3.Connection:
+        conn = getattr(self._thread_local, "conn", None)
+        if conn is None:
+            conn = self._new_connection()
+            self._thread_local.conn = conn
+        return conn
 
-def init_db():
-    """Create the translation cache table if it doesn't exist."""
-    conn = _get_conn()
-    try:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS translations (
-                cache_key TEXT PRIMARY KEY,
-                source_text TEXT NOT NULL,
-                source_lang TEXT NOT NULL,
-                target_lang TEXT NOT NULL,
-                translated_text TEXT NOT NULL,
-                model TEXT NOT NULL DEFAULT 'unknown',
-                created_at TEXT NOT NULL,
-                hit_count INTEGER NOT NULL DEFAULT 1
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_translations_langs
-            ON translations(source_lang, target_lang)
-        """)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    log.info("Translation cache initialized at %s", DB_PATH)
-
-
-# Optional hard cap on cache rows (0 = unlimited). Checked cheaply on writes:
-# when exceeded, the oldest rows are evicted down to the cap.
-CACHE_MAX_ENTRIES = int(os.getenv("BT_CACHE_MAX_ENTRIES", "0"))
-_put_counter = 0
-_ENFORCE_EVERY = 200  # only run the COUNT/DELETE housekeeping every N writes
-
-
-def compute_cache_key(
-    text: str, source_lang: str, target_lang: str, model: str = ""
-) -> str:
-    """SHA-256 hash of (normalized text + source + target + model).
-
-    Model is part of the key so that switching providers/models never serves
-    a stale translation from the previous backend. Before this change a
-    row cached by ``gemma4-12b`` would silently be served after the operator
-    switched to ``MiniMax-M3``, with no signal that the user was getting the
-    cheaper/worse translation. Including model also lets the operator run
-    a parallel ``gemma4-12b`` + ``MiniMax-M3`` comparison on the same book.
-
-    Existing rows (cached before this change) used a model-less key and will
-    simply miss once the new key is in effect — the cache re-warms gradually
-    on first request, no destructive migration needed.
-    """
-    content = f"{model}|{text.strip()}|{source_lang}|{target_lang}"
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
-def get_cached(
-    text: str, source_lang: str, target_lang: str, model: str = ""
-) -> str | None:
-    """Look up a translation in the cache. Returns None if not found.
-    A hit increments hit_count so /stats reflects real cache usage."""
-    cache_key = compute_cache_key(text, source_lang, target_lang, model=model)
-    conn = _get_conn()
-    try:
-        row = conn.execute(
-            "SELECT translated_text FROM translations WHERE cache_key = ?",
-            (cache_key,),
-        ).fetchone()
-        if row:
-            log.debug("Cache HIT for %d chars %s→%s (model=%s)", len(text), source_lang, target_lang, model or "?")
+    def init(self) -> None:
+        with self._init_lock:
+            if self._initialized:
+                return
+            conn = self.connection()
             try:
+                self._preserve_v1(conn)
                 conn.execute(
-                    "UPDATE translations SET hit_count = hit_count + 1 WHERE cache_key = ?",
-                    (cache_key,),
+                    """CREATE TABLE IF NOT EXISTS translations (
+                        cache_key TEXT PRIMARY KEY,
+                        tenant_hash TEXT NOT NULL,
+                        book_hash TEXT NOT NULL,
+                        chapter_hash TEXT NOT NULL,
+                        context_hash TEXT NOT NULL,
+                        source_lang TEXT NOT NULL,
+                        target_lang TEXT NOT NULL,
+                        translated_text TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        prompt_hash TEXT NOT NULL,
+                        protocol_version TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        last_accessed_at TEXT NOT NULL,
+                        hit_count INTEGER NOT NULL DEFAULT 0
+                    )"""
+                )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_cache_v2_langs
+                       ON translations(tenant_hash, source_lang, target_lang)"""
+                )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_cache_v2_created
+                       ON translations(created_at)"""
+                )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_cache_v2_accessed
+                       ON translations(last_accessed_at, created_at)"""
+                )
+                conn.execute(f"PRAGMA user_version={CACHE_SCHEMA_VERSION}")
+                self._delete_expired(conn)
+                self._enforce_cap(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            self._secure_files()
+            self._initialized = True
+            log.info(
+                "Translation cache v%d initialized at %s (ttl=%dd cap=%d)",
+                CACHE_SCHEMA_VERSION,
+                self.db_path,
+                self.ttl_days,
+                self.max_entries,
+            )
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+    def _preserve_v1(self, conn: sqlite3.Connection) -> None:
+        columns = self._table_columns(conn, "translations")
+        if not columns or "source_text" not in columns:
+            return
+        target = "translations_v1"
+        suffix = 1
+        existing = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        while target in existing:
+            suffix += 1
+            target = f"translations_v1_{suffix}"
+        conn.execute(f"ALTER TABLE translations RENAME TO {target}")
+        log.warning(
+            "Preserved legacy cache as %s; v1 rows are intentionally not served",
+            target,
+        )
+
+    def _utc_now(self) -> datetime:
+        value = self._now()
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise ValueError("cache clock must return a timezone-aware datetime")
+        return value.astimezone(timezone.utc)
+
+    def _cutoff(self, days: int | None = None) -> str:
+        return (self._utc_now() - timedelta(days=days or self.ttl_days)).isoformat()
+
+    @staticmethod
+    def _hash_identifier(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def compute_key(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        cache_scope: CacheScope,
+    ) -> str:
+        if not isinstance(text, str):
+            raise ValueError("cache text must be a string")
+        if not isinstance(source_lang, str) or not source_lang.strip():
+            raise ValueError("source_lang must be a non-empty string")
+        if not isinstance(target_lang, str) or not target_lang.strip():
+            raise ValueError("target_lang must be a non-empty string")
+        if not isinstance(cache_scope, CacheScope):
+            raise ValueError("cache_scope must be a CacheScope")
+        payload = [
+            CACHE_KEY_VERSION,
+            cache_scope.tenant,
+            cache_scope.book_id,
+            cache_scope.chapter_id,
+            cache_scope.context_hash,
+            cache_scope.provider,
+            cache_scope.model,
+            cache_scope.prompt_hash,
+            cache_scope.protocol_version,
+            source_lang.strip(),
+            target_lang.strip(),
+            text.strip(),
+        ]
+        encoded = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def get(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        cache_scope: CacheScope,
+    ) -> str | None:
+        cache_key = self.compute_key(text, source_lang, target_lang, cache_scope)
+        row = self.connection().execute(
+            """SELECT translated_text FROM translations
+               WHERE cache_key = ? AND created_at >= ?""",
+            (cache_key, self._cutoff()),
+        ).fetchone()
+        if row is None:
+            return None
+        self._queue_hit(cache_key)
+        log.debug(
+            "Cache HIT chars=%d langs=%s->%s provider=%s model=%s",
+            len(text),
+            source_lang,
+            target_lang,
+            cache_scope.provider,
+            cache_scope.model,
+        )
+        return row[0]
+
+    def _queue_hit(self, cache_key: str) -> None:
+        should_flush = False
+        with self._pending_lock:
+            self._pending_hits[cache_key] += 1
+            self._pending_hits_total += 1
+            should_flush = self._pending_hits_total >= self.hit_flush_threshold
+        if should_flush:
+            self.flush_hits()
+
+    def flush_hits(self) -> int:
+        with self._flush_lock:
+            with self._pending_lock:
+                if not self._pending_hits:
+                    return 0
+                pending = self._pending_hits
+                pending_total = self._pending_hits_total
+                self._pending_hits = Counter()
+                self._pending_hits_total = 0
+
+            conn = self.connection()
+            accessed_at = self._utc_now().isoformat()
+            try:
+                conn.executemany(
+                    """UPDATE translations
+                       SET hit_count = hit_count + ?, last_accessed_at = ?
+                       WHERE cache_key = ?""",
+                    [
+                        (count, accessed_at, cache_key)
+                        for cache_key, count in pending.items()
+                    ],
                 )
                 conn.commit()
             except Exception:
-                conn.rollback()  # stats bookkeeping must never break a read
-            return row[0]
-        return None
-    except Exception:
-        # Read-only SELECT: nothing to roll back, just surface the error.
-        raise
+                conn.rollback()
+                with self._pending_lock:
+                    self._pending_hits.update(pending)
+                    self._pending_hits_total += pending_total
+                raise
+            return pending_total
+
+    def put(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        translated_text: str,
+        cache_scope: CacheScope,
+    ) -> None:
+        if not isinstance(translated_text, str) or not translated_text.strip():
+            raise ValueError("translated_text must be a non-empty string")
+        cache_key = self.compute_key(text, source_lang, target_lang, cache_scope)
+        now = self._utc_now().isoformat()
+        conn = self.connection()
+        try:
+            conn.execute(
+                """INSERT INTO translations (
+                       cache_key, tenant_hash, book_hash, chapter_hash,
+                       context_hash, source_lang, target_lang, translated_text,
+                       provider, model, prompt_hash, protocol_version,
+                       created_at, last_accessed_at, hit_count
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                   ON CONFLICT(cache_key) DO UPDATE SET
+                       translated_text = excluded.translated_text,
+                       provider = excluded.provider,
+                       model = excluded.model,
+                       prompt_hash = excluded.prompt_hash,
+                       protocol_version = excluded.protocol_version,
+                       created_at = excluded.created_at,
+                       last_accessed_at = excluded.last_accessed_at""",
+                (
+                    cache_key,
+                    self._hash_identifier(cache_scope.tenant),
+                    self._hash_identifier(cache_scope.book_id),
+                    self._hash_identifier(cache_scope.chapter_id),
+                    self._hash_identifier(cache_scope.context_hash),
+                    source_lang.strip(),
+                    target_lang.strip(),
+                    translated_text,
+                    cache_scope.provider,
+                    cache_scope.model,
+                    cache_scope.prompt_hash,
+                    cache_scope.protocol_version,
+                    now,
+                    now,
+                ),
+            )
+            self._delete_expired(conn)
+            self._enforce_cap(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        self._secure_files()
+
+    def _delete_expired(self, conn: sqlite3.Connection) -> int:
+        cursor = conn.execute(
+            "DELETE FROM translations WHERE created_at < ?", (self._cutoff(),)
+        )
+        return max(0, cursor.rowcount)
+
+    def _enforce_cap(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """DELETE FROM translations WHERE cache_key IN (
+                   SELECT cache_key FROM translations
+                   ORDER BY last_accessed_at DESC, created_at DESC, cache_key DESC
+                   LIMIT -1 OFFSET ?
+               )""",
+            (self.max_entries,),
+        )
+
+    def cleanup(self, days: int | None = None) -> int:
+        retention_days = self.ttl_days if days is None else days
+        if (
+            isinstance(retention_days, bool)
+            or not isinstance(retention_days, int)
+            or retention_days <= 0
+        ):
+            raise ValueError("days must be a positive integer")
+        self.flush_hits()
+        conn = self.connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM translations WHERE created_at < ?",
+                (self._cutoff(retention_days),),
+            )
+            deleted = max(0, cursor.rowcount)
+            self._enforce_cap(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        log.info(
+            "Cache cleanup evicted %d entries older than %d days",
+            deleted,
+            retention_days,
+        )
+        return deleted
+
+    def stats(self) -> dict:
+        self.flush_hits()
+        conn = self.connection()
+        try:
+            self._delete_expired(conn)
+            self._enforce_cap(conn)
+            conn.commit()
+            total = conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
+            total_hits = conn.execute(
+                "SELECT COALESCE(SUM(hit_count), 0) FROM translations"
+            ).fetchone()[0]
+            pairs = conn.execute(
+                """SELECT source_lang, target_lang, COUNT(*)
+                   FROM translations GROUP BY source_lang, target_lang"""
+            ).fetchall()
+            legacy_tables = conn.execute(
+                """SELECT COUNT(*) FROM sqlite_master
+                   WHERE type='table' AND name LIKE 'translations_v1%'"""
+            ).fetchone()[0]
+        except Exception:
+            conn.rollback()
+            raise
+        return {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "total_entries": total,
+            "total_hits": total_hits,
+            "db_size_mb": self.db_size_mb(),
+            "ttl_days": self.ttl_days,
+            "max_entries": self.max_entries,
+            "legacy_tables_preserved": legacy_tables,
+            "language_pairs": {f"{source}->{target}": count for source, target, count in pairs},
+        }
+
+    def db_size_mb(self) -> float:
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += Path(str(self.db_path) + suffix).stat().st_size
+            except FileNotFoundError:
+                continue
+        return round(total / (1024 * 1024), 2)
+
+    def checkpoint(self) -> None:
+        self.flush_hits()
+        self.connection().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._secure_files()
+
+    def close(self) -> None:
+        try:
+            self.flush_hits()
+        except (sqlite3.Error, OSError):
+            log.exception("Failed to flush cache hit counters during close")
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                log.exception("Failed to close a cache connection")
+        self._thread_local = threading.local()
+
+
+_harden_existing = os.getenv(
+    "BT_CACHE_HARDEN_EXISTING_DIR", "false"
+).lower() in ("1", "true", "yes")
+
+_default_store: CacheStore | None = None
+_default_store_lock = threading.Lock()
+
+
+def _store() -> CacheStore:
+    """Build the process-wide store on first cache use, not module import.
+
+    Lazy initialization keeps read-only tooling (schema inspection, CLI help,
+    unit-test collection) from creating or migrating an operator database as a
+    side effect of merely importing ``cache``.
+    """
+    global _default_store
+    if _default_store is None:
+        with _default_store_lock:
+            if _default_store is None:
+                _default_store = CacheStore(
+                    DB_PATH,
+                    ttl_days=CACHE_TTL_DAYS,
+                    max_entries=CACHE_MAX_ENTRIES,
+                    hit_flush_threshold=CACHE_HIT_FLUSH_THRESHOLD,
+                    harden_existing_directory=_harden_existing,
+                )
+    return _default_store
+
+
+def _scope_for(
+    model: str,
+    scope: CacheScope | None,
+    provider: str = "legacy",
+) -> CacheScope:
+    if scope is None:
+        return CacheScope.legacy(model, provider=provider)
+    if not isinstance(scope, CacheScope):
+        raise ValueError("scope must be a CacheScope")
+    if model and model != scope.model:
+        raise ValueError("model and scope.model must match")
+    return scope
+
+
+def compute_cache_key(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    model: str = "",
+    *,
+    scope: CacheScope | None = None,
+    provider: str = "legacy",
+) -> str:
+    return _store().compute_key(
+        text,
+        source_lang,
+        target_lang,
+        _scope_for(model, scope, provider),
+    )
+
+
+def get_cached(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    model: str = "",
+    *,
+    scope: CacheScope | None = None,
+    provider: str = "legacy",
+) -> str | None:
+    return _store().get(
+        text,
+        source_lang,
+        target_lang,
+        _scope_for(model, scope, provider),
+    )
 
 
 def put_cache(
@@ -119,125 +615,36 @@ def put_cache(
     source_lang: str,
     target_lang: str,
     translated_text: str,
-    model: str,
-):
-    """Store a translation in the cache (upsert; re-puts keep the hit count).
-
-    ``model`` is required (no default) so that callers always tag which
-    backend produced the translation. Mixing backends under the same key
-    was the root cause of cross-provider cache poisoning.
-    """
-    if not model:
-        raise ValueError("put_cache requires a non-empty model name")
-    global _put_counter
-    cache_key = compute_cache_key(text, source_lang, target_lang, model=model)
-    now = datetime.now(timezone.utc).isoformat()
-    conn = _get_conn()
-    try:
-        conn.execute(
-            """INSERT INTO translations
-               (cache_key, source_text, source_lang, target_lang,
-                translated_text, model, created_at, hit_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-               ON CONFLICT(cache_key) DO UPDATE SET
-                 translated_text = excluded.translated_text,
-                 model = excluded.model,
-                 created_at = excluded.created_at""",
-            (cache_key, text.strip(), source_lang, target_lang, translated_text, model, now),
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    log.debug("Cache PUT: %d chars %s→%s", len(text), source_lang, target_lang)
-
-    if CACHE_MAX_ENTRIES > 0:
-        _put_counter += 1
-        if _put_counter >= _ENFORCE_EVERY:
-            _put_counter = 0
-            _enforce_max_entries(conn)
-
-
-def _enforce_max_entries(conn: sqlite3.Connection):
-    """Evict oldest rows beyond CACHE_MAX_ENTRIES (best-effort housekeeping)."""
-    try:
-        total = conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
-        excess = total - CACHE_MAX_ENTRIES
-        if excess > 0:
-            conn.execute(
-                """DELETE FROM translations WHERE cache_key IN (
-                       SELECT cache_key FROM translations
-                       ORDER BY created_at ASC LIMIT ?)""",
-                (excess,),
-            )
-            conn.commit()
-            log.info("Cache cap: evicted %d oldest entries (cap %d)", excess, CACHE_MAX_ENTRIES)
-    except Exception:
-        conn.rollback()
-        log.exception("Cache cap enforcement failed (non-fatal)")
+    model: str = "",
+    *,
+    scope: CacheScope | None = None,
+    provider: str = "legacy",
+) -> None:
+    _store().put(
+        text,
+        source_lang,
+        target_lang,
+        translated_text,
+        _scope_for(model, scope, provider),
+    )
 
 
 def get_cache_stats() -> dict:
-    """Return cache statistics."""
-    conn = _get_conn()
-    try:
-        total = conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
-        total_hits = conn.execute(
-            "SELECT COALESCE(SUM(hit_count), 0) FROM translations"
-        ).fetchone()[0]
-        # Unique language pairs
-        pairs = conn.execute(
-            "SELECT source_lang, target_lang, COUNT(*) as cnt "
-            "FROM translations GROUP BY source_lang, target_lang"
-        ).fetchall()
-    except Exception:
-        raise
-    return {
-        "total_entries": total,
-        "total_hits": total_hits,
-        "db_size_mb": _db_size_mb(),
-        "language_pairs": {
-            f"{s}→{t}": c for s, t, c in pairs
-        },
-    }
+    return _store().stats()
+
+
+def cleanup_old_entries(days: int = CACHE_TTL_DAYS) -> int:
+    return _store().cleanup(days)
+
+
+def init_db() -> None:
+    _store().init()
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Backward-compatible maintenance hook; request code should use helpers."""
+    return _store().connection()
 
 
 def _db_size_mb() -> float:
-    """Total bytes occupied by the SQLite file plus its WAL/SHM siblings.
-
-    With ``journal_mode=WAL``, the main ``.db`` file stays small (often empty)
-    while the actual pages live in ``-wal``. Reports that only inspect the
-    main file under-report the real on-disk footprint by an order of
-    magnitude — operators relying on this for backup sizing or cleanup
-    triggers would make decisions on stale data. Sum all three files.
-    """
-    total = 0
-    for suffix in ("", "-wal", "-shm"):
-        path = str(DB_PATH) + suffix
-        try:
-            total += os.path.getsize(path)
-        except OSError:
-            # -shm/-wal may not exist yet on a brand-new database
-            continue
-    return round(total / (1024 * 1024), 2)
-
-
-def cleanup_old_entries(days: int = 30) -> int:
-    """Evict cached translations older than N days. Returns count of deleted rows."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    conn = _get_conn()
-    try:
-        cursor = conn.execute(
-            "DELETE FROM translations WHERE created_at < ?", (cutoff,)
-        )
-        deleted = cursor.rowcount
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    log.info("Cache cleanup: evicted %d entries older than %d days", deleted, days)
-    return deleted
-
-
-# Initialize on import
-init_db()
+    return _store().db_size_mb()

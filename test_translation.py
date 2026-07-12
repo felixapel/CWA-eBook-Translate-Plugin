@@ -472,11 +472,15 @@ def run():
     stats_after = client.get("/stats").get_json()
     check("audit B4 setup: end-to-end write landed in cache",
           stats_after["total_entries"] >= 2)
-    # Direct DB inspection: count rows under our text+lang pair.
+    # Direct DB inspection by content-addressed key. Schema v2 deliberately
+    # does not persist source_text, so tests must not reintroduce that privacy
+    # leak merely to locate a row.
     conn = cache_mod._get_conn()
+    poison_key = cache_mod.compute_cache_key(
+        poison, "English", "Spanish", model="fake-model")
     rows_for_text = conn.execute(
-        "SELECT model FROM translations WHERE source_text = ? AND source_lang = ? AND target_lang = ?",
-        (poison, "English", "Spanish"),
+        "SELECT model FROM translations WHERE cache_key = ?",
+        (poison_key,),
     ).fetchall()
     check("audit B4: cache row is tagged with the model that produced it",
           len(rows_for_text) == 1 and rows_for_text[0][0] == "fake-model")
