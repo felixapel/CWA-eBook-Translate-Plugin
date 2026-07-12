@@ -16,7 +16,7 @@ class CIContractTests(unittest.TestCase):
         for command in (
             "python3 test_translation.py",
             "python3 test_hardening.py",
-            "python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_cleanup_token",
+            "python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_cleanup_token test_api_schema test_error_privacy",
         ):
             self.assertIn(command, self.workflow)
 
@@ -33,6 +33,18 @@ class CIContractTests(unittest.TestCase):
         self.assertNotIn("skipping docker-smoke", self.workflow)
         self.assertRegex(self.workflow, r"(?m)^\s*run: docker version\s*$")
         self.assertRegex(self.workflow, r"(?m)^\s*run: docker build ")
+
+    def test_docker_smoke_exercises_the_published_proxy_path(self):
+        self.assertIn(
+            "CWA_UPSTREAM=http://127.0.0.1:8390", self.workflow)
+        self.assertIn("-p 127.0.0.1::8080", self.workflow)
+        self.assertIn(
+            "http://127.0.0.1:${PROXY_PORT}/bt-api/ping", self.workflow)
+        self.assertIn("bt-smoke-${{ github.run_id }}", self.workflow)
+        self.assertIn('SMOKE_IMAGE: bt-audit:${{ github.run_id }}-${{ github.run_attempt }}', self.workflow)
+        self.assertIn('docker build -t "$SMOKE_IMAGE" .', self.workflow)
+        self.assertIn('127.0.0.1::8080 "$SMOKE_IMAGE"', self.workflow)
+        self.assertNotIn("docker build -t bt-audit:ci", self.workflow)
 
     def test_package_lock_root_metadata_matches_package_manifest(self):
         package = json.loads((ROOT / "package.json").read_text())
