@@ -51,6 +51,32 @@ class ContainerContractTests(unittest.TestCase):
         template = (ROOT / "proxy" / "nginx.conf.template").read_text()
         self.assertGreaterEqual(template.count("proxy_connect_timeout 2s;"), 2)
 
+    def test_proxy_uses_validated_origin_and_sanitized_forwarding(self):
+        template = (ROOT / "proxy" / "nginx.conf.template").read_text()
+        entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
+        compose = (ROOT / "docker-compose.yml").read_text()
+        smoke = (ROOT / "scripts" / "container-smoke.sh").read_text()
+
+        self.assertNotIn("client_max_body_size 0;", template)
+        self.assertIn("client_max_body_size ${BT_CWA_MAX_BODY_SIZE};", template)
+        self.assertIn("absolute_redirect off;", template)
+        self.assertNotIn("$http_x_forwarded_proto", template)
+        self.assertEqual(
+            template.count("proxy_set_header Host ${BT_PUBLIC_HOST};"), 2
+        )
+        self.assertEqual(
+            template.count("proxy_set_header X-Forwarded-Proto ${BT_PUBLIC_SCHEME};"),
+            2,
+        )
+        self.assertEqual(
+            template.count("proxy_set_header X-Forwarded-For $remote_addr;"), 2
+        )
+        self.assertIn("proxy/render_config.py", entrypoint)
+        self.assertNotIn("envsubst", entrypoint)
+        self.assertIn("BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:-http://localhost:8084}", compose)
+        self.assertIn("BT_CWA_MAX_BODY_SIZE=${BT_CWA_MAX_BODY_SIZE:-2g}", compose)
+        self.assertIn("BT_PUBLIC_ORIGIN=https://books.example.test:8443", smoke)
+
     def test_compose_recommends_independent_hardened_roles(self):
         compose = (ROOT / "docker-compose.yml").read_text()
         self.assertRegex(compose, r"(?m)^  book-translator-api:$")

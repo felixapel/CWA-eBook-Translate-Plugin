@@ -90,8 +90,12 @@ locations pointing directly at CWA):
     }
 ```
 
-The injection proxy forwards your reverse proxy's `X-Forwarded-Proto`, so
-HTTPS sessions and secure cookies keep working.
+Set `BT_PUBLIC_ORIGIN=https://books.example.com` on the translator proxy
+service (use your exact reader origin). The injection proxy forwards that
+validated, fixed scheme and authority to CWA; it never trusts a browser's or
+upstream request's `Host`, `Forwarded`, or `X-Forwarded-Proto` value. HTTPS
+sessions and secure cookies therefore work without making those headers an
+implicit trust boundary.
 
 ### Option 2: Unraid
 
@@ -182,9 +186,11 @@ them):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BT_ROLE` | `auto` | Runtime role: `api`, `proxy`, or compatibility-only `all`. `auto` selects `api` without `CWA_UPSTREAM` and `all` when it is present. The reference Compose file sets roles explicitly. |
-| `CWA_UPSTREAM` | | Required by the proxy role. URL of the stock CWA instance (e.g. `http://calibre-web:8083`). |
-| `BT_API_UPSTREAM` | `http://127.0.0.1:$PORT` | Translation API URL used by the proxy role. The split Compose topology sets `http://book-translator-api:8390`. |
+| `CWA_UPSTREAM` | | Required by the proxy role. Exact base URL of the stock CWA instance (e.g. `http://calibre-web:8083`); credentials, paths, queries, fragments, and non-HTTP schemes fail startup. |
+| `BT_API_UPSTREAM` | `http://127.0.0.1:$PORT` | Exact translation API base URL used by the proxy role. The split Compose topology sets `http://book-translator-api:8390`; the same URL validation applies. |
 | `BT_PROXY_PORT` | `8080` | Container port for the injection proxy (proxy mode only). |
+| `BT_PUBLIC_ORIGIN` | | **Required by proxy/all roles.** Exact browser-facing origin, such as `http://192.168.1.10:8084` or `https://books.example.com`. Its validated host and scheme are the only values forwarded to CWA/API. The reference Compose file defaults to `http://localhost:8084`; override it for every non-local deployment. |
+| `BT_CWA_MAX_BODY_SIZE` | `2g` | Finite nginx cap for CWA uploads. Use a positive nginx size such as `512m` or `4g`; `0`/unlimited and directive-like values fail startup. Translation API bodies retain a separate 3 MiB proxy cap and the stricter Flask limit. |
 | `BT_AUTH_MODE` | `token` | Authentication authority: `cwa_session` (recommended proxy topology), `forwarded` (identity-aware reverse proxy), `token` (shared-secret compatibility), or development-only `disabled`. The default fails startup unless `BT_API_TOKEN` is present. Disabled mode additionally requires `BT_ALLOW_INSECURE_AUTH=true`. `/ping`, `/health`, and `/ready` stay unauthenticated; every other route is protected. |
 | `BT_ALLOW_INSECURE_AUTH` | `false` | Required second acknowledgement for `BT_AUTH_MODE=disabled`. Never enable it in production. |
 | `BT_CWA_AUTH_URL` | | Required for `cwa_session`, e.g. `http://calibre-web:8083/ajax/emailstat`. Only that exact path is accepted. The API forwards selected cookies, refuses redirects, and requires CWA's bounded JSON task-list response; it returns `503` when the authority cannot be evaluated. |
@@ -261,6 +267,13 @@ in memory unless `window.BOOK_TRANSLATOR.persistCache = true` is explicitly set;
 opt-in keys also include stable DOM position to separate repeated text in
 different contexts. Legacy `bt_cache_v2_*` localStorage entries are removed on
 upgrade.
+
+The bundled injection proxy replaces any inbound forwarding chain with the
+immediate peer address it actually observed. Direct LAN clients therefore keep
+per-client API limits. When SWAG/Traefik/NPM is the immediate peer, the API sees
+that edge proxy as one client; enforce client-aware admission at the trusted
+edge or size the translator's downstream limit for the aggregate. This avoids
+accepting spoofable client IPs without an explicit real-IP trust configuration.
 
 ---
 

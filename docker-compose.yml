@@ -82,6 +82,11 @@ services:
       - BT_ROLE=proxy
       - CWA_UPSTREAM=http://calibre-web:8083
       - BT_API_UPSTREAM=http://book-translator-api:8390
+      # Fixed public authority forwarded to CWA/API. Override with the exact
+      # HTTPS origin when this service is behind SWAG/Traefik/NPM/Cloudflare.
+      - BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:-http://localhost:8084}
+      # Finite CWA upload limit; API requests keep their separate 3 MiB cap.
+      - BT_CWA_MAX_BODY_SIZE=${BT_CWA_MAX_BODY_SIZE:-2g}
     ports:
       - "8084:8080"
     read_only: true

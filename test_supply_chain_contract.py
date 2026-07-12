@@ -41,11 +41,7 @@ BASE_IMAGE = (
 )
 NODE_VERSION = "24.18.0"
 APK_PACKAGES = {
-    "gettext": "1.0-r0",
-    "gettext-envsubst": "1.0-r0",
-    "gettext-libs": "1.0-r0",
     "libgomp": "15.2.0-r5",
-    "libunistring": "1.4.2-r0",
     "libxml2": "2.13.9-r2",
     "nginx": "1.30.3-r0",
     "pcre2": "10.47-r1",
