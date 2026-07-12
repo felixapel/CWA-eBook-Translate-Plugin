@@ -256,6 +256,8 @@ configured, otherwise the persisted `/app/data/cleanup_token` value.
 
 Release operators should follow the [Gitea-authoritative release
 runbook](docs/RELEASE.md); GitHub is a mirror and does not publish images.
+See the [architecture overview](docs/ARCHITECTURE.md) for component details and
+accepted architecture decision records.
 
 ## ❤️ Support the project
 

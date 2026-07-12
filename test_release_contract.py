@@ -280,6 +280,10 @@ class ReleasePreflightTests(unittest.TestCase):
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_changelog_has_one_active_unreleased_section(self):
+        changelog = (ROOT / "CHANGELOG.md").read_text()
+        self.assertEqual(changelog.count("\n## [Unreleased]\n"), 1)
+
     def test_gitea_is_the_only_release_authority(self):
         self.assertTrue(GITEA_RELEASE.is_file())
         self.assertTrue(GITEA_CI.is_file())
