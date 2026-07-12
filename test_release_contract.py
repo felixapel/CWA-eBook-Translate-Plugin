@@ -376,6 +376,43 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('rm -rf -- "$DOCKER_CONFIG"', workflow)
         self.assertIn("platforms: linux/amd64,linux/arm64", workflow)
         self.assertIn("push: true", workflow)
+        self.assertIn(
+            'context: "https://github.com/felixapel/CWA-eBook-Translate-Plugin.git#${{ gitea.sha }}"',
+            workflow,
+        )
+        self.assertNotRegex(workflow, r"(?m)^\s+context:\s+\.\s*$")
+
+    def test_published_digest_is_signed_and_attestations_are_verified(self):
+        workflow = GITEA_RELEASE.read_text()
+        self.assertIn("id: build", workflow)
+        self.assertIn("RELEASE_DIGEST: ${{ steps.build.outputs.digest }}", workflow)
+        self.assertIn(
+            "uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2",
+            workflow,
+        )
+        self.assertIn('cosign-release: "v3.0.6"', workflow)
+        for secret in (
+            "COSIGN_PRIVATE_KEY",
+            "COSIGN_PASSWORD",
+            "COSIGN_PUBLIC_KEY",
+        ):
+            self.assertIn(f"{secret}: ${{{{ secrets.{secret} }}}}", workflow)
+        self.assertIn('reference="${image}@${RELEASE_DIGEST}"', workflow)
+        self.assertIn("cosign sign --yes --key env://COSIGN_PRIVATE_KEY", workflow)
+        self.assertIn("cosign verify --key", workflow)
+        self.assertIn("docker buildx imagetools inspect", workflow)
+        self.assertIn("{{json .SBOM}}", workflow)
+        self.assertIn("{{json .Provenance}}", workflow)
+        self.assertIn("scripts/verify_release_attestations.py", workflow)
+        self.assertIn('test "$resolved_digest" = "$RELEASE_DIGEST"', workflow)
+        self.assertIn('digest_hex=${RELEASE_DIGEST#sha256:}', workflow)
+        self.assertIn("''|*[!0-9a-f]*)", workflow)
+        self.assertIn("--source-repository", workflow)
+        self.assertIn("--base-image", workflow)
+        self.assertIn('test "$verified_tag_count" -eq "$expected_tag_count"', workflow)
+        self.assertIn('test "$signed_image_count" -eq "$expected_image_count"', workflow)
+        self.assertIn('cmp -s "$workdir/images" "$workdir/expected-images"', workflow)
+        self.assertIn('cmp -s "$workdir/tags" "$workdir/expected-tags"', workflow)
 
 
 class ReleaseImageTagTests(unittest.TestCase):

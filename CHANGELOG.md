@@ -68,6 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gitea-authoritative release preflight, exact annotated GitHub mirror-tag
   verification, multi-registry image publishing, OCI provenance, SBOM output,
   and a fail-closed release runbook.
+- Digest-bound Cosign signatures plus immediate tag, source-SHA, base-image,
+  SPDX inventory, provenance, and multi-platform policy verification.
 - Reproducible Python lock generation on Python 3.11 plus committed runtime,
   auditor, and compiler hash locks.
 - A shared container smoke harness that proves role isolation, proxy routing,

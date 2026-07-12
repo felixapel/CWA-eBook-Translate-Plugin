@@ -73,10 +73,10 @@ jobs:
           set -e
           python3 -m pip install --break-system-packages --require-hashes --only-binary=:all: -r requirements-audit.txt
           python3 -m pip_audit -r requirements.txt --strict --disable-pip --no-deps
-      - run: python3 -m py_compile auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py scripts/release_preflight.py scripts/release_image_tags.py
+      - run: python3 -m py_compile auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py scripts/release_preflight.py scripts/release_image_tags.py scripts/verify_release_attestations.py
       - run: python3 test_translation.py
       - run: python3 test_hardening.py
-      - run: python3 -m unittest -v test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config
+      - run: python3 -m unittest -v test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_release_contract test_release_attestations test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config
 
   frontend:
     needs: preflight
@@ -127,10 +127,12 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Ensure release tag renderer is available
         run: |
-          if ! command -v python3 >/dev/null 2>&1; then
-            apt-get update && apt-get install -y --no-install-recommends python3
+          if ! command -v python3 >/dev/null 2>&1 || \
+             ! command -v envsubst >/dev/null 2>&1; then
+            apt-get update && \
+              apt-get install -y --no-install-recommends python3 gettext-base
           fi
-          python3 --version
+          python3 --version && envsubst --version
       - name: Authenticate registries and derive tags
         id: registries
         env:
@@ -163,15 +165,26 @@ jobs:
           fi
 
           TAGS=$(python3 scripts/release_image_tags.py "$@")
+          IMAGES=$GHCR_IMAGE
+          if [ -n "$DOCKERHUB_TOKEN" ]; then
+            IMAGES=$(printf '%s\n%s' "$IMAGES" \
+              "docker.io/${DOCKERHUB_USERNAME}/cwa-ebook-translate-plugin")
+          fi
           {
             echo 'tags<<RELEASE_TAGS'
             printf '%s\n' "$TAGS"
             echo 'RELEASE_TAGS'
+            echo 'images<<RELEASE_IMAGES'
+            printf '%s\n' "$IMAGES"
+            echo 'RELEASE_IMAGES'
           } >> "$GITHUB_OUTPUT"
       - name: Build once and publish every registry tag
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
-          context: .
+          # BuildKit fetches the verified public mirror by immutable commit.
+          # A local path context would expose only unverified VCS hints in SLSA.
+          context: "https://github.com/felixapel/CWA-eBook-Translate-Plugin.git#${{ gitea.sha }}"
           platforms: linux/amd64,linux/arm64
           pull: true
           push: true
@@ -181,7 +194,118 @@ jobs:
             org.opencontainers.image.version=${{ gitea.ref_name }}
             org.opencontainers.image.revision=${{ gitea.sha }}
           provenance: mode=max
-          sbom: true
+          sbom: generator=docker.io/docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+      - name: Sign digest and verify release policy
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+          RELEASE_DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_IMAGES: ${{ steps.registries.outputs.images }}
+          RELEASE_TAGS: ${{ steps.registries.outputs.tags }}
+          RELEASE_SHA: ${{ gitea.sha }}
+          RELEASE_TAG: ${{ gitea.ref_name }}
+          SOURCE_REPOSITORY: https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
+          GHCR_IMAGE: ghcr.io/felixapel/cwa-ebook-translate-plugin
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -eu
+          umask 077
+          if [ -z "$COSIGN_PRIVATE_KEY" ] || [ -z "$COSIGN_PASSWORD" ] || \
+             [ -z "$COSIGN_PUBLIC_KEY" ]; then
+            echo "COSIGN_PRIVATE_KEY, COSIGN_PASSWORD, and COSIGN_PUBLIC_KEY are required" >&2
+            exit 1
+          fi
+          if [ "${#RELEASE_DIGEST}" -ne 71 ]; then
+            echo "build action did not return a sha256 digest" >&2
+            exit 1
+          fi
+          digest_hex=${RELEASE_DIGEST#sha256:}
+          case "$digest_hex" in
+            ''|*[!0-9a-f]*)
+              echo "build action returned an invalid digest" >&2
+              exit 1
+              ;;
+          esac
+
+          base_image=$(sed -n \
+            '1s/^FROM \([^@ ][^@ ]*\)@sha256:[0-9a-f]\{64\}$/\1/p' Dockerfile)
+          base_digest=$(sed -n \
+            '1s/^FROM [^@ ][^@ ]*@sha256:\([0-9a-f]\{64\}\)$/\1/p' Dockerfile)
+          if [ -z "$base_image" ] || [ "${#base_digest}" -ne 64 ]; then
+            echo "Dockerfile must pin one sha256 base digest on line 1" >&2
+            exit 1
+          fi
+
+          workdir=$(mktemp -d)
+          trap 'rm -rf -- "$workdir"' EXIT INT TERM
+          printf '%s\n' "$COSIGN_PUBLIC_KEY" > "$workdir/cosign.pub"
+          printf '%s\n' "$RELEASE_IMAGES" > "$workdir/images"
+          printf '%s\n' "$RELEASE_TAGS" > "$workdir/tags"
+
+          printf '%s\n' "$GHCR_IMAGE" > "$workdir/expected-images"
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            printf '%s\n' \
+              "docker.io/${DOCKERHUB_USERNAME}/cwa-ebook-translate-plugin" \
+              >> "$workdir/expected-images"
+          fi
+          if ! cmp -s "$workdir/images" "$workdir/expected-images"; then
+            echo "release image output is empty or does not match configured registries" >&2
+            exit 1
+          fi
+
+          set -- --tag "$RELEASE_TAG"
+          expected_image_count=0
+          while IFS= read -r image; do
+            [ -n "$image" ] || { echo "blank release image" >&2; exit 1; }
+            set -- "$@" --image "$image"
+            expected_image_count=$((expected_image_count + 1))
+          done < "$workdir/expected-images"
+          python3 scripts/release_image_tags.py "$@" > "$workdir/expected-tags"
+          if ! cmp -s "$workdir/tags" "$workdir/expected-tags"; then
+            echo "release tag output is empty or inconsistent with release policy" >&2
+            exit 1
+          fi
+          expected_tag_count=$(wc -l < "$workdir/expected-tags")
+
+          verified_tag_count=0
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || { echo "blank release tag" >&2; exit 1; }
+            resolved_digest=$(docker buildx imagetools inspect \
+              "$tag" --format '{{.Manifest.Digest}}')
+            test "$resolved_digest" = "$RELEASE_DIGEST"
+            verified_tag_count=$((verified_tag_count + 1))
+          done < "$workdir/tags"
+          test "$verified_tag_count" -eq "$expected_tag_count"
+
+          signed_image_count=0
+          while IFS= read -r image; do
+            [ -n "$image" ] || { echo "blank release image" >&2; exit 1; }
+            reference="${image}@${RELEASE_DIGEST}"
+            cosign sign --yes --key env://COSIGN_PRIVATE_KEY \
+              -a "release-tag=$RELEASE_TAG" -a "source-sha=$RELEASE_SHA" "$reference"
+            cosign verify --key "$workdir/cosign.pub" \
+              -a "release-tag=$RELEASE_TAG" -a "source-sha=$RELEASE_SHA" \
+              "$reference" > "$workdir/cosign-verify.json"
+            docker buildx imagetools inspect "$reference" \
+              --format '{{json .SBOM}}' > "$workdir/sbom.json"
+            docker buildx imagetools inspect "$reference" \
+              --format '{{json .Provenance}}' > "$workdir/provenance.json"
+            python3 scripts/verify_release_attestations.py \
+              --sbom "$workdir/sbom.json" \
+              --provenance "$workdir/provenance.json" \
+              --source-sha "$RELEASE_SHA" \
+              --source-repository "$SOURCE_REPOSITORY" \
+              --base-image "$base_image" \
+              --base-digest "$base_digest" \
+              --platform linux/amd64 --platform linux/arm64
+            signed_image_count=$((signed_image_count + 1))
+          done < "$workdir/images"
+          test "$signed_image_count" -eq "$expected_image_count"
       - name: Remove registry credentials
         if: always()
         env:

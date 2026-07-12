@@ -33,6 +33,10 @@ PINNED_ACTIONS = {
         "10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
         "v6.19.2",
     ),
+    "sigstore/cosign-installer": (
+        "6f9f17788090df1f26f669e9d70d6ae9567deba6",
+        "v4.1.2",
+    ),
 }
 
 BASE_IMAGE = (
@@ -40,6 +44,10 @@ BASE_IMAGE = (
     "sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4"
 )
 NODE_VERSION = "24.18.0"
+SBOM_GENERATOR = (
+    "docker.io/docker/buildkit-syft-scanner@"
+    "sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
+)
 APK_PACKAGES = {
     "libgomp": "15.2.0-r5",
     "libxml2": "2.13.9-r2",
@@ -203,6 +211,11 @@ class SupplyChainContractTests(unittest.TestCase):
             source = workflow.read_text()
             self.assertIn('node-version-file: ".node-version"', source)
             self.assertNotRegex(source, r"(?m)^\s*node-version:\s*")
+
+    def test_release_sbom_generator_is_digest_pinned(self):
+        release = (ROOT / ".gitea" / "workflows" / "release.yml").read_text()
+        self.assertIn(f"sbom: generator={SBOM_GENERATOR}", release)
+        self.assertNotRegex(release, r"(?m)^\s+sbom:\s+true\s*$")
 
 
 if __name__ == "__main__":

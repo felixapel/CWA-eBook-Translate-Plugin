@@ -30,8 +30,12 @@ authoritative nor a reliably exercised policy for the canonical repository.
 - Untrusted tag code cannot execute before the validator from trusted `main`
   accepts the candidate.
 - Backend, frontend, and container gates must all pass before registry secrets
-  enter scope. One multi-platform build publishes all requested registry tags
-  with provenance and an SBOM.
+  enter scope. One multi-platform build fetches the preflight-verified GitHub
+  mirror by the exact peeled commit SHA, then publishes all requested registry
+  tags with provenance and an SBOM. The resulting digest is signed and every
+  configured image, tag, signature, structured source/base identity, SBOM, and
+  provenance document is verified before the release job succeeds; see
+  ADR-007.
 - Prereleases publish only their immutable full-version tag. Stable releases
   may additionally move the minor and `latest` aliases, with releases serialized
   operationally because Gitea 1.26 has no dependable concurrency primitive for
