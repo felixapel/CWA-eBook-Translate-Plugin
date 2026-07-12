@@ -20,7 +20,7 @@ class CIContractTests(unittest.TestCase):
         for command in (
             "python3 test_translation.py",
             "python3 test_hardening.py",
-            "python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_supply_chain_contract test_cleanup_token test_api_schema test_error_privacy",
+            "python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_cleanup_token test_api_schema test_error_privacy",
         ):
             self.assertIn(command, self.workflow)
 
