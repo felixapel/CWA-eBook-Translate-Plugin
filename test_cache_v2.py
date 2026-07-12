@@ -12,6 +12,8 @@ from pathlib import Path
 
 from cache import CACHE_SCHEMA_VERSION, CacheScope, CacheStore
 
+ROOT = Path(__file__).parent
+
 
 class MutableClock:
     def __init__(self) -> None:
@@ -249,6 +251,25 @@ class CacheV2Tests(unittest.TestCase):
                         max_entries=max_entries,
                         now=self.clock,
                     )
+
+
+class CacheDeploymentContractTests(unittest.TestCase):
+    def test_container_enforces_private_cache_directory(self) -> None:
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
+        self.assertIn("chmod 700 /app/data", dockerfile)
+        self.assertIn('ENV BT_CACHE_HARDEN_EXISTING_DIR="true"', dockerfile)
+        self.assertIn("umask 077", entrypoint)
+        self.assertIn("chmod 700 /app/data", entrypoint)
+
+    def test_deployment_defaults_are_bounded(self) -> None:
+        compose = (ROOT / "docker-compose.yml").read_text()
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("BT_CACHE_TTL_DAYS=90", compose)
+        self.assertIn("BT_CACHE_MAX_ENTRIES=100000", compose)
+        self.assertIn("| `BT_CACHE_TTL_DAYS` | `90` |", readme)
+        self.assertIn("| `BT_CACHE_MAX_ENTRIES` | `100000` |", readme)
+        self.assertNotIn("`0` = unlimited", readme)
 
 
 if __name__ == "__main__":

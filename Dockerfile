@@ -34,10 +34,13 @@ RUN addgroup -S -g 102 appuser \
  && mkdir -p /app/data \
  && chown appuser:appuser /app/data \
  && chmod 755 /app \
- && chmod 750 /app/data
+ && chmod 700 /app/data
 
 # Set environment variables for the database path and LLM configuration
 ENV DB_PATH="/app/data/translations.db"
+ENV BT_CACHE_TTL_DAYS="90"
+ENV BT_CACHE_MAX_ENTRIES="100000"
+ENV BT_CACHE_HARDEN_EXISTING_DIR="true"
 ENV PORT=8390
 ENV PYTHONDONTWRITEBYTECODE=1
 

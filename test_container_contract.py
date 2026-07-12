@@ -17,7 +17,7 @@ class ContainerContractTests(unittest.TestCase):
         for obsolete in ("gosu", "shadow=", "linux-pam=", "chown -R"):
             self.assertNotIn(obsolete, dockerfile)
 
-    def test_entrypoint_never_repairs_permissions_or_escalates(self):
+    def test_entrypoint_never_changes_ownership_or_escalates(self):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
         for forbidden in ("gosu", "chown", "appuser gunicorn"):
             self.assertNotIn(forbidden, entrypoint)
@@ -88,7 +88,7 @@ class ContainerContractTests(unittest.TestCase):
         ):
             self.assertIn(token, deploy)
             self.assertIn(token, template)
-        self.assertIn("install -d -m 0750 -o 101 -g 102", deploy)
+        self.assertIn("install -d -m 0700 -o 101 -g 102", deploy)
 
 
 if __name__ == "__main__":

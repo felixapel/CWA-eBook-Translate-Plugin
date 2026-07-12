@@ -37,6 +37,14 @@
         apiUrl: existing.apiUrl || '/bt-api',
         sourceLang: existing.sourceLang || 'English',
         targetLang: existing.targetLang || '',
+        // Leave this undefined when the proxy cannot derive it; translator.js
+        // will then use the /read/<book> path instead of collapsing to an
+        // empty/unscoped identifier.
+        bookId: existing.bookId,
+        // Durable browser storage is opt-in because shared browsers may be
+        // used by multiple CWA accounts. The scoped server-side cache is
+        // persistent regardless of this setting.
+        persistCache: existing.persistCache === true,
         // Optional shared secret (BT_API_TOKEN); readable from localStorage so
         // it can be set per-browser without editing any server file:
         //   localStorage.setItem('bt_token', '<token>')

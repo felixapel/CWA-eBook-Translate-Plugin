@@ -10,7 +10,7 @@
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
         ? cfg.apiUrl
-        : (window.location.protocol === 'https:' ? '' : `http://${window.location.hostname}:8390`);
+        : (window.location.protocol === 'https:' ? null : `http://${window.location.hostname}:8390`);
     let SOURCE_LANG = cfg.sourceLang || 'English'; // Assume source is English
 
     // Map browser language codes to the full language name the backend expects
@@ -38,6 +38,8 @@
     const BT_CLIENT_MAX_INFLIGHT = 1;
     const BT_CLIENT_MIN_REQUEST_GAP_MS = 500;
     const BT_CLIENT_RATE_LIMIT_BACKOFF_MS = 10000;
+    const BT_CLIENT_MAX_RATE_LIMIT_RESPONSES = 3;
+    const BT_CLIENT_MAX_RETRY_AFTER_SECONDS = 60;
 
     let translationMode = localStorage.getItem('bt_mode') || 'off'; // 'off', 'bilingual', 'translated'
     let isTranslating = false;
@@ -60,17 +62,30 @@
     let chapterDone = 0;
     let inflightCount = 0;
     let errorCount = 0;       // consecutive failed requests (drives the error state)
+    const failedParagraphs = new Set(); // terminal until an explicit user retry
     let doneHideTimer = null;
     let lastTriggerReason = 'init'; // why translateCurrentPage last ran (shown in the debug menu)
 
-    // ── Persistent translation cache (survives page turns AND browser reloads) ──
-    // Per-language map of contentHash -> translation, mirrored to localStorage so
-    // the work/API cost already spent is never thrown away. (The backend also
-    // caches in SQLite, so even a cleared client never re-pays for a paragraph.)
-    const CACHE_PREFIX = 'bt_cache_v2_'; // v2: 53-bit hash keys (old caches ignored)
+    // ── Browser translation cache ──────────────────────────────────────
+    // Persistence is privacy-sensitive on a shared browser: another CWA user
+    // could otherwise inherit translated book text after logout. Keep the
+    // cache in memory by default; operators may explicitly opt in with
+    // BOOK_TRANSLATOR.persistCache=true. Backend SQLite remains the durable,
+    // server-side cache (and is tenant-isolated when identity auth is enabled).
+    const PERSIST_CACHE = cfg.persistCache === true;
+    const CACHE_PREFIX = 'bt_cache_v3_';
+    const LEGACY_CACHE_PREFIX = 'bt_cache_v2_';
     const CACHE_MAX_ENTRIES = 5000;      // safety cap to stay under the localStorage quota
 
+    // v2 keys omitted book/chapter/source/prompt context. Remove them rather
+    // than risk rendering a stale or cross-user translation after upgrade.
+    try {
+        Object.keys(localStorage).filter(k => k.startsWith(LEGACY_CACHE_PREFIX))
+            .forEach(k => localStorage.removeItem(k));
+    } catch (e) { /* storage may be unavailable */ }
+
     function loadCacheForLang(lang) {
+        if (!PERSIST_CACHE) return {};
         try {
             const raw = localStorage.getItem(CACHE_PREFIX + lang);
             if (raw) return JSON.parse(raw) || {};
@@ -80,11 +95,13 @@
 
     let persistTimer = null;
     function schedulePersist() {
+        if (!PERSIST_CACHE) return;
         if (persistTimer) return;
         persistTimer = setTimeout(persistCacheNow, 1500);
     }
     function persistCacheNow() {
         if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+        if (!PERSIST_CACHE) return;
         try {
             let keys = Object.keys(translatedParagraphs);
             if (keys.length > CACHE_MAX_ENTRIES) {
@@ -110,8 +127,10 @@
 
     // ── In-flight request control (responsive buttons + language switches) ──
     // `generation` is bumped whenever the user changes mode/language so that
-    // stale in-flight responses are ignored. `activeControllers` lets us abort
-    // pending fetches immediately instead of blocking the UI until they finish.
+    // stale in-flight responses are ignored. It is deliberately not part of a
+    // translation cache key: page rediscovery is a transport lifecycle event,
+    // not a semantic prompt change. `activeControllers` lets us abort pending
+    // fetches immediately instead of blocking the UI until they finish.
     let generation = 0;
     const activeControllers = new Set();
 
@@ -140,7 +159,8 @@
 
     function isBadTranslation(tr) {
         // Treat backend error markers and empty results as "not translated" so
-        // they are neither rendered nor cached client-side — letting them retry.
+        // they are neither rendered nor cached client-side. Automatic retries
+        // are unsafe after an ambiguous timeout; the user can retry explicitly.
         return !tr || typeof tr !== 'string'
             || tr.startsWith('[TRANSLATION ERROR')
             || tr.startsWith('[ERROR');
@@ -431,6 +451,7 @@
         document.getElementById('bt-status').onclick = () => {
             if (bar.dataset.state === 'error') {
                 errorCount = 0;
+                failedParagraphs.clear();
                 if (translationMode !== 'off') translateCurrentPage();
             }
         };
@@ -472,15 +493,18 @@
                     if (prefetchEnabled && translationMode !== 'off') triggerPrefetch();
                 } else if (action === 'retry') {
                     errorCount = 0;
+                    failedParagraphs.clear();
                     closeMenu();
                     if (translationMode !== 'off') scheduleTranslate('manual_retry', { immediate: true, forceRediscover: true });
                 } else if (action === 'clear-lang') {
                     translatedParagraphs = {};
+                    failedParagraphs.clear();
                     try { localStorage.removeItem(CACHE_PREFIX + TARGET_LANG); } catch (e2) {}
                     showToast(t.cleared);
                     buildMenu();
                 } else if (action === 'clear-all') {
                     translatedParagraphs = {};
+                    failedParagraphs.clear();
                     try {
                         Object.keys(localStorage).filter(k => k.startsWith(CACHE_PREFIX))
                             .forEach(k => localStorage.removeItem(k));
@@ -527,10 +551,7 @@
                         refreshStatus();
                     }, 1000);
                 }
-            } else if (errorCount > 0 && errorCount < 3) {
-                state = 'page';
-                text.textContent = t.retrying || strings.en.retrying;
-            } else if (errorCount >= 3) {
+            } else if (errorCount > 0) {
                 state = 'error';
                 text.textContent = t.error;
             } else if (isTranslating) {
@@ -695,8 +716,8 @@
     }
 
     function hashText(str) {
-        // cyrb53 — a 53-bit hash. The previous 32-bit hash could collide across a
-        // long book and show the wrong cached translation for a paragraph.
+        // cyrb-style two-lane 64-bit string. Keep both unsigned 32-bit lanes
+        // instead of coercing them into JavaScript's 53-bit Number range.
         let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
         for (let i = 0; i < str.length; i++) {
             const ch = str.charCodeAt(i);
@@ -705,7 +726,82 @@
         }
         h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
         h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-        return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+        return (h2 >>> 0).toString(36).padStart(7, '0')
+            + (h1 >>> 0).toString(36).padStart(7, '0');
+    }
+
+    function boundedScopeValue(value, fallback) {
+        if (value === undefined || value === null) return fallback;
+        const normalized = String(value).trim();
+        return normalized ? normalized.slice(0, 512) : fallback;
+    }
+
+    function currentBookId() {
+        if (cfg.bookId !== undefined && cfg.bookId !== null) {
+            return boundedScopeValue(cfg.bookId, 'unscoped');
+        }
+        const match = window.location.pathname.match(/\/read\/([^/?#]+)/);
+        if (!match) return 'unscoped';
+        try {
+            return boundedScopeValue(decodeURIComponent(match[1]), 'unscoped');
+        } catch (e) {
+            return boundedScopeValue(match[1], 'unscoped');
+        }
+    }
+
+    function currentChapterId() {
+        try {
+            const rendition = window.reader && window.reader.rendition;
+            const location = rendition && rendition.currentLocation && rendition.currentLocation();
+            const start = location && location.start;
+            if (start) {
+                // Prefer the stable chapter resource. Exact provider context is
+                // fingerprinted server-side, while CFI changes on every page
+                // turn and would fragment otherwise reusable cache entries.
+                const identity = start.href || start.cfi || start.index;
+                if (identity !== undefined && identity !== null) {
+                    return boundedScopeValue(identity, 'unscoped');
+                }
+            }
+        } catch (e) { /* reader is not ready yet */ }
+
+        try {
+            const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+            if (iframe) {
+                const doc = iframe.contentDocument;
+                const identity = (doc && doc.documentURI) || iframe.getAttribute('src');
+                if (identity) return boundedScopeValue(identity, 'unscoped');
+            }
+        } catch (e) { /* cross-origin iframe */ }
+        return 'unscoped';
+    }
+
+    function translationScope() {
+        return { book_id: currentBookId(), chapter_id: currentChapterId() };
+    }
+
+    function elementContextId(el) {
+        if (!el || !el.ownerDocument) return 'unscoped-element';
+        const parts = [];
+        let node = el;
+        while (node && node.nodeType === 1 && node.parentElement) {
+            const siblings = Array.from(node.parentElement.children).filter(sibling =>
+                !sibling.classList.contains('bt-translation')
+                && !sibling.classList.contains('bt-loading'));
+            const index = siblings.indexOf(node);
+            parts.push(`${node.tagName.toLowerCase()}:${Math.max(0, index)}`);
+            if (node.parentElement === node.ownerDocument.body) break;
+            node = node.parentElement;
+        }
+        return parts.reverse().join('/') || 'unscoped-element';
+    }
+
+    function cacheKeyForText(text, elementContext = 'unscoped-element') {
+        const scope = translationScope();
+        return hashText(JSON.stringify([
+            'cwa-ui-cache/v3', BT_UI_VERSION, SOURCE_LANG, TARGET_LANG,
+            scope.book_id, scope.chapter_id, elementContext, text
+        ]));
     }
 
     // ── Translation engine ─────────────────────────────────────────────
@@ -728,8 +824,8 @@
                 console.warn(`[BookTranslator] skipping oversized element (${text.length} chars) — likely a container, not a paragraph`);
                 continue;
             }
-            const hash = hashText(text);
-            if (translatedParagraphs[hash] || seen.has(hash)) continue;
+            const hash = cacheKeyForText(text, elementContextId(el));
+            if (translatedParagraphs[hash] || failedParagraphs.has(hash) || seen.has(hash)) continue;
             seen.add(hash);
             out.push({ el, text, hash });
         }
@@ -737,6 +833,10 @@
     }
 
     async function postBatch(texts) {
+        if (!TRANSLATOR_URL) {
+            console.error('[BookTranslator] HTTPS requires a same-origin or TLS apiUrl');
+            return { error: 'configuration' };
+        }
         const controller = new AbortController();
         activeControllers.add(controller);
         // Distinguish OUR safety-net timeout from a deliberate abort
@@ -746,17 +846,28 @@
         try {
             const headers = { 'Content-Type': 'application/json' };
             if (cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken; // optional shared secret
+            const scope = translationScope();
             const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
                 headers,
-                body: JSON.stringify({ paragraphs: texts, source_lang: SOURCE_LANG, target_lang: TARGET_LANG }),
+                body: JSON.stringify({
+                    paragraphs: texts,
+                    source_lang: SOURCE_LANG,
+                    target_lang: TARGET_LANG,
+                    book_id: scope.book_id,
+                    chapter_id: scope.chapter_id
+                }),
                 signal: controller.signal,
             });
             if (!resp.ok) {
                 if (resp.status === 429) {
                     let r = {};
                     try { r = await resp.json(); } catch(e) {}
-                    let after = r.retry_after || parseInt(resp.headers.get('Retry-After')) || (BT_CLIENT_RATE_LIMIT_BACKOFF_MS / 1000);
+                    let after = Number(r.retry_after || resp.headers.get('Retry-After'));
+                    if (!Number.isFinite(after) || after <= 0) {
+                        after = BT_CLIENT_RATE_LIMIT_BACKOFF_MS / 1000;
+                    }
+                    after = Math.min(BT_CLIENT_MAX_RETRY_AFTER_SECONDS, Math.max(1, after));
                     return { error: 'rate_limited', retry_after: after };
                 }
                 return null;
@@ -825,16 +936,30 @@
                 inflightCount = batch.length;
                 refreshStatus();
 
-                // Bounded retry: failed batches go BACK to the front of their
-                // queue (previously they were silently dropped while the status
-                // bar claimed "Retrying…"). Items give up after 3 attempts so a
-                // persistent failure can't spin forever. Only items dropped for
-                // good count as "done" (failed) — retried ones stay pending.
-                const requeueForRetry = (items) => {
-                    const keep = items.filter(x => (x.attempts = (x.attempts || 0) + 1) < 3);
-                    chapterDone += items.length - keep.length;
+                // Network failures and timeouts are ambiguous: the server may
+                // still be translating after the browser gives up. Mark them
+                // terminal for this session and require an explicit user retry.
+                const markBatchFailed = (items) => {
+                    items.forEach(x => failedParagraphs.add(x.hash));
+                    chapterDone += items.length;
+                    errorCount++;
+                };
+
+                // A 429 is safe to retry because the server rejected admission
+                // before provider work. Bound both attempts and Retry-After so
+                // a broken proxy cannot hold the queue forever.
+                const requeueRateLimited = (items) => {
+                    const keep = [];
+                    const dropped = [];
+                    items.forEach(x => {
+                        x.rateLimitResponses = (x.rateLimitResponses || 0) + 1;
+                        if (x.rateLimitResponses < BT_CLIENT_MAX_RATE_LIMIT_RESPONSES) keep.push(x);
+                        else dropped.push(x);
+                    });
+                    if (dropped.length) markBatchFailed(dropped);
                     if (isVisible) visibleQueue.unshift(...keep);
                     else prefetchQueue.unshift(...keep);
+                    return keep.length;
                 };
 
                 let data = null;
@@ -842,10 +967,10 @@
                     data = await postBatch(batch.map(b => b.text));
                 } catch (e) {
                     console.error("Translation request failed:", e);
-                    errorCount++;
-                    requeueForRetry(batch);
+                    markBatchFailed(batch);
                     inflightCount = 0;
                     lastRequestEnd = Date.now();
+                    refreshStatus();
                     continue;
                 }
 
@@ -859,18 +984,16 @@
                 }
 
                 if (data && data.error === 'rate_limited') {
-                    rateLimitUntil = Date.now() + (data.retry_after * 1000);
-                    // Put the batch back at the front of the corresponding queue
-                    // (NOT counted as done — it will be retried).
-                    if (isVisible) visibleQueue.unshift(...batch);
-                    else prefetchQueue.unshift(...batch);
+                    if (requeueRateLimited(batch) > 0) {
+                        rateLimitUntil = Date.now() + (data.retry_after * 1000);
+                    }
                     // errorCount not incremented for rate limit
+                    refreshStatus();
                     continue;
                 }
 
                 if (!data || data.error === 'timeout' || !Array.isArray(data.translations)) {
-                    errorCount++;
-                    requeueForRetry(batch);
+                    markBatchFailed(batch);
                     refreshStatus();
                     continue;
                 }
@@ -885,15 +1008,14 @@
                     }
                 });
 
-                errorCount = anyGood ? 0 : errorCount + 1;
-
                 // Split the batch into translated vs failed (backend error
-                // markers / empty): successes count as done, failures get the
-                // same bounded retry as transport errors.
+                // markers / empty). Only an explicit user action retries a
+                // failed paragraph; successful entries remain available.
                 const succeeded = batch.filter(b => translatedParagraphs[b.hash]);
                 chapterDone += succeeded.length;
                 const failed = batch.filter(b => !translatedParagraphs[b.hash]);
-                if (failed.length) requeueForRetry(failed);
+                if (failed.length) markBatchFailed(failed);
+                else if (anyGood) errorCount = 0;
                 refreshStatus();
                 
                 if (stored) {
@@ -999,7 +1121,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         paragraphs.forEach((el) => {
             const text = getParagraphText(el);
             if (!text) return;
-            const hash = hashText(text);
+            const hash = cacheKeyForText(text, elementContextId(el));
             const translated = translatedParagraphs[hash];
             if (isBadTranslation(translated) || translated === text) return;
 
@@ -1025,7 +1147,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         paragraphs.forEach((el) => {
             const text = getParagraphText(el);
             if (!text) return;
-            const hash = hashText(text);
+            const hash = cacheKeyForText(text, elementContextId(el));
             const translated = translatedParagraphs[hash];
             if (isBadTranslation(translated)) return;
 

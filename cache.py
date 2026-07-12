@@ -312,6 +312,8 @@ class CacheStore:
         source_lang: str,
         target_lang: str,
         cache_scope: CacheScope,
+        *,
+        record_hit: bool = True,
     ) -> str | None:
         cache_key = self.compute_key(text, source_lang, target_lang, cache_scope)
         row = self.connection().execute(
@@ -321,7 +323,8 @@ class CacheStore:
         ).fetchone()
         if row is None:
             return None
-        self._queue_hit(cache_key)
+        if record_hit:
+            self._queue_hit(cache_key)
         log.debug(
             "Cache HIT chars=%d langs=%s->%s provider=%s model=%s",
             len(text),
@@ -331,6 +334,18 @@ class CacheStore:
             cache_scope.model,
         )
         return row[0]
+
+    def record_hit(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        cache_scope: CacheScope,
+    ) -> None:
+        """Record a hit after a caller atomically accepts a complete group."""
+        self._queue_hit(
+            self.compute_key(text, source_lang, target_lang, cache_scope)
+        )
 
     def _queue_hit(self, cache_key: str) -> None:
         should_flush = False
@@ -500,7 +515,7 @@ class CacheStore:
             "ttl_days": self.ttl_days,
             "max_entries": self.max_entries,
             "legacy_tables_preserved": legacy_tables,
-            "language_pairs": {f"{source}->{target}": count for source, target, count in pairs},
+            "language_pairs": {f"{source}→{target}": count for source, target, count in pairs},
         }
 
     def db_size_mb(self) -> float:
@@ -601,13 +616,25 @@ def get_cached(
     *,
     scope: CacheScope | None = None,
     provider: str = "legacy",
+    record_hit: bool = True,
 ) -> str | None:
     return _store().get(
         text,
         source_lang,
         target_lang,
         _scope_for(model, scope, provider),
+        record_hit=record_hit,
     )
+
+
+def record_cache_hit(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    *,
+    scope: CacheScope,
+) -> None:
+    _store().record_hit(text, source_lang, target_lang, scope)
 
 
 def put_cache(
