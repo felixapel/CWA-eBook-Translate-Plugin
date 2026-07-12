@@ -8,6 +8,10 @@
     const BT_UI_VERSION = '2.1.4';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
+    const configuredAuthMode = cfg.authMode || (cfg.apiToken ? 'token' : 'cwa_session');
+    const AUTH_MODE = ['cwa_session', 'token', 'forwarded'].includes(configuredAuthMode)
+        ? configuredAuthMode
+        : 'cwa_session';
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
         ? cfg.apiUrl
         : (window.location.protocol === 'https:' ? null : `http://${window.location.hostname}:8390`);
@@ -846,11 +850,14 @@
         const timer = setTimeout(() => { controller.btTimedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
         try {
             const headers = { 'Content-Type': 'application/json' };
-            if (cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken; // optional shared secret
+            if (AUTH_MODE === 'token' && cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken;
             const scope = translationScope();
             const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
                 headers,
+                credentials: AUTH_MODE === 'cwa_session'
+                    ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
+                    : 'omit',
                 body: JSON.stringify({
                     paragraphs: texts,
                     source_lang: SOURCE_LANG,

@@ -7,6 +7,7 @@ This document details the architecture of the `book-translator` plugin.
 - [ADR-001: Use Gitea as the sole release authority](decisions/ADR-001-gitea-release-authority.md)
 - [ADR-002: Split API and proxy into non-root runtime roles](decisions/ADR-002-split-non-root-runtime-roles.md)
 - [ADR-003: Use an atomically scoped private cache](decisions/ADR-003-scoped-private-cache.md)
+- [ADR-004: Authenticate before deriving cache tenants](decisions/ADR-004-authentication-boundaries.md)
 
 ## Overview
 
@@ -23,7 +24,10 @@ There are two integration methods:
    reachable same-origin under `/bt-api/`, so CORS never applies. Because only
    one tag is injected (instead of maintaining a forked `read.html`), CWA
    template updates cannot silently break or drop the plugin. See
-   `proxy/nginx.conf.template` and `docker-entrypoint.sh`.
+   `proxy/nginx.conf.template` and `docker-entrypoint.sh`. The proxy passes the
+   browser's HttpOnly CWA cookie to the API; the API validates only configured
+   cookie names against CWA's authenticated JSON probe and derives an opaque
+   per-session tenant.
 2. **Bind-mount mode (advanced/development).** `overlay/read.html` plus the
    JS/CSS are mounted into the CWA container; the overlay calls the API on
    `:8390` cross-origin. The template copy is tracked against the CWA version
@@ -51,7 +55,15 @@ Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
   repeated text in different literary contexts cannot collide.
 
 ### Backend (`book-translator-api`)
-- **Flask Server (`server.py`)**: Exposes translation endpoints `/translate` and `/translate/batch` along with metrics and health probes.
+- **Authentication (`auth.py`)**: Fails closed in token, CWA-session, or
+  trusted-forwarded mode before any cache/provider work. Raw credentials and
+  subjects become opaque hashes; CWA checks require the exact protected task
+  endpoint and bounded JSON-list shape, are TTL/cap bounded, and coalesce
+  concurrent duplicates. The frontend attaches cookies only in CWA-session
+  mode.
+- **Flask Server (`server.py`)**: Exposes translation endpoints `/translate`
+  and `/translate/batch` along with metrics and health probes. Only shallow
+  liveness/readiness routes bypass authentication.
 - **SQLite Cache (`cache.py`)**: Schema v2 keys include tenant, book, chapter,
   provider, model, prompt/protocol fingerprint, group context, languages, and
   source hash. Source paragraphs and raw tenant/book/chapter identifiers are not

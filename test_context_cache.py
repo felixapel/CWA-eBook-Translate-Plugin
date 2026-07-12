@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
+
+os.environ.setdefault("BT_AUTH_MODE", "disabled")
+os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
 
 import server
 import translator

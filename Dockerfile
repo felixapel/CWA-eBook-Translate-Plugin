@@ -19,8 +19,9 @@ RUN apk add --no-cache \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt
 
-# Copy source code and runtime assets
-COPY *.py ./
+# Copy only runtime modules; tests, benchmarks, and operator helpers do not
+# belong in the published execution artifact.
+COPY auth.py cache.py server.py singleflight.py translator.py work_budget.py ./
 COPY VERSION ./
 COPY static/ ./static/
 COPY proxy/ ./proxy/

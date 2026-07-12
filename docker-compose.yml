@@ -22,6 +22,20 @@ services:
     # To build locally, replace image with: build: .
     environment:
       - BT_ROLE=api
+      # Validate the browser's existing HttpOnly CWA session and derive an
+      # opaque per-session cache tenant. No credential is stored in JS.
+      - BT_AUTH_MODE=cwa_session
+      - BT_CWA_AUTH_URL=http://calibre-web:8083/ajax/emailstat
+      - BT_CWA_AUTH_COOKIE_NAMES=session,remember_token
+      - BT_CWA_AUTH_TIMEOUT_SECONDS=2
+      - BT_CWA_AUTH_CACHE_TTL_SECONDS=15
+      - BT_CWA_AUTH_CACHE_MAX_ENTRIES=10000
+      - BT_CWA_AUTH_MAX_INFLIGHT=8
+      - BT_CWA_AUTH_MAX_RESPONSE_BYTES=262144
+      - BT_AUTH_RATE_LIMIT_PER_MINUTE=300
+      # Credentialed CORS accepts exact BT_ALLOWED_ORIGINS only. This topology
+      # is same-origin through the proxy and therefore needs no CORS grant.
+      - BT_ALLOW_PRIVATE_LAN=false
       # Only the proxy's fixed address may supply the client X-Forwarded-For.
       - BT_TRUSTED_PROXIES=172.30.39.3/32
       - LLM_PROVIDER=local
@@ -58,6 +72,7 @@ services:
     cpus: 2.0
     restart: unless-stopped
     networks:
+      cwa-net:
       translator-net:
         ipv4_address: 172.30.39.2
 

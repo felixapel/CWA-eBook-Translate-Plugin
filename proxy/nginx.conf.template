@@ -39,6 +39,14 @@ server {
         client_max_body_size 3m;
         proxy_pass ${BT_API_UPSTREAM}/;
         proxy_set_header Host $host;
+        # Forward the browser's HttpOnly CWA session to the API. The API sends
+        # only configured cookie names to CWA's authenticated JSON probe.
+        proxy_set_header Cookie $http_cookie;
+        # This injection proxy is not an identity authority. Always discard
+        # client-supplied forwarded identity; forwarded auth deployments must
+        # route /bt-api through their allowlisted identity-aware proxy instead.
+        proxy_set_header X-BT-Subject "";
+        proxy_set_header X-BT-Roles "";
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $bt_fwd_proto;
         proxy_connect_timeout 2s;

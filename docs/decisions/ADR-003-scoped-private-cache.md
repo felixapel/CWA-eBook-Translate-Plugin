@@ -32,6 +32,6 @@ enabled.
   release.
 - Context-sensitive correctness and tenant privacy take precedence over reuse
   across unrelated books or request groupings.
-- A complete authenticated subject is still required before the tenant
-  namespace can be considered production-isolated; legacy anonymous mode is
-  compatibility-only.
+- The server-owned authenticated subject is the tenant namespace. CWA sessions
+  and trusted forwarded identities are isolated; shared-token mode deliberately
+  shares one tenant and anonymous mode is explicit development-only behavior.

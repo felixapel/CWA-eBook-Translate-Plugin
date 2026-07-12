@@ -20,6 +20,30 @@ REMOTE="${UNRAID_USER}@${UNRAID_HOST}"
 # container itself, not the Unraid host — point at the host's LAN IP or use
 # host.docker.internal. The IP below is a placeholder; substitute your own.
 LLM_HOST="${LLM_HOST:-10.0.0.10}"
+BT_AUTH_MODE="${BT_AUTH_MODE:-cwa_session}"
+BT_API_TOKEN="${BT_API_TOKEN:-}"
+BT_CWA_AUTH_URL="${BT_CWA_AUTH_URL:-}"
+BT_ALLOWED_ORIGINS="${BT_ALLOWED_ORIGINS:-}"
+
+if [ "$BT_AUTH_MODE" != "cwa_session" ]; then
+    echo "ERROR: this overlay deploy helper supports only cwa_session; configure token or forwarded mode manually" >&2
+    exit 64
+fi
+if [ -z "$BT_CWA_AUTH_URL" ] || [ -z "$BT_ALLOWED_ORIGINS" ]; then
+    echo "ERROR: cwa_session requires BT_CWA_AUTH_URL and one exact BT_ALLOWED_ORIGINS value" >&2
+    exit 64
+fi
+if [[ ! "$BT_CWA_AUTH_URL" =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?/ajax/emailstat$ ]]; then
+    echo "ERROR: BT_CWA_AUTH_URL must be the exact http(s) /ajax/emailstat endpoint" >&2
+    exit 64
+fi
+# This legacy helper publishes the API directly on plain HTTP port 8390 and
+# installs an overlay whose empty apiUrl resolves to that port. Accepting an
+# HTTPS reader origin would create an unusable mixed-content deployment.
+if [[ ! "$BT_ALLOWED_ORIGINS" =~ ^http://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]]; then
+    echo "ERROR: BT_ALLOWED_ORIGINS must be one exact http origin for this HTTP-only helper" >&2
+    exit 64
+fi
 
 echo "Starting deployment to $UNRAID_HOST..."
 
@@ -30,6 +54,10 @@ echo "Updating backend code in $API_DIR..."
     # a quoted heredoc, so operator-controlled values are data, never code.
     printf 'api_dir=%q\n' "$API_DIR"
     printf 'llm_host=%q\n' "$LLM_HOST"
+    printf 'auth_mode=%q\n' "$BT_AUTH_MODE"
+    printf 'api_token=%q\n' "$BT_API_TOKEN"
+    printf 'cwa_auth_url=%q\n' "$BT_CWA_AUTH_URL"
+    printf 'allowed_origins=%q\n' "$BT_ALLOWED_ORIGINS"
     cat <<'REMOTE_SCRIPT'
 set -euo pipefail
 
@@ -54,6 +82,11 @@ docker run -d \
   -p 8390:8390 \
   -v /mnt/user/appdata/book-translator-api/data:/app/data \
   -e BT_ROLE=api \
+  -e "BT_AUTH_MODE=${auth_mode}" \
+  -e "BT_API_TOKEN=${api_token}" \
+  -e "BT_CWA_AUTH_URL=${cwa_auth_url}" \
+  -e "BT_ALLOWED_ORIGINS=${allowed_origins}" \
+  -e BT_ALLOW_PRIVATE_LAN=false \
   -e "BT_LOCAL_URL=http://${llm_host}:2819/v1/chat/completions" \
   -e BT_BATCH_SIZE=3 \
   -e BT_MAX_CONCURRENT=1 \

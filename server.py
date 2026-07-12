@@ -13,9 +13,11 @@ import uuid
 import hmac
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlsplit
 from flask import Flask, request, jsonify
 from werkzeug.exceptions import HTTPException
 
+from auth import AuthRejected, AuthUnavailable, RequestAuthenticator
 from translator import (
     translate_text, translate_batch, check_backend_health,
     BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
@@ -95,8 +97,9 @@ try:
 except OSError:
     __version__ = "dev"
 
-# Optional shared-secret. When BT_API_TOKEN is set, translate endpoints require
-# the matching `X-BT-Token` header — use it if the API is reachable beyond the LAN.
+# Operator/shared-secret credential. Production authentication is selected by
+# BT_AUTH_MODE; its safe default is token and therefore requires BT_API_TOKEN.
+# This module-level value remains the destructive-operation credential too.
 API_TOKEN = os.environ.get("BT_API_TOKEN", "")
 
 # Request-size caps: one request must not be able to trigger unbounded LLM work
@@ -149,6 +152,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("book-translator.server")
+
+# Fail during process startup when the selected auth authority is incomplete.
+# BT_AUTH_MODE=disabled remains available only as an explicit development/test
+# choice; it is never the default.
+AUTHENTICATOR = RequestAuthenticator.from_environment()
 
 app = Flask(__name__)
 
@@ -239,8 +247,35 @@ def _has_invalid_unicode(value: str) -> bool:
 # port — the common self-hosted case. Note: in proxy-injection mode the overlay
 # is same-origin and CORS never comes into play.
 
+def _validate_cors_origin(origin: str) -> str:
+    """Require an exact serialized HTTP origin, never a path or wildcard."""
+    if (
+        not origin
+        or origin != origin.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in origin)
+    ):
+        raise ValueError("BT_ALLOWED_ORIGINS contains an invalid origin")
+    try:
+        parsed = urlsplit(origin)
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("BT_ALLOWED_ORIGINS contains an invalid origin") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or any(character.isspace() for character in parsed.hostname)
+    ):
+        raise ValueError("BT_ALLOWED_ORIGINS must contain exact http(s) origins")
+    return origin
+
+
 ALLOWED_ORIGINS = {
-    o.strip()
+    _validate_cors_origin(o.strip())
     for o in os.environ.get(
         "BT_ALLOWED_ORIGINS", "http://localhost:8083,http://localhost:8383"
     ).split(",")
@@ -263,6 +298,11 @@ def _is_origin_allowed(origin: str | None) -> str | None:
         return None
     if origin in ALLOWED_ORIGINS:
         return origin
+    # Credentialed CWA-session requests may never combine cookies with a
+    # subnet-wide origin policy. Cross-origin operators must enumerate the
+    # exact reader origin; same-origin proxy mode needs no CORS at all.
+    if AUTHENTICATOR.mode == "cwa_session":
+        return None
     if BT_ALLOW_PRIVATE_LAN and _PRIVATE_ORIGIN_RE.match(origin):
         return origin
     return None
@@ -272,8 +312,21 @@ def _is_origin_allowed(origin: str | None) -> str | None:
 
 _rate_limit_lock = threading.Lock()
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_auth_rate_limit_store: dict[str, list[float]] = defaultdict(list)
 BT_RATE_LIMIT_PER_MINUTE = int(os.environ.get("BT_RATE_LIMIT_PER_MINUTE", "120"))
 BT_RATE_LIMIT_RETRY_AFTER = int(os.environ.get("BT_RATE_LIMIT_RETRY_AFTER", "10"))
+BT_AUTH_RATE_LIMIT_PER_MINUTE = int(
+    os.environ.get("BT_AUTH_RATE_LIMIT_PER_MINUTE", "300")
+)
+BT_RATE_LIMIT_MAX_CLIENTS = int(os.environ.get("BT_RATE_LIMIT_MAX_CLIENTS", "10000"))
+
+if min(
+    BT_RATE_LIMIT_PER_MINUTE,
+    BT_RATE_LIMIT_RETRY_AFTER,
+    BT_AUTH_RATE_LIMIT_PER_MINUTE,
+    BT_RATE_LIMIT_MAX_CLIENTS,
+) <= 0:
+    raise ValueError("rate-limit settings must be positive integers")
 
 RATE_LIMIT_MAX = BT_RATE_LIMIT_PER_MINUTE
 RATE_LIMIT_WINDOW = 60
@@ -287,21 +340,30 @@ def _cleanup_rate_limits():
         cutoff = now - RATE_LIMIT_WINDOW
         with _rate_limit_lock:
             keys_to_delete = []
-            for ip, timestamps in _rate_limit_store.items():
-                active = [t for t in timestamps if t > cutoff]
-                if not active:
-                    keys_to_delete.append(ip)
-                else:
-                    _rate_limit_store[ip] = active
-            for ip in keys_to_delete:
-                del _rate_limit_store[ip]
+            for store in (_rate_limit_store, _auth_rate_limit_store):
+                keys_to_delete = []
+                for ip, timestamps in store.items():
+                    active = [t for t in timestamps if t > cutoff]
+                    if not active:
+                        keys_to_delete.append(ip)
+                    else:
+                        store[ip] = active
+                for ip in keys_to_delete:
+                    del store[ip]
 
 threading.Thread(target=_cleanup_rate_limits, daemon=True).start()
 
 def _token_matches(provided: str, expected: str) -> bool:
     """Constant-time token comparison (avoids timing side-channels on the
     shared-secret checks; hmac.compare_digest is the standard tool)."""
-    return bool(provided) and bool(expected) and hmac.compare_digest(provided, expected)
+    if not provided or not expected or len(provided) > 4096 or len(expected) > 4096:
+        return False
+    try:
+        return hmac.compare_digest(provided, expected)
+    except TypeError:
+        # compare_digest rejects non-ASCII str values. Treat malformed header
+        # input as an ordinary credential rejection instead of a framework 500.
+        return False
 
 
 def _client_ip() -> str:
@@ -344,18 +406,45 @@ def _client_ip() -> str:
     return peer
 
 
-def _check_rate_limit(ip: str) -> bool:
-    """Return True if the request should be allowed, False if rate-limited."""
+def _check_window_rate_limit(
+    store: dict[str, list[float]], ip: str, limit: int
+) -> bool:
+    """Consume one bounded sliding-window admission slot."""
     now = time.monotonic()
     with _rate_limit_lock:
-        timestamps = _rate_limit_store[ip]
-        # Evict expired timestamps
         cutoff = now - RATE_LIMIT_WINDOW
-        _rate_limit_store[ip] = [t for t in timestamps if t > cutoff]
-        if len(_rate_limit_store[ip]) >= RATE_LIMIT_MAX:
+        if ip not in store and len(store) >= BT_RATE_LIMIT_MAX_CLIENTS:
+            # Reclaim stale buckets only under pressure. If every bucket is
+            # active, reject a new identity rather than growing memory or
+            # evicting an attacker into a fresh allowance.
+            expired = [
+                key
+                for key, values in store.items()
+                if not any(timestamp > cutoff for timestamp in values)
+            ]
+            for key in expired:
+                del store[key]
+            if len(store) >= BT_RATE_LIMIT_MAX_CLIENTS:
+                return False
+        timestamps = store[ip]
+        # Evict expired timestamps
+        store[ip] = [t for t in timestamps if t > cutoff]
+        if len(store[ip]) >= limit:
             return False
-        _rate_limit_store[ip].append(now)
+        store[ip].append(now)
         return True
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Return True if translation/API work should be admitted."""
+    return _check_window_rate_limit(_rate_limit_store, ip, RATE_LIMIT_MAX)
+
+
+def _check_auth_rate_limit(ip: str) -> bool:
+    """Bound credential attempts separately from expensive API work."""
+    return _check_window_rate_limit(
+        _auth_rate_limit_store, ip, BT_AUTH_RATE_LIMIT_PER_MINUTE
+    )
 
 
 # ── Metrics (M5) ────────────────────────────────────────────────────────────
@@ -550,22 +639,49 @@ def _translate_paragraphs(
 
 @app.before_request
 def before_request_hook():
-    """Attach request ID, check rate limit."""
+    """Attach request metadata, authenticate, then admit API work."""
     request.request_id = str(uuid.uuid4())
     request.start_time = time.monotonic()
 
-    # Optional shared-secret auth (skip preflight + health/ping so liveness
-    # probes always work. /stats stays under auth so cache contents aren't
-    # leakable on unauthenticated LANs.)
-    if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/ping"):
-        if not _token_matches(request.headers.get("X-BT-Token", ""), API_TOKEN):
-            return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
+    # Liveness/readiness and preflight stay independent of external auth so
+    # orchestration can diagnose an auth-authority outage. Everything else,
+    # including metrics and stats, receives a server-owned opaque subject.
+    protected = (
+        request.method != "OPTIONS"
+        and request.path not in ("/health", "/ready", "/ping")
+    )
+    if protected:
+        client_ip = _client_ip()
+        if not _check_auth_rate_limit(client_ip):
+            response = jsonify({
+                "error": "rate_limited",
+                "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+                "request_id": request.request_id,
+            })
+            response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
+            return response, 429
+        try:
+            identity = AUTHENTICATOR.authenticate(request.headers, request.remote_addr)
+        except AuthRejected:
+            log.warning("req=%s authentication rejected", request.request_id)
+            return jsonify({
+                "error": "unauthorized",
+                "request_id": request.request_id,
+            }), 401
+        except AuthUnavailable:
+            log.warning("req=%s authentication authority unavailable", request.request_id)
+            return jsonify({
+                "error": "authentication_unavailable",
+                "request_id": request.request_id,
+            }), 503
+        request.auth_subject = identity.subject
+        request.auth_roles = identity.roles
 
     # Rate limiting (H6) — exempt observability endpoints so operators can
     # monitor health/stats even while the per-client budget is exhausted.
     # /stats is in this set (not the auth set above) deliberately: it must
     # stay reachable during a rate-limit storm so the operator can see how
-    # badly things are going, but it still requires API_TOKEN if configured.
+    # badly things are going, but it still passes the selected auth authority.
     # Skip CORS preflights too: an OPTIONS would otherwise burn 2x budget per
     # real cross-origin request, and a 429 on a preflight surfaces as a cryptic
     # CORS error in the browser instead of a rate limit the frontend can honor.
@@ -603,6 +719,9 @@ def after_request_hook(response):
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         # Let cross-origin JS read the request ID and 429 Retry-After header.
         response.headers["Access-Control-Expose-Headers"] = "X-Request-ID, Retry-After"
+        response.vary.add("Origin")
+        if AUTHENTICATOR.mode == "cwa_session":
+            response.headers["Access-Control-Allow-Credentials"] = "true"
 
     return response
 
@@ -1054,8 +1173,8 @@ def cache_cleanup():
     (created_at < future date) and silently wipe the whole cache.
 
     Auth: always required. Two sources of truth for the token, in order:
-      1. BT_API_TOKEN env var (the recommended path; if set, this is the
-         only token accepted for the whole API)
+      1. BT_API_TOKEN env var (the recommended operator credential; in token
+         auth mode it is also the request credential)
       2. Auto-generated deployment token persisted in /app/data/cleanup_token
          (only consulted when BT_API_TOKEN is empty). The token is generated
          on first use with secrets.token_urlsafe and written to a file with
@@ -1193,8 +1312,8 @@ def _get_cleanup_token() -> str:
     """Return the active token for /cache/cleanup.
 
     Order:
-      1. If BT_API_TOKEN is set, use it (single source of truth for the
-         whole API's auth — consistent with the other endpoints).
+      1. If BT_API_TOKEN is set, use it as the operator credential. Token auth
+         mode also uses it for the general request boundary.
       2. Else, read or create /app/data/cleanup_token. Creation is serialized
          across threads and processes, then atomically persisted with mode
          0600. Subsequent calls reuse the in-process cached value.

@@ -12,10 +12,21 @@ public issue. You should get a first response within 7 days.
 
 ## Scope notes for self-hosters
 
-- The translation API is designed for LAN/behind-your-own-proxy use. If you
-  expose it beyond your LAN, set `BT_API_TOKEN` (shared secret), keep the
-  rate limits on, and prefer proxy-injection mode so the API is never
-  reachable except through your authenticated CWA domain.
+- The API fails startup by default unless an authentication authority is
+  configured. Use `cwa_session` in the recommended same-origin proxy topology,
+  or `forwarded` behind an identity proxy whose CIDR is allowlisted. `token` is
+  a shared-tenant compatibility mode; `disabled` is development-only.
+- In `forwarded` mode the identity proxy must strip incoming `X-BT-Subject` and
+  `X-BT-Roles` before setting trusted values. Never publish a bypass route to
+  the API. The bundled injection proxy strips these headers and cannot serve as
+  the trusted identity hop; route `/bt-api` directly through the identity
+  proxy. In `cwa_session` mode credentialed CORS permits exact configured
+  origins only; a private-subnet wildcard is deliberately ignored. The CWA
+  probe must target the exact authenticated `/ajax/emailstat` path and return a
+  bounded JSON task list. Browser requests omit cookies entirely in `token` and
+  `forwarded` modes.
 - The API never stores your provider API keys anywhere except the container
-  environment you configure; the SQLite cache contains only paragraph text
-  and translations.
+  environment you configure. Cache schema v2 stores translated results and
+  one-way source/scope hashes, not source paragraphs, raw identities, or CWA
+  cookies. Provider prompts still leave the host when a cloud provider is
+  configured; see the fallback/privacy warning in the configuration guide.

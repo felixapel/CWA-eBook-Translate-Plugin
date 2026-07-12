@@ -16,6 +16,12 @@ class ContainerContractTests(unittest.TestCase):
         self.assertNotIn('VOLUME ["/app/data"]', dockerfile)
         for obsolete in ("gosu", "shadow=", "linux-pam=", "chown -R"):
             self.assertNotIn(obsolete, dockerfile)
+        self.assertNotIn("COPY *.py", dockerfile)
+        for runtime_module in (
+            "auth.py", "cache.py", "server.py", "singleflight.py",
+            "translator.py", "work_budget.py",
+        ):
+            self.assertIn(runtime_module, dockerfile)
 
     def test_entrypoint_never_changes_ownership_or_escalates(self):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
@@ -52,6 +58,13 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn("BT_ROLE=api", compose)
         self.assertIn("BT_ROLE=proxy", compose)
         self.assertIn("BT_API_UPSTREAM=http://book-translator-api:8390", compose)
+        self.assertIn("BT_AUTH_MODE=cwa_session", compose)
+        self.assertIn("BT_CWA_AUTH_URL=http://calibre-web:8083/ajax/emailstat", compose)
+        self.assertIn("BT_ALLOW_PRIVATE_LAN=false", compose)
+        api_service = compose.split("  book-translator-api:", 1)[1].split(
+            "  book-translator-proxy:", 1
+        )[0]
+        self.assertIn("cwa-net:", api_service)
         self.assertGreaterEqual(compose.count("read_only: true"), 2)
         self.assertGreaterEqual(compose.count("no-new-privileges:true"), 2)
         self.assertGreaterEqual(compose.count("cap_drop:"), 2)
@@ -68,6 +81,8 @@ class ContainerContractTests(unittest.TestCase):
         for token in (
             "BT_ROLE=api",
             "BT_ROLE=proxy",
+            "BT_AUTH_MODE=token",
+            "BT_API_TOKEN=${SMOKE_TOKEN}",
             "--read-only",
             "--cap-drop ALL",
             "--security-opt no-new-privileges:true",
@@ -75,6 +90,19 @@ class ContainerContractTests(unittest.TestCase):
         ):
             self.assertIn(token, smoke)
         self.assertNotIn("gosu", smoke)
+
+    def test_image_auth_defaults_fail_closed_and_proxy_forwards_cwa_cookie(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
+        proxy = (ROOT / "proxy" / "nginx.conf.template").read_text()
+        self.assertNotRegex(dockerfile, r"(?m)^ENV BT_(?:API_TOKEN|AUTH_MODE)=")
+        self.assertIn('mode="${BT_AUTH_MODE:-token}"', entrypoint)
+        self.assertIn("validate_api_auth", entrypoint)
+        self.assertIn("BT_API_TOKEN is required", entrypoint)
+        self.assertIn("disabled auth requires BT_ALLOW_INSECURE_AUTH=true", entrypoint)
+        self.assertIn("proxy_set_header Cookie $http_cookie;", proxy)
+        self.assertIn('proxy_set_header X-BT-Subject "";', proxy)
+        self.assertIn('proxy_set_header X-BT-Roles "";', proxy)
 
     def test_unraid_helpers_preserve_the_non_root_sandbox(self):
         deploy = (ROOT / "deploy_unraid.sh").read_text()

@@ -21,11 +21,11 @@ os.environ["LLM_FALLBACK_MODEL"] = "fake-fallback"
 os.environ["LLM_FALLBACK_API_KEY"] = "x" * 20
 os.environ["BT_MAX_CONCURRENT"] = "2"
 os.environ["BT_BATCH_SIZE"] = "3"
-# BT_API_TOKEN is intentionally NOT set here. test_translation.py exercises
-# the *translate* endpoints (which are unauth'd when BT_API_TOKEN is empty —
-# matches the typical self-host use case), and the three /cache/cleanup
-# tests below pre-write /tmp/cleanup_token so the auto-gen path can be
-# exercised without a real env var.
+# Authentication is disabled explicitly only for this isolated unit suite.
+# Production defaults fail closed. The /cache/cleanup tests below still
+# exercise their independent destructive-operation credential.
+os.environ["BT_AUTH_MODE"] = "disabled"
+os.environ["BT_ALLOW_INSECURE_AUTH"] = "true"
 for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_PATH"] + "-shm"):
     try: os.remove(f)
     except OSError: pass
