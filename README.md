@@ -209,7 +209,7 @@ them):
 | `BT_OUTPUT_TOKEN_FLOOR` | `256` | Minimum `max_tokens` per request. |
 | `BT_CONTEXT_WINDOW` | `0` | Number of surrounding paragraphs included as a do-not-translate `[CONTEXT]` block in batch prompts. Set to `1` or `2` for context-aware translations. Improves literary quality but consumes more tokens per request. |
 | `BT_TIMEOUT` | `60` | Seconds before a single translation request is abandoned. Raise it if a slow local model times out on long paragraphs; lower it (with a smaller `BT_BATCH_SIZE`) if you'd rather fail fast under contention. |
-| `LLM_FALLBACK_PROVIDER` | | Optional. A secondary provider used automatically when the primary fails (e.g. `minimax` while `local` is slow/down). |
+| `LLM_FALLBACK_PROVIDER` | | Optional secondary provider. A `local` fallback may run automatically; every remote/cloud fallback is excluded from network calls, cache lookup, and singleflight unless the current API request includes `"allow_cloud_fallback": true`. |
 | `LLM_FALLBACK_MODEL` | | Model name for the fallback provider. |
 | `LLM_FALLBACK_API_KEY` | | API key for the fallback provider. |
 | `BT_API_TOKEN` | | Required when `BT_AUTH_MODE=token`; send it as `X-BT-Token`. This compatibility mode gives every caller one shared tenant and the secret is JavaScript-readable if placed in `window.BOOK_TRANSLATOR`, so prefer `cwa_session` or `forwarded`. It is also the operator credential for `/cache/cleanup` and `/health/deep`; without it those two routes use the private persisted cleanup token in `/app/data`. The proxy loader never reads a token from `localStorage`. |
@@ -219,7 +219,7 @@ them):
 | `BT_MAX_UPSTREAM_INFLIGHT` | `2` | Process-wide cap on simultaneous in-flight LLM calls across all readers. `BT_MAX_CONCURRENT` only bounds one batch request; this cap prevents multi-reader timeout cascades. Must be greater than zero. |
 | `BT_UPSTREAM_QUEUE_TIMEOUT` | `2` | Maximum seconds to wait for a global upstream slot. A full queue returns `503` with `Retry-After` without starting a provider call. |
 | `BT_SINGLEFLIGHT_MAX_ENTRIES` | `1024` | Process-wide bound on distinct active translation operations. Concurrent requests with the same tenant/book/chapter and exact prompt contract share one provider call; completed results are never retained here and must pass through the scoped SQLite cache. |
-| `BT_REQUEST_MAX_ATTEMPTS` | `20` | Maximum provider calls across groups, primary, and fallback for one API request. Batch groups use one attempt per provider, so the default exactly covers 50 paragraphs at batch size 5 when the primary fails and a healthy fallback succeeds. The single-text endpoint retains two attempts per provider. Attempts are reserved atomically before network I/O. |
+| `BT_REQUEST_MAX_ATTEMPTS` | `20` | Maximum provider calls across groups, primary, and an allowed fallback for one API request. With explicit cloud consent, batch groups use one attempt per provider, so the default exactly covers 50 paragraphs at batch size 5 when the primary fails and a healthy fallback succeeds. The single-text endpoint retains two attempts per provider. Attempts are reserved atomically before network I/O. |
 | `BT_REQUEST_MAX_INPUT_BYTES` | `5000000` | Maximum cumulative UTF-8 prompt bytes reserved across every provider attempt in one API request. The default covers two passes over the largest valid default batch, including four-byte Unicode and protocol overhead. |
 | `BT_REQUEST_MAX_OUTPUT_TOKENS` | `163840` | Maximum cumulative `max_tokens` reserved across every provider attempt in one API request, sized for the same bounded 20-call batch path. |
 | `BT_REQUEST_DEADLINE_SECONDS` | `90` | Absolute request-wide deadline. Once expired, no new provider attempt can start; individual provider timeouts are clamped to the remaining time. |
@@ -236,6 +236,15 @@ them):
 | `BT_CACHE_HARDEN_EXISTING_DIR` | `false` (`true` in image) | Change an existing cache directory to mode `0700`. New directories and all DB/WAL/SHM files are always created private; the container enables this fail-closed check. |
 | `DB_PATH` | `translations.db` | Path to the SQLite translation cache. In Docker this should point inside the `/app/data` volume (the provided Dockerfile/compose already set it to `/app/data/translations.db`) so the cache survives container recreation. |
 | `PORT` | `8390` | Port the API listens on. If you remap it, also update the `-p`/compose port mapping and any reverse-proxy route — `EXPOSE` in the Dockerfile is documentation only. |
+
+Remote fallback is an additive, fail-closed API contract. Both `POST /translate`
+and `POST /translate/batch` accept the optional JSON boolean
+`allow_cloud_fallback`; omission means `false`, and strings/numbers are
+rejected. The reader exposes an explicit privacy switch explaining that book
+text will leave the local deployment. That decision is kept only in the
+current book tab and is never restored from `localStorage`. Configuring a cloud
+provider as the **primary** provider is a separate operator decision and sends
+all normal translation requests to that provider.
 
 > **Why a single gunicorn worker?** Rate limiting, request metrics, and the health
 > cache are kept in process memory for simplicity. Running more than one worker

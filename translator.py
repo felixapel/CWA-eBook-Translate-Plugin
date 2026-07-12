@@ -1,8 +1,8 @@
 """
 book-translator — Unified Multi-provider translation
 Supports OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter, and Local LLMs.
-A primary provider plus an OPTIONAL fallback provider for resilience when a
-local LLM is slow or temporarily unavailable.
+A primary provider plus an OPTIONAL fallback provider for resilience. Remote
+fallback is used only with explicit consent on the current request.
 
 Batched translation: multiple paragraphs can be translated in a SINGLE LLM call
 (see BT_BATCH_SIZE) which is far faster on slow local models. Batched input and
@@ -40,7 +40,8 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "local").lower()
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemma4-12b")
 
-# Optional fallback provider — used automatically when the primary errors out.
+# Optional fallback provider. A local fallback may be used automatically; a
+# remote/cloud fallback requires explicit consent on the current request.
 LLM_FALLBACK_PROVIDER = os.environ.get("LLM_FALLBACK_PROVIDER", "").lower()
 LLM_FALLBACK_API_KEY = os.environ.get("LLM_FALLBACK_API_KEY", "")
 LLM_FALLBACK_MODEL = os.environ.get("LLM_FALLBACK_MODEL", "")
@@ -387,6 +388,11 @@ def _get_fallback() -> Optional[_Provider]:
         else:
             _fallback_provider = None
     return _fallback_provider
+
+
+def _is_cloud_provider(provider_name: str) -> bool:
+    """Return whether the named provider sends content outside local mode."""
+    return provider_name != "local"
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -762,8 +768,9 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
 
 def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
               timeout: Optional[int] = None, max_tokens: int = BT_MAX_TOKENS,
-              budget: Optional[WorkBudget] = None) -> tuple[str, str]:
-    """Run a completion through the primary provider, falling back to the secondary."""
+              budget: Optional[WorkBudget] = None, *,
+              allow_cloud_fallback: bool = False) -> tuple[str, str]:
+    """Run primary completion and only use a cloud fallback with consent."""
     if timeout is None:
         timeout = BT_TIMEOUT
     if budget is None:
@@ -771,7 +778,9 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
 
     providers = [_get_primary()]
     fb = _get_fallback()
-    if fb is not None:
+    if fb is not None and (
+        not _is_cloud_provider(fb.name) or allow_cloud_fallback
+    ):
         providers.append(fb)
 
     for p in providers:
@@ -807,10 +816,19 @@ def model_for_provider(provider_name: str) -> str:
     return LLM_MODEL
 
 
-def cache_lookup_backends() -> list[tuple[str, str]]:
-    """Configured provider/model identities to probe, in failover order."""
+def cache_lookup_backends(
+    *, allow_cloud_fallback: bool = False
+) -> list[tuple[str, str]]:
+    """Provider/model cache identities allowed by this request's policy."""
     backends = [(LLM_PROVIDER, LLM_MODEL)]
-    if LLM_FALLBACK_PROVIDER and LLM_FALLBACK_PROVIDER in PROVIDER_ENDPOINTS:
+    if (
+        LLM_FALLBACK_PROVIDER
+        and LLM_FALLBACK_PROVIDER in PROVIDER_ENDPOINTS
+        and (
+            not _is_cloud_provider(LLM_FALLBACK_PROVIDER)
+            or allow_cloud_fallback
+        )
+    ):
         fallback = (
             LLM_FALLBACK_PROVIDER,
             LLM_FALLBACK_MODEL or LLM_MODEL,
@@ -820,16 +838,18 @@ def cache_lookup_backends() -> list[tuple[str, str]]:
     return backends
 
 
-def cache_lookup_models() -> list[str]:
+def cache_lookup_models(*, allow_cloud_fallback: bool = False) -> list[str]:
     """Model keys to probe on cache lookup, primary first.
 
     When a fallback provider is configured, a paragraph translated during a
-    primary-provider outage lives under the fallback's model key; probing it
-    second means that work is never re-paid once the primary recovers, while
+    primary-provider outage lives under the fallback's model key. It is probed
+    second only when the current request's privacy policy permits that backend;
     primary-model entries still win when both exist.
     """
     models = []
-    for _provider, model in cache_lookup_backends():
+    for _provider, model in cache_lookup_backends(
+        allow_cloud_fallback=allow_cloud_fallback
+    ):
         if model not in models:
             models.append(model)
     return models
@@ -860,9 +880,13 @@ def _validate_operation_namespace(value: str) -> str:
     return value.strip()
 
 
-def _backend_operation_identity() -> list[tuple[str, str, str, str]]:
+def _backend_operation_identity(
+    *, allow_cloud_fallback: bool
+) -> list[tuple[str, str, str, str]]:
     identities = []
-    for provider, model in cache_lookup_backends():
+    for provider, model in cache_lookup_backends(
+        allow_cloud_fallback=allow_cloud_fallback
+    ):
         url, api_type = PROVIDER_ENDPOINTS[provider]
         identities.append((provider, model, url, api_type))
     return identities
@@ -876,13 +900,17 @@ def _single_operation_key(
     operation_namespace: str,
     max_retries: int,
     timeout: int,
+    allow_cloud_fallback: bool,
 ) -> str:
     contract = single_cache_contract(source_lang, target_lang)
     return _contract_hash([
         TRANSLATION_CONTRACT_VERSION,
         "singleflight-single",
         _validate_operation_namespace(operation_namespace),
-        _backend_operation_identity(),
+        _backend_operation_identity(
+            allow_cloud_fallback=allow_cloud_fallback
+        ),
+        allow_cloud_fallback,
         contract.prompt_hash,
         contract.protocol_version,
         contract.context_hash,
@@ -903,6 +931,7 @@ def translate_text(
     budget: Optional[WorkBudget] = None,
     *,
     operation_namespace: str = "legacy",
+    allow_cloud_fallback: bool = False,
 ) -> tuple[str, str]:
     """Translate a single text. Returns (translated_text, provider_name)."""
     if budget is None:
@@ -917,6 +946,7 @@ def translate_text(
         operation_namespace=operation_namespace,
         max_retries=max_retries,
         timeout=resolved_timeout,
+        allow_cloud_fallback=allow_cloud_fallback,
     )
     try:
         flight = _TRANSLATION_SINGLEFLIGHT.run(
@@ -928,6 +958,7 @@ def translate_text(
                 resolved_timeout,
                 _output_cap(text, BT_MAX_TOKENS),
                 budget,
+                allow_cloud_fallback=allow_cloud_fallback,
             ),
             timeout=budget.remaining_seconds(),
         )
@@ -1089,6 +1120,7 @@ def _translate_group_operation(
     target_lang: str,
     budget: WorkBudget,
     operation_namespace: str,
+    allow_cloud_fallback: bool,
 ) -> list[tuple[str, str]]:
     """
     Translate a group of paragraphs in ONE LLM call. A malformed protocol
@@ -1102,7 +1134,8 @@ def _translate_group_operation(
         return [translate_text(
             group_texts[0], source_lang, target_lang,
             max_retries=1, budget=budget,
-            operation_namespace=operation_namespace)]
+            operation_namespace=operation_namespace,
+            allow_cloud_fallback=allow_cloud_fallback)]
 
     segment_ids = []
     while len(segment_ids) < len(idxs):
@@ -1129,6 +1162,7 @@ def _translate_group_operation(
         max_retries=1,
         max_tokens=_output_cap(combined, BT_BATCH_MAX_TOKENS),
         budget=budget,
+        allow_cloud_fallback=allow_cloud_fallback,
     )
     parsed = _parse_segment_envelope(output, segment_ids)
     if parsed is None:
@@ -1142,6 +1176,7 @@ def _batch_operation_key(
     source_lang: str,
     target_lang: str,
     operation_namespace: str,
+    allow_cloud_fallback: bool,
 ) -> str:
     contract = batch_cache_contract(
         all_texts, idxs, source_lang, target_lang
@@ -1150,7 +1185,10 @@ def _batch_operation_key(
         TRANSLATION_CONTRACT_VERSION,
         "singleflight-batch",
         _validate_operation_namespace(operation_namespace),
-        _backend_operation_identity(),
+        _backend_operation_identity(
+            allow_cloud_fallback=allow_cloud_fallback
+        ),
+        allow_cloud_fallback,
         contract.prompt_hash,
         contract.protocol_version,
         contract.context_hash,
@@ -1167,6 +1205,7 @@ def _translate_group(
     target_lang: str,
     budget: WorkBudget,
     operation_namespace: str,
+    allow_cloud_fallback: bool,
 ) -> list[tuple[str, str]]:
     if len(idxs) == 1 and BT_CONTEXT_WINDOW == 0:
         return [translate_text(
@@ -1176,11 +1215,13 @@ def _translate_group(
             max_retries=1,
             budget=budget,
             operation_namespace=operation_namespace,
+            allow_cloud_fallback=allow_cloud_fallback,
         )]
 
     budget.ensure_active()
     key = _batch_operation_key(
-        all_texts, idxs, source_lang, target_lang, operation_namespace
+        all_texts, idxs, source_lang, target_lang, operation_namespace,
+        allow_cloud_fallback,
     )
     try:
         flight = _TRANSLATION_SINGLEFLIGHT.run(
@@ -1192,6 +1233,7 @@ def _translate_group(
                 target_lang,
                 budget,
                 operation_namespace,
+                allow_cloud_fallback,
             ),
             timeout=budget.remaining_seconds(),
         )
@@ -1212,6 +1254,7 @@ def translate_batch(
     *,
     selected_groups: Optional[list[list[int]]] = None,
     operation_namespace: str = "legacy",
+    allow_cloud_fallback: bool = False,
 ) -> list[tuple[str, str]]:
     """
     Translate multiple texts. Non-empty texts are grouped into batches of
@@ -1261,6 +1304,7 @@ def translate_batch(
                 target_lang,
                 budget,
                 operation_namespace,
+                allow_cloud_fallback,
             )
         except SegmentProtocolError as exc:
             # Publish the semantic failure before cancelling the shared budget.

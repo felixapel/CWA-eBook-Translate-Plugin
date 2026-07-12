@@ -124,6 +124,28 @@ class SingleFlightTests(unittest.TestCase):
 
 
 class TranslatorSingleFlightTests(unittest.TestCase):
+    def test_cloud_consent_is_part_of_singleflight_identity(self) -> None:
+        with mock.patch.object(translator, "LLM_FALLBACK_PROVIDER", "minimax"):
+            without_consent = translator._single_operation_key(
+                "private text",
+                "English",
+                "Spanish",
+                operation_namespace="tenant-book-chapter",
+                max_retries=1,
+                timeout=30,
+                allow_cloud_fallback=False,
+            )
+            with_consent = translator._single_operation_key(
+                "private text",
+                "English",
+                "Spanish",
+                operation_namespace="tenant-book-chapter",
+                max_retries=1,
+                timeout=30,
+                allow_cloud_fallback=True,
+            )
+        self.assertNotEqual(without_consent, with_consent)
+
     def test_default_retention_does_not_reuse_sequential_results(self) -> None:
         flights = SingleFlight(max_entries=16, result_ttl_seconds=0)
         with (

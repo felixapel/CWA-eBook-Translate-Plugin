@@ -58,6 +58,9 @@
 
     // UI / status state
     let prefetchEnabled = localStorage.getItem('bt_prefetch') !== '0'; // translate whole chapter ahead
+    // Privacy decision scoped to this reader tab/book. Never restore it from
+    // browser storage: every new book session starts with remote fallback off.
+    let allowCloudFallback = false;
     // Honest chapter progress: `chapterDone` counts paragraphs actually
     // processed this session (visible AND prefetch), `inflightCount` the ones
     // currently at the API. The displayed total is computed live as
@@ -188,6 +191,8 @@
             cached: 'Cached', cleared: 'Cache cleared',
             bookTranslator: 'Book Translator', modeLabel: 'Mode', langLabel: 'Language',
             retryPage: 'Retry current page', debug: 'Debug',
+            cloudFallback: 'Allow cloud fallback',
+            cloudPrivacy: 'Sends book text to the configured remote provider. Not saved; applies only to this book tab.',
             dbgQueue: 'Queue', dbgGen: 'Generation', dbgTrigger: 'Last trigger',
         },
         es: {
@@ -200,6 +205,8 @@
             cached: 'En caché', cleared: 'Caché borrada',
             bookTranslator: 'Book Translator', modeLabel: 'Modo', langLabel: 'Idioma',
             retryPage: 'Reintentar página actual', debug: 'Depuración',
+            cloudFallback: 'Permitir fallback cloud',
+            cloudPrivacy: 'Envía texto del libro al proveedor remoto configurado. No se guarda; solo aplica a esta pestaña del libro.',
             dbgQueue: 'Cola', dbgGen: 'Generación', dbgTrigger: 'Último disparo',
         },
         fr: {
@@ -479,6 +486,11 @@
                 `<span>${t.prefetchWhole}</span>` +
                 `<span class="bt-switch${prefetchEnabled ? ' bt-on' : ''}"></span>` +
             `</div>` +
+            `<button type="button" class="bt-menu-item" data-action="cloud-fallback" role="switch" aria-checked="${allowCloudFallback}">` +
+                `<span>${t.cloudFallback}</span>` +
+                `<span class="bt-switch${allowCloudFallback ? ' bt-on' : ''}" aria-hidden="true"></span>` +
+            `</button>` +
+            `<div class="bt-menu-note bt-menu-warning">${t.cloudPrivacy}</div>` +
             `<div class="bt-menu-item" data-action="retry"><span>↻ ${t.retryPage}</span></div>` +
             `<div class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></div>` +
             `<div class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></div>` +
@@ -495,6 +507,9 @@
                     localStorage.setItem('bt_prefetch', prefetchEnabled ? '1' : '0');
                     buildMenu();
                     if (prefetchEnabled && translationMode !== 'off') triggerPrefetch();
+                } else if (action === 'cloud-fallback') {
+                    allowCloudFallback = !allowCloudFallback;
+                    buildMenu();
                 } else if (action === 'retry') {
                     errorCount = 0;
                     failedParagraphs.clear();
@@ -863,7 +878,8 @@
                     source_lang: SOURCE_LANG,
                     target_lang: TARGET_LANG,
                     book_id: scope.book_id,
-                    chapter_id: scope.chapter_id
+                    chapter_id: scope.chapter_id,
+                    allow_cloud_fallback: allowCloudFallback
                 }),
                 signal: controller.signal,
             });

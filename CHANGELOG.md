@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON task-list response. The Unraid overlay helper is CWA-session-only, and
   token/forwarded browser requests omit CWA cookies. Its legacy direct-port
   topology also rejects HTTPS reader origins because its API route is HTTP-only.
+- Remote/cloud fallback is now fail-closed per request. The reader starts each
+  book tab opted out, shows an explicit data-export warning, never persists the
+  choice, and includes consent in cache and singleflight policy boundaries.
 - Both request limiters cap active client buckets and reject unseen identities
   under saturated cardinality instead of allowing source-IP churn to grow
   process memory without bound.

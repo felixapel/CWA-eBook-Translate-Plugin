@@ -70,10 +70,13 @@ def _cache_lookup(
     tenant: str = "legacy-anonymous",
     book_id: str = "unscoped",
     chapter_id: str = "unscoped",
+    allow_cloud_fallback: bool = False,
 ) -> str | None:
     """Probe exact single-translation contracts in provider failover order."""
     contract = single_cache_contract(source_lang, target_lang)
-    for provider, model in cache_lookup_backends():
+    for provider, model in cache_lookup_backends(
+        allow_cloud_fallback=allow_cloud_fallback
+    ):
         scope = _cache_scope(
             tenant=tenant,
             book_id=book_id,
@@ -189,6 +192,16 @@ def _request_cache_namespace(data: dict) -> tuple[str, str, str]:
             raise ValueError(f"'{field}' contains control characters")
         values.append(value)
     return tenant, values[0], values[1]
+
+
+def _cloud_fallback_consent(data: dict) -> bool:
+    """Validate the additive per-request privacy decision at the API edge."""
+    if "allow_cloud_fallback" not in data:
+        return False
+    consent = data["allow_cloud_fallback"]
+    if type(consent) is not bool:
+        raise ValueError("'allow_cloud_fallback' must be a boolean")
+    return consent
 
 # ── Language validation (H7) ────────────────────────────────────────────────
 # The selectable set mirrors Gemma 4's pre-training coverage (top-10 most
@@ -496,6 +509,7 @@ def _translate_paragraphs(
     tenant: str = "legacy-anonymous",
     book_id: str = "unscoped",
     chapter_id: str = "unscoped",
+    allow_cloud_fallback: bool = False,
 ) -> dict:
     """
     Shared helper for batch translation logic used by /translate/batch.
@@ -535,7 +549,9 @@ def _translate_paragraphs(
     for group in groups:
         contract = contracts[tuple(group)]
         accepted: list[tuple[int, str, CacheScope]] | None = None
-        for provider, model in cache_lookup_backends():
+        for provider, model in cache_lookup_backends(
+            allow_cloud_fallback=allow_cloud_fallback
+        ):
             candidate: list[tuple[int, str, CacheScope]] = []
             for index in group:
                 scope = _cache_scope(
@@ -589,6 +605,7 @@ def _translate_paragraphs(
             operation_namespace=_operation_namespace(
                 tenant, book_id, chapter_id
             ),
+            allow_cloud_fallback=allow_cloud_fallback,
         )
         for group in missing_groups:
             contract = contracts[tuple(group)]
@@ -871,7 +888,8 @@ def translate():
     POST body: {
         "text": "Hello world",
         "source_lang": "English",
-        "target_lang": "Spanish"
+        "target_lang": "Spanish",
+        "allow_cloud_fallback": false
     }
 
     Returns: {
@@ -903,6 +921,11 @@ def translate():
     lang_error = _validate_languages(source_lang, target_lang)
     if lang_error:
         return jsonify({"error": lang_error}), 400
+
+    try:
+        allow_cloud_fallback = _cloud_fallback_consent(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     try:
         tenant, book_id, chapter_id = _request_cache_namespace(data)
@@ -939,6 +962,7 @@ def translate():
         tenant=tenant,
         book_id=book_id,
         chapter_id=chapter_id,
+        allow_cloud_fallback=allow_cloud_fallback,
     )
     if cached is not None:
         _record_metric(0, hits=1, misses=0)
@@ -960,6 +984,7 @@ def translate():
             operation_namespace=_operation_namespace(
                 tenant, book_id, chapter_id
             ),
+            allow_cloud_fallback=allow_cloud_fallback,
         )
     except WorkBudgetExceeded as exc:
         elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -1028,7 +1053,8 @@ def translate_batch_endpoint():
     POST body: {
         "paragraphs": ["Paragraph 1", "Paragraph 2", ...],
         "source_lang": "English",
-        "target_lang": "Spanish"
+        "target_lang": "Spanish",
+        "allow_cloud_fallback": false
     }
 
     Returns: {
@@ -1083,6 +1109,11 @@ def translate_batch_endpoint():
         return jsonify({"error": lang_error}), 400
 
     try:
+        allow_cloud_fallback = _cloud_fallback_consent(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
         tenant, book_id, chapter_id = _request_cache_namespace(data)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -1121,6 +1152,7 @@ def translate_batch_endpoint():
             tenant=tenant,
             book_id=book_id,
             chapter_id=chapter_id,
+            allow_cloud_fallback=allow_cloud_fallback,
         )
     except WorkBudgetExceeded as exc:
         _record_metric(0, hits=0, misses=1, error=True)

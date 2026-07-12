@@ -80,6 +80,103 @@ class ProviderBudgetTests(unittest.TestCase):
         self.assertGreater(translator.BT_MAX_UPSTREAM_INFLIGHT, 0)
         self.assertIsNotNone(translator._UPSTREAM_SEM)
 
+    def test_remote_fallback_requires_explicit_consent(self):
+        calls = {"primary": 0, "fallback": 0}
+
+        class FallbackResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"content": [{"type": "text", "text": "traducido"}]}
+
+            def close(self):
+                return None
+
+        def primary_down_fallback_up(url, **_kwargs):
+            if "minimax" in url:
+                calls["fallback"] += 1
+                return FallbackResponse()
+            calls["primary"] += 1
+            raise translator.requests.exceptions.ConnectionError(
+                "synthetic primary outage")
+
+        translator.requests.post = primary_down_fallback_up
+        translator.time.sleep = lambda _seconds: None
+
+        with self.assertRaises(translator.ProviderUnavailableError):
+            translator.translate_text(
+                "private book text",
+                max_retries=1,
+                budget=self.budget(),
+            )
+        self.assertEqual(calls, {"primary": 1, "fallback": 0})
+        self.assertEqual(
+            translator.cache_lookup_backends(),
+            [("local", "fake-model")],
+        )
+
+        translated, provider = translator.translate_text(
+            "private book text",
+            max_retries=1,
+            budget=self.budget(),
+            allow_cloud_fallback=True,
+        )
+        self.assertEqual((translated, provider), ("traducido", "minimax"))
+        self.assertEqual(calls, {"primary": 2, "fallback": 1})
+        self.assertEqual(
+            translator.cache_lookup_backends(allow_cloud_fallback=True),
+            [("local", "fake-model"), ("minimax", "fake-fallback")],
+        )
+
+    def test_local_fallback_remains_available_without_cloud_consent(self):
+        translator.LLM_PROVIDER = "openai"
+        translator.LLM_MODEL = "remote-primary"
+        translator.LLM_FALLBACK_PROVIDER = "local"
+        translator.LLM_FALLBACK_MODEL = "private-fallback"
+        translator._primary_provider = None
+        translator._fallback_provider = "unset"
+        calls = {"primary": 0, "fallback": 0}
+
+        class LocalResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": "local result"}}]
+                }
+
+            def close(self):
+                return None
+
+        def remote_down_local_up(url, **_kwargs):
+            if url == translator.PROVIDER_ENDPOINTS["local"][0]:
+                calls["fallback"] += 1
+                return LocalResponse()
+            calls["primary"] += 1
+            raise translator.requests.exceptions.ConnectionError(
+                "synthetic remote outage")
+
+        translator.requests.post = remote_down_local_up
+        translator.time.sleep = lambda _seconds: None
+        result = translator.translate_text(
+            "book text", max_retries=1, budget=self.budget()
+        )
+
+        self.assertEqual(result, ("local result", "local"))
+        self.assertEqual(calls, {"primary": 1, "fallback": 1})
+        self.assertEqual(
+            translator.cache_lookup_backends(),
+            [("openai", "remote-primary"), ("local", "private-fallback")],
+        )
+
     def test_output_cap_never_exceeds_explicit_ceiling(self):
         original_floor = translator.BT_OUTPUT_TOKEN_FLOOR
         try:
@@ -451,7 +548,7 @@ class ProviderBudgetTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "queue")
         self.assertEqual(calls, 0)
 
-    def test_default_budget_serves_max_batch_via_healthy_fallback(self):
+    def test_default_budget_serves_max_batch_via_consented_healthy_fallback(self):
         calls = {"primary": 0, "fallback": 0}
 
         class FallbackResponse:
@@ -497,6 +594,7 @@ class ProviderBudgetTests(unittest.TestCase):
             [f"{i:02d}" + "🙂" * 7998 for i in range(50)],
             max_concurrent=2,
             budget=translator.create_work_budget(),
+            allow_cloud_fallback=True,
         )
 
         self.assertEqual(len(results), 50)

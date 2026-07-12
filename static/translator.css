@@ -258,8 +258,14 @@
     font-size: 13px;
 }
 .bt-menu-item:hover { background: rgba(255, 255, 255, 0.10); }
+button.bt-menu-item {
+    width: 100%; border: 0; color: inherit; background: transparent;
+    font: inherit; text-align: left;
+}
+button.bt-menu-item:focus-visible { outline: 2px solid var(--bt-bilingual); }
 .bt-menu-sep { height: 1px; margin: 4px 2px; background: rgba(255, 255, 255, 0.12); }
 .bt-menu-note { padding: 6px 10px; font-size: 11px; opacity: 0.65; }
+.bt-menu-warning { color: #ffdca8; opacity: 0.9; line-height: 1.35; }
 .bt-switch {
     width: 34px; height: 19px; border-radius: 10px; flex: 0 0 auto;
     background: rgba(255, 255, 255, 0.22); position: relative; transition: background 0.2s;
