@@ -12,7 +12,7 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # actions/setup-python only ships prebuilt interpreters for GitHub's
       # hosted Ubuntu images; in a minimal Gitea job container it fails with
       # "version '3.11' ... was not found for this operating system". Use the
@@ -61,13 +61,13 @@ jobs:
       - run: python3 -m py_compile server.py translator.py cache.py work_budget.py
       - run: python3 test_translation.py
       - run: python3 test_hardening.py
-      - run: python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_cleanup_token test_api_schema test_error_privacy
+      - run: python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_supply_chain_contract test_cleanup_token test_api_schema test_error_privacy
 
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
       - run: node -c static/translator.js
@@ -89,7 +89,7 @@ jobs:
       SMOKE_CONTAINER: bt-smoke-${{ github.run_id }}-${{ github.run_attempt }}
       SMOKE_IMAGE: bt-audit:${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Verify Docker daemon
         run: docker version
       - name: Build image

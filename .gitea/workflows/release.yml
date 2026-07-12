@@ -13,13 +13,13 @@ jobs:
       # Execute the validator from authoritative main, not from a candidate
       # tag that has not yet passed the ancestry and mirror checks.
       - name: Check out trusted release policy
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: main
           path: trusted
           fetch-depth: 1
       - name: Check out candidate tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ gitea.ref }}
           path: candidate
@@ -51,7 +51,7 @@ jobs:
     needs: preflight
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Set up Python
         run: |
           if ! command -v python3 >/dev/null 2>&1; then
@@ -77,14 +77,14 @@ jobs:
       - run: python3 -m py_compile server.py translator.py cache.py work_budget.py scripts/release_preflight.py scripts/release_image_tags.py
       - run: python3 test_translation.py
       - run: python3 test_hardening.py
-      - run: python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_cleanup_token test_api_schema test_error_privacy
+      - run: python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_supply_chain_contract test_cleanup_token test_api_schema test_error_privacy
 
   frontend:
     needs: preflight
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
       - run: node -c static/translator.js
@@ -100,7 +100,7 @@ jobs:
       SMOKE_CONTAINER: bt-release-smoke-${{ gitea.run_id }}-${{ gitea.run_attempt }}
       SMOKE_IMAGE: bt-release-audit:${{ gitea.run_id }}-${{ gitea.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Verify Docker daemon
         run: docker version
       - name: Build image
@@ -136,15 +136,15 @@ jobs:
     env:
       DOCKER_CONFIG: ${{ gitea.workspace }}/.docker-release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Isolate registry credentials
         run: |
           mkdir -p "$DOCKER_CONFIG"
           chmod 700 "$DOCKER_CONFIG"
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Ensure release tag renderer is available
         run: |
           if ! command -v python3 >/dev/null 2>&1; then
@@ -189,7 +189,7 @@ jobs:
             echo 'RELEASE_TAGS'
           } >> "$GITHUB_OUTPUT"
       - name: Build once and publish every registry tag
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
