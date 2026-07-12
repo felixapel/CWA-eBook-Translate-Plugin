@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from pathlib import Path
 
 os.environ["LLM_PROVIDER"] = "local"
 os.environ["LLM_MODEL"] = "fake-model"
@@ -14,6 +15,8 @@ os.environ.pop("BT_MAX_UPSTREAM_INFLIGHT", None)
 
 from work_budget import WorkBudget, WorkBudgetExceeded  # noqa: E402
 import translator  # noqa: E402
+
+ROOT = Path(__file__).parent
 
 
 class ProviderBudgetTests(unittest.TestCase):
@@ -129,6 +132,29 @@ class ProviderBudgetTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.reason, "queue")
         self.assertEqual(calls, 0)
+
+
+class DeploymentBudgetContractTests(unittest.TestCase):
+    def test_recommended_compose_pins_safe_budget_defaults(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        expected = {
+            "BT_MAX_UPSTREAM_INFLIGHT": "2",
+            "BT_UPSTREAM_QUEUE_TIMEOUT": "2",
+            "BT_REQUEST_MAX_ATTEMPTS": "20",
+            "BT_REQUEST_MAX_INPUT_BYTES": "2000000",
+            "BT_REQUEST_MAX_OUTPUT_TOKENS": "163840",
+            "BT_REQUEST_DEADLINE_SECONDS": "90",
+        }
+        for name, value in expected.items():
+            self.assertIn(f"- {name}={value}", compose)
+
+    def test_readme_and_unraid_template_do_not_document_unlimited_default(self):
+        readme = (ROOT / "README.md").read_text()
+        template = (ROOT / "my-book-translator-api.xml.tmpl").read_text()
+        self.assertIn("| `BT_MAX_UPSTREAM_INFLIGHT` | `2` |", readme)
+        self.assertNotIn("| `BT_MAX_UPSTREAM_INFLIGHT` | `0` |", readme)
+        self.assertIn('Target="BT_MAX_UPSTREAM_INFLIGHT" Default="2"', template)
+        self.assertNotIn("(0 = unlimited)", template)
 
 
 if __name__ == "__main__":
