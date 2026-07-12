@@ -15,7 +15,7 @@ from flask import Flask, request, jsonify
 
 from translator import (
     translate_text, translate_batch, check_backend_health,
-    LLM_MODEL, model_for_provider, cache_lookup_models,
+    LLM_MODEL, SegmentProtocolError, model_for_provider, cache_lookup_models,
 )
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
 
@@ -668,7 +668,16 @@ def translate_batch_endpoint():
             "request_id": req_id,
         })
 
-    result = _translate_paragraphs(paragraphs, source_lang, target_lang)
+    try:
+        result = _translate_paragraphs(paragraphs, source_lang, target_lang)
+    except SegmentProtocolError:
+        _record_metric(0, hits=0, misses=1, error=True)
+        log.warning("req=%s provider returned an invalid segment envelope",
+                    getattr(request, "request_id", None))
+        return jsonify({
+            "error": "invalid_provider_response",
+            "request_id": getattr(request, "request_id", None),
+        }), 502
     result["request_id"] = getattr(request, "request_id", None)
 
     _record_metric(result["total_elapsed_ms"], hits=result["cached_count"], misses=result["fresh_count"])
