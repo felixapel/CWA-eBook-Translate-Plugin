@@ -7,7 +7,8 @@
     "doc": "docs"
   },
   "scripts": {
-    "test": "node test_frontend.js"
+    "test": "node test_frontend.js",
+    "test:e2e": "playwright test"
   },
   "repository": {
     "type": "git",
@@ -22,6 +23,7 @@
   "author": "Felix",
   "license": "GPL-3.0-only",
   "devDependencies": {
+    "@playwright/test": "1.61.1",
     "jsdom": "^29.1.1"
   },
   "bugs": {
