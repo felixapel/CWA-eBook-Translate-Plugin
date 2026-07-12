@@ -311,6 +311,27 @@ def run():
     check("H6: backward compat: cached_count still present",
           "cached_count" in r1 and "fresh_count" in r1)
 
+    # ─────────────────────────────────────────────────────────────────────
+    # H7: malformed JSON shapes fail closed with a stable JSON 400
+    # ────────────────────────────────────────────────────────────────────
+    malformed_cases = [
+        ("/translate", ["text"], "single: top-level array"),
+        ("/translate/batch", ["paragraphs"], "batch: top-level array"),
+        ("/translate", {"text": "hello", "source_lang": []},
+         "single: source_lang must be a string"),
+        ("/translate", {"text": "hello", "target_lang": 7},
+         "single: target_lang must be a string"),
+        ("/translate/batch", {"paragraphs": ["hello"], "source_lang": {}},
+         "batch: source_lang must be a string"),
+    ]
+    for endpoint, payload, label in malformed_cases:
+        response = client.post(endpoint, json=payload)
+        body = response.get_json(silent=True)
+        check(f"JSON schema: {label} returns 400 JSON",
+              response.status_code == 400
+              and isinstance(body, dict)
+              and isinstance(body.get("error"), str))
+
 
 if __name__ == "__main__":
     run()

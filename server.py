@@ -127,6 +127,9 @@ VALID_LANGUAGES = {
 
 def _validate_languages(source_lang: str, target_lang: str):
     """Return error string if languages are invalid, else None."""
+    if not isinstance(source_lang, str) or not isinstance(target_lang, str):
+        return "'source_lang' and 'target_lang' must be strings"
+
     invalid = []
     if source_lang not in VALID_LANGUAGES:
         invalid.append(f"source_lang '{source_lang}'")
@@ -514,7 +517,9 @@ def translate():
         "request_id": "uuid"
     }
     """
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
     if "text" not in data or not isinstance(data["text"], str):
         return jsonify({"error": "Missing or invalid 'text' field"}), 400
 
@@ -617,7 +622,9 @@ def translate_batch_endpoint():
     operators confirm a request is hitting the backend they expect (e.g.
     that a fallback provider was used when the local one was down).
     """
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
     if "paragraphs" not in data or not isinstance(data["paragraphs"], list):
         return jsonify({"error": "Missing or invalid 'paragraphs' field"}), 400
 
