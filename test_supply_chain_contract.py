@@ -44,18 +44,11 @@ APK_PACKAGES = {
     "gettext": "1.0-r0",
     "gettext-envsubst": "1.0-r0",
     "gettext-libs": "1.0-r0",
-    "gosu": "1.19-r4",
-    "libbsd": "0.12.2-r0",
     "libgomp": "15.2.0-r5",
-    "libmd": "1.2.0-r0",
     "libunistring": "1.4.2-r0",
     "libxml2": "2.13.9-r2",
-    "linux-pam": "1.7.1-r2",
     "nginx": "1.30.3-r0",
     "pcre2": "10.47-r1",
-    "shadow": "4.18.0-r1",
-    "skalibs-libs": "2.15.0.0-r0",
-    "utmps-libs": "0.1.3.3-r0",
 }
 
 USES_LINE = re.compile(

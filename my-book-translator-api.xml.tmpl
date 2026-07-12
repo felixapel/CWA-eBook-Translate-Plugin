@@ -5,7 +5,8 @@
   <Network>bridge</Network>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Overview>Backend API for the Calibre-Web-Automated Book Translator plugin. Built locally — no published registry image. Run install_unraid.sh (or `docker build -t local/book-translator-api:latest .` from the repo) before deploying this container.</Overview>
+  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 --cap-drop=ALL --security-opt=no-new-privileges:true -e BT_ROLE=api</ExtraParams>
+  <Overview>Non-root backend API for the Calibre-Web-Automated Book Translator plugin. The database bind mount must be writable by uid 101 gid 102.</Overview>
   <Category>Tools:Utilities</Category>
   <Config Name="Appdata (Database)" Target="/app/data" Default="/mnt/user/appdata/book-translator-api/data" Mode="rw" Description="Holds translations.db SQLite database" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/book-translator-api/data</Config>
   <Config Name="Port" Target="8390" Default="8390" Mode="tcp" Description="API Port" Type="Port" Display="always" Required="true" Mask="false">8390</Config>

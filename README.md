@@ -32,15 +32,16 @@ lower-resource tier better — switch `LLM_PROVIDER` if a language matters to yo
 
 ## 🚀 Installation
 
-### Recommended: proxy-injection mode (one extra container, stock CWA)
+### Recommended: proxy-injection mode (isolated API and proxy roles)
 
-The translator container sits in front of CWA and injects the overlay into
-reader pages on the fly. Your CWA container stays completely untouched.
+Two non-root containers run the same translator image. The proxy sits in front
+of CWA and injects the overlay; the private API owns translation and cache
+state. Your CWA container stays completely untouched.
 
 ```text
-Browser ──► book-translator (:8084) ──► Calibre-Web-Automated (:8083, stock)
+Browser ──► book-translator-proxy (:8084) ──► CWA (:8083, stock)
                  │ injects overlay on /read/ pages
-                 └─ /bt-api → translation API (same origin, no CORS)
+                 └─ /bt-api → book-translator-api (:8390, private)
 ```
 
 ```bash
@@ -54,22 +55,14 @@ Then read your library at **`http://<host>:8084`** — the translator control
 bar appears in the ebook reader. That's the whole install. The compose file
 pulls the prebuilt multi-arch image
 (`ghcr.io/felixapel/cwa-ebook-translate-plugin`, amd64 + arm64) — no build
-step needed.
+step needed. For an unattended production deployment, replace `latest` in the
+Compose file with the immutable digest reported by the release workflow.
 
-Already have CWA running? Add just the translator service to your existing
-compose file and point `CWA_UPSTREAM` at your CWA container/host:
-
-```yaml
-  book-translator:
-    image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
-    environment:
-      - CWA_UPSTREAM=http://calibre-web-automated:8083
-      - BT_LOCAL_URL=http://host.docker.internal:11434/v1/chat/completions
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    volumes: ["./config/translator:/app/data"]
-    ports: ["8084:8080"]   # read CWA (with overlay) here — any free port works
-    restart: unless-stopped
-```
+Already have CWA running? Copy the `book-translator-api` and
+`book-translator-proxy` services plus their private network and named volume
+from [`docker-compose.yml`](docker-compose.yml), then point `CWA_UPSTREAM` at
+your existing CWA service. Keep the two roles separate in production; the
+legacy combined mode exists only for upgrade compatibility.
 
 > Removing the plugin = stop reading through the proxy port. Nothing in your
 > CWA install was modified.
@@ -175,11 +168,14 @@ If cold translations feel slow, see `BT_BATCH_SIZE`, `BT_OUTPUT_TOKEN_FACTOR`, a
 
 ## ⚙️ Configuration
 
-Environment variables for the `book-translator` container:
+Environment variables for the translator image (set them on the role that uses
+them):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CWA_UPSTREAM` | | **Enables proxy-injection mode.** URL of your CWA instance (e.g. `http://calibre-web-automated:8083`). When set, the container also serves CWA with the overlay injected on port `BT_PROXY_PORT`. Unset = API-only (bind-mount installs). |
+| `BT_ROLE` | `auto` | Runtime role: `api`, `proxy`, or compatibility-only `all`. `auto` selects `api` without `CWA_UPSTREAM` and `all` when it is present. The reference Compose file sets roles explicitly. |
+| `CWA_UPSTREAM` | | Required by the proxy role. URL of the stock CWA instance (e.g. `http://calibre-web:8083`). |
+| `BT_API_UPSTREAM` | `http://127.0.0.1:$PORT` | Translation API URL used by the proxy role. The split Compose topology sets `http://book-translator-api:8390`. |
 | `BT_PROXY_PORT` | `8080` | Container port for the injection proxy (proxy mode only). |
 | `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
 | `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
@@ -210,7 +206,7 @@ Environment variables for the `book-translator` container:
 | `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max requests per client IP per 60s window before the API returns `429`. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | Seconds reported in the `Retry-After` header / response body on a `429`. The frontend reads this and backs off automatically. |
 | `BT_TRUST_PROXY` | `false` | **Legacy/dev only.** When `true`, the API uses the **last** `X-Forwarded-For` hop from any peer as the rate-limit key. A client that can reach the API directly can still spoof this header, so don't rely on it in production — prefer `BT_TRUSTED_PROXIES` below. |
-| `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** rate-limit-key source. Comma-separated CIDRs/IPs of the *peer* (the actual socket source) allowed to set `X-Forwarded-For`. When the peer is in this list, the **last** XFF hop is used as the rate-limit key — the address your trusted proxy appended, which a client cannot forge (a forged first hop just gets the real one appended after it); otherwise the peer is used. Example: `127.0.0.1/32,::1/128` for a local nginx, or `10.0.0.0/8` for a private-network reverse proxy. **In proxy-injection mode the entrypoint defaults this to `127.0.0.1/32`** so per-client limiting works out of the box behind the in-container nginx. |
+| `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** rate-limit-key source. Comma-separated CIDRs/IPs of peers allowed to set `X-Forwarded-For`. The reference Compose network gives the proxy a fixed address and trusts only that `/32`. Combined compatibility mode defaults to loopback. |
 | `BT_ALLOWED_ORIGINS` | `http://localhost:8083,http://localhost:8383` | Comma-separated exact origins allowed for CORS (bind-mount installs; irrelevant in proxy mode, which is same-origin). Add your public reader URL here, e.g. `https://books.example.com`. |
 | `BT_ALLOW_PRIVATE_LAN` | `true` | Additionally allow localhost/RFC1918 origins (`10.*`, `192.168.*`, `172.16-31.*`) on any port — the common self-hosted case. Set `false` to allow only `BT_ALLOWED_ORIGINS`. |
 | `BT_CACHE_MAX_ENTRIES` | `0` | Optional hard cap on cached translations (`0` = unlimited). When exceeded, the oldest entries are evicted. |
@@ -229,24 +225,22 @@ Environment variables for the `book-translator` container:
 ## 🏗️ Architecture
 
 ```text
-                       book-translator container
-                 ┌───────────────────────────────────────┐
-Browser ────────►│ nginx (:8080, proxy mode only)        │      ┌──────────────────────┐
-  reads library  │  ├─ /bt-api/*    → gunicorn (below)   │─────►│ CWA (:8083, stock)   │
-  through :8084  │  ├─ /bt-static/* → overlay js/css     │      │ untouched image      │
-                 │  └─ /*           → CWA + injected tag │      └──────────────────────┘
-                 │                                       │
-                 │ gunicorn (:8390, always on)           │      ┌──────────────────────┐
-                 │  ├─ POST /translate, /translate/batch │─────►│ Providers: local,    │
-                 │  ├─ GET  /ping /health /health/deep   │      │ OpenAI, Anthropic,   │
-                 │  ├─ GET  /metrics /stats              │      │ Gemini, Groq, ...    │
-                 │  └─ SQLite cache (/app/data)          │      └──────────────────────┘
-                 └───────────────────────────────────────┘
+Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
+                │
+                ├─ /bt-static/* → overlay js/css
+                └─ /bt-api/* ──► API role (:8390) ──► providers
+                                         │
+                                         └─ SQLite cache (/app/data)
 ```
 
 In bind-mount installs nginx never starts; the overlay files are mounted into
 CWA and call the API on `:8390` directly (CORS applies — see
 `BT_ALLOWED_ORIGINS`).
+
+Both image roles declare `appuser` (`101:102`), run with zero capabilities, and
+support a read-only root filesystem. If you replace the Compose named volume
+with a host bind mount, create it with ownership `101:102`; runtime ownership
+repair was intentionally removed.
 
 `/ping` is liveness-only and `/health` plus `/ready` are shallow readiness
 checks; none contacts an LLM. The provider-backed `/health/deep` endpoint is

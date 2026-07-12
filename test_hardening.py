@@ -275,7 +275,7 @@ def run():
     # imports server.py. Import-time configuration set later is ineffective.
     entrypoint = (Path(__file__).parent / "docker-entrypoint.sh").read_text()
     trust_export = entrypoint.find('export BT_TRUSTED_PROXIES=')
-    gunicorn_start = entrypoint.find('gosu appuser gunicorn')
+    gunicorn_start = entrypoint.find('exec gunicorn --bind')
     check("entrypoint: trusted proxy config is exported before Gunicorn",
           trust_export >= 0 and gunicorn_start >= 0 and trust_export < gunicorn_start)
 

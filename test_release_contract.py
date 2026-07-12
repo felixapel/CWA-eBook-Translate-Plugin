@@ -340,7 +340,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "npm test",
             "docker version",
             'docker build -t "$SMOKE_IMAGE" .',
-            "http://127.0.0.1:${PROXY_PORT}/bt-api/ping",
+            './scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
         ):
             self.assertIn(command, workflow)
 
