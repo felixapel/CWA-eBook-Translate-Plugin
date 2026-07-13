@@ -60,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A production-readiness record maps every 2026-07-12 audit finding to its
+  repository control, reproducible acceptance gate, historical exception, or
+  operator-owned Gitea/release prerequisite.
 - A required real-Chromium E2E gate verifies reader-route loader isolation,
   DOM rendering, API payloads, explicit cloud consent, console/network health,
   screenshots, and the accessibility tree in both CI and release workflows.
