@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Run this from inside a clone of the repo (it copies the overlay files that
 # live alongside this script — it does not download anything from the network).
-set -e
+set -euo pipefail
 
 echo "=========================================================="
 echo "   📖 Calibre-Web-Automated Book Translator Installer"
@@ -18,7 +18,7 @@ for f in "$SCRIPT_DIR/overlay/read.html" "$SCRIPT_DIR/static/translator.js" "$SC
 done
 
 # 1. Ask for CWA appdata path
-read -p "Enter your Calibre-Web-Automated appdata path [default: /mnt/user/appdata/calibre-web-automated]: " CWA_PATH
+read -r -p "Enter your Calibre-Web-Automated appdata path [default: /mnt/user/appdata/calibre-web-automated]: " CWA_PATH
 CWA_PATH=${CWA_PATH:-/mnt/user/appdata/calibre-web-automated}
 
 if [ ! -d "$CWA_PATH" ]; then
@@ -27,13 +27,13 @@ if [ ! -d "$CWA_PATH" ]; then
 fi
 
 echo "✅ Using CWA path: $CWA_PATH"
-mkdir -p "$CWA_PATH/overlay"
+mkdir -p -- "$CWA_PATH/overlay"
 
 # 2. Copy overlay files from this checkout
 echo "📥 Copying frontend plugin files..."
-cp "$SCRIPT_DIR/overlay/read.html" "$CWA_PATH/overlay/read.html"
-cp "$SCRIPT_DIR/static/translator.js" "$CWA_PATH/overlay/translator.js"
-cp "$SCRIPT_DIR/static/translator.css" "$CWA_PATH/overlay/translator.css"
+cp -- "$SCRIPT_DIR/overlay/read.html" "$CWA_PATH/overlay/read.html"
+cp -- "$SCRIPT_DIR/static/translator.js" "$CWA_PATH/overlay/translator.js"
+cp -- "$SCRIPT_DIR/static/translator.css" "$CWA_PATH/overlay/translator.css"
 
 # 3. Pull the published multi-arch image (build locally only if you want to
 #    hack on the backend: docker build -t ghcr.io/felixapel/cwa-ebook-translate-plugin:latest .)
@@ -51,8 +51,8 @@ fi
 #    lives at github.com/felixapel/unraid-templates).
 echo "📥 Installing Unraid Docker Template for Translator API..."
 TEMPLATE_DIR="/boot/config/plugins/dockerMan/templates-user"
-mkdir -p "$TEMPLATE_DIR"
-cp "$SCRIPT_DIR/my-book-translator-api.xml.tmpl" "$TEMPLATE_DIR/my-book-translator-api.xml"
+mkdir -p -- "$TEMPLATE_DIR"
+cp -- "$SCRIPT_DIR/my-book-translator-api.xml.tmpl" "$TEMPLATE_DIR/my-book-translator-api.xml"
 
 echo "=========================================================="
 echo "🎉 Installation almost complete!"

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Dependency audit — runs `pip-audit` against requirements.txt and
-# `npm audit` against package.json + lockfile. Used by CI; can be run
-# locally before pushing.
+# Dependency audit against the same complete locks enforced by CI.
 #
 # Exit code: 0 = clean, non-zero = vulnerabilities found.
 #
@@ -12,16 +10,12 @@ cd "$(dirname "$0")/.."
 
 echo "==> Python (pip-audit on requirements.txt)"
 if command -v pip-audit >/dev/null 2>&1; then
-    pip-audit -r requirements.txt --strict
+    pip-audit -r requirements.txt --strict --disable-pip --no-deps
 else
-    echo "pip-audit not installed; install with: pip install pip-audit"
+    echo "pip-audit not installed; install requirements-audit.txt with --require-hashes"
     exit 2
 fi
 
 echo
 echo "==> Frontend (npm audit on package.json + package-lock.json)"
-if [ -f package-lock.json ]; then
-    npm audit --omit=dev
-else
-    echo "no package-lock.json; skipping"
-fi
+npm audit --audit-level=high

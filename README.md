@@ -254,6 +254,11 @@ operator-only and uses the same request budget and global provider gate as a
 translation. Authenticate it with `X-BT-Token`: this is `BT_API_TOKEN` when
 configured, otherwise the persisted `/app/data/cleanup_token` value.
 
+Release operators should follow the [Gitea-authoritative release
+runbook](docs/RELEASE.md); GitHub is a mirror and does not publish images.
+See the [architecture overview](docs/ARCHITECTURE.md) for component details and
+accepted architecture decision records.
+
 ## ❤️ Support the project
 
 CWA eBook Translate is free, GPL-licensed, and has no telemetry, ads, or
