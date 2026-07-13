@@ -127,11 +127,11 @@ test "$(git describe --tags --exact-match)" = "v2.2.0"
 # Stop the only writer and snapshot every private data file before the first
 # v2.2.0 start. Keep this directory through the rollback window.
 docker stop book-translator-api
-BACKUP_DIR="/mnt/user/appdata/book-translator-api/backups/pre-v2.2.0-app-data"
+BACKUP_DIR="/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data"
 test ! -e "$BACKUP_DIR"
 install -d -m 0700 -- "$BACKUP_DIR"
 cp -a -- /mnt/user/appdata/book-translator-api/data/. "$BACKUP_DIR/"
-python3 -c 'import sqlite3; db=sqlite3.connect("file:/mnt/user/appdata/book-translator-api/backups/pre-v2.2.0-app-data/translations.db?mode=ro", uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
+python3 -c 'import sqlite3; db=sqlite3.connect("file:/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data/translations.db?mode=ro&immutable=1", uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
 
 # Rebuild the image
 docker build -t local/book-translator-api:latest .

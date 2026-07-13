@@ -55,5 +55,8 @@ provide the required rollback boundary inside the existing private database.
   `translations_v2`.
 - Cache files still require an offline snapshot before upgrade to protect
   against storage, operator, or unrelated migration failures.
+- The reference v2.1.4 Compose bind mount must be copied offline into the v2.2
+  named volume. The untouched bind, external snapshot, and stopped old
+  container remain the rollback authority until the operator accepts v2.2.
 - The compatibility contract must exercise v1 → v2 → v1 → v2 and SQLite
   integrity, including the unreleased draft layout.

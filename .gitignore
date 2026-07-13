@@ -22,6 +22,7 @@ blob-report/
 *.db-journal
 *.db-wal
 *.db-shm
+backups/
 
 # Secrets — never commit API keys or credentials.
 .env

@@ -63,7 +63,10 @@ authenticated `/ajax/emailstat` probe and remains unpublished to the host.
 The Compose file builds the exact checked-out source into the local
 `cwa-ebook-translate-plugin:local` image. Official releases are verified source
 tags, so installation needs no container-registry account, package token, or
-signing key. To upgrade, check out the new release tag and run the same command.
+signing key. A fresh install can check out a new tag and rerun the command.
+Upgrading the reference v2.1.4 Compose deployment requires the one-time
+[combined-to-split data migration](docs/RELEASE.md#upgrade-the-reference-compose-deployment-from-v214)
+before v2.2.0 starts.
 
 Already have CWA running? Copy the `book-translator-api` and
 `book-translator-proxy` services plus their private network and named volume
