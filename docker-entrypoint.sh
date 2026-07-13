@@ -89,7 +89,11 @@ configure_proxy() {
     fi
     BT_API_UPSTREAM="${BT_API_UPSTREAM:-http://127.0.0.1:${PORT}}"
     BT_CWA_MAX_BODY_SIZE="${BT_CWA_MAX_BODY_SIZE:-2g}"
-    export BT_API_UPSTREAM BT_CWA_MAX_BODY_SIZE
+    # CWA's configurable reverse-proxy login header is an authentication
+    # credential. The injection proxy is not an identity authority, so it
+    # always removes that client-supplied header before forwarding to CWA.
+    BT_CWA_IDENTITY_HEADER="${BT_CWA_IDENTITY_HEADER:-Remote-User}"
+    export BT_API_UPSTREAM BT_CWA_MAX_BODY_SIZE BT_CWA_IDENTITY_HEADER
 
     mkdir -p \
         /tmp/nginx/client_temp \

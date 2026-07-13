@@ -28,6 +28,7 @@ class ProxyConfigRendererTests(unittest.TestCase):
             "BT_UI_VERSION": "2.1.4",
             "BT_PUBLIC_ORIGIN": "https://books.example.test:8443",
             "BT_CWA_MAX_BODY_SIZE": "2g",
+            "BT_CWA_IDENTITY_HEADER": "Remote-User",
         })
         for name, value in (overrides or {}).items():
             if value is None:
@@ -56,6 +57,7 @@ class ProxyConfigRendererTests(unittest.TestCase):
         self.assertIn("listen 8080;", rendered)
         self.assertIn("proxy_pass http://calibre-web:8083;", rendered)
         self.assertIn("proxy_pass http://book-translator-api:8390/;", rendered)
+        self.assertIn('proxy_set_header Remote-User "";', rendered)
         self.assertNotIn("$http_x_forwarded_proto", rendered)
         self.assertNotRegex(rendered, r"\$\{(?:BT_|CWA_)")
         self.assertEqual(output.stat().st_mode & 0o777, 0o600)
@@ -107,6 +109,8 @@ class ProxyConfigRendererTests(unittest.TestCase):
             ("BT_CWA_MAX_BODY_SIZE", "2g; include /tmp/evil"),
             ("BT_UI_VERSION", "../../secret"),
             ("BT_UI_VERSION", "v1\nscript"),
+            ("BT_CWA_IDENTITY_HEADER", "Remote_User"),
+            ("BT_CWA_IDENTITY_HEADER", "Remote-User; include"),
         )
         for name, value in cases:
             with self.subTest(name=name, value=value):

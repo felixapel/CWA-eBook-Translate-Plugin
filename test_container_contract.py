@@ -75,6 +75,8 @@ class ContainerContractTests(unittest.TestCase):
         self.assertNotIn("envsubst", entrypoint)
         self.assertIn("BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:-http://localhost:8084}", compose)
         self.assertIn("BT_CWA_MAX_BODY_SIZE=${BT_CWA_MAX_BODY_SIZE:-2g}", compose)
+        self.assertIn("BT_CWA_IDENTITY_HEADER=${BT_CWA_IDENTITY_HEADER:-Remote-User}", compose)
+        self.assertIn('proxy_set_header ${BT_CWA_IDENTITY_HEADER} "";', template)
         self.assertIn("BT_PUBLIC_ORIGIN=https://books.example.test:8443", smoke)
 
     def test_compose_recommends_independent_hardened_roles(self):
@@ -83,7 +85,10 @@ class ContainerContractTests(unittest.TestCase):
         self.assertRegex(compose, r"(?m)^  book-translator-proxy:$")
         self.assertIn("BT_ROLE=api", compose)
         self.assertIn("BT_ROLE=proxy", compose)
-        self.assertIn("BT_API_UPSTREAM=http://book-translator-api:8390", compose)
+        self.assertIn("BT_API_UPSTREAM=http://translator-api:8390", compose)
+        self.assertIn("- translator-api", compose)
+        self.assertIn("BT_TRUSTED_PROXIES=172.30.39.3/32", compose)
+        self.assertIn("- subnet: 172.30.39.0/24", compose)
         self.assertIn("BT_AUTH_MODE=cwa_session", compose)
         self.assertIn("BT_CWA_AUTH_URL=http://calibre-web:8083/ajax/emailstat", compose)
         self.assertIn("BT_ALLOW_PRIVATE_LAN=false", compose)
@@ -127,6 +132,7 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn("BT_API_TOKEN is required", entrypoint)
         self.assertIn("disabled auth requires BT_ALLOW_INSECURE_AUTH=true", entrypoint)
         self.assertIn("proxy_set_header Cookie $http_cookie;", proxy)
+        self.assertIn('proxy_set_header ${BT_CWA_IDENTITY_HEADER} "";', proxy)
         self.assertIn('proxy_set_header X-BT-Subject "";', proxy)
         self.assertIn('proxy_set_header X-BT-Roles "";', proxy)
 

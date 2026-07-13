@@ -75,18 +75,26 @@ services:
       cwa-net:
       translator-net:
         ipv4_address: 172.30.39.2
+        # Network-scoped alias: the proxy must reach the API through this
+        # fixed-address network, not nondeterministically through cwa-net.
+        aliases:
+          - translator-api
 
   book-translator-proxy:
     image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
     environment:
       - BT_ROLE=proxy
       - CWA_UPSTREAM=http://calibre-web:8083
-      - BT_API_UPSTREAM=http://book-translator-api:8390
+      - BT_API_UPSTREAM=http://translator-api:8390
       # Fixed public authority forwarded to CWA/API. Override with the exact
       # HTTPS origin when this service is behind SWAG/Traefik/NPM/Cloudflare.
       - BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:-http://localhost:8084}
       # Finite CWA upload limit; API requests keep their separate 3 MiB cap.
       - BT_CWA_MAX_BODY_SIZE=${BT_CWA_MAX_BODY_SIZE:-2g}
+      # Must match CWA's "Reverse Proxy Header Name" if that feature is
+      # enabled. The injection proxy strips it because it is not an identity
+      # authority and is directly browser-facing in this topology.
+      - BT_CWA_IDENTITY_HEADER=${BT_CWA_IDENTITY_HEADER:-Remote-User}
     ports:
       - "8084:8080"
     read_only: true

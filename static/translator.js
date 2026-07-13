@@ -192,7 +192,7 @@
             bookTranslator: 'Book Translator', modeLabel: 'Mode', langLabel: 'Language',
             retryPage: 'Retry current page', debug: 'Debug',
             cloudFallback: 'Allow cloud fallback',
-            cloudPrivacy: 'Sends book text to the configured remote provider. Not saved; applies only to this book tab.',
+            cloudPrivacy: 'Sends book text to the configured remote provider. This choice is not saved and applies only to this book tab.',
             dbgQueue: 'Queue', dbgGen: 'Generation', dbgTrigger: 'Last trigger',
         },
         es: {
@@ -206,7 +206,7 @@
             bookTranslator: 'Book Translator', modeLabel: 'Modo', langLabel: 'Idioma',
             retryPage: 'Reintentar página actual', debug: 'Depuración',
             cloudFallback: 'Permitir fallback cloud',
-            cloudPrivacy: 'Envía texto del libro al proveedor remoto configurado. No se guarda; solo aplica a esta pestaña del libro.',
+            cloudPrivacy: 'Envía texto del libro al proveedor remoto configurado. Esta elección no se guarda y solo aplica a esta pestaña del libro.',
             dbgQueue: 'Cola', dbgGen: 'Generación', dbgTrigger: 'Último disparo',
         },
         fr: {

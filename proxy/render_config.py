@@ -18,6 +18,7 @@ _HOSTNAME_RE = re.compile(
 )
 _SIZE_RE = re.compile(r"^[1-9][0-9]{0,9}[kKmMgG]?$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _PLACEHOLDER_RE = re.compile(r"\$\{(?:BT_|CWA_)[A-Z0-9_]*\}")
 
 
@@ -105,6 +106,13 @@ def _validated_version(env: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _validated_header_name(env: Mapping[str, str], name: str) -> str:
+    value = _required(env, name)
+    if not _HEADER_NAME_RE.fullmatch(value):
+        raise ProxyConfigError(f"{name} must be a bounded HTTP header name")
+    return value
+
+
 def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> None:
     cwa_upstream, _, _ = _validated_base_url(env, "CWA_UPSTREAM")
     api_upstream, _, _ = _validated_base_url(env, "BT_API_UPSTREAM")
@@ -114,6 +122,9 @@ def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> No
         "${BT_API_UPSTREAM}": api_upstream,
         "${BT_PROXY_PORT}": _validated_port(env, "BT_PROXY_PORT"),
         "${BT_UI_VERSION}": _validated_version(env, "BT_UI_VERSION"),
+        "${BT_CWA_IDENTITY_HEADER}": _validated_header_name(
+            env, "BT_CWA_IDENTITY_HEADER"
+        ),
         "${BT_PUBLIC_SCHEME}": public_scheme,
         "${BT_PUBLIC_HOST}": public_host,
         "${BT_CWA_MAX_BODY_SIZE}": _validated_size(

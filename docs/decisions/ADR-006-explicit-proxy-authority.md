@@ -37,6 +37,13 @@ Both upstream locations:
 - use relative nginx-generated redirects (`absolute_redirect off`);
 - retain bounded connection/read timeouts.
 
+The CWA location also removes `BT_CWA_IDENTITY_HEADER` (default
+`Remote-User`). CWA treats its configured reverse-proxy header as a complete
+login assertion, while the bundled injection proxy is directly browser-facing
+and is not an identity authority. Operators using a custom CWA header must set
+the same name here; header-based SSO belongs behind a separate trusted identity
+proxy rather than this injection boundary.
+
 CWA uploads default to a finite `2g` cap through `BT_CWA_MAX_BODY_SIZE`; API
 bodies retain their smaller proxy and Flask caps. gettext/envsubst is removed
 from the image because unvalidated textual substitution is no longer used.
@@ -50,6 +57,9 @@ from the image because unvalidated textual substitution is no longer used.
   is enforced at the trusted edge; it never guesses trust from a supplied chain.
 - An operator can raise the CWA upload ceiling for a known library, but cannot
   configure an unlimited body through this interface.
+- A mismatched CWA reverse-proxy header name is an unsafe deployment error;
+  operators must keep `BT_CWA_IDENTITY_HEADER` aligned or disable CWA's
+  reverse-proxy-header login.
 - The renderer adds isolated validation tests and is compiled in CI/release;
   the container smoke test checks the rendered authority and forwarding rules.
 

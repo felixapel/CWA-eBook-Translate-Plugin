@@ -180,7 +180,7 @@ class CWASessionAuthenticationTests(unittest.TestCase):
             mode="cwa_session",
             cwa_auth_url="http://calibre-web:8083/ajax/emailstat",
             cwa_cookie_names=("session", "remember_token"),
-            cwa_timeout_seconds=0.5,
+            cwa_timeout_seconds=overrides.get("cwa_timeout_seconds", 0.5),
             cwa_cache_ttl_seconds=10,
             cwa_cache_max_entries=2,
             cwa_max_inflight=4,
@@ -240,6 +240,24 @@ class CWASessionAuthenticationTests(unittest.TestCase):
         )
         with self.assertRaises(AuthUnavailable):
             auth.authenticate({"Cookie": "session=streamed-oversized"}, "127.0.0.1")
+        self.assertTrue(response.closed)
+
+    def test_streamed_body_has_an_absolute_deadline(self):
+        class SlowDripResponse(FakeResponse):
+            def iter_content(self, chunk_size=8192):
+                del chunk_size
+                yield b"["
+                time.sleep(0.05)
+                yield b"]"
+
+        response = SlowDripResponse()
+        auth = self.make_auth(
+            mock.Mock(return_value=response), cwa_timeout_seconds=0.01
+        )
+
+        with self.assertRaises(AuthUnavailable):
+            auth.authenticate({"Cookie": "session=slow-drip"}, "127.0.0.1")
+
         self.assertTrue(response.closed)
 
     def test_missing_cookie_and_login_redirect_are_unauthorized(self):

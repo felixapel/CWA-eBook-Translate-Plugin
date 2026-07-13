@@ -90,6 +90,8 @@ test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
     'proxy_set_header X-Forwarded-Proto https;' /tmp/nginx/proxy.conf)" = "2"
 test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
     'proxy_set_header X-Forwarded-For $remote_addr;' /tmp/nginx/proxy.conf)" = "2"
+test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
+    'proxy_set_header Remote-User "";' /tmp/nginx/proxy.conf)" = "1"
 docker exec "$PROXY_CONTAINER" grep -Fq \
     'client_max_body_size 2g;' /tmp/nginx/proxy.conf
 

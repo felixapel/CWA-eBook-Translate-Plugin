@@ -73,6 +73,9 @@ server {
         proxy_set_header X-Forwarded-Host ${BT_PUBLIC_HOST};
         proxy_set_header X-Forwarded-Port "";
         proxy_set_header X-Forwarded-Proto ${BT_PUBLIC_SCHEME};
+        # CWA can treat a configurable header as a complete login assertion.
+        # This proxy is not that authority and must not forward a client value.
+        proxy_set_header ${BT_CWA_IDENTITY_HEADER} "";
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_connect_timeout 2s;

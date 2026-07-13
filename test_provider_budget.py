@@ -104,7 +104,10 @@ class ProviderBudgetTests(unittest.TestCase):
             raise translator.requests.exceptions.ConnectionError(
                 "synthetic primary outage")
 
-        translator.requests.post = primary_down_fallback_up
+        # Patch the deadline-aware transport seam.  Patching requests.post
+        # would bypass the production call path, which owns its own Session so
+        # response headers and streaming reads share the absolute work budget.
+        translator._provider_post = primary_down_fallback_up
         translator.time.sleep = lambda _seconds: None
 
         with self.assertRaises(translator.ProviderUnavailableError):
@@ -164,7 +167,7 @@ class ProviderBudgetTests(unittest.TestCase):
             raise translator.requests.exceptions.ConnectionError(
                 "synthetic remote outage")
 
-        translator.requests.post = remote_down_local_up
+        translator._provider_post = remote_down_local_up
         translator.time.sleep = lambda _seconds: None
         result = translator.translate_text(
             "book text", max_retries=1, budget=self.budget()

@@ -412,6 +412,7 @@ class RequestAuthenticator:
     def _probe_cwa(self, cookie_header: str) -> bool:
         response = None
         session = None
+        deadline = time.monotonic() + self._cwa_timeout_seconds
         try:
             http_get = self._http_get
             if http_get is None:
@@ -425,6 +426,8 @@ class RequestAuthenticator:
                 allow_redirects=False,
                 stream=True,
             )
+            if time.monotonic() >= deadline:
+                raise AuthUnavailable("authentication authority unavailable")
             status = int(response.status_code)
             content_type = str(response.headers.get("Content-Type", ""))
             if status == 200:
@@ -446,6 +449,12 @@ class RequestAuthenticator:
 
                 payload = bytearray()
                 for chunk in response.iter_content(chunk_size=8192):
+                    # requests' read timeout is an inactivity timeout. Enforce
+                    # the operator's budget across the complete streamed body
+                    # so a peer cannot retain a validation slot by dripping
+                    # one chunk just before every socket timeout.
+                    if time.monotonic() >= deadline:
+                        raise AuthUnavailable("authentication authority unavailable")
                     if not chunk:
                         continue
                     if not isinstance(chunk, bytes):
@@ -453,6 +462,8 @@ class RequestAuthenticator:
                     if len(payload) + len(chunk) > self._cwa_max_response_bytes:
                         raise AuthUnavailable("authentication authority unavailable")
                     payload.extend(chunk)
+                if time.monotonic() >= deadline:
+                    raise AuthUnavailable("authentication authority unavailable")
                 try:
                     parsed = json.loads(payload.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
