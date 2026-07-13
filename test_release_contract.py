@@ -344,6 +344,23 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(command, workflow)
 
+    def test_release_docker_jobs_use_the_host_runner_and_scoped_names(self):
+        workflow = GITEA_RELEASE.read_text()
+        self.assertRegex(
+            workflow,
+            r"(?m)^  docker-smoke:\n    needs: preflight\n"
+            r"(?:    #[^\n]*\n)*    runs-on: weebdb-docker$",
+        )
+        self.assertRegex(
+            workflow,
+            r"(?m)^  publish:\n"
+            r"    needs: \[preflight, backend, frontend, docker-smoke\]\n"
+            r"(?:    #[^\n]*\n)*    runs-on: weebdb-docker$",
+        )
+        self.assertIn("sh scripts/ci-docker-names.sh", workflow)
+        self.assertNotIn("bt-release-smoke-${{ gitea.run_id }}", workflow)
+        self.assertNotIn("bt-release-audit:${{ gitea.run_id }}", workflow)
+
     def test_one_build_publishes_all_requested_registry_tags(self):
         workflow = GITEA_RELEASE.read_text()
         self.assertEqual(workflow.count("uses: docker/build-push-action@"), 1)

@@ -159,6 +159,11 @@ class SupplyChainContractTests(unittest.TestCase):
             self.assertNotIn("--trusted-host", lock)
             self.assertNotRegex(lock, r"(?m)^[a-z0-9_.-]+\s*@\s*")
 
+    def test_direct_runtime_imports_are_declared_as_direct_dependencies(self):
+        intent = (ROOT / "requirements.in").read_text()
+        self.assertIn("requests>=2.31.0,<3.0", intent)
+        self.assertIn("urllib3>=2.0,<3.0", intent)
+
     def test_lock_regeneration_is_pinned_and_uses_public_pypi(self):
         compiler = (ROOT / "scripts" / "compile-requirements.sh").read_text()
         self.assertIn('EXPECTED_PYTHON="3.11"', compiler)

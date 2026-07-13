@@ -94,12 +94,12 @@ jobs:
 
   docker-smoke:
     needs: preflight
-    runs-on: ubuntu-latest
-    env:
-      SMOKE_CONTAINER: bt-release-smoke-${{ gitea.run_id }}-${{ gitea.run_attempt }}
-      SMOKE_IMAGE: bt-release-audit:${{ gitea.run_id }}-${{ gitea.run_attempt }}
+    # Docker is available only on the runner's host-capable label.
+    runs-on: weebdb-docker
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Derive repository-scoped Docker names
+        run: sh scripts/ci-docker-names.sh
       - name: Verify Docker daemon
         run: docker version
       - name: Build image
@@ -131,7 +131,8 @@ jobs:
 
   publish:
     needs: [preflight, backend, frontend, docker-smoke]
-    runs-on: ubuntu-latest
+    # Buildx and registry publication require the host Docker daemon.
+    runs-on: weebdb-docker
     env:
       DOCKER_CONFIG: ${{ gitea.workspace }}/.docker-release
     steps:

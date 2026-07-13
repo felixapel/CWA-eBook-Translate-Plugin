@@ -14,9 +14,11 @@ Complete these once before the first production release:
   backend, frontend, and Docker smoke status contexts used by this repository.
 - Protect `v*` tags so only the release operator can create them and nobody can
   update or delete them.
-- Assign release jobs to a trusted, serialized runner with the `ubuntu-latest`
-  label, a working Docker daemon, binfmt/QEMU support, and outbound HTTPS to
-  GitHub, GHCR, Docker Hub (when enabled), and action sources.
+- Keep normal preflight/backend/frontend jobs on the trusted `ubuntu-latest`
+  label. Assign Docker smoke and publication jobs to the trusted, serialized
+  `weebdb-docker` host label with a working Docker daemon, binfmt/QEMU support,
+  and outbound HTTPS to GitHub, GHCR, Docker Hub (when enabled), and action
+  sources.
 - Do not start another stable release until the current `publish` job has
   finished. Gitea 1.26 does not provide a release concurrency gate that this
   workflow can rely on; overlapping builds could move `latest` or `MAJOR.MINOR`
@@ -87,7 +89,7 @@ version. The build also requests OCI provenance and an SBOM.
    .venv/bin/python -m unittest -v \
      test_work_budget test_provider_budget test_ci_contract \
      test_release_contract test_supply_chain_contract \
-     test_cleanup_token test_api_schema \
+     test_shell_contract test_cleanup_token test_api_schema \
      test_error_privacy
    node -c static/translator.js
    node -c static/loader.js

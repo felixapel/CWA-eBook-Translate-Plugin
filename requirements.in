@@ -3,3 +3,5 @@
 flask>=3.0,<4.0
 gunicorn>=21.2,<23.0
 requests>=2.31.0,<3.0
+# translator.py imports urllib3 directly for the absolute-deadline transport.
+urllib3>=2.0,<3.0
