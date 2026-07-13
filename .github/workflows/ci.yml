@@ -81,8 +81,11 @@ jobs:
   # USER appuser) that pure Python tests can't. Docker is a required artifact
   # gate: runners without a working daemon fail instead of reporting a green
   # workflow whose build and runtime checks never executed.
+  # The global runner maps ubuntu-latest to a node job container without a
+  # Docker client. Its host-capable label runs on the isolated runner VM and
+  # is already proven by the WeebDB Docker gates on the same runner.
   docker-smoke:
-    runs-on: ubuntu-latest
+    runs-on: weebdb-docker
     steps:
       - uses: actions/checkout@v4
       - name: Derive repository-scoped Docker names

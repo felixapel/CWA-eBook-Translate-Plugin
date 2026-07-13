@@ -35,6 +35,10 @@ class CIContractTests(unittest.TestCase):
         self.assertNotIn("Detect Docker", self.workflow)
         self.assertNotIn("docker.outputs.available", self.workflow)
         self.assertNotIn("skipping docker-smoke", self.workflow)
+        self.assertRegex(
+            self.workflow,
+            r"(?m)^  docker-smoke:\n    runs-on: weebdb-docker$",
+        )
         self.assertRegex(self.workflow, r"(?m)^\s*run: docker version\s*$")
         self.assertRegex(self.workflow, r"(?m)^\s*run: docker build ")
 
