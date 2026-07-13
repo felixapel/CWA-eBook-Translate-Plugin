@@ -83,13 +83,12 @@ jobs:
   # workflow whose build and runtime checks never executed.
   docker-smoke:
     runs-on: ubuntu-latest
-    env:
-      # Unique per run: shared/self-hosted runners may execute two repos or
-      # attempts concurrently. Random loopback ports avoid cross-run clashes.
-      SMOKE_CONTAINER: bt-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-      SMOKE_IMAGE: bt-audit:${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
+      - name: Derive repository-scoped Docker names
+        # GITHUB_RUN_ID is only unique within one repository. Include a stable
+        # repository hash before using a shared/self-hosted Docker daemon.
+        run: sh scripts/ci-docker-names.sh
       - name: Verify Docker daemon
         run: docker version
       - name: Build image

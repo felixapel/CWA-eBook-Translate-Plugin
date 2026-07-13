@@ -1,10 +1,14 @@
 """Static contracts preventing required CI gates from degrading to skipped."""
 import json
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
+DOCKER_NAMES = ROOT / "scripts" / "ci-docker-names.sh"
 
 
 class CIContractTests(unittest.TestCase):
@@ -40,11 +44,54 @@ class CIContractTests(unittest.TestCase):
         self.assertIn("-p 127.0.0.1::8080", self.workflow)
         self.assertIn(
             "http://127.0.0.1:${PROXY_PORT}/bt-api/ping", self.workflow)
-        self.assertIn("bt-smoke-${{ github.run_id }}", self.workflow)
-        self.assertIn('SMOKE_IMAGE: bt-audit:${{ github.run_id }}-${{ github.run_attempt }}', self.workflow)
+        self.assertIn("sh scripts/ci-docker-names.sh", self.workflow)
+        self.assertNotIn("bt-smoke-${{ github.run_id }}", self.workflow)
+        self.assertNotIn(
+            "bt-audit:${{ github.run_id }}-${{ github.run_attempt }}",
+            self.workflow,
+        )
         self.assertIn('docker build -t "$SMOKE_IMAGE" .', self.workflow)
         self.assertIn('127.0.0.1::8080 "$SMOKE_IMAGE"', self.workflow)
         self.assertNotIn("docker build -t bt-audit:ci", self.workflow)
+
+    def test_docker_names_are_isolated_across_repositories(self):
+        def derive(repository, run_id="4242", run_attempt="1"):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                env_file = Path(temp_dir) / "github-env"
+                env = os.environ.copy()
+                env.update({
+                    "GITHUB_REPOSITORY": repository,
+                    "GITHUB_RUN_ID": run_id,
+                    "GITHUB_RUN_ATTEMPT": run_attempt,
+                    "GITHUB_ENV": str(env_file),
+                })
+                subprocess.run(
+                    ["sh", str(DOCKER_NAMES)],
+                    cwd=ROOT,
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return dict(
+                    line.split("=", 1)
+                    for line in env_file.read_text().splitlines()
+                )
+
+        first = derive("felix/CWA-translate-plugin")
+        second = derive("another-owner/another-repository")
+        repeated = derive("felix/CWA-translate-plugin")
+        next_attempt = derive("felix/CWA-translate-plugin", run_attempt="2")
+
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first["SMOKE_CONTAINER"], second["SMOKE_CONTAINER"])
+        self.assertNotEqual(first["SMOKE_IMAGE"], second["SMOKE_IMAGE"])
+        self.assertNotEqual(
+            first["SMOKE_CONTAINER"], next_attempt["SMOKE_CONTAINER"])
+        self.assertRegex(
+            first["SMOKE_CONTAINER"], r"^bt-smoke-[0-9a-f]{16}-4242-1$")
+        self.assertRegex(
+            first["SMOKE_IMAGE"], r"^bt-audit:[0-9a-f]{16}-4242-1$")
 
     def test_package_lock_root_metadata_matches_package_manifest(self):
         package = json.loads((ROOT / "package.json").read_text())
