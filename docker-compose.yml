@@ -86,9 +86,9 @@ services:
       - BT_ROLE=proxy
       - CWA_UPSTREAM=http://calibre-web:8083
       - BT_API_UPSTREAM=http://translator-api:8390
-      # Fixed public authority forwarded to CWA/API. Override with the exact
-      # HTTPS origin when this service is behind SWAG/Traefik/NPM/Cloudflare.
-      - BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:-http://localhost:8084}
+      # Fixed public authority forwarded to CWA/API. Require an explicit value
+      # so a remote browser is never given localhost as the session authority.
+      - BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:?Set BT_PUBLIC_ORIGIN to the exact browser-facing origin}
       # Finite CWA upload limit; API requests keep their separate 3 MiB cap.
       - BT_CWA_MAX_BODY_SIZE=${BT_CWA_MAX_BODY_SIZE:-2g}
       # Must match CWA's "Reverse Proxy Header Name" if that feature is

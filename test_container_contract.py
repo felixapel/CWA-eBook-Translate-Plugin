@@ -73,7 +73,11 @@ class ContainerContractTests(unittest.TestCase):
         )
         self.assertIn("proxy/render_config.py", entrypoint)
         self.assertNotIn("envsubst", entrypoint)
-        self.assertIn("BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:-http://localhost:8084}", compose)
+        self.assertIn(
+            "BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:?Set BT_PUBLIC_ORIGIN to the exact browser-facing origin}",
+            compose,
+        )
+        self.assertNotIn("BT_PUBLIC_ORIGIN=${BT_PUBLIC_ORIGIN:-", compose)
         self.assertIn("BT_CWA_MAX_BODY_SIZE=${BT_CWA_MAX_BODY_SIZE:-2g}", compose)
         self.assertIn("BT_CWA_IDENTITY_HEADER=${BT_CWA_IDENTITY_HEADER:-Remote-User}", compose)
         self.assertIn('proxy_set_header ${BT_CWA_IDENTITY_HEADER} "";', template)
