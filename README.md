@@ -45,9 +45,12 @@ Browser ──► book-translator-proxy (:8084) ──► CWA (:8083, stock)
 ```
 
 ```bash
-git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
+git clone --branch v2.2.0 --depth 1 \
+  https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
 cd CWA-eBook-Translate-Plugin
 # Edit docker-compose.yml: set BT_LOCAL_URL (or a cloud provider + API key)
+# Replace this example with the exact origin you use in the browser.
+export BT_PUBLIC_ORIGIN=http://192.168.1.10:8084
 docker compose up -d --build
 ```
 
@@ -114,7 +117,8 @@ script, then run it **locally** (don't pipe an unreviewed remote script into
 `bash`):
 
 ```bash
-git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
+git clone --branch v2.2.0 --depth 1 \
+  https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
 cd CWA-eBook-Translate-Plugin
 chmod +x install_unraid.sh
 ./install_unraid.sh
@@ -187,7 +191,7 @@ them):
 | `CWA_UPSTREAM` | | Required by the proxy role. Exact base URL of the stock CWA instance (e.g. `http://calibre-web:8083`); credentials, paths, queries, fragments, and non-HTTP schemes fail startup. |
 | `BT_API_UPSTREAM` | `http://127.0.0.1:$PORT` | Exact translation API base URL used by the proxy role. The split Compose topology uses the network-scoped `http://translator-api:8390` alias so traffic reaches the API through the fixed trusted-proxy network; the same URL validation applies. |
 | `BT_PROXY_PORT` | `8080` | Container port for the injection proxy (proxy mode only). |
-| `BT_PUBLIC_ORIGIN` | | **Required by proxy/all roles.** Exact browser-facing origin, such as `http://192.168.1.10:8084` or `https://books.example.com`. Its validated host and scheme are the only values forwarded to CWA/API. The reference Compose file defaults to `http://localhost:8084`; override it for every non-local deployment. |
+| `BT_PUBLIC_ORIGIN` | | **Required by proxy/all roles and by the reference Compose file.** Exact browser-facing origin, such as `http://192.168.1.10:8084` or `https://books.example.com`. Its validated host and scheme are the only values forwarded to CWA/API; there is no implicit `localhost` deployment value. |
 | `BT_CWA_MAX_BODY_SIZE` | `2g` | Finite nginx cap for CWA uploads. Use a positive nginx size such as `512m` or `4g`; `0`/unlimited and directive-like values fail startup. Translation API bodies retain a separate 3 MiB proxy cap and the stricter Flask limit. |
 | `BT_CWA_IDENTITY_HEADER` | `Remote-User` | Header CWA is configured to trust for reverse-proxy login. The bundled injection proxy always strips this client-supplied credential before forwarding to CWA because it is not an identity authority. If CWA uses a custom header name, set the same exact name here; leaving them mismatched can permit header-forgery login through a directly exposed proxy. Use a separate identity-aware proxy and the documented `forwarded` API mode when header-based SSO is required. |
 | `BT_AUTH_MODE` | `token` | Authentication authority: `cwa_session` (recommended proxy topology), `forwarded` (identity-aware reverse proxy), `token` (shared-secret compatibility), or development-only `disabled`. The default fails startup unless `BT_API_TOKEN` is present. Disabled mode additionally requires `BT_ALLOW_INSECURE_AUTH=true`. `/ping`, `/health`, and `/ready` stay unauthenticated; every other route is protected. |
@@ -258,10 +262,11 @@ all normal translation requests to that provider.
 > within that one worker — don't raise `--workers` without moving that state to
 > something shared (e.g. SQLite, like the translation cache already is).
 
-Cache schema v2 intentionally preserves an existing v1 table as
-`translations_v1` but never serves those unscoped rows. The cache re-warms
-without a destructive migration. V2 stores no source paragraph and hashes
-tenant/book/chapter identifiers before persistence. Browser translations stay
+Cache schema v2 intentionally leaves the existing v1 `translations` table
+intact for rollback but never serves those unscoped rows. V2 writes only to
+`translations_v2`, so the cache re-warms without a destructive migration. V2
+stores no source paragraph and hashes tenant/book/chapter identifiers before
+persistence. Browser translations stay
 in memory unless `window.BOOK_TRANSLATOR.persistCache = true` is explicitly set;
 opt-in keys also include stable DOM position to separate repeated text in
 different contexts. Legacy `bt_cache_v2_*` localStorage entries are removed on

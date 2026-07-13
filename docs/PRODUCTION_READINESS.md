@@ -1,8 +1,9 @@
 # Production readiness record
 
 This document records the disposition of the 2026-07-12 security and
-production-readiness audit of the `v2.1.4` codebase. It is a promotion record,
-not a claim that an image has already been released or deployed.
+production-readiness audit that started from the `v2.1.4` codebase and produced
+the `v2.2.0` candidate. It is a promotion record, not a claim that the new
+source version has already been released or deployed.
 
 The source remediation is complete when the repository gates below pass. A
 source release remains blocked until every item under
@@ -30,7 +31,7 @@ source release remains blocked until every item under
 | F-06 unprotected `main` and release tags | Operator prerequisite | Gitea branch and tag protection must be configured before promotion. |
 | F-07 ambiguous segment protocol | Implemented and gated | Translation batches use unpredictable IDs and validate a strict one-to-one structured envelope. |
 | F-08 context-incomplete cache keys | Implemented and gated | Cache schema v2 includes tenant, book, chapter, provider/model, prompt/protocol, languages, and context fingerprints. |
-| F-09 plaintext unbounded retention | Implemented and gated | Source text is not persisted, identifiers are hashed, file modes are private, and server/browser retention is bounded and opt-in where applicable. |
+| F-09 plaintext unbounded retention | Implemented and gated | Source text is not persisted in `translations_v2`, identifiers are hashed, file modes are private, and server/browser retention is bounded and opt-in where applicable. The v1 table remains physically separate only for rollback. |
 | F-10 nested retries without coalescing | Implemented and gated | Absolute request budgets, bounded admission, and `singleflight.py` coalesce equivalent active work; the browser does not retry ambiguous provider work. |
 | F-11 public provider-backed health probe | Implemented and gated | `/ping`, `/health`, and `/ready` are shallow; authenticated `/health/deep` uses the normal provider budget. |
 | F-12 browser token in `localStorage` | Implemented and gated | The recommended topology validates the existing HttpOnly CWA session and browser loaders no longer recover a shared secret from storage. |
@@ -65,8 +66,11 @@ all of these outcomes without a skipped or unavailable gate:
 6. Release-policy contracts prove the fail-closed source workflow wiring;
    preflight rejects wrong versions, tags, commits, ancestry, or mirror parity,
    and the artifact smoke gate rejects a broken container build or runtime.
+7. Cache migration contracts prove v1 and v2 tables coexist, the prior release
+   remains read/write compatible, the unreleased draft layout normalizes
+   atomically, and SQLite integrity survives v1 → v2 → v1 → v2.
 
-The final local audit run on 2026-07-13 passed the backend matrix (184 contract
+The final local audit run on 2026-07-13 passed the backend matrix (175 contract
 tests plus the standalone translation and hardening suites), frontend unit
 tests, three Chromium scenarios, Python and npm vulnerability audits, the live
 rate-limit probe, and the container smoke gate. The earlier image-publication

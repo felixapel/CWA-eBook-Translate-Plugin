@@ -79,6 +79,11 @@ build/runtime smoke test. No workflow step receives a publication credential.
 5. Fast-forward the GitHub mirror and verify both `main` refs resolve to that
    exact commit.
 
+For the v1-to-v2 cache transition, `test_cache_v2` is a release blocker. It
+must prove that `translations` remains readable/writable by the v2.1.4 schema,
+that v2 uses `translations_v2`, and that the unreleased draft layout is
+normalized without losing either table.
+
 ## Create the source release
 
 Create one annotated tag object and push it to GitHub first because Gitea's
@@ -104,16 +109,34 @@ increment the version, and create a new tag.
 
 ## Install or roll back
 
-Clone or check out the desired official tag and build it locally:
+Clone or check out the desired official tag and build it locally. Proxy mode
+requires the exact origin used by the browser:
 
 ```bash
 git checkout v2.2.0
+export BT_PUBLIC_ORIGIN=http://192.168.1.10:8084  # replace with your origin
 docker compose up -d --build
 ```
 
-Rollback uses the same command after checking out an earlier immutable tag.
-Preserve the existing data volume unless the version's migration notes say
-otherwise.
+Before the first v2.2.0 start, stop every API writer and take an offline copy
+of all `/app/data` files, including `translations.db`, any `-wal`/`-shm`
+siblings, and `cleanup_token`. For the reference Compose deployment:
+
+```bash
+docker compose stop book-translator-proxy book-translator-api
+install -d -m 0700 ./backups/pre-v2.2.0-app-data
+API_CONTAINER="$(docker compose ps -aq book-translator-api)"
+test -n "$API_CONTAINER"
+docker cp "$API_CONTAINER:/app/data/." ./backups/pre-v2.2.0-app-data/
+python3 -c 'import sqlite3; db=sqlite3.connect("file:backups/pre-v2.2.0-app-data/translations.db?mode=ro", uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
+```
+
+Schema v2 writes `translations_v2` and leaves the v1 `translations` table
+intact. An in-place code rollback therefore checks out `v2.1.4` and rebuilds
+against the same volume; the old release ignores v2 rows. Keep the offline
+copy until the new release has completed its rollback window. If integrity or
+startup fails, preserve the v2 database separately and restore the complete
+pre-upgrade copy before starting the old image.
 
 ## Historical split tag
 

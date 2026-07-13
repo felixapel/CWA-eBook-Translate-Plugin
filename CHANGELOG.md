@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hashes tenant/book/chapter identifiers, and enforces private files plus
   mandatory TTL/cap. Browser persistence is opt-in and legacy unscoped browser
   entries are purged on upgrade.
+- Cache schema v2 now writes to a side-by-side `translations_v2` table while
+  leaving the v1 `translations` table readable and writable by v2.1.4, making
+  an in-place code rollback functional after the upgrade.
 - Proxy startup now validates exact upstream URLs and a required public origin.
   nginx forwards only that fixed host/scheme, replaces spoofable forwarding
   chains with its observed peer, emits relative self-generated redirects, and

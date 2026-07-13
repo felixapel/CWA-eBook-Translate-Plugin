@@ -12,6 +12,7 @@ This document details the architecture of the `book-translator` plugin.
 - [ADR-006: Make proxy authority and forwarding explicit](decisions/ADR-006-explicit-proxy-authority.md)
 - [ADR-007: Sign and verify release digests with a self-managed key (superseded)](decisions/ADR-007-sign-release-digests.md)
 - [ADR-008: Publish verified source releases without registry credentials](decisions/ADR-008-source-only-releases.md)
+- [ADR-009: Keep cache schemas side by side for rollback](decisions/ADR-009-side-by-side-cache-schemas.md)
 
 ## Overview
 
