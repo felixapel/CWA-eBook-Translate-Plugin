@@ -55,7 +55,7 @@ class ErrorPrivacyTests(unittest.TestCase):
 
     def test_provider_failure_has_stable_sanitized_contract(self):
         with mock.patch.object(
-            translator.requests, "post", side_effect=self.leaking_http_error
+            translator, "_provider_post", side_effect=self.leaking_http_error
         ), self.assertLogs(level="WARNING") as captured:
             response = self.client.post(
                 "/translate",
@@ -68,7 +68,7 @@ class ErrorPrivacyTests(unittest.TestCase):
 
     def test_deep_health_never_returns_provider_exception_details(self):
         with mock.patch.object(
-            translator.requests, "post", side_effect=self.leaking_http_error
+            translator, "_provider_post", side_effect=self.leaking_http_error
         ), mock.patch.object(
             server, "_get_cleanup_token", return_value="operator-token"
         ):
@@ -81,7 +81,7 @@ class ErrorPrivacyTests(unittest.TestCase):
         self.assert_private_details_absent(response, [])
 
     def test_shallow_health_never_touches_a_provider(self):
-        with mock.patch.object(translator.requests, "post") as provider_call:
+        with mock.patch.object(translator, "_provider_post") as provider_call:
             health = self.client.get("/health")
             ready = self.client.get("/ready")
 
@@ -126,7 +126,7 @@ class ErrorPrivacyTests(unittest.TestCase):
         try:
             with mock.patch.object(
                 server, "_get_cleanup_token", return_value="operator-token"
-            ), mock.patch.object(translator.requests, "post") as provider_call:
+            ), mock.patch.object(translator, "_provider_post") as provider_call:
                 response = self.client.get(
                     "/health/deep",
                     headers={"X-BT-Token": "operator-token"},

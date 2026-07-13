@@ -14,12 +14,17 @@ import math
 import os
 import re
 import secrets
+import socket as _socket
 import threading as _threading
 import time
 import logging
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
 from typing import Optional
+from urllib3 import PoolManager, ProxyManager
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from work_budget import WorkBudget, WorkBudgetExceeded
 
 log = logging.getLogger("book-translator.translator")
@@ -143,6 +148,211 @@ class _ProviderResponseTooLarge(RuntimeError):
     """A provider response crossed the configured in-memory boundary."""
 
 
+_HTTP_CALL_CONTEXT = _threading.local()
+
+
+class _DeadlineSocket:
+    """Socket proxy that applies the remaining wall-clock budget per I/O."""
+
+    def __init__(self, sock, budget: WorkBudget, inactivity_timeout: float):
+        self._sock = sock
+        self._budget = budget
+        self._inactivity_timeout = inactivity_timeout
+        self._io_refs = 0
+        self._closed = False
+
+    def reset(self, budget: WorkBudget, inactivity_timeout: float) -> None:
+        """Attach a reused pooled connection to the current request budget."""
+        self._budget = budget
+        self._inactivity_timeout = inactivity_timeout
+
+    def _before_io(self) -> None:
+        self._budget.ensure_active()
+        remaining = self._budget.remaining_seconds()
+        if remaining <= 0:
+            raise WorkBudgetExceeded("deadline")
+        self._sock.settimeout(min(self._inactivity_timeout, remaining))
+
+    def recv(self, *args, **kwargs):
+        self._before_io()
+        return self._sock.recv(*args, **kwargs)
+
+    def recv_into(self, *args, **kwargs):
+        self._before_io()
+        return self._sock.recv_into(*args, **kwargs)
+
+    def send(self, *args, **kwargs):
+        self._before_io()
+        return self._sock.send(*args, **kwargs)
+
+    def sendall(self, *args, **kwargs):
+        self._before_io()
+        return self._sock.sendall(*args, **kwargs)
+
+    def makefile(self, *args, **kwargs):
+        # ``http.client`` reads status, headers, and body through makefile().
+        # Reuse the stdlib implementation with this proxy as the SocketIO
+        # target so every underlying recv_into() recomputes the time left.
+        return _socket.socket.makefile(self, *args, **kwargs)
+
+    def _decref_socketios(self) -> None:
+        if self._io_refs > 0:
+            self._io_refs -= 1
+        if self._closed:
+            self.close()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._io_refs <= 0:
+            self._sock.close()
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
+class _DeadlineConnectionMixin:
+    """Install the deadline socket before urllib3 reads response headers."""
+
+    def _apply_call_budget(self) -> None:
+        budget = getattr(_HTTP_CALL_CONTEXT, "budget", None)
+        inactivity_timeout = getattr(
+            _HTTP_CALL_CONTEXT, "inactivity_timeout", None)
+        if budget is None or inactivity_timeout is None:
+            raise RuntimeError("provider HTTP call is missing its work budget")
+        if self.sock is None:
+            return
+        if isinstance(self.sock, _DeadlineSocket):
+            self.sock.reset(budget, inactivity_timeout)
+        else:
+            self.sock = _DeadlineSocket(
+                self.sock, budget, inactivity_timeout)
+
+    def request(self, *args, **kwargs):
+        # A keep-alive connection can already have a wrapped socket before the
+        # next request body is sent. Refresh it with the new request budget.
+        if self.sock is not None:
+            self._apply_call_budget()
+        return super().request(*args, **kwargs)
+
+    def getresponse(self):
+        # New sockets are connected inside request(); wrap them before the
+        # first status/header byte is read.
+        self._apply_call_budget()
+        return super().getresponse()
+
+
+class _DeadlineHTTPConnection(_DeadlineConnectionMixin, HTTPConnection):
+    pass
+
+
+class _DeadlineHTTPSConnection(_DeadlineConnectionMixin, HTTPSConnection):
+    pass
+
+
+class _DeadlineHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _DeadlineHTTPConnection
+
+
+class _DeadlineHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _DeadlineHTTPSConnection
+
+
+def _install_deadline_pools(manager) -> None:
+    manager.pool_classes_by_scheme = dict(manager.pool_classes_by_scheme)
+    manager.pool_classes_by_scheme.update({
+        "http": _DeadlineHTTPConnectionPool,
+        "https": _DeadlineHTTPSConnectionPool,
+    })
+
+
+class _DeadlinePoolManager(PoolManager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _install_deadline_pools(self)
+
+
+class _DeadlineProxyManager(ProxyManager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _install_deadline_pools(self)
+
+
+class _DeadlineHTTPAdapter(HTTPAdapter):
+    """Requests adapter whose header/body reads share the WorkBudget clock."""
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        self._pool_connections = connections
+        self._pool_maxsize = maxsize
+        self._pool_block = block
+        self.poolmanager = _DeadlinePoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        if proxy in self.proxy_manager:
+            return self.proxy_manager[proxy]
+        if proxy.lower().startswith("socks"):
+            raise requests.exceptions.InvalidSchema(
+                "SOCKS proxies are not supported by the deadline transport")
+        manager = _DeadlineProxyManager(
+            proxy_url=proxy,
+            proxy_headers=self.proxy_headers(proxy),
+            num_pools=self._pool_connections,
+            maxsize=self._pool_maxsize,
+            block=self._pool_block,
+            **proxy_kwargs,
+        )
+        self.proxy_manager[proxy] = manager
+        return manager
+
+
+def _deadline_provider_post(
+    url: str,
+    *,
+    headers: dict[str, str],
+    json: dict,
+    timeout: float,
+    stream: bool,
+    budget: WorkBudget,
+):
+    """Start one HTTP operation with inactivity and absolute time bounds."""
+    budget.ensure_active()
+    session = requests.Session()
+    adapter = _DeadlineHTTPAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    _HTTP_CALL_CONTEXT.budget = budget
+    _HTTP_CALL_CONTEXT.inactivity_timeout = float(timeout)
+    try:
+        response = session.post(
+            url,
+            headers=headers,
+            json=json,
+            timeout=timeout,
+            stream=stream,
+        )
+        response._bt_deadline_session = session
+        return response
+    except WorkBudgetExceeded:
+        session.close()
+        raise
+    except Exception:
+        session.close()
+        # Convert a socket/read error caused by the absolute deadline while
+        # preserving ordinary provider errors for the retry policy.
+        budget.ensure_active()
+        raise
+    finally:
+        _HTTP_CALL_CONTEXT.__dict__.pop("budget", None)
+        _HTTP_CALL_CONTEXT.__dict__.pop("inactivity_timeout", None)
+
+
+_provider_post = _deadline_provider_post
+
+
 _primary_provider: Optional[_Provider] = None
 _fallback_provider = "unset"  # sentinel distinct from None (= "no fallback")
 
@@ -205,14 +415,20 @@ class SegmentProtocolError(RuntimeError):
 
 def _close_provider_response(response) -> None:
     """Best-effort close used by normal cleanup and the deadline watchdog."""
-    close = getattr(response, "close", None)
-    if callable(close):
+    resources = (
+        response,
+        getattr(response, "_bt_deadline_session", None),
+    )
+    for resource in resources:
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
         try:
             close()
         except Exception as exc:
             # Cleanup must not replace the provider/deadline failure.
             log.debug(
-                "provider response close failed error_type=%s",
+                "provider HTTP cleanup failed error_type=%s",
                 type(exc).__name__,
             )
 
@@ -226,27 +442,27 @@ def _read_capped_json_response(response, budget: WorkBudget) -> object:
     timeouts only bound socket inactivity; the watchdog closes a response that
     keeps dripping bytes beyond the request's absolute deadline.
     """
-    budget.ensure_active()
-    remaining = budget.remaining_seconds()
-    if remaining <= 0:
-        raise WorkBudgetExceeded("deadline")
-
     deadline_reached = _threading.Event()
-
-    def abort_at_deadline() -> None:
-        deadline_reached.set()
-        _close_provider_response(response)
-
-    deadline_timer = _threading.Timer(remaining, abort_at_deadline)
-    deadline_timer.daemon = True
-    deadline_timer.start()
-
-    def ensure_response_active() -> None:
-        if deadline_reached.is_set():
-            raise WorkBudgetExceeded("deadline")
-        budget.ensure_active()
-
+    deadline_timer = None
     try:
+        budget.ensure_active()
+        remaining = budget.remaining_seconds()
+        if remaining <= 0:
+            raise WorkBudgetExceeded("deadline")
+
+        def abort_at_deadline() -> None:
+            deadline_reached.set()
+            _close_provider_response(response)
+
+        deadline_timer = _threading.Timer(remaining, abort_at_deadline)
+        deadline_timer.daemon = True
+        deadline_timer.start()
+
+        def ensure_response_active() -> None:
+            if deadline_reached.is_set():
+                raise WorkBudgetExceeded("deadline")
+            budget.ensure_active()
+
         ensure_response_active()
         response.raise_for_status()
         ensure_response_active()
@@ -290,7 +506,8 @@ def _read_capped_json_response(response, budget: WorkBudget) -> object:
             raise WorkBudgetExceeded("deadline") from None
         raise
     finally:
-        deadline_timer.cancel()
+        if deadline_timer is not None:
+            deadline_timer.cancel()
         _close_provider_response(response)
 
 
@@ -327,8 +544,14 @@ def _translate_openai(
         ],
     }
 
-    resp = requests.post(
-        p.url, headers=headers, json=payload, timeout=timeout, stream=True)
+    resp = _provider_post(
+        p.url,
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+        stream=True,
+        budget=budget,
+    )
     body = _read_capped_json_response(resp, budget)
 
     content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -358,8 +581,14 @@ def _translate_anthropic(
         "messages": [{"role": "user", "content": user_content}],
     }
 
-    resp = requests.post(
-        p.url, headers=headers, json=payload, timeout=timeout, stream=True)
+    resp = _provider_post(
+        p.url,
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+        stream=True,
+        budget=budget,
+    )
     body = _read_capped_json_response(resp, budget)
 
     content = body.get("content", [])

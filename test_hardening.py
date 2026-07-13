@@ -33,14 +33,14 @@ for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_
     except OSError:
         pass
 
-import requests
 import ipaddress
 
 # Re-use the same fake_post from test_translation.py.
 import test_translation  # noqa: E402
 STATE = test_translation.STATE
 fake_post = test_translation.fake_post
-requests.post = fake_post
+import translator  # noqa: E402
+translator._provider_post = fake_post
 
 # Import server after fake_post is installed.
 import server  # noqa: E402

@@ -1,5 +1,6 @@
 """Integration tests for work limits across providers and batch workers."""
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -22,7 +23,7 @@ ROOT = Path(__file__).parent
 
 class ProviderBudgetTests(unittest.TestCase):
     def setUp(self):
-        self.original_post = translator.requests.post
+        self.original_post = translator._provider_post
         self.original_sleep = translator.time.sleep
         self.original_batch_size = translator.BT_BATCH_SIZE
         self.original_primary = translator._primary_provider
@@ -35,7 +36,7 @@ class ProviderBudgetTests(unittest.TestCase):
         translator._fallback_provider = "unset"
 
     def tearDown(self):
-        translator.requests.post = self.original_post
+        translator._provider_post = self.original_post
         translator.time.sleep = self.original_sleep
         translator.BT_BATCH_SIZE = self.original_batch_size
         translator._primary_provider = self.original_primary
@@ -104,7 +105,7 @@ class ProviderBudgetTests(unittest.TestCase):
                 self.closed = True
 
         response = OversizedStreamingResponse()
-        translator.requests.post = lambda *_args, **_kwargs: response
+        translator._provider_post = lambda *_args, **_kwargs: response
         translator._fallback_provider = None
 
         with self.assertRaises(translator.ProviderUnavailableError):
@@ -153,7 +154,7 @@ class ProviderBudgetTests(unittest.TestCase):
             clock=clock,
         )
         response = DripStreamingResponse()
-        translator.requests.post = lambda *_args, **_kwargs: response
+        translator._provider_post = lambda *_args, **_kwargs: response
         translator._fallback_provider = None
         translator._UPSTREAM_SEM = threading.BoundedSemaphore(1)
 
@@ -192,7 +193,7 @@ class ProviderBudgetTests(unittest.TestCase):
                 self.unblocked.set()
 
         response = BlockingStreamingResponse()
-        translator.requests.post = lambda *_args, **_kwargs: response
+        translator._provider_post = lambda *_args, **_kwargs: response
         translator._fallback_provider = None
         translator._UPSTREAM_SEM = threading.BoundedSemaphore(1)
 
@@ -213,13 +214,74 @@ class ProviderBudgetTests(unittest.TestCase):
         if slot_released:
             translator._UPSTREAM_SEM.release()
 
+    def test_deadline_covers_slow_response_headers_and_releases_slot(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(1)
+        port = listener.getsockname()[1]
+        server_done = threading.Event()
+
+        def drip_headers():
+            try:
+                connection, _address = listener.accept()
+                with connection:
+                    connection.settimeout(1)
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request:
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            return
+                        request.extend(chunk)
+                    response = (
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: 2\r\n\r\n{}"
+                    )
+                    for value in response:
+                        try:
+                            connection.sendall(bytes((value,)))
+                        except OSError:
+                            break
+                        time.sleep(0.02)
+            finally:
+                listener.close()
+                server_done.set()
+
+        server_thread = threading.Thread(target=drip_headers, daemon=True)
+        server_thread.start()
+        provider = translator._Provider("local", "fake-model", "")
+        provider.url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        translator._primary_provider = provider
+        translator._fallback_provider = None
+        translator._provider_post = translator._deadline_provider_post
+        translator._UPSTREAM_SEM = threading.BoundedSemaphore(1)
+
+        started = time.monotonic()
+        with self.assertRaises(WorkBudgetExceeded) as raised:
+            translator.translate_text(
+                "hello",
+                max_retries=1,
+                budget=self.budget(max_attempts=1, deadline_seconds=0.08),
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(raised.exception.reason, "deadline")
+        self.assertLess(elapsed, 0.5)
+        slot_released = translator._UPSTREAM_SEM.acquire(blocking=False)
+        self.assertTrue(slot_released)
+        if slot_released:
+            translator._UPSTREAM_SEM.release()
+        self.assertTrue(server_done.wait(timeout=1))
+
     def test_final_failed_attempt_does_not_sleep(self):
         sleeps = []
 
         def always_down(*_args, **_kwargs):
             raise translator.requests.exceptions.ConnectionError("synthetic")
 
-        translator.requests.post = always_down
+        translator._provider_post = always_down
         translator.time.sleep = sleeps.append
         translator._fallback_provider = None
 
@@ -256,7 +318,7 @@ class ProviderBudgetTests(unittest.TestCase):
             deadline_seconds=0.25,
             clock=clock,
         )
-        translator.requests.post = rate_limited
+        translator._provider_post = rate_limited
         translator.time.sleep = advance
         translator._fallback_provider = None
 
@@ -314,7 +376,7 @@ class ProviderBudgetTests(unittest.TestCase):
                 calls += 1
             raise translator.requests.exceptions.ConnectionError("synthetic down")
 
-        translator.requests.post = always_down
+        translator._provider_post = always_down
         translator.time.sleep = lambda _seconds: None
         translator.BT_BATCH_SIZE = 1
         budget = self.budget(max_attempts=7)
@@ -337,7 +399,7 @@ class ProviderBudgetTests(unittest.TestCase):
             calls += 1
             raise AssertionError("provider should not be called")
 
-        translator.requests.post = must_not_run
+        translator._provider_post = must_not_run
         budget = self.budget(deadline_seconds=0.001)
         budget._deadline = budget._clock()  # deterministic expiry before call
 
@@ -355,7 +417,7 @@ class ProviderBudgetTests(unittest.TestCase):
             calls += 1
             raise AssertionError("provider should not be called")
 
-        translator.requests.post = must_not_run
+        translator._provider_post = must_not_run
         translator._UPSTREAM_SEM = threading.BoundedSemaphore(1)
         translator.BT_UPSTREAM_QUEUE_TIMEOUT = 0.001
         translator._UPSTREAM_SEM.acquire()
@@ -406,7 +468,7 @@ class ProviderBudgetTests(unittest.TestCase):
             calls["fallback"] += 1
             return FallbackResponse(kwargs["json"])
 
-        translator.requests.post = primary_down_fallback_up
+        translator._provider_post = primary_down_fallback_up
         translator.time.sleep = lambda _seconds: None
         translator.BT_BATCH_SIZE = 5
 
@@ -467,7 +529,7 @@ class ProviderBudgetTests(unittest.TestCase):
                 slow_done.set()
             return OpenAIResponse(kwargs["json"], malformed=malformed)
 
-        translator.requests.post = one_malformed_others_slow
+        translator._provider_post = one_malformed_others_slow
         translator.BT_BATCH_SIZE = 2
         translator._fallback_provider = None
         translator._UPSTREAM_SEM = threading.BoundedSemaphore(2)

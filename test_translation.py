@@ -1,7 +1,7 @@
 """
 Self-contained backend tests — no live server, no network.
 
-Uses Flask's test client and a mocked LLM (monkeypatched requests.post), so it
+Uses Flask's test client and a mocked provider transport, so it
 runs anywhere with just `flask` + `requests` installed:
 
     pip install flask requests
@@ -45,7 +45,9 @@ class FakeResp:
             err = requests.exceptions.HTTPError(f"HTTP {self.status_code}"); err.response = self; raise err
 
 
-def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+def fake_post(
+    url, headers=None, json=None, timeout=None, stream=False, budget=None
+):
     is_local = "1234" in url or "localhost" in url
     if is_local and not STATE["local_up"]:
         raise requests.exceptions.ConnectionError("local refused")
@@ -78,8 +80,8 @@ def fake_post(url, headers=None, json=None, timeout=None, stream=False):
     return FakeResp(200, {"choices": [{"message": {"content": content}}]})
 
 
-requests.post = fake_post
-
+import translator  # noqa: E402
+translator._provider_post = fake_post
 import server  # noqa: E402
 client = server.app.test_client()
 
@@ -186,20 +188,22 @@ def run():
 
     # Capture the exact prompt the LLM receives to verify the context block.
     received_prompts = []
-    original_post = requests.post
-    def context_check_post(url, headers=None, json=None, timeout=None, stream=False):
+    original_post = translator._provider_post
+    def context_check_post(
+        url, headers=None, json=None, timeout=None, stream=False, budget=None
+    ):
         user_text = json["messages"][-1]["content"]
         received_prompts.append(user_text)
-        return fake_post(url, headers, json, timeout, stream)
+        return fake_post(url, headers, json, timeout, stream, budget)
 
-    requests.post = context_check_post
+    translator._provider_post = context_check_post
     # 4 paragraphs at BT_BATCH_SIZE=3 -> group 1 covers indices 0..2 (context
     # after = para D), group 2 covers index 3 (context before = para C). Use a
     # direct translator call so the full chapter is visible to the context
     # builder regardless of server-side cache state.
     translator.translate_batch(
         ["ctx_para_A", "ctx_para_B", "ctx_para_C", "ctx_para_D"], "English", "Spanish")
-    requests.post = original_post
+    translator._provider_post = original_post
     translator.BT_CONTEXT_WINDOW = 0
 
     batch_prompts = [
