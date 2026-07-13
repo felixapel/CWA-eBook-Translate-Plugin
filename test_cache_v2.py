@@ -42,6 +42,23 @@ def scope(**overrides: str) -> CacheScope:
     return CacheScope(**values)
 
 
+def create_v1_table(conn: sqlite3.Connection, table: str = "translations") -> None:
+    if table not in {"translations", "translations_v1"}:
+        raise ValueError("unsupported v1 fixture table")
+    conn.execute(
+        f"""CREATE TABLE {table} (
+            cache_key TEXT PRIMARY KEY,
+            source_text TEXT NOT NULL,
+            source_lang TEXT NOT NULL,
+            target_lang TEXT NOT NULL,
+            translated_text TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 1
+        )"""
+    )
+
+
 class CacheV2Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -188,7 +205,7 @@ class CacheV2Tests(unittest.TestCase):
         columns = {
             row[1]
             for row in self.store.connection().execute(
-                "PRAGMA table_info(translations)"
+                "PRAGMA table_info(translations_v2)"
             )
         }
         self.assertNotIn("source_text", columns)
@@ -217,18 +234,7 @@ class CacheV2Tests(unittest.TestCase):
         self.cache_dir.mkdir(mode=0o700)
         self.db_path = self.cache_dir / "translations.db"
         conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            """CREATE TABLE translations (
-                cache_key TEXT PRIMARY KEY,
-                source_text TEXT NOT NULL,
-                source_lang TEXT NOT NULL,
-                target_lang TEXT NOT NULL,
-                translated_text TEXT NOT NULL,
-                model TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                hit_count INTEGER NOT NULL DEFAULT 1
-            )"""
-        )
+        create_v1_table(conn)
         conn.execute(
             "INSERT INTO translations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -257,10 +263,11 @@ class CacheV2Tests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        self.assertIn("translations_v1", names)
         self.assertIn("translations", names)
+        self.assertIn("translations_v2", names)
+        self.assertNotIn("translations_v1", names)
         legacy_count = self.store.connection().execute(
-            "SELECT COUNT(*) FROM translations_v1"
+            "SELECT COUNT(*) FROM translations"
         ).fetchone()[0]
         self.assertEqual(legacy_count, 1)
         self.assertIsNone(
@@ -268,9 +275,101 @@ class CacheV2Tests(unittest.TestCase):
                 "legacy source", "English", "Spanish", scope(model="legacy-model")
             )
         )
+        self.store.put(
+            "v2 source", "English", "Spanish", "v2 target", scope()
+        )
+        legacy_conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(
+                legacy_conn.execute(
+                    "SELECT translated_text FROM translations WHERE cache_key = ?",
+                    ("legacy-key",),
+                ).fetchone()[0],
+                "legacy target",
+            )
+            legacy_conn.execute(
+                "INSERT INTO translations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-key-2",
+                    "second legacy source",
+                    "English",
+                    "French",
+                    "second legacy target",
+                    "legacy-model",
+                    self.clock().isoformat(),
+                    1,
+                ),
+            )
+            legacy_conn.commit()
+            self.assertEqual(
+                legacy_conn.execute("PRAGMA integrity_check").fetchone()[0],
+                "ok",
+            )
+        finally:
+            legacy_conn.close()
+        self.assertEqual(
+            self.store.get("v2 source", "English", "Spanish", scope()),
+            "v2 target",
+        )
         self.assertEqual(
             self.store.connection().execute("PRAGMA user_version").fetchone()[0],
             CACHE_SCHEMA_VERSION,
+        )
+
+    def test_unreleased_draft_layout_is_normalized_atomically(self) -> None:
+        self.store.put(
+            "draft v2 source", "English", "Spanish", "draft v2 target", scope()
+        )
+        self.store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE translations_v2 RENAME TO translations")
+        create_v1_table(conn, "translations_v1")
+        conn.execute(
+            "INSERT INTO translations_v1 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "draft-v1-key",
+                "draft v1 source",
+                "English",
+                "Spanish",
+                "draft v1 target",
+                "legacy-model",
+                self.clock().isoformat(),
+                2,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        self.store = CacheStore(
+            self.db_path,
+            ttl_days=30,
+            max_entries=3,
+            now=self.clock,
+        )
+        names = {
+            row[0]
+            for row in self.store.connection().execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        self.assertIn("translations", names)
+        self.assertIn("translations_v2", names)
+        self.assertNotIn("translations_v1", names)
+        self.assertEqual(
+            self.store.connection().execute(
+                "SELECT translated_text FROM translations WHERE cache_key = ?",
+                ("draft-v1-key",),
+            ).fetchone()[0],
+            "draft v1 target",
+        )
+        self.assertEqual(
+            self.store.get("draft v2 source", "English", "Spanish", scope()),
+            "draft v2 target",
+        )
+        self.assertEqual(
+            self.store.connection().execute("PRAGMA integrity_check").fetchone()[0],
+            "ok",
         )
 
     def test_invalid_retention_configuration_fails_closed(self) -> None:

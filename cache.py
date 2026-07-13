@@ -24,6 +24,7 @@ log = logging.getLogger("book-translator.cache")
 
 CACHE_SCHEMA_VERSION = 2
 CACHE_KEY_VERSION = "cwa-translate-cache/v2"
+CACHE_TABLE = "translations_v2"
 DB_PATH = Path(os.getenv("DB_PATH", "translations.db"))
 
 
@@ -185,9 +186,9 @@ class CacheStore:
                 return
             conn = self.connection()
             try:
-                self._preserve_v1(conn)
+                self._normalize_cache_tables(conn)
                 conn.execute(
-                    """CREATE TABLE IF NOT EXISTS translations (
+                    """CREATE TABLE IF NOT EXISTS translations_v2 (
                         cache_key TEXT PRIMARY KEY,
                         tenant_hash TEXT NOT NULL,
                         book_hash TEXT NOT NULL,
@@ -207,15 +208,15 @@ class CacheStore:
                 )
                 conn.execute(
                     """CREATE INDEX IF NOT EXISTS idx_cache_v2_langs
-                       ON translations(tenant_hash, source_lang, target_lang)"""
+                       ON translations_v2(tenant_hash, source_lang, target_lang)"""
                 )
                 conn.execute(
                     """CREATE INDEX IF NOT EXISTS idx_cache_v2_created
-                       ON translations(created_at)"""
+                       ON translations_v2(created_at)"""
                 )
                 conn.execute(
                     """CREATE INDEX IF NOT EXISTS idx_cache_v2_accessed
-                       ON translations(last_accessed_at, created_at)"""
+                       ON translations_v2(last_accessed_at, created_at)"""
                 )
                 conn.execute(f"PRAGMA user_version={CACHE_SCHEMA_VERSION}")
                 self._delete_expired(conn)
@@ -238,26 +239,46 @@ class CacheStore:
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
         return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
-    def _preserve_v1(self, conn: sqlite3.Connection) -> None:
-        columns = self._table_columns(conn, "translations")
-        if not columns or "source_text" not in columns:
-            return
-        target = "translations_v1"
-        suffix = 1
-        existing = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        while target in existing:
-            suffix += 1
-            target = f"translations_v1_{suffix}"
-        conn.execute(f"ALTER TABLE translations RENAME TO {target}")
-        log.warning(
-            "Preserved legacy cache as %s; v1 rows are intentionally not served",
-            target,
-        )
+    def _normalize_cache_tables(self, conn: sqlite3.Connection) -> None:
+        """Keep the v1 table available for an in-place rollback.
+
+        The unreleased draft schema renamed ``translations`` to
+        ``translations_v1`` and reused the old name for v2. Normalize that
+        layout atomically while it is still safe to do so before v2.2.0.
+        """
+        primary_columns = self._table_columns(conn, "translations")
+        v2_columns = self._table_columns(conn, CACHE_TABLE)
+        draft_v1_columns = self._table_columns(conn, "translations_v1")
+
+        primary_is_v1 = "source_text" in primary_columns
+        primary_is_v2 = {
+            "tenant_hash", "book_hash", "chapter_hash", "context_hash",
+            "prompt_hash", "protocol_version",
+        }.issubset(primary_columns)
+
+        if primary_columns and not primary_is_v1 and not primary_is_v2:
+            raise RuntimeError("unsupported translations cache schema")
+        if v2_columns and "source_text" in v2_columns:
+            raise RuntimeError("translations_v2 unexpectedly contains a v1 schema")
+        if draft_v1_columns and "source_text" not in draft_v1_columns:
+            raise RuntimeError("translations_v1 does not contain the expected v1 schema")
+
+        if primary_is_v2:
+            if v2_columns:
+                raise RuntimeError("ambiguous duplicate v2 cache tables")
+            conn.execute("ALTER TABLE translations RENAME TO translations_v2")
+            if draft_v1_columns:
+                conn.execute("ALTER TABLE translations_v1 RENAME TO translations")
+                log.warning(
+                    "Normalized draft cache layout; v1 remains available for rollback"
+                )
+            else:
+                log.warning(
+                    "Normalized draft v2 cache layout without a preserved v1 table"
+                )
+        elif not primary_columns and draft_v1_columns:
+            conn.execute("ALTER TABLE translations_v1 RENAME TO translations")
+            log.warning("Restored the preserved v1 table name for rollback")
 
     def _utc_now(self) -> datetime:
         value = self._now()
@@ -317,7 +338,7 @@ class CacheStore:
     ) -> str | None:
         cache_key = self.compute_key(text, source_lang, target_lang, cache_scope)
         row = self.connection().execute(
-            """SELECT translated_text FROM translations
+            """SELECT translated_text FROM translations_v2
                WHERE cache_key = ? AND created_at >= ?""",
             (cache_key, self._cutoff()),
         ).fetchone()
@@ -370,7 +391,7 @@ class CacheStore:
             accessed_at = self._utc_now().isoformat()
             try:
                 conn.executemany(
-                    """UPDATE translations
+                    """UPDATE translations_v2
                        SET hit_count = hit_count + ?, last_accessed_at = ?
                        WHERE cache_key = ?""",
                     [
@@ -402,7 +423,7 @@ class CacheStore:
         conn = self.connection()
         try:
             conn.execute(
-                """INSERT INTO translations (
+                """INSERT INTO translations_v2 (
                        cache_key, tenant_hash, book_hash, chapter_hash,
                        context_hash, source_lang, target_lang, translated_text,
                        provider, model, prompt_hash, protocol_version,
@@ -443,14 +464,14 @@ class CacheStore:
 
     def _delete_expired(self, conn: sqlite3.Connection) -> int:
         cursor = conn.execute(
-            "DELETE FROM translations WHERE created_at < ?", (self._cutoff(),)
+            "DELETE FROM translations_v2 WHERE created_at < ?", (self._cutoff(),)
         )
         return max(0, cursor.rowcount)
 
     def _enforce_cap(self, conn: sqlite3.Connection) -> None:
         conn.execute(
-            """DELETE FROM translations WHERE cache_key IN (
-                   SELECT cache_key FROM translations
+            """DELETE FROM translations_v2 WHERE cache_key IN (
+                   SELECT cache_key FROM translations_v2
                    ORDER BY last_accessed_at DESC, created_at DESC, cache_key DESC
                    LIMIT -1 OFFSET ?
                )""",
@@ -469,7 +490,7 @@ class CacheStore:
         conn = self.connection()
         try:
             cursor = conn.execute(
-                "DELETE FROM translations WHERE created_at < ?",
+                "DELETE FROM translations_v2 WHERE created_at < ?",
                 (self._cutoff(retention_days),),
             )
             deleted = max(0, cursor.rowcount)
@@ -492,15 +513,17 @@ class CacheStore:
             self._delete_expired(conn)
             self._enforce_cap(conn)
             conn.commit()
-            total = conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM translations_v2").fetchone()[0]
             total_hits = conn.execute(
-                "SELECT COALESCE(SUM(hit_count), 0) FROM translations"
+                "SELECT COALESCE(SUM(hit_count), 0) FROM translations_v2"
             ).fetchone()[0]
             pairs = conn.execute(
                 """SELECT source_lang, target_lang, COUNT(*)
-                   FROM translations GROUP BY source_lang, target_lang"""
+                   FROM translations_v2 GROUP BY source_lang, target_lang"""
             ).fetchall()
-            legacy_tables = conn.execute(
+            legacy_tables = int(
+                "source_text" in self._table_columns(conn, "translations")
+            ) + conn.execute(
                 """SELECT COUNT(*) FROM sqlite_master
                    WHERE type='table' AND name LIKE 'translations_v1%'"""
             ).fetchone()[0]
