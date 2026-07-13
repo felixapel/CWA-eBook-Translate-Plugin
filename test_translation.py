@@ -1,16 +1,16 @@
 """
 Self-contained backend tests — no live server, no network.
 
-Uses Flask's test client and a mocked LLM (monkeypatched requests.post), so it
+Uses Flask's test client and a mocked provider transport, so it
 runs anywhere with just `flask` + `requests` installed:
 
     pip install flask requests
     python test_translation.py
 
 Covers: provider fallback, errors not cached, batched-prompt translation
-(one LLM call per group) and its per-paragraph fallback on a malformed reply.
+(one LLM call per group), and strict fail-closed segment envelopes.
 """
-import os, sys, json, re, tempfile
+import os, sys, json as jsonlib, re, tempfile
 
 os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_test_translations.db")
 os.environ["BT_CACHE_DIR"] = tempfile.gettempdir()  # for /cache/cleanup auth token
@@ -33,28 +33,21 @@ for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_
 import requests
 
 STATE = {"local_up": False, "fallback_up": True, "batch_calls": 0, "single_calls": 0, "malform": False}
-SEG_RE = re.compile(r"@@\s*SEG\s*(\d+)\s*@@", re.IGNORECASE)
+SEGMENT_PROTOCOL = "cwa-translate-segments/v1"
 
 
 class FakeResp:
     def __init__(self, status, body):
-        self.status_code = status; self._body = body; self.text = json.dumps(body)
+        self.status_code = status; self._body = body; self.text = jsonlib.dumps(body)
     def json(self): return self._body
     def raise_for_status(self):
         if self.status_code >= 400:
             err = requests.exceptions.HTTPError(f"HTTP {self.status_code}"); err.response = self; raise err
 
 
-def _segments(user_text):
-    matches = list(SEG_RE.finditer(user_text))
-    out = []
-    for k, m in enumerate(matches):
-        start = m.end(); end = matches[k + 1].start() if k + 1 < len(matches) else len(user_text)
-        out.append((int(m.group(1)), user_text[start:end].strip()))
-    return out
-
-
-def fake_post(url, headers=None, json=None, timeout=None):
+def fake_post(
+    url, headers=None, json=None, timeout=None, stream=False, budget=None
+):
     is_local = "1234" in url or "localhost" in url
     if is_local and not STATE["local_up"]:
         raise requests.exceptions.ConnectionError("local refused")
@@ -65,16 +58,19 @@ def fake_post(url, headers=None, json=None, timeout=None):
     user_text = json["messages"][-1]["content"]
     tag = "LOCAL" if is_local else "FB"
 
-    if "@@SEG" in system:
+    if SEGMENT_PROTOCOL in system:
         STATE["batch_calls"] += 1
-        segs = _segments(user_text)
-        lines = []
-        for idx, (n, txt) in enumerate(segs):
-            if STATE["malform"] and idx == len(segs) - 1:
-                lines.append(f"[{tag}] {txt}")          # missing marker -> parse mismatch
-            else:
-                lines.append(f"@@SEG {n}@@\n[{tag}] {txt}")
-        content = "\n\n".join(lines)
+        envelope = jsonlib.loads(user_text)
+        translations = [
+            {"id": segment["id"], "text": f"[{tag}] {segment['text']}"}
+            for segment in envelope["segments"]
+        ]
+        if STATE["malform"]:
+            translations = translations[:-1]  # count mismatch -> atomic failure
+        content = jsonlib.dumps({
+            "protocol": SEGMENT_PROTOCOL,
+            "translations": translations,
+        })
     else:
         STATE["single_calls"] += 1
         content = f"[{tag}] {user_text}"
@@ -84,8 +80,8 @@ def fake_post(url, headers=None, json=None, timeout=None):
     return FakeResp(200, {"choices": [{"message": {"content": content}}]})
 
 
-requests.post = fake_post
-
+import translator  # noqa: E402
+translator._provider_post = fake_post
 import server  # noqa: E402
 client = server.app.test_client()
 
@@ -110,13 +106,72 @@ def run():
     check("batch: all 5 translated in order", d["translations"] == [f"[LOCAL] para {i}" for i in range(5)])
     check("batch: 2 grouped LLM calls (not 5)", STATE["batch_calls"] == 2 and STATE["single_calls"] == 0)
 
-    # Malformed segmented reply -> transparent per-paragraph fallback.
+    # Malformed segmented replies fail atomically. Retrying each paragraph
+    # would multiply upstream work and could cache text under the wrong slot.
     STATE["malform"] = True
     STATE["batch_calls"] = STATE["single_calls"] = 0
-    d = client.post("/translate/batch", json={"paragraphs": [f"a{i}" for i in range(3)]}).get_json()
-    check("batch-fallback: still all correct", d["translations"] == [f"[LOCAL] a{i}" for i in range(3)])
-    check("batch-fallback: used per-paragraph calls", STATE["single_calls"] == 3)
+    malformed_response = client.post(
+        "/translate/batch", json={"paragraphs": [f"a{i}" for i in range(3)]})
+    d = malformed_response.get_json()
+    check("segment protocol: malformed group fails atomically",
+          malformed_response.status_code == 502
+          and d.get("error") == "invalid_provider_response")
+    check("segment protocol: malformed group triggers no per-paragraph fanout",
+          STATE["single_calls"] == 0)
+    import cache as segment_cache
+    check("segment protocol: malformed group writes nothing to cache",
+          all(segment_cache.get_cached(
+              f"a{i}", "English", "Spanish", model="fake-model") is None
+              for i in range(3)))
     STATE["malform"] = False
+
+    # Input text that contains the legacy marker must remain ordinary content;
+    # it must never create, renumber, or truncate a segment.
+    marker_text = "literal @@SEG 99@@ marker"
+    translated = __import__("translator").translate_batch(
+        [marker_text, "ordinary segment"], "English", "Spanish")
+    check("segment protocol: marker-like ebook content is preserved",
+          translated[0][0] == f"[LOCAL] {marker_text}")
+
+    # Strict JSON response envelope: exact version, exact ordered IDs, no
+    # duplicate keys, missing/extra/reordered items, or surrounding prose.
+    import translator
+    parser = getattr(translator, "_parse_segment_envelope", None)
+    check("segment protocol: strict JSON parser is available", callable(parser))
+    if parser:
+        expected_ids = ["seg-a", "seg-b"]
+        valid = jsonlib.dumps({
+            "protocol": "cwa-translate-segments/v1",
+            "translations": [
+                {"id": "seg-a", "text": "uno"},
+                {"id": "seg-b", "text": "dos"},
+            ],
+        })
+        check("segment protocol: valid envelope accepted",
+              parser(valid, expected_ids) == ["uno", "dos"])
+        invalid_outputs = [
+            valid + "\ncommentary",
+            '{"protocol":"cwa-translate-segments/v1",'
+            '"protocol":"cwa-translate-segments/v1","translations":[]}',
+            jsonlib.dumps({"protocol": "cwa-translate-segments/v1", "translations": [
+                {"id": "seg-a", "text": "uno"},
+            ]}),
+            jsonlib.dumps({"protocol": "cwa-translate-segments/v1", "translations": [
+                {"id": "seg-a", "text": "uno"},
+                {"id": "seg-b", "text": "dos"},
+                {"id": "seg-c", "text": "tres"},
+            ]}),
+            jsonlib.dumps({"protocol": "cwa-translate-segments/v1", "translations": [
+                {"id": "seg-b", "text": "dos"},
+                {"id": "seg-a", "text": "uno"},
+            ]}),
+            jsonlib.dumps({"protocol": "cwa-translate-segments/v1", "translations": [
+                {"id": "seg-a", "text": "uno"},
+                {"id": "seg-a", "text": "poison"},
+            ]}),
+        ]
+        check("segment protocol: malformed envelopes all fail closed",
+              all(parser(output, expected_ids) is None for output in invalid_outputs))
 
     # Errors not cached; retried after recovery.
     STATE["local_up"] = STATE["fallback_up"] = False
@@ -129,34 +184,46 @@ def run():
 
     # Context Window. translator.py reads BT_CONTEXT_WINDOW at import time, so
     # patch the module variable directly for this block.
-    import translator
     translator.BT_CONTEXT_WINDOW = 1
 
     # Capture the exact prompt the LLM receives to verify the context block.
     received_prompts = []
-    original_post = requests.post
-    def context_check_post(url, headers=None, json=None, timeout=None):
+    original_post = translator._provider_post
+    def context_check_post(
+        url, headers=None, json=None, timeout=None, stream=False, budget=None
+    ):
         user_text = json["messages"][-1]["content"]
         received_prompts.append(user_text)
-        return fake_post(url, headers, json, timeout)
+        return fake_post(url, headers, json, timeout, stream, budget)
 
-    requests.post = context_check_post
+    translator._provider_post = context_check_post
     # 4 paragraphs at BT_BATCH_SIZE=3 -> group 1 covers indices 0..2 (context
     # after = para D), group 2 covers index 3 (context before = para C). Use a
     # direct translator call so the full chapter is visible to the context
     # builder regardless of server-side cache state.
     translator.translate_batch(
         ["ctx_para_A", "ctx_para_B", "ctx_para_C", "ctx_para_D"], "English", "Spanish")
-    requests.post = original_post
+    translator._provider_post = original_post
     translator.BT_CONTEXT_WINDOW = 0
 
-    batch_prompts = [p for p in received_prompts if "@@SEG" in p]
+    batch_prompts = [
+        jsonlib.loads(p) for p in received_prompts
+        if f'"protocol":"{SEGMENT_PROTOCOL}"' in p
+    ]
     check("context: [CONTEXT] block included in batch prompt",
-          any("[CONTEXT]" in p for p in batch_prompts))
+          any("[CONTEXT]" in p.get("context", "") for p in batch_prompts))
     check("context: plain text, never a Python list repr",
-          all("['" not in p and '["' not in p for p in batch_prompts))
-    check("context: context precedes the first segment marker",
-          all(p.index("[CONTEXT]") < p.index("@@SEG") for p in batch_prompts if "[CONTEXT]" in p))
+          all(isinstance(p.get("context", ""), str) for p in batch_prompts))
+    check("context: isolated from translatable segment fields",
+          all("context" not in segment
+              for p in batch_prompts for segment in p["segments"]))
+    prompt_ids = [
+        segment["id"] for p in batch_prompts for segment in p["segments"]
+    ]
+    check("segment protocol: input IDs are random-looking and unique",
+          bool(prompt_ids)
+          and len(prompt_ids) == len(set(prompt_ids))
+          and all(re.fullmatch(r"[0-9a-f]{32}", value) for value in prompt_ids))
 
     # Request-size caps: oversized input is rejected, not silently truncated.
     too_many = [f"p{i}" for i in range(server.BT_MAX_BATCH_PARAGRAPHS + 1)]

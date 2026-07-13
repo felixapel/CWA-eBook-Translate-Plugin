@@ -14,7 +14,7 @@ Covers:
 
 Run with: python3 test_hardening.py
 """
-import os, sys, json, tempfile
+import os, sys, json, subprocess, tempfile
 from pathlib import Path
 
 # Same env-var contract as test_translation.py.
@@ -33,17 +33,18 @@ for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_
     except OSError:
         pass
 
-import requests
 import ipaddress
 
 # Re-use the same fake_post from test_translation.py.
 import test_translation  # noqa: E402
 STATE = test_translation.STATE
 fake_post = test_translation.fake_post
-requests.post = fake_post
+import translator  # noqa: E402
+translator._provider_post = fake_post
 
 # Import server after fake_post is installed.
 import server  # noqa: E402
+from work_budget import WorkBudgetExceeded  # noqa: E402
 client = server.app.test_client()
 
 failed = []
@@ -202,6 +203,7 @@ def run():
     server.BT_TRUST_PROXY = False
     original_trusted = set(server.BT_TRUSTED_PROXIES)
     original_nets = list(server._TRUSTED_PROXY_NETS)
+    original_limit = server.RATE_LIMIT_MAX
     try:
         # Werkzeug's test client connects from 127.0.0.1. Allowlist it.
         server.BT_TRUSTED_PROXIES = {"127.0.0.1/32"}
@@ -238,10 +240,61 @@ def run():
         keys = list(server._rate_limit_store.keys())
         check("BT_TRUSTED_PROXIES: peer NOT in allowlist ignores XFF (anti-spoof)",
               keys and keys[0] != "9.9.9.9")
+
+        # Route-level isolation contract: exhausting client A's bucket behind
+        # the trusted in-container proxy must not consume client B's budget.
+        server.BT_TRUSTED_PROXIES = {"127.0.0.1/32"}
+        server._TRUSTED_PROXY_NETS = [
+            ipaddress.ip_network("127.0.0.1/32", strict=False)
+        ]
+        server.RATE_LIMIT_MAX = 1
+        server._rate_limit_store.clear()
+        payload = {
+            "text": "proxy bucket probe",
+            "source_lang": "English",
+            "target_lang": "English",
+        }
+        a_first = client.post("/translate", json=payload,
+                              headers={"X-Forwarded-For": "192.0.2.10"})
+        a_second = client.post("/translate", json=payload,
+                               headers={"X-Forwarded-For": "192.0.2.10"})
+        b_first = client.post("/translate", json=payload,
+                              headers={"X-Forwarded-For": "192.0.2.11"})
+        check("trusted proxy: exhausted client A does not block client B",
+              a_first.status_code == 200
+              and a_second.status_code == 429
+              and b_first.status_code == 200)
+        server.RATE_LIMIT_MAX = original_limit
     finally:
         server.BT_TRUSTED_PROXIES = original_trusted
         server._TRUSTED_PROXY_NETS = original_nets
+        server.RATE_LIMIT_MAX = original_limit
         server._rate_limit_store.clear()
+
+    # The entrypoint must export the proxy trust boundary before Gunicorn
+    # imports server.py. Import-time configuration set later is ineffective.
+    entrypoint = (Path(__file__).parent / "docker-entrypoint.sh").read_text()
+    trust_export = entrypoint.find('export BT_TRUSTED_PROXIES=')
+    gunicorn_start = entrypoint.find('gosu appuser gunicorn')
+    check("entrypoint: trusted proxy config is exported before Gunicorn",
+          trust_export >= 0 and gunicorn_start >= 0 and trust_export < gunicorn_start)
+
+    # A typo in the trust allowlist must fail startup, never degrade silently
+    # to trusting or grouping the wrong clients.
+    invalid_env = os.environ.copy()
+    invalid_env["BT_TRUSTED_PROXIES"] = "definitely-not-a-cidr"
+    invalid_env["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_invalid_proxy.db")
+    invalid_proxy = subprocess.run(
+        [sys.executable, "-c", "import server"],
+        cwd=Path(__file__).parent,
+        env=invalid_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    check("BT_TRUSTED_PROXIES: invalid CIDR fails startup",
+          invalid_proxy.returncode != 0
+          and "definitely-not-a-cidr" in (invalid_proxy.stdout + invalid_proxy.stderr))
 
     # ─────────────────────────────────────────────────────────────────────
     # H6: /translate/batch per-paragraph attribution
@@ -310,6 +363,75 @@ def run():
     # Backward compat: the original aggregate fields are still there.
     check("H6: backward compat: cached_count still present",
           "cached_count" in r1 and "fresh_count" in r1)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # H7: malformed JSON shapes fail closed with a stable JSON 400
+    # ────────────────────────────────────────────────────────────────────
+    malformed_cases = [
+        ("/translate", ["text"], "single: top-level array"),
+        ("/translate/batch", ["paragraphs"], "batch: top-level array"),
+        ("/translate", {"text": "hello", "source_lang": []},
+         "single: source_lang must be a string"),
+        ("/translate", {"text": "hello", "target_lang": 7},
+         "single: target_lang must be a string"),
+        ("/translate/batch", {"paragraphs": ["hello"], "source_lang": {}},
+         "batch: source_lang must be a string"),
+    ]
+    for endpoint, payload, label in malformed_cases:
+        response = client.post(endpoint, json=payload)
+        body = response.get_json(silent=True)
+        check(f"JSON schema: {label} returns 400 JSON",
+              response.status_code == 400
+              and isinstance(body, dict)
+              and isinstance(body.get("error"), str))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # H8: work-budget exhaustion has a stable, retry-safe HTTP contract
+    # ────────────────────────────────────────────────────────────────────
+    original_translate_text = server.translate_text
+    original_translate_batch = server.translate_batch
+    try:
+        def exhaust_single(*args, **kwargs):
+            raise WorkBudgetExceeded("attempts")
+
+        server.translate_text = exhaust_single
+        server._rate_limit_store.clear()
+        response = client.post(
+            "/translate", json={"text": "h8 unique single budget miss"})
+        body = response.get_json(silent=True)
+        check("work budget: single exhaustion returns stable 503 JSON",
+              response.status_code == 503
+              and body.get("error") == "work_budget_exhausted"
+              and body.get("reason") == "attempts")
+
+        def exhaust_batch(*args, **kwargs):
+            raise WorkBudgetExceeded("deadline")
+
+        server.translate_batch = exhaust_batch
+        server._rate_limit_store.clear()
+        response = client.post("/translate/batch", json={
+            "paragraphs": ["h8 unique batch budget miss"],
+        })
+        body = response.get_json(silent=True)
+        check("work budget: batch exhaustion returns stable 503 JSON",
+              response.status_code == 503
+              and body.get("error") == "work_budget_exhausted"
+              and body.get("reason") == "deadline")
+
+        def queue_full(*args, **kwargs):
+            raise WorkBudgetExceeded("queue")
+
+        server.translate_text = queue_full
+        server._rate_limit_store.clear()
+        response = client.post(
+            "/translate", json={"text": "h8 unique queue miss"})
+        check("work budget: transient queue rejection exposes Retry-After",
+              response.status_code == 503
+              and response.headers.get("Retry-After") is not None)
+    finally:
+        server.translate_text = original_translate_text
+        server.translate_batch = original_translate_batch
+        server._rate_limit_store.clear()
 
 
 if __name__ == "__main__":

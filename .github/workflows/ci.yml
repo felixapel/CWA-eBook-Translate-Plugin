@@ -58,9 +58,10 @@ jobs:
           # Pin transitive deps for audit. --quiet keeps the log readable.
           python3 -m piptools compile --quiet --output-file=requirements-pinned.txt --no-header --strip-extras requirements.txt
           python3 -m pip_audit -r requirements-pinned.txt --strict --disable-pip --no-deps
-      - run: python3 -m py_compile server.py translator.py cache.py
+      - run: python3 -m py_compile server.py translator.py cache.py work_budget.py
       - run: python3 test_translation.py
       - run: python3 test_hardening.py
+      - run: python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_cleanup_token test_api_schema test_error_privacy
 
   frontend:
     runs-on: ubuntu-latest
@@ -71,67 +72,66 @@ jobs:
           node-version: "20"
       - run: node -c static/translator.js
       - run: node -c static/loader.js
-      - run: npm install
-      - run: npm audit --omit=dev
+      - run: npm ci
+      - run: npm audit --audit-level=high
       - run: npm test
 
   # Smoke test: build the image, run it, hit /ping, expect 200.
   # Catches Dockerfile regressions (syntax, missing deps, broken entrypoint,
-  # USER appuser) that pure Python tests can't. Skips when Docker isn't
-  # available — some Gitea job containers ship without dind, and we'd
-  # rather get a green run with a "skipped" note than a hard fail that
-  # blocks legitimate PRs. The pure-Python backend suite above already
-  # exercises the application code on a mock LLM, so losing this smoke
-  # step in those environments doesn't drop coverage to zero.
+  # USER appuser) that pure Python tests can't. Docker is a required artifact
+  # gate: runners without a working daemon fail instead of reporting a green
+  # workflow whose build and runtime checks never executed.
+  # The global runner maps ubuntu-latest to a node job container without a
+  # Docker client. Its host-capable label runs on the isolated runner VM and
+  # is already proven by the WeebDB Docker gates on the same runner.
   docker-smoke:
-    runs-on: ubuntu-latest
+    runs-on: weebdb-docker
     steps:
       - uses: actions/checkout@v4
-      - name: Detect Docker
-        id: docker
-        run: |
-          if command -v docker >/dev/null 2>&1; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            docker --version
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::docker not installed in runner; skipping docker-smoke job"
-          fi
+      - name: Derive repository-scoped Docker names
+        # GITHUB_RUN_ID is only unique within one repository. Include a stable
+        # repository hash before using a shared/self-hosted Docker daemon.
+        run: sh scripts/ci-docker-names.sh
+      - name: Verify Docker daemon
+        run: docker version
       - name: Build image
-        if: steps.docker.outputs.available == 'true'
-        run: docker build -t bt-audit:ci .
+        run: docker build -t "$SMOKE_IMAGE" .
       - name: Run container
-        if: steps.docker.outputs.available == 'true'
         run: |
-          docker run -d --name bt-smoke -p 8390:8390 bt-audit:ci
-          # Wait for /ping to come up (the image has start-period=10s in its
-          # HEALTHCHECK, but we don't want to depend on Docker's healthcheck
-          # state for the smoke test — poll the endpoint directly).
+          docker run -d --name "$SMOKE_CONTAINER" \
+            -e CWA_UPSTREAM=http://127.0.0.1:8390 \
+            -p 127.0.0.1::8390 -p 127.0.0.1::8080 "$SMOKE_IMAGE"
+          API_PORT=$(docker port "$SMOKE_CONTAINER" 8390/tcp | sed 's/.*://')
+          PROXY_PORT=$(docker port "$SMOKE_CONTAINER" 8080/tcp | sed 's/.*://')
+          test -n "$API_PORT" && test -n "$PROXY_PORT"
+          # Poll the browser-facing proxy route, not only the internal API.
+          # This proves nginx rendered and started in the shipped image.
           for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:8390/ping >/dev/null 2>&1; then
-              echo "ping ok on try $i"
+            if curl -sf "http://127.0.0.1:${PROXY_PORT}/bt-api/ping" >/dev/null 2>&1; then
+              echo "proxy ping ok on try $i"
               break
             fi
             sleep 1
           done
-          # The actual assertion: /ping returns 200 with {"status":"ok"}.
-          curl -sf http://127.0.0.1:8390/ping | grep -q '"status":"ok"'
+          # Assert both process paths. The proxy response exercises nginx;
+          # direct loopback confirms Gunicorn independently for diagnosis.
+          curl -sf "http://127.0.0.1:${PROXY_PORT}/bt-api/ping" | grep -q '"status":"ok"'
+          curl -sf "http://127.0.0.1:${API_PORT}/ping" | grep -q '"status":"ok"'
       - name: Verify non-root API process
         # The /ping endpoint serves from gunicorn. The `appuser` should own
         # the gunicorn process; the entrypoint (and nginx if it were started)
         # can stay root.
-        if: steps.docker.outputs.available == 'true'
         run: |
           # BusyBox `ps` (Alpine) has no -p flag — list user+args and grep the
           # gunicorn master instead. [g]unicorn avoids matching the grep itself.
-          USER=$(docker exec bt-smoke ps -o user,args | grep '[g]unicorn' | head -1 | awk '{print $1}')
+          USER=$(docker exec "$SMOKE_CONTAINER" ps -o user,args | grep '[g]unicorn' | head -1 | awk '{print $1}')
           if [ "$USER" = "appuser" ]; then
             echo "gunicorn runs as appuser (unprivileged) — OK"
           else
             echo "gunicorn runs as '$USER', expected appuser"
-            docker exec bt-smoke ps -o user,args | head -10
+            docker exec "$SMOKE_CONTAINER" ps -o user,args | head -10
             exit 1
           fi
       - name: Cleanup
-        if: always() && steps.docker.outputs.available == 'true'
-        run: docker rm -f bt-smoke 2>/dev/null || true
+        if: always()
+        run: docker rm -f "$SMOKE_CONTAINER" 2>/dev/null || true

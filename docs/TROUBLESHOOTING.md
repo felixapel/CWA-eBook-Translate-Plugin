@@ -58,8 +58,11 @@ docker exec calibre-web-automated grep -n "BT_UI_VERSION" /app/calibre-web-autom
 
 ## 1. Button visible but no translation
 
-- **API health**: `curl -s http://127.0.0.1:8390/health` — must show `"status":"ok"`.
-  (`/ping` is a faster liveness-only check, no LLM call.)
+- **API readiness**: `curl -s http://127.0.0.1:8390/health` — must show
+  `"status":"ok"`. This is a shallow check; `/ping` is liveness-only and
+  neither endpoint contacts the LLM. To diagnose the configured provider, call
+  `/health/deep` with `X-BT-Token` set to `BT_API_TOKEN`, or to the persisted
+  `/app/data/cleanup_token` when no API token is configured.
 - **`BT_LOCAL_URL` is wrong**: Inside Docker, `localhost` means the container, not the host.
   Use your host's LAN IP (or `host.docker.internal`), e.g.
   `BT_LOCAL_URL=http://192.168.1.x:8000/v1/chat/completions`.

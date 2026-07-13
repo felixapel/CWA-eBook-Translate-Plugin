@@ -3,6 +3,7 @@ book-translator — Flask microservice for ebook paragraph translation.
 Runs on port 8390. Frontend (CWA overlay) calls this service.
 """
 import logging
+import math
 import os
 import re
 import time
@@ -12,11 +13,15 @@ import hmac
 from collections import defaultdict
 from pathlib import Path
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import HTTPException
 
 from translator import (
     translate_text, translate_batch, check_backend_health,
-    LLM_MODEL, model_for_provider, cache_lookup_models,
+    LLM_MODEL, BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
+    ProviderUnavailableError, create_work_budget, model_for_provider,
+    cache_lookup_models,
 )
+from work_budget import WorkBudget, WorkBudgetExceeded
 from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
 
 
@@ -127,6 +132,9 @@ VALID_LANGUAGES = {
 
 def _validate_languages(source_lang: str, target_lang: str):
     """Return error string if languages are invalid, else None."""
+    if not isinstance(source_lang, str) or not isinstance(target_lang, str):
+        return "'source_lang' and 'target_lang' must be strings"
+
     invalid = []
     if source_lang not in VALID_LANGUAGES:
         invalid.append(f"source_lang '{source_lang}'")
@@ -135,6 +143,15 @@ def _validate_languages(source_lang: str, target_lang: str):
     if invalid:
         return f"Invalid language(s): {', '.join(invalid)}. Valid: {sorted(VALID_LANGUAGES)}"
     return None
+
+
+def _has_invalid_unicode(value: str) -> bool:
+    """JSON can decode lone UTF-16 surrogates that UTF-8 cannot represent."""
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return True
+    return False
 
 
 # ── CORS whitelist (H5) ─────────────────────────────────────────────────────
@@ -286,10 +303,25 @@ def _record_metric(latency_ms: float, hits: int = 0, misses: int = 0, error: boo
             _metrics["errors"] += 1
 
 
+def _work_budget_response(exc: WorkBudgetExceeded):
+    """Map internal admission limits to a stable, non-sensitive 503."""
+    request_id = getattr(request, "request_id", None)
+    log.warning("req=%s upstream work rejected reason=%s", request_id, exc.reason)
+    response = jsonify({
+        "error": "work_budget_exhausted",
+        "reason": exc.reason,
+        "request_id": request_id,
+    })
+    if exc.reason == "queue":
+        response.headers["Retry-After"] = str(
+            max(1, math.ceil(BT_UPSTREAM_QUEUE_TIMEOUT)))
+    return response, 503
+
+
 # ── Shared batch helper (M3) ───────────────────────────────────────────────
 
 def _translate_paragraphs(
-    paragraphs: list[str], source_lang: str, target_lang: str
+    paragraphs: list[str], source_lang: str, target_lang: str, budget: WorkBudget
 ) -> dict:
     """
     Shared helper for batch translation logic used by /translate/batch.
@@ -331,7 +363,8 @@ def _translate_paragraphs(
 
     # Translate misses concurrently (concurrency controlled by BT_MAX_CONCURRENT)
     if misses:
-        results = translate_batch(misses, source_lang, target_lang)
+        results = translate_batch(
+            misses, source_lang, target_lang, budget=budget)
         for idx, (translated, backend) in zip(miss_indices, results):
             translations[idx] = translated
             backends[idx] = backend or "unknown"
@@ -366,7 +399,7 @@ def before_request_hook():
     # Optional shared-secret auth (skip preflight + health/ping so liveness
     # probes always work. /stats stays under auth so cache contents aren't
     # leakable on unauthenticated LANs.)
-    if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ping"):
+    if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/ping"):
         if not _token_matches(request.headers.get("X-BT-Token", ""), API_TOKEN):
             return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
 
@@ -378,7 +411,7 @@ def before_request_hook():
     # Skip CORS preflights too: an OPTIONS would otherwise burn 2x budget per
     # real cross-origin request, and a 429 on a preflight surfaces as a cryptic
     # CORS error in the browser instead of a rate limit the frontend can honor.
-    if request.method != "OPTIONS" and request.path not in ("/health", "/metrics", "/ping", "/stats"):
+    if request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/metrics", "/ping", "/stats"):
         client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
@@ -419,6 +452,40 @@ def after_request_hook(response):
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 
+@app.errorhandler(HTTPException)
+def http_error(exc: HTTPException):
+    """Keep framework-generated failures on the public JSON API contract."""
+    error_codes = {
+        400: "bad_request",
+        401: "unauthorized",
+        403: "forbidden",
+        404: "not_found",
+        405: "method_not_allowed",
+        413: "request_too_large",
+        415: "unsupported_media_type",
+        429: "rate_limited",
+    }
+    status_code = int(exc.code or 500)
+    return jsonify({
+        "error": error_codes.get(status_code, "http_error"),
+        "request_id": getattr(request, "request_id", None),
+    }), status_code
+
+
+@app.errorhandler(Exception)
+def unhandled_error(exc: Exception):
+    """Fail closed without returning or logging private exception strings."""
+    request_id = getattr(request, "request_id", None)
+    log.error(
+        "req=%s unhandled request error type=%s",
+        request_id, type(exc).__name__,
+    )
+    return jsonify({
+        "error": "internal_error",
+        "request_id": request_id,
+    }), 500
+
+
 @app.errorhandler(413)
 def request_too_large(_e):
     """Return a clean JSON 413 when MAX_CONTENT_LENGTH trips.
@@ -439,25 +506,48 @@ def request_too_large(_e):
 def ping():
     """Liveness probe — instant, never touches the LLM. Used by the Docker
     HEALTHCHECK so a busy/slow vLLM can't mark the container unhealthy while it
-    is in fact serving translations. /health (below) remains the deep probe."""
+    is in fact serving translations. /health is shallow; /health/deep probes
+    providers only for an authenticated operator."""
     return jsonify({"status": "ok"})
 
 
-BT_HEALTH_DETAILS = os.environ.get("BT_HEALTH_DETAILS", "true").lower() in ("1", "true", "yes")
-
-
 @app.route("/health")
+@app.route("/ready")
 def health():
-    """Health check with backend status (M2).
+    """Shallow readiness: process/config loaded, with no provider network I/O."""
+    return jsonify({
+        "status": "ok",
+        "service": "book-translator",
+        "version": __version__,
+        "request_id": getattr(request, "request_id", None),
+    })
 
-    /health is exempt from auth so liveness probes always work. When the API
-    is exposed beyond a trusted LAN, set BT_HEALTH_DETAILS=false to hide the
-    provider names/latency from unauthenticated callers (a valid X-BT-Token
-    still gets the full body); /ping remains the bare liveness endpoint."""
-    if not BT_HEALTH_DETAILS and API_TOKEN and not _token_matches(request.headers.get("X-BT-Token", ""), API_TOKEN):
-        return jsonify({"status": "ok", "service": "book-translator",
-                        "request_id": getattr(request, "request_id", None)})
-    backend_health = check_backend_health()
+
+@app.route("/health/deep")
+def deep_health():
+    """Operator-only provider probe using normal work and concurrency caps."""
+    provided_token = request.headers.get("X-BT-Token", "")
+    if API_TOKEN:
+        authorized = _token_matches(provided_token, API_TOKEN)
+    else:
+        try:
+            operator_token = _get_cleanup_token()
+        except CleanupCredentialUnavailable:
+            return jsonify({
+                "error": "operator_credential_unavailable",
+                "request_id": getattr(request, "request_id", None),
+            }), 503
+        authorized = _token_matches(provided_token, operator_token)
+    if not authorized:
+        return jsonify({
+            "error": "Unauthorized",
+            "request_id": getattr(request, "request_id", None),
+        }), 401
+
+    try:
+        backend_health = check_backend_health(create_work_budget())
+    except WorkBudgetExceeded as exc:
+        return _work_budget_response(exc)
     overall = "ok" if any(
         b.get("status") == "ok" for b in backend_health.values()
     ) else "degraded"
@@ -514,11 +604,15 @@ def translate():
         "request_id": "uuid"
     }
     """
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
     if "text" not in data or not isinstance(data["text"], str):
         return jsonify({"error": "Missing or invalid 'text' field"}), 400
 
     text = data["text"].strip()
+    if _has_invalid_unicode(text):
+        return jsonify({"error": "'text' contains invalid Unicode"}), 400
     if len(text) > BT_MAX_PARAGRAPH_CHARS:
         return jsonify({
             "error": f"'text' exceeds the {BT_MAX_PARAGRAPH_CHARS}-character limit"
@@ -531,6 +625,8 @@ def translate():
     lang_error = _validate_languages(source_lang, target_lang)
     if lang_error:
         return jsonify({"error": lang_error}), 400
+
+    budget = create_work_budget()
 
     req_id = getattr(request, "request_id", None)
 
@@ -566,12 +662,31 @@ def translate():
     # Translate via best available backend
     start = time.monotonic()
     try:
-        translated, backend = translate_text(text, source_lang, target_lang)
+        translated, backend = translate_text(
+            text, source_lang, target_lang, budget=budget)
+    except WorkBudgetExceeded as exc:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+        return _work_budget_response(exc)
+    except ProviderUnavailableError:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+        log.warning("req=%s translation provider unavailable", req_id)
+        return jsonify({
+            "error": "provider_unavailable",
+            "request_id": req_id,
+        }), 502
     except Exception as e:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
-        log.exception("Translation failed")
-        return jsonify({"error": str(e), "request_id": req_id}), 500
+        log.error(
+            "req=%s translation failed error_type=%s",
+            req_id, type(e).__name__,
+        )
+        return jsonify({
+            "error": "translation_failed",
+            "request_id": req_id,
+        }), 500
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
     _record_metric(elapsed_ms, hits=0, misses=1)
@@ -580,7 +695,7 @@ def translate():
     try:
         put_cache(text, source_lang, target_lang, translated, model=model_for_provider(backend))
     except Exception as e:
-        log.exception("Cache write failed (non-fatal)")
+        log.error("Cache write failed (non-fatal) error_type=%s", type(e).__name__)
 
     return jsonify({
         "translated": translated,
@@ -617,7 +732,9 @@ def translate_batch_endpoint():
     operators confirm a request is hitting the backend they expect (e.g.
     that a fallback provider was used when the local one was down).
     """
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
     if "paragraphs" not in data or not isinstance(data["paragraphs"], list):
         return jsonify({"error": "Missing or invalid 'paragraphs' field"}), 400
 
@@ -628,6 +745,15 @@ def translate_batch_endpoint():
         }), 413
     if not all(isinstance(p, str) for p in paragraphs):
         return jsonify({"error": "All 'paragraphs' entries must be strings"}), 400
+    invalid_unicode = next(
+        (i for i, paragraph in enumerate(paragraphs)
+         if _has_invalid_unicode(paragraph)),
+        None,
+    )
+    if invalid_unicode is not None:
+        return jsonify({
+            "error": f"Paragraph {invalid_unicode} contains invalid Unicode"
+        }), 400
     oversized = next((i for i, p in enumerate(paragraphs) if len(p) > BT_MAX_PARAGRAPH_CHARS), None)
     if oversized is not None:
         return jsonify({
@@ -641,6 +767,8 @@ def translate_batch_endpoint():
     lang_error = _validate_languages(source_lang, target_lang)
     if lang_error:
         return jsonify({"error": lang_error}), 400
+
+    budget = create_work_budget()
 
     # Short-circuit source==target: mirror /translate's behaviour. Echo every
     # paragraph back unchanged; mark as skipped so the frontend can distinguish
@@ -661,7 +789,40 @@ def translate_batch_endpoint():
             "request_id": req_id,
         })
 
-    result = _translate_paragraphs(paragraphs, source_lang, target_lang)
+    try:
+        result = _translate_paragraphs(
+            paragraphs, source_lang, target_lang, budget)
+    except WorkBudgetExceeded as exc:
+        _record_metric(0, hits=0, misses=1, error=True)
+        return _work_budget_response(exc)
+    except SegmentProtocolError:
+        _record_metric(0, hits=0, misses=1, error=True)
+        log.warning("req=%s provider returned an invalid segment envelope",
+                    getattr(request, "request_id", None))
+        return jsonify({
+            "error": "invalid_provider_response",
+            "request_id": getattr(request, "request_id", None),
+        }), 502
+    except ProviderUnavailableError:
+        _record_metric(0, hits=0, misses=1, error=True)
+        log.warning(
+            "req=%s batch provider unavailable",
+            getattr(request, "request_id", None),
+        )
+        return jsonify({
+            "error": "provider_unavailable",
+            "request_id": getattr(request, "request_id", None),
+        }), 502
+    except Exception as exc:
+        _record_metric(0, hits=0, misses=1, error=True)
+        log.error(
+            "req=%s batch translation failed error_type=%s",
+            getattr(request, "request_id", None), type(exc).__name__,
+        )
+        return jsonify({
+            "error": "translation_failed",
+            "request_id": getattr(request, "request_id", None),
+        }), 500
     result["request_id"] = getattr(request, "request_id", None)
 
     _record_metric(result["total_elapsed_ms"], hits=result["cached_count"], misses=result["fresh_count"])
@@ -669,6 +830,10 @@ def translate_batch_endpoint():
     return jsonify(result)
 
 
+
+
+class CleanupCredentialUnavailable(RuntimeError):
+    """The destructive endpoint cannot establish a shared credential."""
 
 
 @app.route("/cache/cleanup", methods=["POST"])
@@ -680,7 +845,7 @@ def cache_cleanup():
     Auth: always required. Two sources of truth for the token, in order:
       1. BT_API_TOKEN env var (the recommended path; if set, this is the
          only token accepted for the whole API)
-      2. Per-process auto-generated token persisted in /app/data/cleanup_token
+      2. Auto-generated deployment token persisted in /app/data/cleanup_token
          (only consulted when BT_API_TOKEN is empty). The token is generated
          on first use with secrets.token_urlsafe and written to a file with
          mode 0600 (the value itself is never logged — read it with
@@ -689,7 +854,13 @@ def cache_cleanup():
          NOT get an unauthenticated destructive endpoint on their LAN.
 
     Tests can monkeypatch `_get_cleanup_token` to return a known value."""
-    token = _get_cleanup_token()
+    try:
+        token = _get_cleanup_token()
+    except CleanupCredentialUnavailable:
+        return jsonify({
+            "error": "cleanup_credential_unavailable",
+            "request_id": getattr(request, "request_id", None),
+        }), 503
     request_token = request.headers.get("X-BT-Token", "")
     if not _token_matches(request_token, token):
         return jsonify({
@@ -697,7 +868,13 @@ def cache_cleanup():
             "request_id": getattr(request, "request_id", None),
         }), 401
 
-    data = request.get_json(silent=True) or {}
+    raw_body = request.get_data(cache=True)
+    if not raw_body:
+        data = {}
+    else:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Request body must be a JSON object"}), 400
     days = data.get("days", 30)
     if isinstance(days, bool) or not isinstance(days, int) or not (1 <= days <= 3650):
         return jsonify({"error": "'days' must be an integer between 1 and 3650"}), 400
@@ -709,9 +886,96 @@ def cache_cleanup():
 # Persistent path inside the data dir, alongside the sqlite database. The
 # file is intentionally named without a leading dot so `ls` shows it by
 # default — operators need to be able to see it to understand the auth model.
+import fcntl as _fcntl  # Linux/Alpine process lock for the persisted secret
 import secrets as _secrets  # local: small surface
+import stat as _stat
+import tempfile as _tempfile
 _CLEANUP_TOKEN_PATH = Path(os.environ.get("BT_CACHE_DIR", "/app/data")) / "cleanup_token"
 _cleanup_token_cache: str | None = None
+_cleanup_token_lock = threading.Lock()
+
+
+def _read_cleanup_token_file() -> str:
+    """Read the persisted token without following symlinks, repairing mode."""
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(_CLEANUP_TOKEN_PATH, flags)
+    except FileNotFoundError:
+        return ""
+
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("cleanup token path is not a regular file")
+        with os.fdopen(fd, "r", encoding="utf-8") as token_file:
+            fd = -1  # fdopen owns and closes it from this point.
+            os.fchmod(token_file.fileno(), 0o600)
+            # A generated token is ~43 bytes. Refuse an unexpectedly large
+            # file rather than letting a corrupt volume consume unbounded RAM.
+            value = token_file.read(4097)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(value) > 4096:
+        raise OSError("cleanup token file exceeds 4096 bytes")
+    return value.strip()
+
+
+def _persist_cleanup_token() -> tuple[str, bool]:
+    """Read or atomically create the shared token under an OS file lock."""
+    _CLEANUP_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _CLEANUP_TOKEN_PATH.with_name(
+        f"{_CLEANUP_TOKEN_PATH.name}.lock")
+    lock_flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_NONBLOCK", 0))
+    lock_fd = os.open(lock_path, lock_flags, 0o600)
+
+    if not _stat.S_ISREG(os.fstat(lock_fd).st_mode):
+        os.close(lock_fd)
+        raise OSError("cleanup token lock path is not a regular file")
+
+    with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_file:
+        os.fchmod(lock_file.fileno(), 0o600)
+        _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
+
+        existing = _read_cleanup_token_file()
+        if existing:
+            return existing, False
+
+        token = _secrets.token_urlsafe(32)
+        temp_fd, temp_name = _tempfile.mkstemp(
+            prefix=f".{_CLEANUP_TOKEN_PATH.name}.",
+            dir=_CLEANUP_TOKEN_PATH.parent,
+        )
+        try:
+            os.fchmod(temp_fd, 0o600)
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file:
+                temp_fd = -1  # fdopen owns and closes it from this point.
+                temp_file.write(token)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            os.replace(temp_name, _CLEANUP_TOKEN_PATH)
+            temp_name = ""
+
+            # Persist the rename itself before releasing the inter-process
+            # lock, so a host crash cannot expose a partially-created secret.
+            directory_fd = os.open(
+                _CLEANUP_TOKEN_PATH.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
+        return token, True
 
 
 def _get_cleanup_token() -> str:
@@ -720,45 +984,37 @@ def _get_cleanup_token() -> str:
     Order:
       1. If BT_API_TOKEN is set, use it (single source of truth for the
          whole API's auth — consistent with the other endpoints).
-      2. Else, read or create /app/data/cleanup_token. The first call
-         generates a fresh secrets.token_urlsafe(32) value, writes it to
-         the file with mode 0600, and logs it once at INFO. Subsequent
-         calls (within the same process) reuse the cached value.
+      2. Else, read or create /app/data/cleanup_token. Creation is serialized
+         across threads and processes, then atomically persisted with mode
+         0600. Subsequent calls reuse the in-process cached value.
     """
     global _cleanup_token_cache
     if API_TOKEN:
         return API_TOKEN
-    if _cleanup_token_cache is not None:
-        return _cleanup_token_cache
-    try:
-        _CLEANUP_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        existing = _CLEANUP_TOKEN_PATH.read_text().strip() if _CLEANUP_TOKEN_PATH.exists() else ""
-        if existing:
-            _cleanup_token_cache = existing
-        else:
-            # Missing OR empty file: generate and PERSIST (an empty file must
-            # not leave the operator with an unrecoverable in-memory token).
-            _cleanup_token_cache = _secrets.token_urlsafe(32)
-            _CLEANUP_TOKEN_PATH.write_text(_cleanup_token_cache)
-            try:
-                _CLEANUP_TOKEN_PATH.chmod(0o600)
-            except OSError:
-                pass
-            log.warning(
-                "BT_API_TOKEN not set. Auto-generated a /cache/cleanup token and "
-                "persisted it at %s (mode 0600). Read it with: "
-                "docker exec <container> cat %s — the value is intentionally "
-                "NOT logged (logs are not secret storage). Set BT_API_TOKEN to "
-                "use a fixed value instead.",
-                _CLEANUP_TOKEN_PATH, _CLEANUP_TOKEN_PATH,
+    with _cleanup_token_lock:
+        if _cleanup_token_cache is not None:
+            return _cleanup_token_cache
+        try:
+            _cleanup_token_cache, generated = _persist_cleanup_token()
+            if generated:
+                log.warning(
+                    "BT_API_TOKEN not set. Auto-generated a /cache/cleanup token and "
+                    "persisted it at %s (mode 0600). Read it with: "
+                    "docker exec <container> cat %s — the value is intentionally "
+                    "NOT logged (logs are not secret storage). Set BT_API_TOKEN to "
+                    "use a fixed value instead.",
+                    _CLEANUP_TOKEN_PATH, _CLEANUP_TOKEN_PATH,
+                )
+        except Exception as exc:
+            # A per-process fallback would create different credentials across
+            # Gunicorn workers and make a destructive endpoint nondeterministic.
+            # Fail closed until the shared data volume is writable again.
+            log.error(
+                "Cleanup credential persistence failed type=%s; endpoint disabled",
+                type(exc).__name__,
             )
-    except Exception as e:
-        # If we cannot persist, fall back to an in-memory token that lasts
-        # for the process lifetime. Less convenient for the operator (lost
-        # on restart) but still better than no auth.
-        log.exception("Failed to persist cleanup token; using in-memory fallback")
-        _cleanup_token_cache = _secrets.token_urlsafe(32)
-    return _cleanup_token_cache
+            raise CleanupCredentialUnavailable from exc
+        return _cleanup_token_cache
 
 
 # ── Main ────────────────────────────────────────────────────────────────────

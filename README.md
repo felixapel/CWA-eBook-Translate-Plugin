@@ -186,7 +186,7 @@ Environment variables for the `book-translator` container:
 | `LLM_API_KEY` | | Your API key for the chosen provider (the only supported key mechanism since 2.0.0) |
 | `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local`. OpenAI-compatible endpoint — the **path is always `/v1/chat/completions`** (vLLM, LM Studio, Ollama, llama.cpp all speak it); only host:port changes (vLLM `:8000`, LM Studio `:1234`, Ollama `:11434`). **In Docker, `localhost` is the container itself** — use `http://host.docker.internal:<port>/...` or the host IP. |
 | `BT_MAX_CONCURRENT` | `2` | Simultaneous translation requests (batches). For a slow single-GPU local model, `1`–`2` is **more** stable than `3` (avoids timeout cascades). |
-| `BT_BATCH_SIZE` | `5` | Paragraphs translated per LLM call. `>1` is dramatically faster on slow models (one generation instead of one-per-paragraph); if the model's segmented reply can't be parsed it transparently falls back to per-paragraph. Set `1` for legacy one-call-per-paragraph. |
+| `BT_BATCH_SIZE` | `5` | Paragraphs translated per LLM call. `>1` is dramatically faster on slow models (one generation instead of one-per-paragraph). Batches use a strict, versioned JSON envelope; an invalid provider response fails the group atomically and is never cached. Set `1` for one-call-per-paragraph. |
 | `BT_MAX_TOKENS` | `4096` | Hard ceiling on `max_tokens` for a **single**-paragraph request. The actual value sent is the smaller of this and the proportional cap (see `BT_OUTPUT_TOKEN_FACTOR`). |
 | `BT_BATCH_MAX_TOKENS` | `8192` | Same ceiling, but for a **batched** (multi-paragraph) request. |
 | `BT_OUTPUT_TOKEN_FACTOR` | `2.0` | Caps generated `max_tokens` at `input_tokens × FACTOR + FLOOR`, clamped to the ceiling above. Prevents a rambling/stuck local model from generating thousands of tokens for a short paragraph (the main cause of 8–20s and 120s stalls). `2.0` never truncates real translations; lower it (e.g. `1.6`) for a bit more speed at some risk on very expansive target languages. |
@@ -196,12 +196,17 @@ Environment variables for the `book-translator` container:
 | `LLM_FALLBACK_PROVIDER` | | Optional. A secondary provider used automatically when the primary fails (e.g. `minimax` while `local` is slow/down). |
 | `LLM_FALLBACK_MODEL` | | Model name for the fallback provider. |
 | `LLM_FALLBACK_API_KEY` | | API key for the fallback provider. |
-| `BT_API_TOKEN` | | Optional shared secret. When set, translate endpoints require the `X-BT-Token` header — use it if the API is reachable beyond your LAN. In proxy mode set it per-browser via `localStorage.setItem('bt_token', '<token>')`; in bind-mount installs set `apiToken` in `window.BOOK_TRANSLATOR`. Also gates `/cache/cleanup` (a destructive endpoint) for the same reason. |
+| `BT_API_TOKEN` | | Optional shared secret. When set, translate endpoints require the `X-BT-Token` header — use it if the API is reachable beyond your LAN. In proxy mode set it per-browser via `localStorage.setItem('bt_token', '<token>')`; in bind-mount installs set `apiToken` in `window.BOOK_TRANSLATOR`. Also gates `/cache/cleanup` and the provider-backed `/health/deep` probe. |
 | `BT_MAX_BATCH_PARAGRAPHS` | `50` | Max paragraphs accepted per `/translate/batch` request (oversized requests get `413`). Protects your GPU/API bill from a single runaway request. |
 | `BT_MAX_PARAGRAPH_CHARS` | `8000` | Max characters per paragraph (`413` beyond it). |
 | `BT_MAX_CONTENT_LENGTH` | `2097152` (2 MB) | Hard cap on the request body (the WSGI-level backstop). Per-field caps (`BT_MAX_BATCH_PARAGRAPHS`, `BT_MAX_PARAGRAPH_CHARS`) check the parsed content; this cap rejects oversize bodies before parsing. Lower it for untrusted networks, raise it for very long paragraphs. |
-| `BT_MAX_UPSTREAM_INFLIGHT` | `0` | Process-wide cap on simultaneous in-flight LLM calls (`0` = unlimited). `BT_MAX_CONCURRENT` bounds concurrency per request; this bounds the TOTAL across all requests — set `2` for a single local GPU to prevent timeout cascades under multi-reader load. |
-| `BT_HEALTH_DETAILS` | `true` | When `false` (and `BT_API_TOKEN` is set), unauthenticated `/health` returns only `{"status":"ok"}` — backend names/latency require the token. Use when the API is reachable beyond a trusted LAN. |
+| `BT_MAX_UPSTREAM_INFLIGHT` | `2` | Process-wide cap on simultaneous in-flight LLM calls across all readers. `BT_MAX_CONCURRENT` only bounds one batch request; this cap prevents multi-reader timeout cascades. Must be greater than zero. |
+| `BT_UPSTREAM_QUEUE_TIMEOUT` | `2` | Maximum seconds to wait for a global upstream slot. A full queue returns `503` with `Retry-After` without starting a provider call. |
+| `BT_REQUEST_MAX_ATTEMPTS` | `20` | Maximum provider calls across groups, primary, and fallback for one API request. Batch groups use one attempt per provider, so the default exactly covers 50 paragraphs at batch size 5 when the primary fails and a healthy fallback succeeds. The single-text endpoint retains two attempts per provider. Attempts are reserved atomically before network I/O. |
+| `BT_REQUEST_MAX_INPUT_BYTES` | `5000000` | Maximum cumulative UTF-8 prompt bytes reserved across every provider attempt in one API request. The default covers two passes over the largest valid default batch, including four-byte Unicode and protocol overhead. |
+| `BT_REQUEST_MAX_OUTPUT_TOKENS` | `163840` | Maximum cumulative `max_tokens` reserved across every provider attempt in one API request, sized for the same bounded 20-call batch path. |
+| `BT_REQUEST_DEADLINE_SECONDS` | `90` | Absolute request-wide deadline. Once expired, no new provider attempt can start; individual provider timeouts are clamped to the remaining time. |
+| `BT_MAX_UPSTREAM_RESPONSE_BYTES` | `1048576` (1 MiB) | Maximum decompressed JSON bytes accepted from one provider call. Responses are streamed and aborted at the boundary before JSON materialization; providers that ignore `max_tokens` cannot grow memory/cache without limit. |
 | `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max requests per client IP per 60s window before the API returns `429`. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | Seconds reported in the `Retry-After` header / response body on a `429`. The frontend reads this and backs off automatically. |
 | `BT_TRUST_PROXY` | `false` | **Legacy/dev only.** When `true`, the API uses the **last** `X-Forwarded-For` hop from any peer as the rate-limit key. A client that can reach the API directly can still spoof this header, so don't rely on it in production — prefer `BT_TRUSTED_PROXIES` below. |
@@ -233,14 +238,21 @@ Browser ────────►│ nginx (:8080, proxy mode only)        │
                  │                                       │
                  │ gunicorn (:8390, always on)           │      ┌──────────────────────┐
                  │  ├─ POST /translate, /translate/batch │─────►│ Providers: local,    │
-                 │  ├─ GET  /ping /health /metrics /stats│      │ OpenAI, Anthropic,   │
-                 │  └─ SQLite cache (/app/data)          │      │ Gemini, Groq, ...    │
-                 └───────────────────────────────────────┘      └──────────────────────┘
+                 │  ├─ GET  /ping /health /health/deep   │      │ OpenAI, Anthropic,   │
+                 │  ├─ GET  /metrics /stats              │      │ Gemini, Groq, ...    │
+                 │  └─ SQLite cache (/app/data)          │      └──────────────────────┘
+                 └───────────────────────────────────────┘
 ```
 
 In bind-mount installs nginx never starts; the overlay files are mounted into
 CWA and call the API on `:8390` directly (CORS applies — see
 `BT_ALLOWED_ORIGINS`).
+
+`/ping` is liveness-only and `/health` plus `/ready` are shallow readiness
+checks; none contacts an LLM. The provider-backed `/health/deep` endpoint is
+operator-only and uses the same request budget and global provider gate as a
+translation. Authenticate it with `X-BT-Token`: this is `BT_API_TOKEN` when
+configured, otherwise the persisted `/app/data/cleanup_token` value.
 
 ## ❤️ Support the project
 

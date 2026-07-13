@@ -54,6 +54,15 @@ services:
       # Slow local model? Lower concurrency (1-2) is more stable than 3.
       - BT_MAX_CONCURRENT=2
       - BT_TIMEOUT=60
+      # Request-wide cost and overload guards. Every value must stay > 0;
+      # invalid/unbounded settings fail startup instead of disabling a limit.
+      - BT_MAX_UPSTREAM_INFLIGHT=2
+      - BT_UPSTREAM_QUEUE_TIMEOUT=2
+      - BT_REQUEST_MAX_ATTEMPTS=20
+      - BT_REQUEST_MAX_INPUT_BYTES=5000000
+      - BT_REQUEST_MAX_OUTPUT_TOKENS=163840
+      - BT_REQUEST_DEADLINE_SECONDS=90
+      - BT_MAX_UPSTREAM_RESPONSE_BYTES=1048576
       # Optional resilience: fall back to a cloud provider when local fails.
       # - LLM_FALLBACK_PROVIDER=minimax
       # - LLM_FALLBACK_MODEL=MiniMax-M3
