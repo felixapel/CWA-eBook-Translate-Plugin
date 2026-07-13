@@ -25,6 +25,33 @@ log = logging.getLogger("book-translator.cache")
 CACHE_SCHEMA_VERSION = 2
 CACHE_KEY_VERSION = "cwa-translate-cache/v2"
 CACHE_TABLE = "translations_v2"
+V1_REQUIRED_SCHEMA = {
+    "cache_key": ("TEXT", False, True),
+    "source_text": ("TEXT", True, False),
+    "source_lang": ("TEXT", True, False),
+    "target_lang": ("TEXT", True, False),
+    "translated_text": ("TEXT", True, False),
+    "model": ("TEXT", True, False),
+    "created_at": ("TEXT", True, False),
+    "hit_count": ("INTEGER", True, False),
+}
+V2_REQUIRED_SCHEMA = {
+    "cache_key": ("TEXT", False, True),
+    "tenant_hash": ("TEXT", True, False),
+    "book_hash": ("TEXT", True, False),
+    "chapter_hash": ("TEXT", True, False),
+    "context_hash": ("TEXT", True, False),
+    "source_lang": ("TEXT", True, False),
+    "target_lang": ("TEXT", True, False),
+    "translated_text": ("TEXT", True, False),
+    "provider": ("TEXT", True, False),
+    "model": ("TEXT", True, False),
+    "prompt_hash": ("TEXT", True, False),
+    "protocol_version": ("TEXT", True, False),
+    "created_at": ("TEXT", True, False),
+    "last_accessed_at": ("TEXT", True, False),
+    "hit_count": ("INTEGER", True, False),
+}
 DB_PATH = Path(os.getenv("DB_PATH", "translations.db"))
 
 
@@ -129,7 +156,11 @@ class CacheStore:
         self._init_lock = threading.Lock()
         self._initialized = False
         self._prepare_directory()
-        self.init()
+        try:
+            self.init()
+        except Exception:
+            self.close()
+            raise
 
     def _prepare_directory(self) -> None:
         parent = self.db_path.parent
@@ -186,6 +217,11 @@ class CacheStore:
                 return
             conn = self.connection()
             try:
+                # sqlite3 does not start a transaction for DDL. Begin one
+                # explicitly so the two draft-layout renames and all schema
+                # initialization either commit together or leave the original
+                # rollback-compatible layout untouched.
+                conn.execute("BEGIN IMMEDIATE")
                 self._normalize_cache_tables(conn)
                 conn.execute(
                     """CREATE TABLE IF NOT EXISTS translations_v2 (
@@ -239,6 +275,21 @@ class CacheStore:
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
         return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
+    @staticmethod
+    def _table_matches_schema(
+        conn: sqlite3.Connection,
+        table: str,
+        expected: dict[str, tuple[str, bool, bool]],
+    ) -> bool:
+        actual = {
+            row[1]: (row[2].upper(), bool(row[3]), bool(row[5]))
+            for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        return bool(actual) and all(
+            actual.get(column) == signature
+            for column, signature in expected.items()
+        )
+
     def _normalize_cache_tables(self, conn: sqlite3.Connection) -> None:
         """Keep the v1 table available for an in-place rollback.
 
@@ -250,17 +301,23 @@ class CacheStore:
         v2_columns = self._table_columns(conn, CACHE_TABLE)
         draft_v1_columns = self._table_columns(conn, "translations_v1")
 
-        primary_is_v1 = "source_text" in primary_columns
-        primary_is_v2 = {
-            "tenant_hash", "book_hash", "chapter_hash", "context_hash",
-            "prompt_hash", "protocol_version",
-        }.issubset(primary_columns)
+        primary_is_v1 = self._table_matches_schema(
+            conn, "translations", V1_REQUIRED_SCHEMA
+        )
+        primary_is_v2 = self._table_matches_schema(
+            conn, "translations", V2_REQUIRED_SCHEMA
+        )
 
-        if primary_columns and not primary_is_v1 and not primary_is_v2:
+        if primary_columns and (primary_is_v1 == primary_is_v2):
             raise RuntimeError("unsupported translations cache schema")
-        if v2_columns and "source_text" in v2_columns:
-            raise RuntimeError("translations_v2 unexpectedly contains a v1 schema")
-        if draft_v1_columns and "source_text" not in draft_v1_columns:
+        if v2_columns and (
+            not self._table_matches_schema(conn, CACHE_TABLE, V2_REQUIRED_SCHEMA)
+            or "source_text" in v2_columns
+        ):
+            raise RuntimeError("translations_v2 does not contain the expected v2 schema")
+        if draft_v1_columns and not self._table_matches_schema(
+            conn, "translations_v1", V1_REQUIRED_SCHEMA
+        ):
             raise RuntimeError("translations_v1 does not contain the expected v1 schema")
 
         if primary_is_v2:

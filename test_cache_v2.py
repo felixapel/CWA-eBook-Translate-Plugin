@@ -42,12 +42,18 @@ def scope(**overrides: str) -> CacheScope:
     return CacheScope(**values)
 
 
-def create_v1_table(conn: sqlite3.Connection, table: str = "translations") -> None:
+def create_v1_table(
+    conn: sqlite3.Connection,
+    table: str = "translations",
+    *,
+    primary_key: bool = True,
+) -> None:
     if table not in {"translations", "translations_v1"}:
         raise ValueError("unsupported v1 fixture table")
+    key_constraint = "PRIMARY KEY" if primary_key else "NOT NULL"
     conn.execute(
         f"""CREATE TABLE {table} (
-            cache_key TEXT PRIMARY KEY,
+            cache_key TEXT {key_constraint},
             source_text TEXT NOT NULL,
             source_lang TEXT NOT NULL,
             target_lang TEXT NOT NULL,
@@ -371,6 +377,180 @@ class CacheV2Tests(unittest.TestCase):
             self.store.connection().execute("PRAGMA integrity_check").fetchone()[0],
             "ok",
         )
+
+    def test_draft_normalization_rolls_back_if_second_rename_fails(self) -> None:
+        self.store.put(
+            "draft v2 source", "English", "Spanish", "draft v2 target", scope()
+        )
+        self.store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE translations_v2 RENAME TO translations")
+        create_v1_table(conn, "translations_v1")
+        conn.commit()
+        conn.close()
+
+        class FailingSecondRenameStore(CacheStore):
+            def _new_connection(self) -> sqlite3.Connection:
+                connection = super()._new_connection()
+
+                def deny_second_rename(
+                    action: int,
+                    _database: str | None,
+                    table: str | None,
+                    _source: str | None,
+                    _trigger: str | None,
+                ) -> int:
+                    if (
+                        action == sqlite3.SQLITE_ALTER_TABLE
+                        and table == "translations_v1"
+                    ):
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                connection.set_authorizer(deny_second_rename)
+                return connection
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            FailingSecondRenameStore(
+                self.db_path,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertEqual(names, {"translations", "translations_v1"})
+            self.assertIn(
+                "tenant_hash",
+                {row[1] for row in conn.execute("PRAGMA table_info(translations)")},
+            )
+            self.assertIn(
+                "source_text",
+                {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(translations_v1)")
+                },
+            )
+        finally:
+            conn.close()
+
+    def test_incomplete_existing_schemas_fail_closed(self) -> None:
+        self.store.close()
+
+        malformed_v1 = Path(self.tmp.name) / "malformed-v1" / "translations.db"
+        malformed_v1.parent.mkdir()
+        conn = sqlite3.connect(malformed_v1)
+        conn.execute("CREATE TABLE translations (source_text TEXT)")
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "unsupported translations"):
+            CacheStore(
+                malformed_v1,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+        malformed_v2 = Path(self.tmp.name) / "malformed-v2" / "translations.db"
+        malformed_v2.parent.mkdir()
+        conn = sqlite3.connect(malformed_v2)
+        conn.execute(
+            """CREATE TABLE translations_v2 (
+                cache_key TEXT PRIMARY KEY,
+                tenant_hash TEXT,
+                source_lang TEXT,
+                target_lang TEXT,
+                created_at TEXT,
+                last_accessed_at TEXT
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "translations_v2"):
+            CacheStore(
+                malformed_v2,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+    def test_existing_schemas_without_primary_keys_fail_closed(self) -> None:
+        self.store.close()
+
+        malformed_v1 = Path(self.tmp.name) / "unkeyed-v1" / "translations.db"
+        malformed_v1.parent.mkdir()
+        conn = sqlite3.connect(malformed_v1)
+        create_v1_table(conn, primary_key=False)
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "unsupported translations"):
+            CacheStore(
+                malformed_v1,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+        malformed_v2 = Path(self.tmp.name) / "unkeyed-v2" / "translations.db"
+        malformed_v2.parent.mkdir()
+        conn = sqlite3.connect(malformed_v2)
+        conn.execute(
+            """CREATE TABLE translations_v2 (
+                cache_key TEXT NOT NULL,
+                tenant_hash TEXT NOT NULL,
+                book_hash TEXT NOT NULL,
+                chapter_hash TEXT NOT NULL,
+                context_hash TEXT NOT NULL,
+                source_lang TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                translated_text TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                protocol_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_accessed_at TEXT NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "translations_v2"):
+            CacheStore(
+                malformed_v2,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+    def test_v2_schema_with_source_text_fails_closed(self) -> None:
+        self.store.put("private source", "English", "Spanish", "privado", scope())
+        self.store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE translations_v2 ADD COLUMN source_text TEXT")
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "translations_v2"):
+            CacheStore(
+                self.db_path,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
 
     def test_invalid_retention_configuration_fails_closed(self) -> None:
         bad_db = Path(self.tmp.name) / "bad" / "cache.db"
