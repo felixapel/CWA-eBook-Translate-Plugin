@@ -228,4 +228,10 @@ docker inspect calibre-web-automated --format "{{range .Mounts}}{{.Source}} -> {
   ```bash
   BENCHMARK_URL=http://192.168.1.x:8390 python benchmark.py
   ```
+- `test_ratelimit.py` also needs valid authentication (set `BT_API_TOKEN` for
+  token mode or `BT_RATE_LIMIT_TEST_COOKIE` through the proxy for CWA-session
+  mode), a fresh limiter window, and `--requests` greater than the server's
+  `BT_RATE_LIMIT_PER_MINUTE`. It uses same-language requests and does not spend
+  provider capacity. The probe deliberately ignores shell proxy variables and
+  refuses HTTP redirects; pass the final HTTP(S) API base URL directly.
 - For mocked tests with no live server required, use `test_translation.py` instead.

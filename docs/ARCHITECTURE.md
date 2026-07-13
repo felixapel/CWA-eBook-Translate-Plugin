@@ -10,6 +10,7 @@ This document details the architecture of the `book-translator` plugin.
 - [ADR-004: Authenticate before deriving cache tenants](decisions/ADR-004-authentication-boundaries.md)
 - [ADR-005: Require request consent for cloud fallback](decisions/ADR-005-cloud-fallback-consent.md)
 - [ADR-006: Make proxy authority and forwarding explicit](decisions/ADR-006-explicit-proxy-authority.md)
+- [ADR-007: Sign and verify release digests with a self-managed key](decisions/ADR-007-sign-release-digests.md)
 
 ## Overview
 

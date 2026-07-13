@@ -9,6 +9,10 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 DOCKER_NAMES = ROOT / "scripts" / "ci-docker-names.sh"
+FRONTEND_WORKFLOWS = (
+    CI,
+    ROOT / ".gitea" / "workflows" / "release.yml",
+)
 
 
 class CIContractTests(unittest.TestCase):
@@ -20,8 +24,8 @@ class CIContractTests(unittest.TestCase):
         for command in (
             "python3 test_translation.py",
             "python3 test_hardening.py",
-            "python3 -m unittest -v test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config",
-            "python3 -m py_compile auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
+            "python3 -m unittest -v test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_release_contract test_release_attestations test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts",
+            "python3 -m py_compile auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py scripts/verify_release_attestations.py",
         ):
             self.assertIn(command, self.workflow)
 
@@ -31,6 +35,16 @@ class CIContractTests(unittest.TestCase):
         self.assertRegex(
             self.workflow, r"(?m)^\s*- run: npm audit --audit-level=high\s*$")
         self.assertNotIn("npm audit --omit=dev", self.workflow)
+
+    def test_frontend_browser_gate_is_required(self):
+        for workflow in FRONTEND_WORKFLOWS:
+            source = workflow.read_text()
+            self.assertRegex(
+                source,
+                r"(?m)^\s*- run: npx playwright install --with-deps --only-shell chromium\s*$",
+            )
+            self.assertRegex(source, r"(?m)^\s*- run: npm run test:e2e\s*$")
+            self.assertNotIn("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", source)
 
     def test_docker_gate_cannot_report_success_when_docker_is_missing(self):
         self.assertNotIn("Detect Docker", self.workflow)

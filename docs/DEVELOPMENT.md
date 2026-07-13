@@ -44,6 +44,31 @@ python3 server.py &
 BENCHMARK_URL=http://127.0.0.1:8390 python3 test_endpoints.py
 ```
 
+The rate-limit probe requires a fresh limiter window and valid authentication.
+It sends same-language requests, so it exercises authentication and admission
+without calling the configured translation provider. Its default 130 probes
+cover the default limit of 120; raise `--requests` if your deployment uses a
+higher `BT_RATE_LIMIT_PER_MINUTE`:
+
+```bash
+BT_API_TOKEN='<token>' python3 test_ratelimit.py \
+  --url http://127.0.0.1:8390 --requests 130 --timeout 5
+```
+
+For the recommended CWA-session proxy, pass the browser cookie through an
+environment variable rather than the command line:
+
+```bash
+BT_RATE_LIMIT_TEST_COOKIE='session=<opaque-value>' \
+  python3 test_ratelimit.py --url http://127.0.0.1:8080/bt-api
+```
+
+It exits nonzero on connection/authentication errors, unexpected statuses, or
+if it does not observe both an admitted request and a `429` response. The probe
+ignores inherited `HTTP_PROXY`/`HTTPS_PROXY` settings, refuses redirects and URL
+credentials, streams no response body, and closes each response immediately so
+the token or CWA cookie stays bound to the explicitly selected origin.
+
 ## Frontend Development
 
 The frontend consists of `static/translator.js`, `static/translator.css`, and
@@ -56,7 +81,15 @@ The frontend consists of `static/translator.js`, `static/translator.css`, and
 node -c static/translator.js   # syntax check
 npm ci                         # exact package-lock.json dependency tree
 npm test                       # runs test_frontend.js against a mocked reader/iframe
+npx playwright install --with-deps --only-shell chromium
+npm run test:e2e               # real Chromium: loader, DOM, network, a11y, consent
 ```
+
+The browser suite starts a localhost-only CWA reader fixture, intercepts only
+its `/bt-api/translate/batch` route, and fails on browser console errors,
+warnings, page exceptions, or failed requests. To reuse a compatible local
+Chromium instead of Playwright's managed headless shell, set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/absolute/path/to/chromium`.
 
 ## Updating Dependency Locks
 
@@ -83,7 +116,11 @@ then run `./scripts/audit-deps.sh`.
 
 ### Manual Testing
 
-The DOM-injection logic only fully exercises against the real EPUB.js reader.
+The automated Chromium gate covers loader isolation, the reader iframe,
+translation rendering, cloud-fallback consent, and the control accessibility
+tree. CWA/EPUB.js compatibility and theme integration still require the real
+application.
+
 After any change to `getTranslatableElements`, paragraph detection, or
 rendering, manually verify in a browser: open an EPUB in CWA, cycle
 Original → Bilingual → Translated, change chapters/pages, and check Light /

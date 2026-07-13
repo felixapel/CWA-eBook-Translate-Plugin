@@ -331,7 +331,10 @@ Authentication-derived tenant behavior is intentional:
 Release operators should follow the [Gitea-authoritative release
 runbook](docs/RELEASE.md); GitHub is a mirror and does not publish images.
 See the [architecture overview](docs/ARCHITECTURE.md) for component details and
-accepted architecture decision records.
+accepted architecture decision records. The
+[production-readiness record](docs/PRODUCTION_READINESS.md) maps the latest
+audit findings to their repository controls and lists the remote promotion
+prerequisites that a source commit cannot establish.
 
 ## ❤️ Support the project
 

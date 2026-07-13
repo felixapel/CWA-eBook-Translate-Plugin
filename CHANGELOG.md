@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Python dependencies, audit/compiler tooling, npm artifacts, the Python base
   image, direct/transitive Alpine packages, Node.js, and third-party Actions are
   pinned to reviewed versions, hashes, digests, or commits.
+- The privileged release builder no longer inherits mutable Buildx,
+  BuildKit, or binfmt/QEMU tooling: the Buildx asset is SHA-256 checked, both
+  helper images are digest-pinned, emulation is platform-scoped, and the
+  builder is bridge-confined with `security.insecure` and client-side
+  entitlement grants forbidden.
 - The published image now declares its stable non-root user; API and nginx run
   as independent roles with read-only root filesystems, zero capabilities, and
   no root ownership-repair supervisor in the recommended Compose topology.
@@ -60,11 +65,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A production-readiness record maps every 2026-07-12 audit finding to its
+  repository control, reproducible acceptance gate, historical exception, or
+  operator-owned Gitea/release prerequisite.
+- A required real-Chromium E2E gate verifies reader-route loader isolation,
+  DOM rendering, API payloads, explicit cloud consent, console/network health,
+  screenshots, and the accessibility tree in both CI and release workflows.
 - Request work-budget and global upstream-cap contracts with concurrency,
   cancellation, deadline, fallback, and response-size regression tests.
 - Gitea-authoritative release preflight, exact annotated GitHub mirror-tag
   verification, multi-registry image publishing, OCI provenance, SBOM output,
   and a fail-closed release runbook.
+- Digest-bound Cosign signatures plus immediate tag, source-SHA, base-image,
+  SPDX inventory, provenance, and multi-platform policy verification.
 - Reproducible Python lock generation on Python 3.11 plus committed runtime,
   auditor, and compiler hash locks.
 - A shared container smoke harness that proves role isolation, proxy routing,
@@ -78,9 +91,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reader controls now expose a named toolbar, live status, honest progress,
+  keyboard-operable settings actions, synchronized popover/switch state, and
+  a visible non-fatal wait message while the API is rate limiting requests.
 - CI and release gates now run every backend contract suite, the complete locked
   npm tree audit, and a required proxy/API/non-root container smoke test. Gitea
   and GitHub CI definitions remain byte-identical by contract.
+- The live rate-limit probe is import-safe, authenticated, timeout-bounded, and
+  fails closed while using same-language requests that never call a provider.
+  It ignores inherited HTTP proxies, refuses redirects/URL credentials, and
+  closes streamed responses without reading their bodies. Output-token scaling
+  also rejects non-finite or non-positive startup values.
 - `/ping`, `/health`, and `/ready` are cheap local probes; `/health/deep` is the
   explicit authenticated provider diagnostic.
 - Deployment helpers use strict shell mode, safe remote argument serialization,
