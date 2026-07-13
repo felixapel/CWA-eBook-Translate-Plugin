@@ -24,8 +24,8 @@ class CIContractTests(unittest.TestCase):
         for command in (
             "python3 test_translation.py",
             "python3 test_hardening.py",
-            "python3 -m unittest -v test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_release_contract test_release_attestations test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts",
-            "python3 -m py_compile auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py scripts/verify_release_attestations.py",
+            "python3 -m unittest -v test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts",
+            "python3 -m py_compile auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
         ):
             self.assertIn(command, self.workflow)
 
@@ -57,7 +57,7 @@ class CIContractTests(unittest.TestCase):
         self.assertRegex(self.workflow, r"(?m)^\s*run: docker version\s*$")
         self.assertRegex(self.workflow, r"(?m)^\s*run: docker build ")
 
-    def test_docker_smoke_exercises_the_published_proxy_path(self):
+    def test_docker_smoke_exercises_the_built_proxy_path(self):
         self.assertIn("./scripts/container-smoke.sh", self.workflow)
         self.assertIn("sh scripts/ci-docker-names.sh", self.workflow)
         self.assertNotIn("bt-smoke-${{ github.run_id }}", self.workflow)

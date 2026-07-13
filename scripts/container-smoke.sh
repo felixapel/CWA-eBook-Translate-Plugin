@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise the exact published image as independent, sandboxed API/proxy roles.
+# Exercise one locally built image as independent, sandboxed API/proxy roles.
 set -euo pipefail
 
 SMOKE_IMAGE="${1:?usage: container-smoke.sh IMAGE PREFIX}"

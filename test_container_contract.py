@@ -1,4 +1,4 @@
-"""Security contracts for the published image and recommended topology."""
+"""Security contracts for the built image and recommended topology."""
 import re
 import unittest
 from pathlib import Path
@@ -81,6 +81,11 @@ class ContainerContractTests(unittest.TestCase):
 
     def test_compose_recommends_independent_hardened_roles(self):
         compose = (ROOT / "docker-compose.yml").read_text()
+        self.assertEqual(compose.count("    build: .\n"), 1)
+        self.assertEqual(
+            compose.count("    image: cwa-ebook-translate-plugin:local\n"),
+            2,
+        )
         self.assertRegex(compose, r"(?m)^  book-translator-api:$")
         self.assertRegex(compose, r"(?m)^  book-translator-proxy:$")
         self.assertIn("BT_ROLE=api", compose)

@@ -17,7 +17,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 SCRIPT = ROOT / "scripts" / "release_preflight.py"
-TAG_SCRIPT = ROOT / "scripts" / "release_image_tags.py"
 GITEA_RELEASE = ROOT / ".gitea" / "workflows" / "release.yml"
 GITEA_CI = ROOT / ".gitea" / "workflows" / "ci.yml"
 GITHUB_RELEASE = ROOT / ".github" / "workflows" / "release.yml"
@@ -294,9 +293,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         # a missing CI copy would silently remove every normal push/PR gate.
         self.assertEqual(GITEA_CI.read_text(), GITHUB_CI.read_text())
 
-    def test_publish_is_gated_by_preflight_and_all_artifact_checks(self):
+    def test_source_release_is_gated_by_preflight_and_all_quality_checks(self):
         workflow = GITEA_RELEASE.read_text()
-        self.assertIn("needs: [preflight, backend, frontend, docker-smoke]", workflow)
         self.assertIn("fetch-depth: 0", workflow)
         self.assertIn("scripts/release_preflight.py", workflow)
         self.assertIn(
@@ -318,14 +316,13 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 rf"(?m)^  {re.escape(job)}:\n    needs: preflight$",
             )
 
-    def test_gitea_release_uses_only_supported_conditional_expression(self):
+    def test_gitea_release_avoids_unsupported_workflow_features(self):
         workflow = GITEA_RELEASE.read_text()
         conditional_lines = [
             line.strip() for line in workflow.splitlines()
             if line.strip().startswith("if:")
         ]
-        self.assertTrue(conditional_lines)
-        self.assertEqual(set(conditional_lines), {"if: always()"})
+        self.assertFalse(conditional_lines)
         self.assertNotIn("concurrency:", workflow)
         self.assertNotIn("timeout-minutes:", workflow)
 
@@ -346,120 +343,26 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(command, workflow)
 
-    def test_release_docker_jobs_use_the_host_runner_and_scoped_names(self):
+    def test_release_docker_smoke_uses_the_host_runner_and_scoped_names(self):
         workflow = GITEA_RELEASE.read_text()
         self.assertRegex(
             workflow,
             r"(?m)^  docker-smoke:\n    needs: preflight\n"
             r"(?:    #[^\n]*\n)*    runs-on: weebdb-docker$",
         )
-        self.assertRegex(
-            workflow,
-            r"(?m)^  publish:\n"
-            r"    needs: \[preflight, backend, frontend, docker-smoke\]\n"
-            r"(?:    #[^\n]*\n)*    runs-on: weebdb-docker$",
-        )
         self.assertIn("sh scripts/ci-docker-names.sh", workflow)
         self.assertNotIn("bt-release-smoke-${{ gitea.run_id }}", workflow)
         self.assertNotIn("bt-release-audit:${{ gitea.run_id }}", workflow)
 
-    def test_one_build_publishes_all_requested_registry_tags(self):
+    def test_release_is_source_only_and_requires_no_secrets(self):
         workflow = GITEA_RELEASE.read_text()
-        self.assertEqual(workflow.count("uses: docker/build-push-action@"), 1)
-        self.assertIn("GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}", workflow)
-        self.assertIn("GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}", workflow)
-        self.assertIn("DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}", workflow)
-        self.assertIn("DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}", workflow)
-        self.assertIn(
-            "DOCKER_CONFIG: ${{ gitea.workspace }}/.docker-release", workflow
-        )
-        self.assertIn('rm -rf -- "$DOCKER_CONFIG"', workflow)
-        self.assertIn("platforms: linux/amd64,linux/arm64", workflow)
-        self.assertIn("push: true", workflow)
-        self.assertIn(
-            'context: "https://github.com/felixapel/CWA-eBook-Translate-Plugin.git#${{ gitea.sha }}"',
-            workflow,
-        )
-        self.assertNotRegex(workflow, r"(?m)^\s+context:\s+\.\s*$")
-
-    def test_published_digest_is_signed_and_attestations_are_verified(self):
-        workflow = GITEA_RELEASE.read_text()
-        self.assertIn("id: build", workflow)
-        self.assertIn("RELEASE_DIGEST: ${{ steps.build.outputs.digest }}", workflow)
-        self.assertIn(
-            "uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2",
-            workflow,
-        )
-        self.assertIn('cosign-release: "v3.0.6"', workflow)
-        for secret in (
-            "COSIGN_PRIVATE_KEY",
-            "COSIGN_PASSWORD",
-            "COSIGN_PUBLIC_KEY",
-        ):
-            self.assertIn(f"{secret}: ${{{{ secrets.{secret} }}}}", workflow)
-        self.assertIn('reference="${image}@${RELEASE_DIGEST}"', workflow)
-        self.assertIn("cosign sign --yes --key env://COSIGN_PRIVATE_KEY", workflow)
-        self.assertIn("cosign verify --key", workflow)
-        self.assertIn("docker buildx imagetools inspect", workflow)
-        self.assertIn("{{json .SBOM}}", workflow)
-        self.assertIn("{{json .Provenance}}", workflow)
-        self.assertIn("scripts/verify_release_attestations.py", workflow)
-        self.assertIn('test "$resolved_digest" = "$RELEASE_DIGEST"', workflow)
-        self.assertIn('digest_hex=${RELEASE_DIGEST#sha256:}', workflow)
-        self.assertIn("''|*[!0-9a-f]*)", workflow)
-        self.assertIn("--source-repository", workflow)
-        self.assertIn("--base-image", workflow)
-        self.assertIn('test "$verified_tag_count" -eq "$expected_tag_count"', workflow)
-        self.assertIn('test "$signed_image_count" -eq "$expected_image_count"', workflow)
-        self.assertIn('cmp -s "$workdir/images" "$workdir/expected-images"', workflow)
-        self.assertIn('cmp -s "$workdir/tags" "$workdir/expected-tags"', workflow)
-
-
-class ReleaseImageTagTests(unittest.TestCase):
-    def tags(self, tag: str, *images: str) -> subprocess.CompletedProcess[str]:
-        command = [sys.executable, str(TAG_SCRIPT), "--tag", tag]
-        for image in images:
-            command.extend(("--image", image))
-        return subprocess.run(command, check=False, capture_output=True, text=True)
-
-    def test_stable_release_moves_full_minor_and_latest_aliases(self):
-        result = self.tags(
-            "v2.3.4",
-            "ghcr.io/felixapel/cwa-ebook-translate-plugin",
-            "docker.io/felixapel/cwa-ebook-translate-plugin",
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            "ghcr.io/felixapel/cwa-ebook-translate-plugin:2.3.4",
-            "ghcr.io/felixapel/cwa-ebook-translate-plugin:2.3",
-            "ghcr.io/felixapel/cwa-ebook-translate-plugin:latest",
-            "docker.io/felixapel/cwa-ebook-translate-plugin:2.3.4",
-            "docker.io/felixapel/cwa-ebook-translate-plugin:2.3",
-            "docker.io/felixapel/cwa-ebook-translate-plugin:latest",
-        ])
-
-    def test_prerelease_only_publishes_the_immutable_full_version(self):
-        result = self.tags(
-            "v2.3.4-rc.1", "ghcr.io/felixapel/cwa-ebook-translate-plugin"
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            "ghcr.io/felixapel/cwa-ebook-translate-plugin:2.3.4-rc.1"
-        ])
-
-    def test_rejects_invalid_tag_or_image_without_a_traceback(self):
-        for tag, image in (
-            ("2.3.4", "ghcr.io/felixapel/plugin"),
-            ("v2.3.4", "GHCR.IO/Felix/Plugin"),
-            ("v2.3.4", "ghcr.io/felix/plugin:old"),
-        ):
-            with self.subTest(tag=tag, image=image):
-                result = self.tags(tag, image)
-                self.assertEqual(result.returncode, 2)
-                self.assertTrue(result.stderr.strip())
-                self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("publish:", workflow)
+        self.assertNotIn("secrets.", workflow)
+        self.assertNotIn("docker login", workflow)
+        self.assertNotIn("build-push-action", workflow)
+        self.assertNotIn("cosign", workflow.lower())
+        self.assertNotIn("SBOM", workflow)
+        self.assertNotIn("Provenance", workflow)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted; container publication details superseded by
+[ADR-008](ADR-008-source-only-releases.md)
 
 ## Date
 
@@ -11,10 +12,10 @@ Accepted
 ## Context
 
 The canonical repository is the private homelab Gitea instance. GitHub exists
-as a public source mirror and hosts GHCR, so both services participate in a
-release without having equal authority. Independent release workflows or tags
-can create split-brain source, duplicate publications, and mutable image aliases
-that point at different commits.
+as a public source mirror. At the time of this decision it also hosted the
+project's container registry, so both services participated in a release
+without having equal authority. Independent release workflows or tags can
+create split-brain source or duplicate publications from different commits.
 
 Gitea also selects the first configured workflow directory that exists. Once
 `.gitea/workflows` is present, a GitHub-only release definition is neither an
@@ -22,24 +23,17 @@ authoritative nor a reliably exercised policy for the canonical repository.
 
 ## Decision
 
-- Gitea is the only service allowed to initiate a release. The sole publishing
-  workflow is `.gitea/workflows/release.yml`; GitHub runs mirror CI only.
+- Gitea is the only service allowed to initiate a release. The authoritative
+  validation workflow is `.gitea/workflows/release.yml`; GitHub runs mirror CI
+  only.
 - Releases use annotated SemVer tags whose tag object and peeled commit already
   exist identically on GitHub. The candidate commit must be on Gitea `main`, and
   every version surface must match the tag.
 - Untrusted tag code cannot execute before the validator from trusted `main`
   accepts the candidate.
-- Backend, frontend, and container gates must all pass before registry secrets
-  enter scope. One multi-platform build fetches the preflight-verified GitHub
-  mirror by the exact peeled commit SHA, then publishes all requested registry
-  tags with provenance and an SBOM. The resulting digest is signed and every
-  configured image, tag, signature, structured source/base identity, SBOM, and
-  provenance document is verified before the release job succeeds; see
-  ADR-007.
-- Prereleases publish only their immutable full-version tag. Stable releases
-  may additionally move the minor and `latest` aliases, with releases serialized
-  operationally because Gitea 1.26 has no dependable concurrency primitive for
-  this workflow.
+- Backend, frontend, and container gates must all pass for the source tag. The
+  validated annotated tag and Gitea-generated source archives are the release
+  artifacts; see ADR-008.
 
 ## Alternatives Considered
 
@@ -65,10 +59,10 @@ artifacts without a matching public source tag.
 
 - Operators must push the one local annotated tag object to GitHub first and to
   Gitea second, following `docs/RELEASE.md`.
-- GitHub or registry unavailability blocks a release rather than weakening the
-  identity check. A partial publication is never blindly retried under the same
-  version.
-- Gitea `main`, `v*` tags, secrets, and the trusted runner require one-time
-  remote configuration outside this repository.
+- GitHub unavailability blocks a release rather than weakening the identity
+  check.
+- Gitea `main`, `v*` tags, and the trusted runner require one-time remote
+  configuration outside this repository. Release-specific registry or signing
+  secrets are not required.
 - The historical divergent `v2.0.0` tags remain documented exceptions; new
   versions cannot use that precedent.
