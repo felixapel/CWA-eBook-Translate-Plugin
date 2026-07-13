@@ -160,13 +160,19 @@ def run():
     check("/metrics: all counters present",
           all(k in body for k in [
               "total_requests", "average_latency_ms", "cache_hit_rate_pct",
-              "cache_hits", "cache_misses", "errors"]))
+              "cache_hits", "cache_misses", "errors", "singleflight"]))
     check("/metrics: total_requests is non-negative int",
           isinstance(body["total_requests"], int) and body["total_requests"] >= 0)
     check("/metrics: cache_hit_rate_pct is a percentage in [0, 100]",
           0.0 <= body["cache_hit_rate_pct"] <= 100.0)
     check("/metrics: total = hits + misses (invariants)",
           body["total_requests"] == body["cache_hits"] + body["cache_misses"])
+    check("/metrics: singleflight state is bounded and observable",
+          all(isinstance(body["singleflight"].get(k), int)
+              and body["singleflight"][k] >= 0
+              for k in ["leaders", "shared_results", "followers_waiting",
+                        "wait_timeouts", "capacity_rejections",
+                        "active_entries", "retained_entries"]))
 
     # ─────────────────────────────────────────────────────────────────────
     # H4: rate-limit is per-IP
@@ -275,7 +281,7 @@ def run():
     # imports server.py. Import-time configuration set later is ineffective.
     entrypoint = (Path(__file__).parent / "docker-entrypoint.sh").read_text()
     trust_export = entrypoint.find('export BT_TRUSTED_PROXIES=')
-    gunicorn_start = entrypoint.find('gosu appuser gunicorn')
+    gunicorn_start = entrypoint.find('exec gunicorn --bind')
     check("entrypoint: trusted proxy config is exported before Gunicorn",
           trust_export >= 0 and gunicorn_start >= 0 and trust_export < gunicorn_start)
 
@@ -333,15 +339,17 @@ def run():
     check("H6: cache-hit doesn't increment fresh_count",
           r2.get("fresh_count") == 0 and r2.get("cached_count") == len(paras_h6))
 
-    # Mixed: one new (fresh) + one already cached.
+    # Mixed group: one member exists under a different group context. The whole
+    # new group must refresh atomically; otherwise removing the cached member
+    # would change the prompt seen by its sibling.
     mixed = ["h6_mixed_brand_new", paras_h6[0]]
     r3 = client.post("/translate/batch", json={"paragraphs": mixed}).get_json()
-    check("H6: mixed batch has one fresh + one cache",
-          r3.get("fresh_count") == 1 and r3.get("cached_count") == 1)
-    check("H6: mixed batch per-para backends align correctly",
-          r3["backends"][0] != "cache" and r3["backends"][1] == "cache")
-    check("H6: mixed batch per-para cached align correctly",
-          r3["cached"][0] is False and r3["cached"][1] is True)
+    check("H6: partial group cache refreshes the full group",
+          r3.get("fresh_count") == 2 and r3.get("cached_count") == 0)
+    check("H6: refreshed group reports fresh backends",
+          all(backend != "cache" for backend in r3["backends"]))
+    check("H6: refreshed group reports no cache hits",
+          all(value is False for value in r3["cached"]))
 
     # Backend attribution: with local down, fresh paragraphs should report
     # the fallback provider.

@@ -1,15 +1,8 @@
-# CWA Translate Plugin — recommended setup (proxy-injection mode).
-#
-# The translator container proxies CWA and injects the overlay into reader
-# pages on the fly: stock CWA image, NO template mounts, survives CWA updates.
-# Read your library through http://<host>:8084 and the translator UI appears.
-# (The classic bind-mount install remains documented in the README under
-# "Advanced: bind-mount install".)
+# Recommended proxy-injection topology. The same immutable image runs as two
+# isolated non-root roles so API and nginx have independent health/restarts.
 
 services:
   calibre-web:
-    # Pinned to a version the overlay is tested against. `latest` can pull a
-    # reader rewrite mid-flight; bump this deliberately instead.
     image: crocodilestick/calibre-web-automated:v4.0.6
     container_name: calibre-web-automated
     environment:
@@ -20,66 +13,91 @@ services:
       - ./config/cwa:/config
       - ./books:/calibre-library
       - ./ingest:/cwa-book-ingest
-    # No published port needed: read CWA through the translator proxy below.
-    # Uncomment to also keep direct (overlay-less) access on :8083.
-    # ports:
-    #   - "8083:8083"
     restart: unless-stopped
     networks:
-      - webnet
+      - cwa-net
 
-  book-translator:
-    # Prebuilt multi-arch image (amd64 + arm64). To build from source instead,
-    # comment out `image:` and uncomment `build: .`
+  book-translator-api:
     image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
-    # build: .
-    container_name: book-translator
+    # To build locally, replace image with: build: .
     environment:
-      # ── Proxy-injection mode ────────────────────────────────────────────
-      # Point at the CWA service; remove this line for API-only mode.
-      - CWA_UPSTREAM=http://calibre-web-automated:8083
-
-      # ── LLM backend ─────────────────────────────────────────────────────
+      - BT_ROLE=api
+      # Only the proxy's fixed address may supply the client X-Forwarded-For.
+      - BT_TRUSTED_PROXIES=172.30.39.3/32
       - LLM_PROVIDER=local
       - LLM_MODEL=gemma4-12b
       - LLM_API_KEY=
-      # For provider=local: OpenAI-compatible endpoint of your LLM. The PATH is
-      # always /v1/chat/completions (vLLM, LM Studio, Ollama and Llama.cpp all
-      # speak it); only host:PORT changes. Point at the HOST, not this container
-      # (host.docker.internal resolves to the host via extra_hosts below).
-      #   vLLM      -> typically :8000
-      #   LM Studio -> :1234
-      #   Ollama    -> :11434
       - BT_LOCAL_URL=http://host.docker.internal:8000/v1/chat/completions
-      # Slow local model? Lower concurrency (1-2) is more stable than 3.
       - BT_MAX_CONCURRENT=2
       - BT_TIMEOUT=60
-      # Request-wide cost and overload guards. Every value must stay > 0;
-      # invalid/unbounded settings fail startup instead of disabling a limit.
       - BT_MAX_UPSTREAM_INFLIGHT=2
       - BT_UPSTREAM_QUEUE_TIMEOUT=2
+      - BT_SINGLEFLIGHT_MAX_ENTRIES=1024
       - BT_REQUEST_MAX_ATTEMPTS=20
       - BT_REQUEST_MAX_INPUT_BYTES=5000000
       - BT_REQUEST_MAX_OUTPUT_TOKENS=163840
       - BT_REQUEST_DEADLINE_SECONDS=90
       - BT_MAX_UPSTREAM_RESPONSE_BYTES=1048576
-      # Optional resilience: fall back to a cloud provider when local fails.
-      # - LLM_FALLBACK_PROVIDER=minimax
-      # - LLM_FALLBACK_MODEL=MiniMax-M3
-      # - LLM_FALLBACK_API_KEY=
+      - BT_CACHE_TTL_DAYS=90
+      - BT_CACHE_MAX_ENTRIES=100000
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./config/translator:/app/data
-    ports:
-      - "8084:8080"   # read CWA (with overlay) here
-      - "8390:8390"   # direct API access (optional; used by bind-mount installs)
-    depends_on:
-      - calibre-web
+      - translator-data:/app/data
+    expose:
+      - "8390"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
     restart: unless-stopped
     networks:
-      - webnet
+      translator-net:
+        ipv4_address: 172.30.39.2
+
+  book-translator-proxy:
+    image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
+    environment:
+      - BT_ROLE=proxy
+      - CWA_UPSTREAM=http://calibre-web:8083
+      - BT_API_UPSTREAM=http://book-translator-api:8390
+    ports:
+      - "8084:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    depends_on:
+      calibre-web:
+        condition: service_started
+      book-translator-api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      cwa-net:
+      translator-net:
+        ipv4_address: 172.30.39.3
+
+volumes:
+  translator-data:
 
 networks:
-  webnet:
+  cwa-net:
     driver: bridge
+  translator-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.39.0/24

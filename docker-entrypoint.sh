@@ -1,86 +1,128 @@
 #!/bin/sh
-# book-translator entrypoint.
-#
-# Always runs the translation API (gunicorn). When CWA_UPSTREAM is set it also
-# renders and starts the injection proxy (nginx) — see proxy/nginx.conf.template.
-# A monitor loop exits the container if either process dies, so the
-# orchestrator's restart policy can do its job instead of the container
-# lingering half-alive.
-#
-# gunicorn runs as `appuser` (unprivileged) via gosu. nginx runs as root
-# because it needs to bind the listen port and write to /run/nginx +
-# /var/log/nginx. If you only need the API (no proxy), set CWA_UPSTREAM=""
-# and nginx won't be started; the API still runs unprivileged.
+# Non-root runtime dispatcher for API, proxy, or legacy combined mode.
 set -eu
+umask 077
 
 PORT="${PORT:-8390}"
 BT_PROXY_PORT="${BT_PROXY_PORT:-8080}"
+BT_ROLE="${BT_ROLE:-auto}"
 BT_UI_VERSION="$(cat /app/VERSION 2>/dev/null || echo dev)"
-export PORT BT_PROXY_PORT BT_UI_VERSION
+export PORT BT_PROXY_PORT BT_ROLE BT_UI_VERSION
 
-# server.py reads the trusted-proxy allowlist at import time, so proxy-mode
-# defaults must exist before Gunicorn imports the application. Every API
-# request in this mode arrives from the in-container nginx on loopback; trust
-# only that peer and key rate limits on the last X-Forwarded-For hop nginx
-# observed. An explicitly supplied allowlist still takes precedence.
-if [ -n "${CWA_UPSTREAM:-}" ]; then
+if [ "$BT_ROLE" = "auto" ]; then
+    if [ -n "${CWA_UPSTREAM:-}" ]; then
+        BT_ROLE="all"
+    else
+        BT_ROLE="api"
+    fi
+    export BT_ROLE
+fi
+
+case "$BT_ROLE" in
+    api|proxy|all) ;;
+    *)
+        echo "[entrypoint] ERROR: BT_ROLE must be api, proxy, all, or auto" >&2
+        exit 64
+        ;;
+esac
+
+if [ "$BT_ROLE" = "all" ]; then
     export BT_TRUSTED_PROXIES="${BT_TRUSTED_PROXIES:-127.0.0.1/32}"
 fi
 
-# The data dir is almost always a BIND MOUNT owned by the host (root, or an
-# appdata user) — the build-time chown only covers the image's own layer, so
-# without this runtime chown gunicorn (running as appuser) cannot open the
-# SQLite database and the worker dies at boot ("unable to open database
-# file"). Reproduced with `-v /root-owned-dir:/app/data`; anonymous volumes
-# masked it because they inherit the image's ownership.
-mkdir -p /app/data
-# Only repair ownership when appuser actually lacks write access, and only on
-# the flat data dir + its immediate files (no -R: recursive chown on a big
-# host appdata tree is slow and mutates host-side ownership more than needed).
-if ! gosu appuser sh -c 'test -w /app/data && { test ! -e /app/data/translations.db || test -w /app/data/translations.db; }'; then
-    chown appuser:appuser /app/data /app/data/* /app/data/.[!.]* 2>/dev/null || true
-    gosu appuser sh -c 'test -w /app/data' || \
-        echo "[entrypoint] WARNING: could not make /app/data writable (read-only mount?) — the API may fail to write its cache"
-fi
+check_data_dir() {
+    if [ ! -d /app/data ]; then
+        echo "[entrypoint] ERROR: /app/data is missing" >&2
+        exit 78
+    fi
+    if ! chmod 700 /app/data 2>/dev/null; then
+        echo "[entrypoint] ERROR: /app/data must permit private mode 0700" >&2
+        exit 78
+    fi
+    probe="/app/data/.write-probe.$$"
+    if ! (umask 077 && : > "$probe") 2>/dev/null; then
+        echo "[entrypoint] ERROR: /app/data must be writable by uid 101 gid 102" >&2
+        exit 78
+    fi
+    rm -f "$probe"
+}
 
-# Drop privileges for gunicorn. `gosu` (vs su) does not leak env or fork a
-# tty, and forwards signals (SIGTERM) cleanly to the child process so
-# `docker stop` reaches gunicorn directly.
-gosu appuser gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 --timeout 120 server:app &
-API_PID=$!
+configure_proxy() {
+    if [ -z "${CWA_UPSTREAM:-}" ]; then
+        echo "[entrypoint] ERROR: CWA_UPSTREAM is required for the proxy role" >&2
+        exit 64
+    fi
+    BT_API_UPSTREAM="${BT_API_UPSTREAM:-http://127.0.0.1:${PORT}}"
+    export BT_API_UPSTREAM
 
-NGINX_PID=""
-if [ -n "${CWA_UPSTREAM:-}" ]; then
-    echo "[entrypoint] proxy mode: :${BT_PROXY_PORT} -> ${CWA_UPSTREAM} (overlay injected)"
-    mkdir -p /run/nginx
-    # Substitute ONLY our variables; nginx's own $vars must survive verbatim.
-    # Literal ${...} names below are envsubst's allowlist, not shell expansion.
+    mkdir -p \
+        /tmp/nginx/client_temp \
+        /tmp/nginx/proxy_temp \
+        /tmp/nginx/fastcgi_temp \
+        /tmp/nginx/uwsgi_temp \
+        /tmp/nginx/scgi_temp
+    # Literal ${...} names below are envsubst's allowlist.
     # shellcheck disable=SC2016
-    envsubst '${CWA_UPSTREAM} ${PORT} ${BT_PROXY_PORT} ${BT_UI_VERSION}' \
-        < /app/proxy/nginx.conf.template > /etc/nginx/http.d/default.conf
-    nginx -t
-    nginx -g 'daemon off;' &
-    NGINX_PID=$!
-else
-    echo "[entrypoint] API-only mode (set CWA_UPSTREAM to enable the injection proxy)"
-fi
+    envsubst '${CWA_UPSTREAM} ${BT_API_UPSTREAM} ${BT_PROXY_PORT} ${BT_UI_VERSION}' \
+        < /app/proxy/nginx.conf.template > /tmp/nginx/proxy.conf
+    nginx -t -c /app/proxy/nginx-main.conf -e /dev/stderr
+}
+
+start_api() {
+    gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 \
+        --timeout 120 server:app
+}
+
+start_proxy() {
+    nginx -c /app/proxy/nginx-main.conf -e /dev/stderr -g 'daemon off;'
+}
+
+case "$BT_ROLE" in
+    api)
+        check_data_dir
+        echo "[entrypoint] API role on :${PORT}"
+        exec gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 \
+            --timeout 120 server:app
+        ;;
+    proxy)
+        configure_proxy
+        echo "[entrypoint] proxy role on :${BT_PROXY_PORT} -> ${CWA_UPSTREAM}"
+        exec nginx -c /app/proxy/nginx-main.conf -e /dev/stderr -g 'daemon off;'
+        ;;
+esac
+
+# Legacy one-container compatibility. It is non-root, but the recommended
+# topology uses two role-specific containers so each has its own health and
+# restart lifecycle.
+check_data_dir
+configure_proxy
+echo "[entrypoint] combined role: API :${PORT}, proxy :${BT_PROXY_PORT}"
+start_api &
+API_PID=$!
+start_proxy &
+NGINX_PID=$!
+
+stop_children() {
+    kill -TERM "$API_PID" "$NGINX_PID" 2>/dev/null || true
+    wait "$API_PID" 2>/dev/null || true
+    wait "$NGINX_PID" 2>/dev/null || true
+}
 
 shutdown() {
-    kill -TERM "$API_PID" ${NGINX_PID:+$NGINX_PID} 2>/dev/null || true
-    wait "$API_PID" 2>/dev/null || true
-    [ -z "$NGINX_PID" ] || wait "$NGINX_PID" 2>/dev/null || true
+    stop_children
     exit 0
 }
 trap shutdown TERM INT
 
-# Monitor: if any child dies, exit so the container restarts as a whole.
 while :; do
     if ! kill -0 "$API_PID" 2>/dev/null; then
-        echo "[entrypoint] gunicorn exited — stopping container"
+        echo "[entrypoint] gunicorn exited; stopping combined container" >&2
+        stop_children
         exit 1
     fi
-    if [ -n "$NGINX_PID" ] && ! kill -0 "$NGINX_PID" 2>/dev/null; then
-        echo "[entrypoint] nginx exited — stopping container"
+    if ! kill -0 "$NGINX_PID" 2>/dev/null; then
+        echo "[entrypoint] nginx exited; stopping combined container" >&2
+        stop_children
         exit 1
     fi
     sleep 5 &

@@ -5,6 +5,8 @@ This document details the architecture of the `book-translator` plugin.
 ## Architecture decisions
 
 - [ADR-001: Use Gitea as the sole release authority](decisions/ADR-001-gitea-release-authority.md)
+- [ADR-002: Split API and proxy into non-root runtime roles](decisions/ADR-002-split-non-root-runtime-roles.md)
+- [ADR-003: Use an atomically scoped private cache](decisions/ADR-003-scoped-private-cache.md)
 
 ## Overview
 
@@ -12,8 +14,10 @@ The plugin operates as a decoupled overlay integrated into Calibre-Web-Automated
 
 There are two integration methods:
 
-1. **Proxy-injection mode (recommended, 2.0.0+).** The container runs nginx in
-   front of a **stock** CWA instance (`CWA_UPSTREAM`). HTML responses get a
+1. **Proxy-injection mode (recommended, 2.0.0+).** Two isolated non-root
+   containers run the same release image with `BT_ROLE=proxy` and
+   `BT_ROLE=api`. nginx sits in front of a **stock** CWA instance
+   (`CWA_UPSTREAM`). HTML responses get a
    single `<script src="/bt-static/loader.js">` tag injected before `</head>`;
    `loader.js` self-guards to `/read/` pages and loads the overlay. The API is
    reachable same-origin under `/bt-api/`, so CORS never applies. Because only
@@ -25,22 +29,15 @@ There are two integration methods:
    `:8390` cross-origin. The template copy is tracked against the CWA version
    pinned in `docker-compose.yml`.
 
-The diagram below shows the bind-mount data flow; in proxy mode the same
-frontend/API components apply, with nginx in front.
+The diagram below shows the recommended proxy data flow. The proxy is the only
+browser-facing translator role; the API owns the writable SQLite volume.
 
 ```
-┌────────────────────────────────┐         HTTP          ┌─────────────────────────┐
-│ calibre-web-automated (Reader)  │  ────────────────►  │  book-translator-api    │
-│                                │                      │                         │
-│  - translator.js (Frontend)     │                      │  - Flask server.py      │
-│  - translator.css              │                      │  - translator.py        │
-│  - read.html (Injection point) │                      │  - SQLite Cache         │
-└────────────────────────────────┘                      └────────────┬────────────┘
-                                                                     │ HTTP
-                                                                     ▼
-                                                        ┌─────────────────────────┐
-                                                        │ LLM Provider (vLLM)     │
-                                                        └─────────────────────────┘
+Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
+                │
+                └── /bt-api/* ──► API role (:8390) ──► LLM provider
+                                         │
+                                         └── SQLite volume (/app/data)
 ```
 
 ## Component Breakdown
@@ -48,9 +45,16 @@ frontend/API components apply, with nginx in front.
 ### Frontend (`translator.js`)
 - **Lifecycle Observers**: Hooks into CWA reader using iframe document checking and `epub.js` rendition hooks (`relocated`, `rendered`).
 - **Translation Management**: Coordinates visible-first translation chunking and background sequential prefetching.
-- **Client Cache**: Leverages browser `localStorage` (indexed by a 53-bit cyrb53 hash of the paragraph text) to render translations instantly upon page load or chapter returns.
+- **Client Cache**: Keeps context-scoped translations in memory. Durable
+  `localStorage` is an explicit opt-in for trusted single-user browsers; keys
+  include release, languages, book, chapter, and stable DOM position so
+  repeated text in different literary contexts cannot collide.
 
 ### Backend (`book-translator-api`)
 - **Flask Server (`server.py`)**: Exposes translation endpoints `/translate` and `/translate/batch` along with metrics and health probes.
-- **SQLite Cache (`cache.py`)**: Stores translations using SHA-256 hashes of text, source, and target languages to prevent duplicate LLM calls across all clients.
+- **SQLite Cache (`cache.py`)**: Schema v2 keys include tenant, book, chapter,
+  provider, model, prompt/protocol fingerprint, group context, languages, and
+  source hash. Source paragraphs and raw tenant/book/chapter identifiers are not
+  stored. TTL/cap are mandatory and group hits are atomic, so cached paragraphs
+  cannot alter the context seen by a later provider call.
 - **LLM Client (`translator.py`)**: Multi-provider wrapper that supports batch translation prompts with dynamic context windows (`BT_CONTEXT_WINDOW`).

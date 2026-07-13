@@ -1,11 +1,10 @@
 # Deploying to Unraid
 
-> **v2.0.0+: proxy-injection mode is the recommended Unraid install** and needs
-> none of the bind-mounts below. Run the container with `CWA_UPSTREAM` set to
-> your CWA container URL, map a free host port to container port `8080`, and
-> read your library through that port — stock CWA, no template edits, survives
-> CWA updates. The rest of this document describes the classic bind-mount
-> deployment, kept for existing installs and development.
+> **Proxy injection is the recommended integration.** The repository Compose
+> file runs the shared image as isolated `api` and `proxy` roles. Existing
+> Unraid one-container proxy deployments remain compatible through
+> `BT_ROLE=auto`, while the rest of this document covers the classic API plus
+> bind-mounted overlay deployment.
 
 A concrete, worked example of a two-container deployment (translator API +
 Calibre-Web-Automated with the overlay bind-mounts). The hostnames, IPs
@@ -112,13 +111,21 @@ git pull origin main
 # Rebuild the image
 docker build -t local/book-translator-api:latest .
 
+# The image runs as the stable uid/gid 101:102 and never changes host
+# ownership at startup.
+install -d -m 0700 -o 101 -g 102 -- \
+  /mnt/user/appdata/book-translator-api/data
+
 # Recreate the container so it runs the NEW image (the /app/data bind mount
 # keeps the SQLite cache). Re-use your exact env — see "Initial Setup" below,
 # or copy the flags from `docker inspect book-translator-api` first.
 docker rm -f book-translator-api
 docker run -d --name book-translator-api --restart unless-stopped --net bridge \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
   -p 8390:8390 -v /mnt/user/appdata/book-translator-api/data:/app/data \
   -l net.unraid.docker.managed=dockerman \
+  -e BT_ROLE=api \
   -e LLM_PROVIDER=local -e LLM_MODEL=gemma4-12b \
   -e BT_LOCAL_URL=http://<YOUR-HOST-IP>:2819/v1/chat/completions \
   -e BT_BATCH_SIZE=3 -e BT_MAX_CONCURRENT=1 -e BT_TIMEOUT=60 \
@@ -144,12 +151,13 @@ If the containers don't exist yet:
 
 ### 1. Backend container
 
-**Recommended: run it as an Unraid-managed container.** The image is built
-locally (`local/book-translator-api:latest`) and isn't in a registry, so the
-cleanest path is:
+**Recommended: run it as an Unraid-managed container.** The installer pulls the
+published image and installs a hardened API template; building
+`local/book-translator-api:latest` remains available for development.
 
-1. Run `install_unraid.sh` from a clone of the repo — it builds the image and
-   installs the Unraid template (from `my-book-translator-api.xml.tmpl`) into
+1. Run `install_unraid.sh` from a clone of the repo — it pulls the image,
+   prepares `/app/data` ownership, and installs the template (from
+   `my-book-translator-api.xml.tmpl`) into
    `/boot/config/plugins/dockerMan/templates-user/`.
 2. In the Unraid **Docker** tab → *Add Container* → pick `book-translator-api`
    from the Template dropdown → set your `BT_LOCAL_URL` → **Apply**.
@@ -168,7 +176,12 @@ docker run -d \
   --name book-translator-api \
   --restart unless-stopped \
   --net bridge \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges:true \
   -p 8390:8390 \
+  -e BT_ROLE=api \
   -e LLM_PROVIDER=local \
   -e LLM_MODEL=gemma4-12b \
   -e BT_LOCAL_URL=http://<YOUR-HOST-IP>:2819/v1/chat/completions \
@@ -187,6 +200,11 @@ docker run -d \
 grep -qxF book-translator-api /var/lib/docker/unraid-autostart \
   || echo book-translator-api >> /var/lib/docker/unraid-autostart
 ```
+
+Before a manual run, create the data directory with
+`install -d -m 0700 -o 101 -g 102 -- /mnt/user/appdata/book-translator-api/data`.
+An older bind mount with different ownership must be migrated once; the
+container deliberately has no root path that could repair it silently.
 
 > ⚠️ Do NOT use `localhost` as `BT_LOCAL_URL` inside Docker.
 > `localhost` inside a container refers to the container itself, not the host.

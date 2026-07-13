@@ -51,8 +51,10 @@ fi
 #    lives at github.com/felixapel/unraid-templates).
 echo "📥 Installing Unraid Docker Template for Translator API..."
 TEMPLATE_DIR="/boot/config/plugins/dockerMan/templates-user"
+DATA_DIR="/mnt/user/appdata/book-translator-api/data"
 mkdir -p -- "$TEMPLATE_DIR"
 cp -- "$SCRIPT_DIR/my-book-translator-api.xml.tmpl" "$TEMPLATE_DIR/my-book-translator-api.xml"
+install -d -m 0700 -o 101 -g 102 -- "$DATA_DIR"
 
 echo "=========================================================="
 echo "🎉 Installation almost complete!"

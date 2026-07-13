@@ -20,7 +20,7 @@ class CIContractTests(unittest.TestCase):
         for command in (
             "python3 test_translation.py",
             "python3 test_hardening.py",
-            "python3 -m unittest -v test_work_budget test_provider_budget test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_cleanup_token test_api_schema test_error_privacy",
+            "python3 -m unittest -v test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy",
         ):
             self.assertIn(command, self.workflow)
 
@@ -43,11 +43,7 @@ class CIContractTests(unittest.TestCase):
         self.assertRegex(self.workflow, r"(?m)^\s*run: docker build ")
 
     def test_docker_smoke_exercises_the_published_proxy_path(self):
-        self.assertIn(
-            "CWA_UPSTREAM=http://127.0.0.1:8390", self.workflow)
-        self.assertIn("-p 127.0.0.1::8080", self.workflow)
-        self.assertIn(
-            "http://127.0.0.1:${PROXY_PORT}/bt-api/ping", self.workflow)
+        self.assertIn("./scripts/container-smoke.sh", self.workflow)
         self.assertIn("sh scripts/ci-docker-names.sh", self.workflow)
         self.assertNotIn("bt-smoke-${{ github.run_id }}", self.workflow)
         self.assertNotIn(
@@ -55,7 +51,7 @@ class CIContractTests(unittest.TestCase):
             self.workflow,
         )
         self.assertIn('docker build -t "$SMOKE_IMAGE" .', self.workflow)
-        self.assertIn('127.0.0.1::8080 "$SMOKE_IMAGE"', self.workflow)
+        self.assertIn('./scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"', self.workflow)
         self.assertNotIn("docker build -t bt-audit:ci", self.workflow)
 
     def test_docker_names_are_isolated_across_repositories(self):
@@ -85,17 +81,27 @@ class CIContractTests(unittest.TestCase):
         first = derive("felix/CWA-translate-plugin")
         second = derive("another-owner/another-repository")
         repeated = derive("felix/CWA-translate-plugin")
+        next_run = derive("felix/CWA-translate-plugin", run_id="4243")
         next_attempt = derive("felix/CWA-translate-plugin", run_attempt="2")
+        long_identifiers = derive(
+            "felix/CWA-translate-plugin",
+            run_id="9" * 200,
+            run_attempt="8" * 200,
+        )
 
         self.assertEqual(first, repeated)
-        self.assertNotEqual(first["SMOKE_CONTAINER"], second["SMOKE_CONTAINER"])
+        self.assertNotEqual(first["SMOKE_PREFIX"], second["SMOKE_PREFIX"])
         self.assertNotEqual(first["SMOKE_IMAGE"], second["SMOKE_IMAGE"])
+        self.assertNotEqual(first["SMOKE_PREFIX"], next_run["SMOKE_PREFIX"])
         self.assertNotEqual(
-            first["SMOKE_CONTAINER"], next_attempt["SMOKE_CONTAINER"])
+            first["SMOKE_PREFIX"], next_attempt["SMOKE_PREFIX"])
         self.assertRegex(
-            first["SMOKE_CONTAINER"], r"^bt-smoke-[0-9a-f]{16}-4242-1$")
+            first["SMOKE_PREFIX"], r"^bt-ci-[0-9a-f]{20}$")
         self.assertRegex(
-            first["SMOKE_IMAGE"], r"^bt-audit:[0-9a-f]{16}-4242-1$")
+            first["SMOKE_IMAGE"], r"^bt-audit:[0-9a-f]{20}$")
+        self.assertRegex(
+            long_identifiers["SMOKE_PREFIX"], r"^bt-ci-[0-9a-f]{20}$")
+        self.assertLessEqual(len(long_identifiers["SMOKE_PREFIX"]), 49)
 
     def test_package_lock_root_metadata_matches_package_manifest(self):
         package = json.loads((ROOT / "package.json").read_text())

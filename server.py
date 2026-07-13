@@ -3,6 +3,7 @@ book-translator — Flask microservice for ebook paragraph translation.
 Runs on port 8390. Frontend (CWA overlay) calls this service.
 """
 import logging
+import hashlib
 import math
 import os
 import re
@@ -17,20 +18,71 @@ from werkzeug.exceptions import HTTPException
 
 from translator import (
     translate_text, translate_batch, check_backend_health,
-    LLM_MODEL, BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
+    BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
     ProviderUnavailableError, create_work_budget, model_for_provider,
-    cache_lookup_models,
+    cache_lookup_backends, translation_groups, batch_cache_contract,
+    single_cache_contract, singleflight_stats,
 )
 from work_budget import WorkBudget, WorkBudgetExceeded
-from cache import get_cached, put_cache, get_cache_stats, cleanup_old_entries
+from cache import (
+    CacheScope, get_cached, put_cache, record_cache_hit,
+    get_cache_stats, cleanup_old_entries,
+)
 
 
-def _cache_lookup(text: str, source_lang: str, target_lang: str) -> str | None:
-    """Model-scoped cache lookup: primary model first, then the fallback's
-    model (a paragraph translated during a primary outage lives under the
-    fallback key and must not be re-paid once the primary recovers)."""
-    for model in cache_lookup_models():
-        hit = get_cached(text, source_lang, target_lang, model=model)
+def _cache_scope(
+    *,
+    tenant: str,
+    book_id: str,
+    chapter_id: str,
+    context_hash: str,
+    provider: str,
+    model: str,
+    prompt_hash: str,
+    protocol_version: str,
+) -> CacheScope:
+    return CacheScope(
+        tenant=tenant,
+        book_id=book_id,
+        chapter_id=chapter_id,
+        context_hash=context_hash,
+        provider=provider,
+        model=model,
+        prompt_hash=prompt_hash,
+        protocol_version=protocol_version,
+    )
+
+
+def _operation_namespace(tenant: str, book_id: str, chapter_id: str) -> str:
+    """Opaque tenant/book/chapter boundary for in-process singleflight."""
+    return hashlib.sha256(
+        "\0".join((tenant, book_id, chapter_id)).encode("utf-8")
+    ).hexdigest()
+
+
+def _cache_lookup(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    *,
+    tenant: str = "legacy-anonymous",
+    book_id: str = "unscoped",
+    chapter_id: str = "unscoped",
+) -> str | None:
+    """Probe exact single-translation contracts in provider failover order."""
+    contract = single_cache_contract(source_lang, target_lang)
+    for provider, model in cache_lookup_backends():
+        scope = _cache_scope(
+            tenant=tenant,
+            book_id=book_id,
+            chapter_id=chapter_id,
+            context_hash=contract.context_hash,
+            provider=provider,
+            model=model,
+            prompt_hash=contract.prompt_hash,
+            protocol_version=contract.protocol_version,
+        )
+        hit = get_cached(text, source_lang, target_lang, scope=scope)
         if hit is not None:
             return hit
     return None
@@ -52,6 +104,7 @@ API_TOKEN = os.environ.get("BT_API_TOKEN", "")
 # rejected with 413 rather than truncated — silent truncation would corrupt text.
 BT_MAX_BATCH_PARAGRAPHS = int(os.environ.get("BT_MAX_BATCH_PARAGRAPHS", "50"))
 BT_MAX_PARAGRAPH_CHARS = int(os.environ.get("BT_MAX_PARAGRAPH_CHARS", "8000"))
+BT_CACHE_SCOPE_MAX_CHARS = int(os.environ.get("BT_CACHE_SCOPE_MAX_CHARS", "512"))
 
 # Global request-size cap (defence in depth). The per-field caps above check
 # the *parsed* content; MAX_CONTENT_LENGTH is a hard backstop at the WSGI
@@ -103,6 +156,31 @@ app = Flask(__name__)
 # per-field caps in the route handlers are the second backstop). Returning
 # 413 here means a 10 MB JSON gets rejected before Flask even parses it.
 app.config["MAX_CONTENT_LENGTH"] = BT_MAX_CONTENT_LENGTH
+
+
+def _request_cache_namespace(data: dict) -> tuple[str, str, str]:
+    """Return server-owned tenant plus bounded client book/chapter metadata.
+
+    ``tenant`` is never accepted from JSON.  The authentication middleware
+    owns it; the legacy value is temporary compatibility until an explicit
+    production auth mode is selected.  Book/chapter identifiers affect only a
+    one-way cache hash and are never logged or stored verbatim.
+    """
+    tenant = getattr(request, "auth_subject", None) or "legacy-anonymous"
+    values = []
+    for field in ("book_id", "chapter_id"):
+        value = data.get(field, "unscoped")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"'{field}' must be a non-empty string")
+        value = value.strip()
+        if len(value) > BT_CACHE_SCOPE_MAX_CHARS:
+            raise ValueError(
+                f"'{field}' exceeds the {BT_CACHE_SCOPE_MAX_CHARS}-character limit"
+            )
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError(f"'{field}' contains control characters")
+        values.append(value)
+    return tenant, values[0], values[1]
 
 # ── Language validation (H7) ────────────────────────────────────────────────
 # The selectable set mirrors Gemma 4's pre-training coverage (top-10 most
@@ -321,7 +399,14 @@ def _work_budget_response(exc: WorkBudgetExceeded):
 # ── Shared batch helper (M3) ───────────────────────────────────────────────
 
 def _translate_paragraphs(
-    paragraphs: list[str], source_lang: str, target_lang: str, budget: WorkBudget
+    paragraphs: list[str],
+    source_lang: str,
+    target_lang: str,
+    budget: WorkBudget,
+    *,
+    tenant: str = "legacy-anonymous",
+    book_id: str = "unscoped",
+    chapter_id: str = "unscoped",
 ) -> dict:
     """
     Shared helper for batch translation logic used by /translate/batch.
@@ -344,37 +429,110 @@ def _translate_paragraphs(
     fresh_count = 0
     start = time.monotonic()
 
-    # Identify cache misses
-    misses = []
-    miss_indices = []
+    # Cache and translate deterministic groups atomically.  Serving one cached
+    # segment while translating its siblings would remove that text from the
+    # provider prompt and silently change the context.  A group is therefore a
+    # hit only when every non-empty segment exists under one exact backend and
+    # prompt/context contract; otherwise the whole original group is refreshed.
+    groups = translation_groups(paragraphs)
+    missing_groups: list[list[int]] = []
+    contracts = {
+        tuple(group): batch_cache_contract(
+            paragraphs, group, source_lang, target_lang
+        )
+        for group in groups
+    }
 
-    for i, para in enumerate(paragraphs):
-        if not para.strip():
+    for group in groups:
+        contract = contracts[tuple(group)]
+        accepted: list[tuple[int, str, CacheScope]] | None = None
+        for provider, model in cache_lookup_backends():
+            candidate: list[tuple[int, str, CacheScope]] = []
+            for index in group:
+                scope = _cache_scope(
+                    tenant=tenant,
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    context_hash=contract.context_hash,
+                    provider=provider,
+                    model=model,
+                    prompt_hash=contract.prompt_hash,
+                    protocol_version=contract.protocol_version,
+                )
+                hit = get_cached(
+                    paragraphs[index],
+                    source_lang,
+                    target_lang,
+                    scope=scope,
+                    record_hit=False,
+                )
+                if hit is None:
+                    candidate = []
+                    break
+                candidate.append((index, hit, scope))
+            if candidate:
+                accepted = candidate
+                break
+
+        if accepted is None:
+            missing_groups.append(group)
             continue
-        hit = _cache_lookup(para, source_lang, target_lang)
-        if hit is not None:
-            translations[i] = hit
-            backends[i] = "cache"
-            cached[i] = True
-            cached_count += 1
-        else:
-            misses.append(para)
-            miss_indices.append(i)
 
-    # Translate misses concurrently (concurrency controlled by BT_MAX_CONCURRENT)
-    if misses:
+        for index, hit, scope in accepted:
+            translations[index] = hit
+            backends[index] = "cache"
+            cached[index] = True
+            cached_count += 1
+            record_cache_hit(
+                paragraphs[index],
+                source_lang,
+                target_lang,
+                scope=scope,
+            )
+
+    if missing_groups:
         results = translate_batch(
-            misses, source_lang, target_lang, budget=budget)
-        for idx, (translated, backend) in zip(miss_indices, results):
-            translations[idx] = translated
-            backends[idx] = backend or "unknown"
-            if not translated.startswith("[TRANSLATION ERROR:"):
+            paragraphs,
+            source_lang,
+            target_lang,
+            budget=budget,
+            selected_groups=missing_groups,
+            operation_namespace=_operation_namespace(
+                tenant, book_id, chapter_id
+            ),
+        )
+        for group in missing_groups:
+            contract = contracts[tuple(group)]
+            for index in group:
+                translated, backend = results[index]
+                translations[index] = translated
+                backends[index] = backend or "unknown"
+                if translated.startswith("[TRANSLATION ERROR:"):
+                    continue
                 fresh_count += 1
                 try:
-                    put_cache(paragraphs[idx], source_lang, target_lang, translated,
-                              model=model_for_provider(backend))
-                except Exception:
-                    pass
+                    scope = _cache_scope(
+                        tenant=tenant,
+                        book_id=book_id,
+                        chapter_id=chapter_id,
+                        context_hash=contract.context_hash,
+                        provider=backend,
+                        model=model_for_provider(backend),
+                        prompt_hash=contract.prompt_hash,
+                        protocol_version=contract.protocol_version,
+                    )
+                    put_cache(
+                        paragraphs[index],
+                        source_lang,
+                        target_lang,
+                        translated,
+                        scope=scope,
+                    )
+                except Exception as exc:
+                    log.error(
+                        "Cache write failed (non-fatal) error_type=%s",
+                        type(exc).__name__,
+                    )
 
     total_elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -582,6 +740,7 @@ def metrics():
         "cache_hits": snapshot["cache_hits"],
         "cache_misses": snapshot["cache_misses"],
         "errors": snapshot["errors"],
+        "singleflight": singleflight_stats(),
     })
 
 
@@ -626,6 +785,11 @@ def translate():
     if lang_error:
         return jsonify({"error": lang_error}), 400
 
+    try:
+        tenant, book_id, chapter_id = _request_cache_namespace(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     budget = create_work_budget()
 
     req_id = getattr(request, "request_id", None)
@@ -649,7 +813,14 @@ def translate():
         })
 
     # Check cache first
-    cached = _cache_lookup(text, source_lang, target_lang)
+    cached = _cache_lookup(
+        text,
+        source_lang,
+        target_lang,
+        tenant=tenant,
+        book_id=book_id,
+        chapter_id=chapter_id,
+    )
     if cached is not None:
         _record_metric(0, hits=1, misses=0)
         return jsonify({
@@ -663,7 +834,14 @@ def translate():
     start = time.monotonic()
     try:
         translated, backend = translate_text(
-            text, source_lang, target_lang, budget=budget)
+            text,
+            source_lang,
+            target_lang,
+            budget=budget,
+            operation_namespace=_operation_namespace(
+                tenant, book_id, chapter_id
+            ),
+        )
     except WorkBudgetExceeded as exc:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
@@ -693,7 +871,24 @@ def translate():
 
     # Store in cache with correct model name
     try:
-        put_cache(text, source_lang, target_lang, translated, model=model_for_provider(backend))
+        contract = single_cache_contract(source_lang, target_lang)
+        scope = _cache_scope(
+            tenant=tenant,
+            book_id=book_id,
+            chapter_id=chapter_id,
+            context_hash=contract.context_hash,
+            provider=backend,
+            model=model_for_provider(backend),
+            prompt_hash=contract.prompt_hash,
+            protocol_version=contract.protocol_version,
+        )
+        put_cache(
+            text,
+            source_lang,
+            target_lang,
+            translated,
+            scope=scope,
+        )
     except Exception as e:
         log.error("Cache write failed (non-fatal) error_type=%s", type(e).__name__)
 
@@ -768,6 +963,11 @@ def translate_batch_endpoint():
     if lang_error:
         return jsonify({"error": lang_error}), 400
 
+    try:
+        tenant, book_id, chapter_id = _request_cache_namespace(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     budget = create_work_budget()
 
     # Short-circuit source==target: mirror /translate's behaviour. Echo every
@@ -789,9 +989,20 @@ def translate_batch_endpoint():
             "request_id": req_id,
         })
 
+    # Provider prompts and cache fingerprints use the same normalized text.
+    # Empty slots stay empty so response indices remain stable.
+    paragraphs = [paragraph.strip() for paragraph in paragraphs]
+
     try:
         result = _translate_paragraphs(
-            paragraphs, source_lang, target_lang, budget)
+            paragraphs,
+            source_lang,
+            target_lang,
+            budget,
+            tenant=tenant,
+            book_id=book_id,
+            chapter_id=chapter_id,
+        )
     except WorkBudgetExceeded as exc:
         _record_metric(0, hits=0, misses=1, error=True)
         return _work_budget_response(exc)

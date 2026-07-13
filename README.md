@@ -13,7 +13,7 @@ Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://gi
 - 🚀 **Background Prefetching** — translates the rest of the chapter sequentially in the background
 - 🧠 **Context-Aware Translation** — feeds surrounding paragraphs to the LLM to improve literary quality and character voice
 - 📚 **Deep DOM Parsing** — accurately captures headings, custom title classes, and clickable TOC links
-- 💾 **Persistent Double Cache** — server-side SQLite (SHA-256) + client-side `localStorage` caching ensures you never lose a translation or re-pay API costs
+- 💾 **Private Bounded Cache** — durable server-side SQLite uses scoped SHA-256 keys, mandatory TTL/cap, and private file modes; browser persistence is opt-in on trusted single-user devices
 - 🔒 **Rate limited & Stable** — request-size caps and per-IP rate limiting protect your API keys and GPU from runaway requests, with `AbortController` cancellation for perfectly responsive UI buttons
 - 🔌 **Zero-touch install** — proxy-injection mode overlays a **stock** CWA container: no template mounts, nothing to re-apply when CWA updates
 
@@ -32,15 +32,16 @@ lower-resource tier better — switch `LLM_PROVIDER` if a language matters to yo
 
 ## 🚀 Installation
 
-### Recommended: proxy-injection mode (one extra container, stock CWA)
+### Recommended: proxy-injection mode (isolated API and proxy roles)
 
-The translator container sits in front of CWA and injects the overlay into
-reader pages on the fly. Your CWA container stays completely untouched.
+Two non-root containers run the same translator image. The proxy sits in front
+of CWA and injects the overlay; the private API owns translation and cache
+state. Your CWA container stays completely untouched.
 
 ```text
-Browser ──► book-translator (:8084) ──► Calibre-Web-Automated (:8083, stock)
+Browser ──► book-translator-proxy (:8084) ──► CWA (:8083, stock)
                  │ injects overlay on /read/ pages
-                 └─ /bt-api → translation API (same origin, no CORS)
+                 └─ /bt-api → book-translator-api (:8390, private)
 ```
 
 ```bash
@@ -54,22 +55,14 @@ Then read your library at **`http://<host>:8084`** — the translator control
 bar appears in the ebook reader. That's the whole install. The compose file
 pulls the prebuilt multi-arch image
 (`ghcr.io/felixapel/cwa-ebook-translate-plugin`, amd64 + arm64) — no build
-step needed.
+step needed. For an unattended production deployment, replace `latest` in the
+Compose file with the immutable digest reported by the release workflow.
 
-Already have CWA running? Add just the translator service to your existing
-compose file and point `CWA_UPSTREAM` at your CWA container/host:
-
-```yaml
-  book-translator:
-    image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
-    environment:
-      - CWA_UPSTREAM=http://calibre-web-automated:8083
-      - BT_LOCAL_URL=http://host.docker.internal:11434/v1/chat/completions
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    volumes: ["./config/translator:/app/data"]
-    ports: ["8084:8080"]   # read CWA (with overlay) here — any free port works
-    restart: unless-stopped
-```
+Already have CWA running? Copy the `book-translator-api` and
+`book-translator-proxy` services plus their private network and named volume
+from [`docker-compose.yml`](docker-compose.yml), then point `CWA_UPSTREAM` at
+your existing CWA service. Keep the two roles separate in production; the
+legacy combined mode exists only for upgrade compatibility.
 
 > Removing the plugin = stop reading through the proxy port. Nothing in your
 > CWA install was modified.
@@ -175,11 +168,14 @@ If cold translations feel slow, see `BT_BATCH_SIZE`, `BT_OUTPUT_TOKEN_FACTOR`, a
 
 ## ⚙️ Configuration
 
-Environment variables for the `book-translator` container:
+Environment variables for the translator image (set them on the role that uses
+them):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CWA_UPSTREAM` | | **Enables proxy-injection mode.** URL of your CWA instance (e.g. `http://calibre-web-automated:8083`). When set, the container also serves CWA with the overlay injected on port `BT_PROXY_PORT`. Unset = API-only (bind-mount installs). |
+| `BT_ROLE` | `auto` | Runtime role: `api`, `proxy`, or compatibility-only `all`. `auto` selects `api` without `CWA_UPSTREAM` and `all` when it is present. The reference Compose file sets roles explicitly. |
+| `CWA_UPSTREAM` | | Required by the proxy role. URL of the stock CWA instance (e.g. `http://calibre-web:8083`). |
+| `BT_API_UPSTREAM` | `http://127.0.0.1:$PORT` | Translation API URL used by the proxy role. The split Compose topology sets `http://book-translator-api:8390`. |
 | `BT_PROXY_PORT` | `8080` | Container port for the injection proxy (proxy mode only). |
 | `LLM_PROVIDER` | `local` | `local`, `openai`, `anthropic`, `gemini`, `groq`, `together`, `minimax`, `deepseek`, `openrouter` |
 | `LLM_MODEL` | `gemma4-12b` | Model name for the chosen provider |
@@ -202,6 +198,7 @@ Environment variables for the `book-translator` container:
 | `BT_MAX_CONTENT_LENGTH` | `2097152` (2 MB) | Hard cap on the request body (the WSGI-level backstop). Per-field caps (`BT_MAX_BATCH_PARAGRAPHS`, `BT_MAX_PARAGRAPH_CHARS`) check the parsed content; this cap rejects oversize bodies before parsing. Lower it for untrusted networks, raise it for very long paragraphs. |
 | `BT_MAX_UPSTREAM_INFLIGHT` | `2` | Process-wide cap on simultaneous in-flight LLM calls across all readers. `BT_MAX_CONCURRENT` only bounds one batch request; this cap prevents multi-reader timeout cascades. Must be greater than zero. |
 | `BT_UPSTREAM_QUEUE_TIMEOUT` | `2` | Maximum seconds to wait for a global upstream slot. A full queue returns `503` with `Retry-After` without starting a provider call. |
+| `BT_SINGLEFLIGHT_MAX_ENTRIES` | `1024` | Process-wide bound on distinct active translation operations. Concurrent requests with the same tenant/book/chapter and exact prompt contract share one provider call; completed results are never retained here and must pass through the scoped SQLite cache. |
 | `BT_REQUEST_MAX_ATTEMPTS` | `20` | Maximum provider calls across groups, primary, and fallback for one API request. Batch groups use one attempt per provider, so the default exactly covers 50 paragraphs at batch size 5 when the primary fails and a healthy fallback succeeds. The single-text endpoint retains two attempts per provider. Attempts are reserved atomically before network I/O. |
 | `BT_REQUEST_MAX_INPUT_BYTES` | `5000000` | Maximum cumulative UTF-8 prompt bytes reserved across every provider attempt in one API request. The default covers two passes over the largest valid default batch, including four-byte Unicode and protocol overhead. |
 | `BT_REQUEST_MAX_OUTPUT_TOKENS` | `163840` | Maximum cumulative `max_tokens` reserved across every provider attempt in one API request, sized for the same bounded 20-call batch path. |
@@ -210,10 +207,13 @@ Environment variables for the `book-translator` container:
 | `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max requests per client IP per 60s window before the API returns `429`. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | Seconds reported in the `Retry-After` header / response body on a `429`. The frontend reads this and backs off automatically. |
 | `BT_TRUST_PROXY` | `false` | **Legacy/dev only.** When `true`, the API uses the **last** `X-Forwarded-For` hop from any peer as the rate-limit key. A client that can reach the API directly can still spoof this header, so don't rely on it in production — prefer `BT_TRUSTED_PROXIES` below. |
-| `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** rate-limit-key source. Comma-separated CIDRs/IPs of the *peer* (the actual socket source) allowed to set `X-Forwarded-For`. When the peer is in this list, the **last** XFF hop is used as the rate-limit key — the address your trusted proxy appended, which a client cannot forge (a forged first hop just gets the real one appended after it); otherwise the peer is used. Example: `127.0.0.1/32,::1/128` for a local nginx, or `10.0.0.0/8` for a private-network reverse proxy. **In proxy-injection mode the entrypoint defaults this to `127.0.0.1/32`** so per-client limiting works out of the box behind the in-container nginx. |
+| `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** rate-limit-key source. Comma-separated CIDRs/IPs of peers allowed to set `X-Forwarded-For`. The reference Compose network gives the proxy a fixed address and trusts only that `/32`. Combined compatibility mode defaults to loopback. |
 | `BT_ALLOWED_ORIGINS` | `http://localhost:8083,http://localhost:8383` | Comma-separated exact origins allowed for CORS (bind-mount installs; irrelevant in proxy mode, which is same-origin). Add your public reader URL here, e.g. `https://books.example.com`. |
 | `BT_ALLOW_PRIVATE_LAN` | `true` | Additionally allow localhost/RFC1918 origins (`10.*`, `192.168.*`, `172.16-31.*`) on any port — the common self-hosted case. Set `false` to allow only `BT_ALLOWED_ORIGINS`. |
-| `BT_CACHE_MAX_ENTRIES` | `0` | Optional hard cap on cached translations (`0` = unlimited). When exceeded, the oldest entries are evicted. |
+| `BT_CACHE_TTL_DAYS` | `90` | Mandatory maximum age for cached translations. Expired rows are never served and are removed during normal writes/stats/cleanup. Must be greater than zero. |
+| `BT_CACHE_MAX_ENTRIES` | `100000` | Mandatory hard cap on schema-v2 rows. The least-recently-accessed rows are evicted in the same transaction as a write. Must be greater than zero. |
+| `BT_CACHE_HIT_FLUSH_THRESHOLD` | `100` | Number of cache-hit counters batched before SQLite is updated. Translation hits stay read-only between flushes, reducing WAL contention. |
+| `BT_CACHE_HARDEN_EXISTING_DIR` | `false` (`true` in image) | Change an existing cache directory to mode `0700`. New directories and all DB/WAL/SHM files are always created private; the container enables this fail-closed check. |
 | `DB_PATH` | `translations.db` | Path to the SQLite translation cache. In Docker this should point inside the `/app/data` volume (the provided Dockerfile/compose already set it to `/app/data/translations.db`) so the cache survives container recreation. |
 | `PORT` | `8390` | Port the API listens on. If you remap it, also update the `-p`/compose port mapping and any reverse-proxy route — `EXPOSE` in the Dockerfile is documentation only. |
 
@@ -224,35 +224,46 @@ Environment variables for the `book-translator` container:
 > within that one worker — don't raise `--workers` without moving that state to
 > something shared (e.g. SQLite, like the translation cache already is).
 
+Cache schema v2 intentionally preserves an existing v1 table as
+`translations_v1` but never serves those unscoped rows. The cache re-warms
+without a destructive migration. V2 stores no source paragraph and hashes
+tenant/book/chapter identifiers before persistence. Browser translations stay
+in memory unless `window.BOOK_TRANSLATOR.persistCache = true` is explicitly set;
+opt-in keys also include stable DOM position to separate repeated text in
+different contexts. Legacy `bt_cache_v2_*` localStorage entries are removed on
+upgrade.
+
 ---
 
 ## 🏗️ Architecture
 
 ```text
-                       book-translator container
-                 ┌───────────────────────────────────────┐
-Browser ────────►│ nginx (:8080, proxy mode only)        │      ┌──────────────────────┐
-  reads library  │  ├─ /bt-api/*    → gunicorn (below)   │─────►│ CWA (:8083, stock)   │
-  through :8084  │  ├─ /bt-static/* → overlay js/css     │      │ untouched image      │
-                 │  └─ /*           → CWA + injected tag │      └──────────────────────┘
-                 │                                       │
-                 │ gunicorn (:8390, always on)           │      ┌──────────────────────┐
-                 │  ├─ POST /translate, /translate/batch │─────►│ Providers: local,    │
-                 │  ├─ GET  /ping /health /health/deep   │      │ OpenAI, Anthropic,   │
-                 │  ├─ GET  /metrics /stats              │      │ Gemini, Groq, ...    │
-                 │  └─ SQLite cache (/app/data)          │      └──────────────────────┘
-                 └───────────────────────────────────────┘
+Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
+                │
+                ├─ /bt-static/* → overlay js/css
+                └─ /bt-api/* ──► API role (:8390) ──► providers
+                                         │
+                                         └─ SQLite cache (/app/data)
 ```
 
 In bind-mount installs nginx never starts; the overlay files are mounted into
 CWA and call the API on `:8390` directly (CORS applies — see
 `BT_ALLOWED_ORIGINS`).
 
+Both image roles declare `appuser` (`101:102`), run with zero capabilities, and
+support a read-only root filesystem. If you replace the Compose named volume
+with a host bind mount, create it with ownership `101:102`; runtime ownership
+repair was intentionally removed.
+
 `/ping` is liveness-only and `/health` plus `/ready` are shallow readiness
 checks; none contacts an LLM. The provider-backed `/health/deep` endpoint is
 operator-only and uses the same request budget and global provider gate as a
 translation. Authenticate it with `X-BT-Token`: this is `BT_API_TOKEN` when
 configured, otherwise the persisted `/app/data/cleanup_token` value.
+
+`/metrics` reports request/cache counters plus bounded singleflight activity
+(`active_entries`, shared results, follower timeouts, and capacity rejections),
+so duplicate-work pressure is visible without exposing book text or cache keys.
 
 Release operators should follow the [Gitea-authoritative release
 runbook](docs/RELEASE.md); GitHub is a mirror and does not publish images.

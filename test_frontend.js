@@ -161,6 +161,14 @@ async function runTest() {
     fetchCalls.forEach((c, i) => {
         console.log(`Fetch ${i}:`, JSON.parse(c.options.body).paragraphs);
     });
+
+    fetchCalls.forEach((c) => {
+        const body = JSON.parse(c.options.body);
+        assert(typeof body.book_id === 'string' && body.book_id.length > 0,
+            'Every translation request must carry a bounded book cache scope');
+        assert(typeof body.chapter_id === 'string' && body.chapter_id.length > 0,
+            'Every translation request must carry a bounded chapter cache scope');
+    });
     
     // visible 1, visible 1, visible 2, prefetch 1, prefetch 2, prefetch 3, prefetch 4
     // We expect 7 paragraphs in total passed to fetch
@@ -173,6 +181,23 @@ async function runTest() {
     assert(!hasDups, 'There should be no duplicate translation blocks requested');
     
     assert(maxActiveFetches === 1, 'Never exceeded one active fetch');
+
+    // An ambiguous transport failure must not automatically create duplicate
+    // provider work. It remains failed until the user explicitly retries.
+    const failedParagraph = iframeDoc.createElement('p');
+    failedParagraph.textContent = 'network failure';
+    failedParagraph.getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+    fetchResponses.push(new Error('synthetic network failure'));
+    iframeDoc.querySelector('section').appendChild(failedParagraph);
+    await wait(1800);
+    const failureCalls = fetchCalls.filter(c =>
+        JSON.parse(c.options.body).paragraphs.includes('network failure'));
+    assert.strictEqual(failureCalls.length, 1,
+        'Ambiguous transport failures must wait for an explicit user retry');
+    assert.strictEqual(btBar.dataset.state, 'error',
+        'Terminal transport failures must surface an actionable error state');
 
     // Regression guard for the status-bar flicker bug: the position-based
     // page-turn poll (every 350ms) used to run unconditionally, including
@@ -205,20 +230,33 @@ async function runTest() {
         'Inline mode must preserve and restore the original markup (regression: italics/links lost)'
     );
 
-    // Regression guard: failed batches used to be silently dropped while the
-    // status bar said "Retrying…". They must be re-queued with a bounded
-    // attempt counter instead.
+    // Regression guard: ambiguous timeouts/network failures must never spawn a
+    // second provider request automatically. Only admission-rejected 429s may
+    // requeue, and those responses have a strict bound.
     assert(
-        /requeueForRetry/.test(code) && /attempts = \(x\.attempts \|\| 0\) \+ 1\) < 3/.test(code),
-        'Failed batches must re-queue for a bounded retry (regression: silent drop)'
+        !/requeueForRetry/.test(code)
+            && /function|const markBatchFailed/.test(code)
+            && /requeueRateLimited/.test(code)
+            && /BT_CLIENT_MAX_RATE_LIMIT_RESPONSES/.test(code),
+        'Only bounded 429 admission retries may be automatic'
     );
 
     // Regression guard: the client safety-net timeout must be distinguishable
-    // from a deliberate abort (mode/language/page change), so timeouts retry
-    // while deliberate aborts just discard stale work.
+    // from a deliberate abort (mode/language/page change), so timeouts become
+    // visible terminal failures while deliberate aborts discard stale work.
     assert(
         /btTimedOut/.test(code) && /'timeout'/.test(code) && /'aborted'/.test(code),
-        'Timeout aborts must be distinguished from deliberate aborts'
+        'Timeout failures must be distinguished from deliberate aborts'
+    );
+
+    assert(
+        /const PERSIST_CACHE = cfg\.persistCache === true/.test(code)
+            && /function cacheKeyForText\(text/.test(code)
+            && /function elementContextId\(el\)/.test(code)
+            && /scope\.book_id, scope\.chapter_id, elementContext, text/.test(code)
+            && /BT_UI_VERSION, SOURCE_LANG, TARGET_LANG/.test(code)
+            && !/BT_UI_VERSION, generation, SOURCE_LANG, TARGET_LANG/.test(code),
+        'Persistent browser caching must be opt-in and keys must be context-scoped'
     );
 
     console.log("All assertions passed.");

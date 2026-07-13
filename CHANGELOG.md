@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Python dependencies, audit/compiler tooling, npm artifacts, the Python base
   image, direct/transitive Alpine packages, Node.js, and third-party Actions are
   pinned to reviewed versions, hashes, digests, or commits.
+- The published image now declares its stable non-root user; API and nginx run
+  as independent roles with read-only root filesystems, zero capabilities, and
+  no root ownership-repair supervisor in the recommended Compose topology.
+- Cache schema v2 never reuses unscoped v1 rows, stores no source paragraph,
+  hashes tenant/book/chapter identifiers, and enforces private files plus
+  mandatory TTL/cap. Browser persistence is opt-in and legacy unscoped browser
+  entries are purged on upgrade.
 
 ### Added
 
@@ -36,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a fail-closed release runbook.
 - Reproducible Python lock generation on Python 3.11 plus committed runtime,
   auditor, and compiler hash locks.
+- A shared container smoke harness that proves role isolation, proxy routing,
+  immutable root filesystems, exact runtime identity, and clean shutdown.
+- Atomic group-cache and prompt-fingerprint contracts covering provider/model,
+  tenant, book, chapter, context, language, protocol, migration, and retention.
+- Bounded singleflight coalescing for identical active translation operations,
+  with tenant/context isolation and pressure counters in `/metrics`.
 
 ### Changed
 
@@ -44,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and GitHub CI definitions remain byte-identical by contract.
 - `/ping`, `/health`, and `/ready` are cheap local probes; `/health/deep` is the
   explicit authenticated provider diagnostic.
+- Deployment helpers use strict shell mode, safe remote argument serialization,
+  fail-closed health/hash checks, and the same non-root sandbox as CI.
+- The browser retries only bounded `429` admission rejections. Ambiguous
+  timeouts, network failures, and invalid responses require an explicit user
+  retry so they cannot duplicate provider work still running server-side.
 
 ## [2.1.4] - 2026-07-08
 
