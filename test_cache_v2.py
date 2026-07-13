@@ -7,6 +7,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -139,6 +140,38 @@ class CacheV2Tests(unittest.TestCase):
         stats = self.store.stats()
         self.assertEqual(stats["total_hits"], 1)
         self.assertGreater(connection.total_changes, changes_before)
+
+    def test_thread_local_connections_support_concurrent_reads_and_writes(self) -> None:
+        concurrent_store = CacheStore(
+            Path(self.tmp.name) / "concurrent-cache" / "translations.db",
+            ttl_days=30,
+            max_entries=200,
+            hit_flush_threshold=8,
+            now=self.clock,
+        )
+
+        def worker(worker_id: int) -> None:
+            for offset in range(20):
+                source = f"source-{worker_id}-{offset}"
+                translated = f"target-{worker_id}-{offset}"
+                concurrent_store.put(
+                    source, "English", "Spanish", translated, scope()
+                )
+                self.assertEqual(
+                    concurrent_store.get(
+                        source, "English", "Spanish", scope()
+                    ),
+                    translated,
+                )
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(worker, range(8)))
+            stats = concurrent_store.stats()
+            self.assertEqual(stats["total_entries"], 160)
+            self.assertEqual(stats["total_hits"], 160)
+        finally:
+            concurrent_store.close()
 
     def test_source_text_is_not_persisted_and_identifiers_are_hashed(self) -> None:
         private_source = "private source text that must not be stored"

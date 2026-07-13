@@ -840,8 +840,9 @@
         const controller = new AbortController();
         activeControllers.add(controller);
         // Distinguish OUR safety-net timeout from a deliberate abort
-        // (newGeneration on mode/language/page change): a timeout is a failure
-        // that should be retried; a deliberate abort means the work is stale.
+        // (newGeneration on mode/language/page change): a timeout is an
+        // ambiguous terminal failure until the user explicitly retries; a
+        // deliberate abort means the work is stale and can be discarded.
         const timer = setTimeout(() => { controller.btTimedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
         try {
             const headers = { 'Content-Type': 'application/json' };

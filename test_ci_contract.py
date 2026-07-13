@@ -81,17 +81,27 @@ class CIContractTests(unittest.TestCase):
         first = derive("felix/CWA-translate-plugin")
         second = derive("another-owner/another-repository")
         repeated = derive("felix/CWA-translate-plugin")
+        next_run = derive("felix/CWA-translate-plugin", run_id="4243")
         next_attempt = derive("felix/CWA-translate-plugin", run_attempt="2")
+        long_identifiers = derive(
+            "felix/CWA-translate-plugin",
+            run_id="9" * 200,
+            run_attempt="8" * 200,
+        )
 
         self.assertEqual(first, repeated)
         self.assertNotEqual(first["SMOKE_PREFIX"], second["SMOKE_PREFIX"])
         self.assertNotEqual(first["SMOKE_IMAGE"], second["SMOKE_IMAGE"])
+        self.assertNotEqual(first["SMOKE_PREFIX"], next_run["SMOKE_PREFIX"])
         self.assertNotEqual(
             first["SMOKE_PREFIX"], next_attempt["SMOKE_PREFIX"])
         self.assertRegex(
             first["SMOKE_PREFIX"], r"^bt-ci-[0-9a-f]{20}$")
         self.assertRegex(
             first["SMOKE_IMAGE"], r"^bt-audit:[0-9a-f]{20}$")
+        self.assertRegex(
+            long_identifiers["SMOKE_PREFIX"], r"^bt-ci-[0-9a-f]{20}$")
+        self.assertLessEqual(len(long_identifiers["SMOKE_PREFIX"]), 49)
 
     def test_package_lock_root_metadata_matches_package_manifest(self):
         package = json.loads((ROOT / "package.json").read_text())

@@ -88,7 +88,7 @@ class ContainerContractTests(unittest.TestCase):
         ):
             self.assertIn(token, deploy)
             self.assertIn(token, template)
-        self.assertIn("install -d -m 0700 -o 101 -g 102", deploy)
+        self.assertIn("install -d -m 0700 -o 101 -g 102 --", deploy)
 
 
 if __name__ == "__main__":

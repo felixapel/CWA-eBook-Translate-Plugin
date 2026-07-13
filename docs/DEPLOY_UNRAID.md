@@ -113,7 +113,7 @@ docker build -t local/book-translator-api:latest .
 
 # The image runs as the stable uid/gid 101:102 and never changes host
 # ownership at startup.
-install -d -m 0700 -o 101 -g 102 \
+install -d -m 0700 -o 101 -g 102 -- \
   /mnt/user/appdata/book-translator-api/data
 
 # Recreate the container so it runs the NEW image (the /app/data bind mount
@@ -202,7 +202,7 @@ grep -qxF book-translator-api /var/lib/docker/unraid-autostart \
 ```
 
 Before a manual run, create the data directory with
-`install -d -m 0700 -o 101 -g 102 /mnt/user/appdata/book-translator-api/data`.
+`install -d -m 0700 -o 101 -g 102 -- /mnt/user/appdata/book-translator-api/data`.
 An older bind mount with different ownership must be migrated once; the
 container deliberately has no root path that could repair it silently.
 

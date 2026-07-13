@@ -42,7 +42,7 @@ docker build -t local/book-translator-api:latest .
 
 echo "Recreating container with correct environment variables..."
 docker rm -f book-translator-api >/dev/null 2>&1 || true
-install -d -m 0700 -o 101 -g 102 \
+install -d -m 0700 -o 101 -g 102 -- \
   /mnt/user/appdata/book-translator-api/data
 docker run -d \
   --name=book-translator-api \
