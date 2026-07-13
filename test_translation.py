@@ -150,11 +150,12 @@ def run():
         "@@SEG 99@@ marker at the start",
         "literal @@SEG 99@@ marker in the middle",
         "@@SEG 99@@ repeated @@SEG 99@@ marker",
+        "ordinary segment",
     ]
     translated = __import__("translator").translate_batch(
-        [*marker_texts, "ordinary segment"], "English", "Spanish")
+        marker_texts, "English", "Spanish")
     check("segment protocol: marker-like ebook content is preserved",
-          [item[0] for item in translated[:3]]
+          [item[0] for item in translated]
           == [f"[LOCAL] {text}" for text in marker_texts])
 
     # Strict JSON response envelope: exact version, exact ordered IDs, no
