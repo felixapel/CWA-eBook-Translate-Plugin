@@ -97,6 +97,29 @@ class ShellContractTests(unittest.TestCase):
             source,
         )
 
+    def test_install_builds_the_checked_out_source_without_registry_access(self):
+        source = (ROOT / "install_unraid.sh").read_text()
+        self.assertIn(
+            'docker build -t local/book-translator-api:latest "$SCRIPT_DIR"',
+            source,
+        )
+        self.assertNotIn("docker pull", source)
+        self.assertNotIn("ghcr.io", source)
+        self.assertLess(
+            source.index("docker build -t local/book-translator-api:latest"),
+            source.index('mkdir -p -- "$CWA_PATH/overlay"'),
+        )
+        missing_docker = re.search(
+            r"if ! command -v docker.*?fi", source, re.DOTALL
+        )
+        self.assertIsNotNone(missing_docker)
+        self.assertRegex(missing_docker.group(0), r"\bexit\s+1\b")
+        template = (ROOT / "my-book-translator-api.xml.tmpl").read_text()
+        self.assertIn(
+            "<Repository>local/book-translator-api:latest</Repository>",
+            template,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

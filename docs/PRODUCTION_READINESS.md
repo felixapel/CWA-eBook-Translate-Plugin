@@ -5,9 +5,8 @@ production-readiness audit of the `v2.1.4` codebase. It is a promotion record,
 not a claim that an image has already been released or deployed.
 
 The source remediation is complete when the repository gates below pass. A
-production release remains blocked until every item under
-[Remote promotion prerequisites](#remote-promotion-prerequisites) is completed
-by an authorized Gitea operator.
+source release remains blocked until every item under
+[Remote promotion prerequisites](#remote-promotion-prerequisites) is complete.
 
 ## Status vocabulary
 
@@ -26,7 +25,7 @@ by an authorized Gitea operator.
 | F-01 unauthenticated translation | Implemented and gated | `auth.py`, `test_auth.py`, and the private API topology in `docker-compose.yml` authenticate before cache/provider work. |
 | F-02 shared proxy rate-limit identity | Implemented and gated | Trusted peers are initialized before Gunicorn; proxy and hardening contracts exercise distinct clients and reject forged forwarding. |
 | F-03 unbounded work and storage | Implemented and gated | `work_budget.py`, provider-budget tests, mandatory cache TTL/cap, and bounded global upstream admission enforce finite work. |
-| F-04 release independent of authoritative CI/parity | Implemented and gated, plus operator prerequisites | `.gitea/workflows/release.yml` validates the exact Gitea/GitHub tag and commit before one multi-platform build; protected checks and release credentials still require operator setup. |
+| F-04 release independent of authoritative CI/parity | Implemented and gated, plus operator prerequisites | `.gitea/workflows/release.yml` validates the exact Gitea/GitHub tag and commit before all backend, browser, and container gates. Official artifacts are the validated source tag and archives. |
 | F-05 divergent historical `v2.0.0` tags | Historical exception | [The release runbook](RELEASE.md#historical-split-tag) records both immutable commit identities; all future releases fail on tag divergence. |
 | F-06 unprotected `main` and release tags | Operator prerequisite | Gitea branch and tag protection must be configured before promotion. |
 | F-07 ambiguous segment protocol | Implemented and gated | Translation batches use unpredictable IDs and validate a strict one-to-one structured envelope. |
@@ -35,7 +34,7 @@ by an authorized Gitea operator.
 | F-10 nested retries without coalescing | Implemented and gated | Absolute request budgets, bounded admission, and `singleflight.py` coalesce equivalent active work; the browser does not retry ambiguous provider work. |
 | F-11 public provider-backed health probe | Implemented and gated | `/ping`, `/health`, and `/ready` are shallow; authenticated `/health/deep` uses the normal provider budget. |
 | F-12 browser token in `localStorage` | Implemented and gated | The recommended topology validates the existing HttpOnly CWA session and browser loaders no longer recover a shared secret from storage. |
-| F-13 unsigned, weakly reproducible supply chain | Implemented and gated, plus operator prerequisites | Actions, Buildx, BuildKit, binfmt/QEMU, dependencies, and base inputs are pinned; the release workflow requires SPDX/provenance, signs the exact index that contains those attestation manifests, and immediately verifies source, base image, platforms, tags, and inventories. Signing keys and registry credentials remain operator-owned. |
+| F-13 unsigned, weakly reproducible supply chain | Scope reduced and gated | Official container publication was removed by ADR-008. Source identity is enforced by matching annotated tags and commits; Actions, dependencies, base inputs, and local container builds remain pinned and tested. |
 | F-14 CI could skip artifact and contract checks | Implemented and gated | Docker absence is fatal; backend, frontend, Chromium, dependency, proxy, and non-root artifact gates are mandatory. |
 | F-15 sensitive fallback and error leakage | Implemented and gated | Cloud fallback requires per-request consent; response sizes and error/log envelopes are bounded and sanitized. |
 | F-16 privileged combined runtime | Implemented and gated | API and proxy are independent non-root roles with read-only roots, zero capabilities, and clean independent shutdown. |
@@ -45,7 +44,7 @@ by an authorized Gitea operator.
 | F-20 frontend state/integration drift | Implemented and gated | Real Chromium tests cover route isolation, rendering, state, rate-limit handling, consent, accessibility, and console/network health; unit contracts cover transport retries. |
 | F-21 avoidable cache contention | Implemented and gated | Schema v2 uses indexed expiry/maintenance paths, WAL/busy-timeout handling, bounded maintenance, and concurrency contracts. |
 | F-22 brittle limits, scripts, and metadata | Implemented and gated | Extreme numeric inputs fail closed, deployment helpers use strict quoting, dependencies/metadata are locked, and shell/workflow contracts are enforced. |
-| F-23 ref and authenticity hygiene | Partially operator-owned | The release workflow requires future release digests to be signed and verified. Remote branch cleanup and optional Git commit/tag signing remain deliberate maintainer operations. |
+| F-23 ref and authenticity hygiene | Partially operator-owned | Protected annotated tags and exact Gitea/GitHub object parity bind official source releases. Remote branch cleanup and optional Git commit/tag signing remain deliberate maintainer operations. |
 
 ## Reproducible acceptance gate
 
@@ -63,18 +62,17 @@ all of these outcomes without a skipped or unavailable gate:
    read-only filesystems, zero capabilities, routing, and independent shutdown.
 5. Gitea and GitHub CI definitions remain byte-identical and the workflow
    contract suites pass.
-6. Release-policy contracts prove the fail-closed workflow wiring; during
-   publication, preflight and artifact verification reject wrong tags, commits,
-   registries, platforms, signatures, provenance sources, base images, or SBOM
-   inventories.
+6. Release-policy contracts prove the fail-closed source workflow wiring;
+   preflight rejects wrong versions, tags, commits, ancestry, or mirror parity,
+   and the artifact smoke gate rejects a broken container build or runtime.
 
 The final local audit run on 2026-07-13 passed the backend matrix (184 contract
 tests plus the standalone translation and hardening suites), frontend unit
 tests, three Chromium scenarios, Python and npm vulnerability audits, the live
-rate-limit probe, the multi-platform attestation verifier, and the container
-smoke gate. The final review also parsed every workflow and syntax-checked each
-embedded shell block. This snapshot supports review of the branch; protected
-CI must repeat the maintained gates for the exact commit that is merged.
+rate-limit probe, and the container smoke gate. The earlier image-publication
+audit also exercised multi-platform attestations before that publication path
+was retired by ADR-008. Protected CI must repeat the currently maintained gates
+for the exact commit that is merged.
 
 ## Remote promotion prerequisites
 
@@ -84,21 +82,15 @@ Before creating the first post-audit version tag, an authorized operator must:
   frontend, and Docker smoke contexts;
 - protect `v*` tags from updates/deletion and restrict creation to the release
   operator;
-- assign the release workflow to a trusted serialized runner with Docker,
-  binfmt/QEMU, and the documented outbound access;
-- configure `GHCR_USERNAME`, `GHCR_TOKEN`, `COSIGN_PRIVATE_KEY`,
-  `COSIGN_PASSWORD`, and `COSIGN_PUBLIC_KEY` in Gitea Actions; configure both
-  Docker Hub secrets or neither;
-- distribute the Cosign public key and record its SHA-256 fingerprint in the
-  deployment trust policy;
+- assign Docker smoke to the trusted host-capable runner;
 - complete and record the single maintainer's self-review, merge through the
   protected branch with zero assumed human approvals, wait for all checks on
   the exact `main` commit, and mirror it to GitHub before creating the annotated
   tag;
-- publish only through the Gitea-authoritative workflow, then deploy the
-  independently verified immutable image digest rather than a mutable tag.
+- publish only the annotated source tag through the Gitea-authoritative
+  workflow, then build and deploy that exact checked-out tag locally.
 
-Secret scopes, runner requirements, tag order, verification commands, partial
-failure handling, and rollback policy are defined in the
-[release runbook](RELEASE.md). If any prerequisite or gate is missing, skipped,
-or ambiguous, the release decision is **stop**.
+Runner requirements, tag order, verification commands, and rollback policy are
+defined in the [release runbook](RELEASE.md). No release-specific Actions
+secrets are required. If any prerequisite or gate is missing, skipped, or
+ambiguous, the release decision is **stop**.

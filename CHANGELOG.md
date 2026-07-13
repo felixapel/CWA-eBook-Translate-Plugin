@@ -45,11 +45,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Python dependencies, audit/compiler tooling, npm artifacts, the Python base
   image, direct/transitive Alpine packages, Node.js, and third-party Actions are
   pinned to reviewed versions, hashes, digests, or commits.
-- The privileged release builder no longer inherits mutable Buildx,
-  BuildKit, or binfmt/QEMU tooling: the Buildx asset is SHA-256 checked, both
-  helper images are digest-pinned, emulation is platform-scoped, and the
-  builder is bridge-confined with `security.insecure` and client-side
-  entitlement grants forbidden.
 - The published image now declares its stable non-root user; API and nginx run
   as independent roles with read-only root filesystems, zero capabilities, and
   no root ownership-repair supervisor in the recommended Compose topology.
@@ -73,11 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   screenshots, and the accessibility tree in both CI and release workflows.
 - Request work-budget and global upstream-cap contracts with concurrency,
   cancellation, deadline, fallback, and response-size regression tests.
-- Gitea-authoritative release preflight, exact annotated GitHub mirror-tag
-  verification, multi-registry image publishing, OCI provenance, SBOM output,
-  and a fail-closed release runbook.
-- Digest-bound Cosign signatures plus immediate tag, source-SHA, base-image,
-  SPDX inventory, provenance, and multi-platform policy verification.
+- Gitea-authoritative source-release preflight, exact annotated GitHub
+  mirror-tag verification, and a fail-closed release runbook.
 - Reproducible Python lock generation on Python 3.11 plus committed runtime,
   auditor, and compiler hash locks.
 - A shared container smoke harness that proves role isolation, proxy routing,
@@ -90,6 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and partial-batch failure counters without content-derived metric labels.
 
 ### Changed
+
+- Releases are now verified source tags and Gitea-generated source archives.
+  Registry publication, Cosign key custody, SBOM/provenance automation, and the
+  privileged multi-architecture release builder were removed. Compose and
+  Unraid installs build the exact checked-out source locally without release
+  credentials.
 
 - Reader controls now expose a named toolbar, live status, honest progress,
   keyboard-operable settings actions, synchronized popover/switch state, and

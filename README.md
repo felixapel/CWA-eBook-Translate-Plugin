@@ -48,7 +48,7 @@ Browser ──► book-translator-proxy (:8084) ──► CWA (:8083, stock)
 git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
 cd CWA-eBook-Translate-Plugin
 # Edit docker-compose.yml: set BT_LOCAL_URL (or a cloud provider + API key)
-docker compose up -d
+docker compose up -d --build
 ```
 
 Then read your library at **`http://<host>:8084`** — the translator control
@@ -57,10 +57,10 @@ validates the browser's existing HttpOnly CWA session for every protected API
 request; it does not put a translator credential in JavaScript or
 `localStorage`. The API is attached to the CWA network only so it can call the
 authenticated `/ajax/emailstat` probe and remains unpublished to the host.
-The compose file pulls the prebuilt multi-arch image
-(`ghcr.io/felixapel/cwa-ebook-translate-plugin`, amd64 + arm64) — no build
-step needed. For an unattended production deployment, replace `latest` in the
-Compose file with the immutable digest reported by the release workflow.
+The Compose file builds the exact checked-out source into the local
+`cwa-ebook-translate-plugin:local` image. Official releases are verified source
+tags, so installation needs no container-registry account, package token, or
+signing key. To upgrade, check out the new release tag and run the same command.
 
 Already have CWA running? Copy the `book-translator-api` and
 `book-translator-proxy` services plus their private network and named volume
@@ -99,14 +99,12 @@ implicit trust boundary.
 
 ### Option 2: Unraid
 
-**Community Applications (recommended once listed):** search for
-**"CWA eBook Translate"** in the Apps tab. Until the listing is approved, add
-the template manually — Docker tab → *Add Container* → *Template repositories*
-→ add `https://github.com/felixapel/unraid-templates`, or download the
-[template XML](https://raw.githubusercontent.com/felixapel/unraid-templates/main/templates/cwa-ebook-translate-plugin.xml)
-into `/boot/config/plugins/dockerMan/templates-user/`. The template installs
-**proxy-injection mode**: set `CWA URL` to your CWA instance and read through
-this container's port — your CWA container stays stock.
+Clone a release tag on the Unraid host and run `./install_unraid.sh`. The script
+builds `local/book-translator-api:latest` from that checkout and installs the
+legacy API template without downloading a project-published image or requiring
+registry credentials. Docker may download the pinned public base image during
+the build. For the recommended proxy-injection topology, use the Compose
+instructions above.
 
 #### Legacy: bind-mount installer script
 
@@ -328,8 +326,9 @@ Authentication-derived tenant behavior is intentional:
 - `token` is one shared tenant. `disabled` is one anonymous tenant and must not
   be used for production.
 
-Release operators should follow the [Gitea-authoritative release
-runbook](docs/RELEASE.md); GitHub is a mirror and does not publish images.
+Release operators should follow the [Gitea-authoritative source release
+runbook](docs/RELEASE.md); GitHub is a public source mirror and neither service
+publishes container images.
 See the [architecture overview](docs/ARCHITECTURE.md) for component details and
 accepted architecture decision records. The
 [production-readiness record](docs/PRODUCTION_READINESS.md) maps the latest

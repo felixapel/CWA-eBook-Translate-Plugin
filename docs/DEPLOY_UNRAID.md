@@ -170,12 +170,14 @@ If the containers don't exist yet:
 
 ### 1. Backend container
 
-**Recommended: run it as an Unraid-managed container.** The installer pulls the
-published image and installs a hardened API template; building
-`local/book-translator-api:latest` remains available for development.
+**Recommended: run it as an Unraid-managed container.** The installer builds
+the checked-out source as `local/book-translator-api:latest` and installs a
+hardened API template. Docker may download the pinned public base image, but no
+project registry or publication credential is used.
 
-1. Run `install_unraid.sh` from a clone of the repo — it pulls the image,
-   prepares `/app/data` ownership, and installs the template (from
+1. Run `install_unraid.sh` from a checked-out release tag — it builds the image
+   before modifying the installation, prepares `/app/data` ownership, and
+   installs the template (from
    `my-book-translator-api.xml.tmpl`) into
    `/boot/config/plugins/dockerMan/templates-user/`.
 2. In the Unraid **Docker** tab → *Add Container* → pick `book-translator-api`
@@ -240,12 +242,11 @@ container deliberately has no root path that could repair it silently.
 > `localhost` inside a container refers to the container itself, not the host.
 > Use the host's LAN IP (e.g. `10.0.0.10`) or `host.docker.internal`.
 
-> Note: since v2.0.0 a prebuilt image exists (`ghcr.io/felixapel/cwa-ebook-translate-plugin`),
-> so you can substitute it anywhere below instead of building locally.
-> `local/book-translator-api:latest` is built locally, not pulled from a
-> registry. It persists across reboots, but if you ever recreate the Docker
-> image (`docker.img`) you must rebuild it: `cd /mnt/user/appdata/book-translator-api
-> && docker build -t local/book-translator-api:latest .`
+> Official releases are source tags. `local/book-translator-api:latest` is
+> built from the checked-out tag and is never pulled from a registry. It
+> persists across reboots, but if you recreate the Docker image (`docker.img`)
+> you must rebuild it: `cd /mnt/user/appdata/book-translator-api && docker build
+> -t local/book-translator-api:latest .`
 
 ### 2. CWA container recreation with plugin mounts
 
@@ -295,19 +296,20 @@ curl -s http://127.0.0.1:8390/health
 
 ## Rollback
 
-Backups of previous overlay files are in:
-```
-/mnt/user/appdata/book-translator-api/backups/<YYYYMMDD-HHMMSS>/cwa-overlay/
+The installer does not create hidden backups. To roll back, check out the
+previous immutable release tag and rerun the same fail-closed installer:
+
+```bash
+cd /path/to/CWA-eBook-Translate-Plugin
+git checkout v<previous-version>
+./install_unraid.sh
 ```
 
-To roll back:
-```bash
-BACKUP=/mnt/user/appdata/book-translator-api/backups/<timestamp>/cwa-overlay
-cp $BACKUP/translator.js  /mnt/user/appdata/calibre-web-automated/overlay/translator.js
-cp $BACKUP/translator.css /mnt/user/appdata/calibre-web-automated/overlay/translator.css
-cp $BACKUP/read.html      /mnt/user/appdata/calibre-web-automated/overlay/read.html
-docker restart calibre-web-automated
-```
+Then open Unraid's **Docker** tab, edit `book-translator-api`, and click
+**Apply** (or **Force Update**) so Unraid recreates the API container from the
+rebuilt local image while preserving its configured `/app/data` bind mount and
+environment. Finally restart `calibre-web-automated` so it reloads the restored
+overlay files.
 
 ---
 

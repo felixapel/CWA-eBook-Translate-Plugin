@@ -17,7 +17,16 @@ for f in "$SCRIPT_DIR/overlay/read.html" "$SCRIPT_DIR/static/translator.js" "$SC
     fi
 done
 
-# 1. Ask for CWA appdata path
+# 1. Build before modifying an existing installation. Docker may download the
+#    pinned public base image, but no project registry or credentials are used.
+if ! command -v docker >/dev/null 2>&1; then
+    echo "❌ Error: docker is required to build the translator image." >&2
+    exit 1
+fi
+echo "📦 Building the translator image from this checkout..."
+docker build -t local/book-translator-api:latest "$SCRIPT_DIR"
+
+# 2. Ask for CWA appdata path
 read -r -p "Enter your Calibre-Web-Automated appdata path [default: /mnt/user/appdata/calibre-web-automated]: " CWA_PATH
 CWA_PATH=${CWA_PATH:-/mnt/user/appdata/calibre-web-automated}
 
@@ -29,21 +38,11 @@ fi
 echo "✅ Using CWA path: $CWA_PATH"
 mkdir -p -- "$CWA_PATH/overlay"
 
-# 2. Copy overlay files from this checkout
+# 3. Copy overlay files from this checkout
 echo "📥 Copying frontend plugin files..."
 cp -- "$SCRIPT_DIR/overlay/read.html" "$CWA_PATH/overlay/read.html"
 cp -- "$SCRIPT_DIR/static/translator.js" "$CWA_PATH/overlay/translator.js"
 cp -- "$SCRIPT_DIR/static/translator.css" "$CWA_PATH/overlay/translator.css"
-
-# 3. Pull the published multi-arch image (build locally only if you want to
-#    hack on the backend: docker build -t ghcr.io/felixapel/cwa-ebook-translate-plugin:latest .)
-echo "📦 Pulling the translator image from GHCR..."
-if command -v docker >/dev/null 2>&1; then
-    docker pull ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
-else
-    echo "⚠️  docker not found on this shell; pull it yourself:"
-    echo "    docker pull ghcr.io/felixapel/cwa-ebook-translate-plugin:latest"
-fi
 
 # 4. Install the Unraid Docker Template for the API container. The source of
 #    truth ships as .xml.tmpl (non-.xml so Community Applications' repository

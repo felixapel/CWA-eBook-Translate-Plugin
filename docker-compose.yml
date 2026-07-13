@@ -18,8 +18,8 @@ services:
       - cwa-net
 
   book-translator-api:
-    image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
-    # To build locally, replace image with: build: .
+    image: cwa-ebook-translate-plugin:local
+    build: .
     environment:
       - BT_ROLE=api
       # Validate the browser's existing HttpOnly CWA session and derive an
@@ -81,7 +81,7 @@ services:
           - translator-api
 
   book-translator-proxy:
-    image: ghcr.io/felixapel/cwa-ebook-translate-plugin:latest
+    image: cwa-ebook-translate-plugin:local
     environment:
       - BT_ROLE=proxy
       - CWA_UPSTREAM=http://calibre-web:8083
