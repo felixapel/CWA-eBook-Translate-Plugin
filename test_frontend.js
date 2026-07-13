@@ -4,6 +4,18 @@ const jsdom = require("jsdom");
 const { JSDOM } = jsdom;
 
 const code = fs.readFileSync('static/translator.js', 'utf-8');
+const loaderCode = fs.readFileSync('static/loader.js', 'utf-8');
+
+assert(!/getItem\(['"]bt_token['"]\)/.test(loaderCode),
+    'The proxy loader must never recover a JavaScript-readable API token from localStorage');
+assert(/apiToken:\s*existing\.apiToken\s*\|\|\s*''/.test(loaderCode),
+    'Token compatibility must require explicit trusted bootstrap configuration');
+assert(/authMode:\s*existing\.authMode\s*\|\|\s*\(existing\.apiToken\s*\?\s*'token'\s*:\s*'cwa_session'\)/.test(loaderCode),
+    'The proxy loader must declare the browser authentication transport');
+assert(/AUTH_MODE\s*===\s*'token'\s*&&\s*cfg\.apiToken/.test(code),
+    'The browser must send X-BT-Token only in explicit token mode');
+assert(/AUTH_MODE\s*===\s*'cwa_session'[\s\S]{0,160}?['"]omit['"]/.test(code),
+    'Only cwa_session mode may attach browser cookies; other modes must omit them');
 
 let fetchCalls = [];
 let fetchResponses = [];
@@ -92,6 +104,57 @@ async function wait(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
+async function captureAuthTransport(config, enableCloudFallback = false) {
+    const authDom = new JSDOM(`
+<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>
+`, { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' });
+    authDom.window.BOOK_TRANSLATOR = Object.assign({ apiUrl: '/bt-api' }, config);
+    authDom.window.localStorage.setItem(
+        'bt_mode', enableCloudFallback ? 'off' : 'translated');
+    authDom.window.localStorage.setItem('bt_prefetch', '0');
+    authDom.window.localStorage.setItem('bt_lang', 'Spanish');
+    authDom.window.requestAnimationFrame = (cb) => setTimeout(cb, 0);
+
+    const authDoc = authDom.window.document.querySelector('iframe').contentDocument;
+    authDoc.body.innerHTML = '<p>credential transport probe</p>';
+    authDoc.querySelector('p').getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+
+    let captured = null;
+    authDom.window.fetch = async (url, options) => {
+        captured = captured || { url, options };
+        const count = JSON.parse(options.body).paragraphs.length;
+        return {
+            ok: true,
+            status: 200,
+            json: async () => ({ translations: Array(count).fill('translated') }),
+            headers: { get: () => null }
+        };
+    };
+
+    const authScript = authDom.window.document.createElement('script');
+    authScript.textContent = code;
+    authDom.window.document.body.appendChild(authScript);
+    if (enableCloudFallback) {
+        const controlDeadline = Date.now() + 2000;
+        while (
+            !authDom.window.document.querySelector('[data-action="cloud-fallback"]')
+            && Date.now() < controlDeadline
+        ) await wait(20);
+        const toggle = authDom.window.document.querySelector(
+            '[data-action="cloud-fallback"]');
+        assert(toggle, 'Cloud fallback must have an explicit reader control');
+        toggle.click();
+        authDom.window.document.getElementById('bt-toggle').click();
+    }
+    const deadline = Date.now() + 2000;
+    while (!captured && Date.now() < deadline) await wait(20);
+    authDom.window.close();
+    assert(captured, `Expected a request for auth mode ${config.authMode}`);
+    return captured.options;
+}
+
 async function runTest() {
     console.log("Starting frontend assertions test...");
     
@@ -168,6 +231,10 @@ async function runTest() {
             'Every translation request must carry a bounded book cache scope');
         assert(typeof body.chapter_id === 'string' && body.chapter_id.length > 0,
             'Every translation request must carry a bounded chapter cache scope');
+        assert.strictEqual(c.options.credentials, 'same-origin',
+            'Cookie credentials must not be sent cross-origin without explicit opt-in');
+        assert.strictEqual(body.allow_cloud_fallback, false,
+            'Cloud fallback consent must be false unless the reader explicitly opts in');
     });
     
     // visible 1, visible 1, visible 2, prefetch 1, prefetch 2, prefetch 3, prefetch 4
@@ -258,6 +325,31 @@ async function runTest() {
             && !/BT_UI_VERSION, generation, SOURCE_LANG, TARGET_LANG/.test(code),
         'Persistent browser caching must be opt-in and keys must be context-scoped'
     );
+
+    const [tokenTransport, forwardedTransport, cwaTransport, consentedTransport] = await Promise.all([
+        captureAuthTransport({ authMode: 'token', apiToken: 'browser-token' }),
+        captureAuthTransport({ authMode: 'forwarded', apiToken: 'must-not-leak' }),
+        captureAuthTransport({ authMode: 'cwa_session', sendCredentials: true }),
+        captureAuthTransport({ authMode: 'cwa_session' }, true)
+    ]);
+    assert.strictEqual(tokenTransport.credentials, 'omit',
+        'Token mode must omit CWA cookies');
+    assert.strictEqual(tokenTransport.headers['X-BT-Token'], 'browser-token',
+        'Token mode must send only its explicit compatibility token');
+    assert.strictEqual(forwardedTransport.credentials, 'omit',
+        'Forwarded mode must omit CWA cookies');
+    assert(!('X-BT-Token' in forwardedTransport.headers),
+        'Forwarded mode must not leak an accidentally configured token');
+    assert.strictEqual(cwaTransport.credentials, 'include',
+        'Explicit cross-origin CWA-session mode must include its HttpOnly cookie');
+    assert(!('X-BT-Token' in cwaTransport.headers),
+        'CWA-session mode must not send a compatibility token');
+    assert.strictEqual(JSON.parse(tokenTransport.body).allow_cloud_fallback, false,
+        'A fresh reader must not consent to cloud fallback');
+    assert.strictEqual(JSON.parse(consentedTransport.body).allow_cloud_fallback, true,
+        'The explicit privacy control must consent only subsequent requests');
+    assert(!/localStorage\.(?:getItem|setItem)\([^)]*cloud/i.test(code),
+        'Cloud fallback consent must never persist across reader sessions');
 
     console.log("All assertions passed.");
     process.exit(0);

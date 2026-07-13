@@ -1,5 +1,7 @@
 """Fail-closed contracts for operator-facing shell helpers."""
+import os
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -34,6 +36,46 @@ class ShellContractTests(unittest.TestCase):
             '"mkdir -p $CWA_OVERLAY_DIR',
         ):
             self.assertNotIn(unsafe_fragment, source)
+
+    def test_deploy_never_starts_an_anonymous_api(self):
+        source = (ROOT / "deploy_unraid.sh").read_text()
+        self.assertIn('BT_AUTH_MODE="${BT_AUTH_MODE:-cwa_session}"', source)
+        self.assertIn('if [ "$BT_AUTH_MODE" != "cwa_session" ]', source)
+        self.assertIn('supports only cwa_session', source)
+        self.assertIn('cwa_session requires BT_CWA_AUTH_URL', source)
+        self.assertIn('BT_ALLOWED_ORIGINS must be one exact http origin for this HTTP-only helper', source)
+        self.assertIn('-e "BT_AUTH_MODE=${auth_mode}"', source)
+        self.assertIn("-e BT_ALLOW_PRIVATE_LAN=false", source)
+
+    def test_deploy_rejects_unsafe_auth_before_any_remote_action(self):
+        base = {
+            **os.environ,
+            "BT_CWA_AUTH_URL": "http://cwa.example.test:8383/ajax/emailstat",
+            "BT_ALLOWED_ORIGINS": "http://cwa.example.test:8383",
+        }
+        cases = (
+            ({"BT_AUTH_MODE": "token", "BT_API_TOKEN": "compat-token"},
+             "supports only cwa_session"),
+            ({"BT_AUTH_MODE": "cwa_session", "BT_ALLOWED_ORIGINS": "http://cwa.example.test:8383/path"},
+             "must be one exact http origin for this HTTP-only helper"),
+            ({"BT_AUTH_MODE": "cwa_session", "BT_ALLOWED_ORIGINS": "https://cwa.example.test"},
+             "must be one exact http origin for this HTTP-only helper"),
+            ({"BT_AUTH_MODE": "cwa_session", "BT_CWA_AUTH_URL": "http://cwa.example.test:8383/ping"},
+             "exact http(s) /ajax/emailstat endpoint"),
+        )
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                completed = subprocess.run(
+                    ["bash", str(ROOT / "deploy_unraid.sh")],
+                    cwd=ROOT,
+                    env={**base, **overrides},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 64)
+                self.assertIn(expected, completed.stderr)
+                self.assertNotIn("Starting deployment", completed.stdout)
 
     def test_verify_fails_when_frontend_hash_does_not_match(self):
         source = (ROOT / "verify_unraid.sh").read_text()

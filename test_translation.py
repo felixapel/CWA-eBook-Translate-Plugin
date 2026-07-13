@@ -21,11 +21,11 @@ os.environ["LLM_FALLBACK_MODEL"] = "fake-fallback"
 os.environ["LLM_FALLBACK_API_KEY"] = "x" * 20
 os.environ["BT_MAX_CONCURRENT"] = "2"
 os.environ["BT_BATCH_SIZE"] = "3"
-# BT_API_TOKEN is intentionally NOT set here. test_translation.py exercises
-# the *translate* endpoints (which are unauth'd when BT_API_TOKEN is empty —
-# matches the typical self-host use case), and the three /cache/cleanup
-# tests below pre-write /tmp/cleanup_token so the auto-gen path can be
-# exercised without a real env var.
+# Authentication is disabled explicitly only for this isolated unit suite.
+# Production defaults fail closed. The /cache/cleanup tests below still
+# exercise their independent destructive-operation credential.
+os.environ["BT_AUTH_MODE"] = "disabled"
+os.environ["BT_ALLOW_INSECURE_AUTH"] = "true"
 for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_PATH"] + "-shm"):
     try: os.remove(f)
     except OSError: pass
@@ -93,10 +93,20 @@ def check(name, cond):
 
 
 def run():
-    # Single translate falls back to the secondary when local is down.
-    d = client.post("/translate", json={"text": "hello"}).get_json()
+    # A remote fallback is privacy-sensitive: no request consent means the
+    # local outage fails closed without exporting the paragraph.
+    r = client.post("/translate", json={"text": "private-no-consent"})
+    check("single: cloud fallback blocked without consent",
+          r.status_code == 502 and r.get_json().get("error") == "provider_unavailable")
+
+    # Explicit per-request consent permits the configured cloud fallback.
+    d = client.post("/translate", json={
+        "text": "hello", "allow_cloud_fallback": True,
+    }).get_json()
     check("single: fallback used when local down", d.get("translated") == "[FB] hello")
-    d = client.post("/translate", json={"text": "hello"}).get_json()
+    d = client.post("/translate", json={
+        "text": "hello", "allow_cloud_fallback": True,
+    }).get_json()
     check("single: cache hit on repeat", d.get("cached") is True)
 
     # Batched: 5 paragraphs at BT_BATCH_SIZE=3 -> 2 grouped calls, order preserved.
@@ -308,7 +318,9 @@ def run():
     import cache as cache_mod
     STATE["local_up"] = False
     STATE["fallback_up"] = True
-    d = client.post("/translate", json={"text": "fb_scope_para"}).get_json()
+    d = client.post("/translate", json={
+        "text": "fb_scope_para", "allow_cloud_fallback": True,
+    }).get_json()
     check("fb-scope: fallback served the fresh translation",
           d.get("translated") == "[FB] fb_scope_para" and d.get("backend") == "minimax")
     fb_contract = translator.single_cache_contract("English", "Spanish")
@@ -327,10 +339,14 @@ def run():
     check("fb-scope: NOT cached under the primary model key",
           cache_mod.get_cached("fb_scope_para", "English", "Spanish", scope=primary_scope) is None)
     STATE["local_up"] = True
-    d = client.post("/translate", json={"text": "fb_scope_para"}).get_json()
+    d = client.post("/translate", json={
+        "text": "fb_scope_para", "allow_cloud_fallback": True,
+    }).get_json()
     check("fb-scope: cache hit after primary recovers (no re-pay)",
           d.get("cached") is True and d.get("translated") == "[FB] fb_scope_para")
-    d = client.post("/translate/batch", json={"paragraphs": ["fb_scope_para"]}).get_json()
+    d = client.post("/translate/batch", json={
+        "paragraphs": ["fb_scope_para"], "allow_cloud_fallback": True,
+    }).get_json()
     check("fb-scope: batch lookup also finds the fallback-keyed entry",
           d.get("cached_count") == 1 and d["translations"][0] == "[FB] fb_scope_para")
 
@@ -338,7 +354,10 @@ def run():
     # served them (fallback when local is down), not the configured primary.
     STATE["local_up"] = False
     STATE["fallback_up"] = True
-    results = translator.translate_batch(["attribution_test_para"], "English", "Spanish")
+    results = translator.translate_batch(
+        ["attribution_test_para"], "English", "Spanish",
+        allow_cloud_fallback=True,
+    )
     check("attribution: fallback provider reported in batch results",
           results[0][0] == "[FB] attribution_test_para" and results[0][1] == "minimax")
     STATE["local_up"] = True

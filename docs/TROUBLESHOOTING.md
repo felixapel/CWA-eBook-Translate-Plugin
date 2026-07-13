@@ -36,6 +36,25 @@ the Compose project also refreshes both endpoints.
 
 ---
 
+## Proxy exits at startup with `BT_PUBLIC_ORIGIN` or upstream validation errors
+
+Proxy and combined roles now fail closed unless `BT_PUBLIC_ORIGIN` is an exact
+`http://host[:port]` or `https://host[:port]` origin. Do not include a path,
+query, fragment, or credentials. Set the browser-visible value, not the CWA
+container URL; for example:
+
+```yaml
+environment:
+  - CWA_UPSTREAM=http://calibre-web:8083
+  - BT_PUBLIC_ORIGIN=https://books.example.com
+```
+
+`CWA_UPSTREAM` and `BT_API_UPSTREAM` accept only exact HTTP(S) base origins for
+the same reason. `BT_CWA_MAX_BODY_SIZE` must be finite and positive (for
+example `512m` or `2g`).
+
+---
+
 ## How to confirm the right frontend version is running
 
 Open browser DevTools (F12), go to **Console** tab, then:

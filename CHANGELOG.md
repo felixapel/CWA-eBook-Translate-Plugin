@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Authentication now fails closed before cache/provider work. The recommended
+  proxy topology validates the existing HttpOnly CWA session with bounded,
+  coalesced probes; trusted forwarded identity and shared-token compatibility
+  are explicit alternatives, while anonymous mode is development-only.
+- Browser loaders no longer recover API credentials from `localStorage`.
+  Credentialed CORS accepts exact origins only, identity headers are honored
+  only from allowlisted proxy CIDRs, and rejected auth attempts have a separate
+  rate limit.
+- CWA-session probes now require the exact authenticated endpoint and a bounded
+  JSON task-list response, including an absolute streaming deadline. The Unraid
+  overlay helper is CWA-session-only, and token/forwarded browser requests omit
+  CWA cookies. Its legacy direct-port topology also rejects HTTPS reader origins
+  because its API route is HTTP-only.
+- Remote/cloud fallback is now fail-closed per request. The reader starts each
+  book tab opted out, shows an explicit data-export warning, never persists the
+  choice, and includes consent in cache and singleflight policy boundaries.
+- Both request limiters cap active client buckets and reject unseen identities
+  under saturated cardinality instead of allowing source-IP churn to grow
+  process memory without bound.
 - Translation endpoints now reject non-object JSON and invalid Unicode before
   provider dispatch. Batched provider responses use unpredictable segment IDs
   and a strict, bounded response envelope so prompt output cannot be mistaken
@@ -33,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hashes tenant/book/chapter identifiers, and enforces private files plus
   mandatory TTL/cap. Browser persistence is opt-in and legacy unscoped browser
   entries are purged on upgrade.
+- Proxy startup now validates exact upstream URLs and a required public origin.
+  nginx forwards only that fixed host/scheme, replaces spoofable forwarding
+  chains with its observed peer, emits relative self-generated redirects, and
+  enforces a finite configurable CWA upload cap. It also strips CWA's configured
+  reverse-proxy login header instead of accepting a browser-supplied identity.
 
 ### Added
 
@@ -49,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tenant, book, chapter, context, language, protocol, migration, and retention.
 - Bounded singleflight coalescing for identical active translation operations,
   with tenant/context isolation and pressure counters in `/metrics`.
+- Fixed-cardinality HTTP, authentication, rate-limit, work-budget, provider,
+  and partial-batch failure counters without content-derived metric labels.
 
 ### Changed
 
@@ -59,6 +85,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit authenticated provider diagnostic.
 - Deployment helpers use strict shell mode, safe remote argument serialization,
   fail-closed health/hash checks, and the same non-root sandbox as CI.
+- The proxy renderer is a standard-library validator with atomic private output;
+  gettext/envsubst and their Alpine dependency surface were removed.
+- The split Compose proxy reaches the API through a network-scoped alias on the
+  fixed trusted-proxy subnet, avoiding ambiguous multi-network DNS routing.
 - The browser retries only bounded `429` admission rejections. Ambiguous
   timeouts, network failures, and invalid responses require an explicit user
   retry so they cannot duplicate provider work still running server-side.

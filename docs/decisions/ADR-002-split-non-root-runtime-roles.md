@@ -43,8 +43,9 @@ existing one-container deployments while Compose users migrate.
   document the required ownership.
 - The combined role remains supported for compatibility but is not the
   production recommendation.
-- nginx and gettext remain present in the shared image even for the API role;
-  this is the accepted cost of keeping one auditable release artifact.
+- nginx and the standard-library-only validated config renderer remain present
+  in the shared image even for the API role; this is the accepted cost of
+  keeping one auditable release artifact. gettext/envsubst was removed.
 
 ## Verification
 

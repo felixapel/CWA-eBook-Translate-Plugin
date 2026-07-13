@@ -13,9 +13,11 @@ import uuid
 import hmac
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlsplit
 from flask import Flask, request, jsonify
 from werkzeug.exceptions import HTTPException
 
+from auth import AuthRejected, AuthUnavailable, RequestAuthenticator
 from translator import (
     translate_text, translate_batch, check_backend_health,
     BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
@@ -68,10 +70,13 @@ def _cache_lookup(
     tenant: str = "legacy-anonymous",
     book_id: str = "unscoped",
     chapter_id: str = "unscoped",
+    allow_cloud_fallback: bool = False,
 ) -> str | None:
     """Probe exact single-translation contracts in provider failover order."""
     contract = single_cache_contract(source_lang, target_lang)
-    for provider, model in cache_lookup_backends():
+    for provider, model in cache_lookup_backends(
+        allow_cloud_fallback=allow_cloud_fallback
+    ):
         scope = _cache_scope(
             tenant=tenant,
             book_id=book_id,
@@ -95,8 +100,9 @@ try:
 except OSError:
     __version__ = "dev"
 
-# Optional shared-secret. When BT_API_TOKEN is set, translate endpoints require
-# the matching `X-BT-Token` header — use it if the API is reachable beyond the LAN.
+# Operator/shared-secret credential. Production authentication is selected by
+# BT_AUTH_MODE; its safe default is token and therefore requires BT_API_TOKEN.
+# This module-level value remains the destructive-operation credential too.
 API_TOKEN = os.environ.get("BT_API_TOKEN", "")
 
 # Request-size caps: one request must not be able to trigger unbounded LLM work
@@ -150,6 +156,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("book-translator.server")
 
+# Fail during process startup when the selected auth authority is incomplete.
+# BT_AUTH_MODE=disabled remains available only as an explicit development/test
+# choice; it is never the default.
+AUTHENTICATOR = RequestAuthenticator.from_environment()
+
 app = Flask(__name__)
 
 # Reject oversize request bodies at the WSGI layer (defence in depth — the
@@ -181,6 +192,16 @@ def _request_cache_namespace(data: dict) -> tuple[str, str, str]:
             raise ValueError(f"'{field}' contains control characters")
         values.append(value)
     return tenant, values[0], values[1]
+
+
+def _cloud_fallback_consent(data: dict) -> bool:
+    """Validate the additive per-request privacy decision at the API edge."""
+    if "allow_cloud_fallback" not in data:
+        return False
+    consent = data["allow_cloud_fallback"]
+    if type(consent) is not bool:
+        raise ValueError("'allow_cloud_fallback' must be a boolean")
+    return consent
 
 # ── Language validation (H7) ────────────────────────────────────────────────
 # The selectable set mirrors Gemma 4's pre-training coverage (top-10 most
@@ -239,8 +260,35 @@ def _has_invalid_unicode(value: str) -> bool:
 # port — the common self-hosted case. Note: in proxy-injection mode the overlay
 # is same-origin and CORS never comes into play.
 
+def _validate_cors_origin(origin: str) -> str:
+    """Require an exact serialized HTTP origin, never a path or wildcard."""
+    if (
+        not origin
+        or origin != origin.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in origin)
+    ):
+        raise ValueError("BT_ALLOWED_ORIGINS contains an invalid origin")
+    try:
+        parsed = urlsplit(origin)
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("BT_ALLOWED_ORIGINS contains an invalid origin") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or any(character.isspace() for character in parsed.hostname)
+    ):
+        raise ValueError("BT_ALLOWED_ORIGINS must contain exact http(s) origins")
+    return origin
+
+
 ALLOWED_ORIGINS = {
-    o.strip()
+    _validate_cors_origin(o.strip())
     for o in os.environ.get(
         "BT_ALLOWED_ORIGINS", "http://localhost:8083,http://localhost:8383"
     ).split(",")
@@ -263,6 +311,11 @@ def _is_origin_allowed(origin: str | None) -> str | None:
         return None
     if origin in ALLOWED_ORIGINS:
         return origin
+    # Credentialed CWA-session requests may never combine cookies with a
+    # subnet-wide origin policy. Cross-origin operators must enumerate the
+    # exact reader origin; same-origin proxy mode needs no CORS at all.
+    if AUTHENTICATOR.mode == "cwa_session":
+        return None
     if BT_ALLOW_PRIVATE_LAN and _PRIVATE_ORIGIN_RE.match(origin):
         return origin
     return None
@@ -272,8 +325,21 @@ def _is_origin_allowed(origin: str | None) -> str | None:
 
 _rate_limit_lock = threading.Lock()
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_auth_rate_limit_store: dict[str, list[float]] = defaultdict(list)
 BT_RATE_LIMIT_PER_MINUTE = int(os.environ.get("BT_RATE_LIMIT_PER_MINUTE", "120"))
 BT_RATE_LIMIT_RETRY_AFTER = int(os.environ.get("BT_RATE_LIMIT_RETRY_AFTER", "10"))
+BT_AUTH_RATE_LIMIT_PER_MINUTE = int(
+    os.environ.get("BT_AUTH_RATE_LIMIT_PER_MINUTE", "300")
+)
+BT_RATE_LIMIT_MAX_CLIENTS = int(os.environ.get("BT_RATE_LIMIT_MAX_CLIENTS", "10000"))
+
+if min(
+    BT_RATE_LIMIT_PER_MINUTE,
+    BT_RATE_LIMIT_RETRY_AFTER,
+    BT_AUTH_RATE_LIMIT_PER_MINUTE,
+    BT_RATE_LIMIT_MAX_CLIENTS,
+) <= 0:
+    raise ValueError("rate-limit settings must be positive integers")
 
 RATE_LIMIT_MAX = BT_RATE_LIMIT_PER_MINUTE
 RATE_LIMIT_WINDOW = 60
@@ -287,21 +353,30 @@ def _cleanup_rate_limits():
         cutoff = now - RATE_LIMIT_WINDOW
         with _rate_limit_lock:
             keys_to_delete = []
-            for ip, timestamps in _rate_limit_store.items():
-                active = [t for t in timestamps if t > cutoff]
-                if not active:
-                    keys_to_delete.append(ip)
-                else:
-                    _rate_limit_store[ip] = active
-            for ip in keys_to_delete:
-                del _rate_limit_store[ip]
+            for store in (_rate_limit_store, _auth_rate_limit_store):
+                keys_to_delete = []
+                for ip, timestamps in store.items():
+                    active = [t for t in timestamps if t > cutoff]
+                    if not active:
+                        keys_to_delete.append(ip)
+                    else:
+                        store[ip] = active
+                for ip in keys_to_delete:
+                    del store[ip]
 
 threading.Thread(target=_cleanup_rate_limits, daemon=True).start()
 
 def _token_matches(provided: str, expected: str) -> bool:
     """Constant-time token comparison (avoids timing side-channels on the
     shared-secret checks; hmac.compare_digest is the standard tool)."""
-    return bool(provided) and bool(expected) and hmac.compare_digest(provided, expected)
+    if not provided or not expected or len(provided) > 4096 or len(expected) > 4096:
+        return False
+    try:
+        return hmac.compare_digest(provided, expected)
+    except TypeError:
+        # compare_digest rejects non-ASCII str values. Treat malformed header
+        # input as an ordinary credential rejection instead of a framework 500.
+        return False
 
 
 def _client_ip() -> str:
@@ -344,34 +419,97 @@ def _client_ip() -> str:
     return peer
 
 
-def _check_rate_limit(ip: str) -> bool:
-    """Return True if the request should be allowed, False if rate-limited."""
+def _check_window_rate_limit(
+    store: dict[str, list[float]], ip: str, limit: int
+) -> bool:
+    """Consume one bounded sliding-window admission slot."""
     now = time.monotonic()
     with _rate_limit_lock:
-        timestamps = _rate_limit_store[ip]
-        # Evict expired timestamps
         cutoff = now - RATE_LIMIT_WINDOW
-        _rate_limit_store[ip] = [t for t in timestamps if t > cutoff]
-        if len(_rate_limit_store[ip]) >= RATE_LIMIT_MAX:
+        if ip not in store and len(store) >= BT_RATE_LIMIT_MAX_CLIENTS:
+            # Reclaim stale buckets only under pressure. If every bucket is
+            # active, reject a new identity rather than growing memory or
+            # evicting an attacker into a fresh allowance.
+            expired = [
+                key
+                for key, values in store.items()
+                if not any(timestamp > cutoff for timestamp in values)
+            ]
+            for key in expired:
+                del store[key]
+            if len(store) >= BT_RATE_LIMIT_MAX_CLIENTS:
+                return False
+        timestamps = store[ip]
+        # Evict expired timestamps
+        store[ip] = [t for t in timestamps if t > cutoff]
+        if len(store[ip]) >= limit:
             return False
-        _rate_limit_store[ip].append(now)
+        store[ip].append(now)
         return True
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """Return True if translation/API work should be admitted."""
+    return _check_window_rate_limit(_rate_limit_store, ip, RATE_LIMIT_MAX)
+
+
+def _check_auth_rate_limit(ip: str) -> bool:
+    """Bound credential attempts separately from expensive API work."""
+    return _check_window_rate_limit(
+        _auth_rate_limit_store, ip, BT_AUTH_RATE_LIMIT_PER_MINUTE
+    )
 
 
 # ── Metrics (M5) ────────────────────────────────────────────────────────────
 
 _metrics_lock = threading.Lock()
-_metrics = {
-    "total_requests": 0,
-    "total_latency_ms": 0.0,
-    "cache_hits": 0,
-    "cache_misses": 0,
-    "errors": 0,
-}
+_HTTP_RESPONSE_CLASSES = ("2xx", "3xx", "4xx", "5xx")
+_METRIC_OUTCOMES = (
+    "auth_rejected",
+    "auth_unavailable",
+    "auth_rate_limited",
+    "api_rate_limited",
+    "work_budget_exhausted",
+    "provider_unavailable",
+    "invalid_provider_response",
+    "translation_failed",
+    "internal_error",
+    "batch_partial_failure_requests",
+)
+_WORK_BUDGET_REASONS = (
+    "attempts",
+    "input_bytes",
+    "output_tokens",
+    "deadline",
+    "queue",
+    "cancelled",
+    "unknown",
+)
+
+
+def _empty_metrics() -> dict:
+    """Create the complete fixed-cardinality in-process metric schema."""
+    return {
+        # Backward-compatible translation/cache aggregates.
+        "total_requests": 0,
+        "total_latency_ms": 0.0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "errors": 0,
+        # No route, identity, book, provider URL, or error string is ever a
+        # metric key. Every dimension below is owned by this module.
+        "http_responses": {name: 0 for name in _HTTP_RESPONSE_CLASSES},
+        "outcomes": {name: 0 for name in _METRIC_OUTCOMES},
+        "work_budget_reasons": {name: 0 for name in _WORK_BUDGET_REASONS},
+        "batch_partial_failure_segments": 0,
+    }
+
+
+_metrics = _empty_metrics()
 
 
 def _record_metric(latency_ms: float, hits: int = 0, misses: int = 0, error: bool = False):
-    """Record request metrics (thread-safe)."""
+    """Record backward-compatible translation/cache aggregates."""
     with _metrics_lock:
         _metrics["total_requests"] += 1
         _metrics["total_latency_ms"] += latency_ms
@@ -381,8 +519,50 @@ def _record_metric(latency_ms: float, hits: int = 0, misses: int = 0, error: boo
             _metrics["errors"] += 1
 
 
+def _record_http_response(status_code: int) -> None:
+    """Count a response by its fixed HTTP class, including middleware exits."""
+    response_class = f"{int(status_code) // 100}xx"
+    if response_class not in _HTTP_RESPONSE_CLASSES:
+        return
+    with _metrics_lock:
+        _metrics["http_responses"][response_class] += 1
+
+
+def _record_outcome(name: str) -> None:
+    """Count one server-owned semantic outcome; dynamic labels are forbidden."""
+    if name not in _METRIC_OUTCOMES:
+        raise ValueError("unknown metric outcome")
+    with _metrics_lock:
+        _metrics["outcomes"][name] += 1
+
+
+def _record_work_budget_exhaustion(reason: str) -> None:
+    """Count a bounded work rejection without exposing arbitrary reasons."""
+    bounded_reason = reason if reason in _WORK_BUDGET_REASONS else "unknown"
+    with _metrics_lock:
+        _metrics["outcomes"]["work_budget_exhausted"] += 1
+        _metrics["work_budget_reasons"][bounded_reason] += 1
+
+
+def _record_batch_partial_failure(segment_count: int) -> None:
+    """Count one partial batch plus its failed segments, without content labels."""
+    if isinstance(segment_count, bool) or not isinstance(segment_count, int) or segment_count <= 0:
+        raise ValueError("segment_count must be a positive integer")
+    with _metrics_lock:
+        _metrics["outcomes"]["batch_partial_failure_requests"] += 1
+        _metrics["batch_partial_failure_segments"] += segment_count
+
+
+def _reset_metrics_for_tests() -> None:
+    """Restore the metric schema atomically for deterministic contract tests."""
+    with _metrics_lock:
+        _metrics.clear()
+        _metrics.update(_empty_metrics())
+
+
 def _work_budget_response(exc: WorkBudgetExceeded):
     """Map internal admission limits to a stable, non-sensitive 503."""
+    _record_work_budget_exhaustion(exc.reason)
     request_id = getattr(request, "request_id", None)
     log.warning("req=%s upstream work rejected reason=%s", request_id, exc.reason)
     response = jsonify({
@@ -407,6 +587,7 @@ def _translate_paragraphs(
     tenant: str = "legacy-anonymous",
     book_id: str = "unscoped",
     chapter_id: str = "unscoped",
+    allow_cloud_fallback: bool = False,
 ) -> dict:
     """
     Shared helper for batch translation logic used by /translate/batch.
@@ -446,7 +627,9 @@ def _translate_paragraphs(
     for group in groups:
         contract = contracts[tuple(group)]
         accepted: list[tuple[int, str, CacheScope]] | None = None
-        for provider, model in cache_lookup_backends():
+        for provider, model in cache_lookup_backends(
+            allow_cloud_fallback=allow_cloud_fallback
+        ):
             candidate: list[tuple[int, str, CacheScope]] = []
             for index in group:
                 scope = _cache_scope(
@@ -500,6 +683,7 @@ def _translate_paragraphs(
             operation_namespace=_operation_namespace(
                 tenant, book_id, chapter_id
             ),
+            allow_cloud_fallback=allow_cloud_fallback,
         )
         for group in missing_groups:
             contract = contracts[tuple(group)]
@@ -550,28 +734,59 @@ def _translate_paragraphs(
 
 @app.before_request
 def before_request_hook():
-    """Attach request ID, check rate limit."""
+    """Attach request metadata, authenticate, then admit API work."""
     request.request_id = str(uuid.uuid4())
     request.start_time = time.monotonic()
 
-    # Optional shared-secret auth (skip preflight + health/ping so liveness
-    # probes always work. /stats stays under auth so cache contents aren't
-    # leakable on unauthenticated LANs.)
-    if API_TOKEN and request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/ping"):
-        if not _token_matches(request.headers.get("X-BT-Token", ""), API_TOKEN):
-            return jsonify({"error": "Unauthorized", "request_id": request.request_id}), 401
+    # Liveness/readiness and preflight stay independent of external auth so
+    # orchestration can diagnose an auth-authority outage. Everything else,
+    # including metrics and stats, receives a server-owned opaque subject.
+    protected = (
+        request.method != "OPTIONS"
+        and request.path not in ("/health", "/ready", "/ping")
+    )
+    if protected:
+        client_ip = _client_ip()
+        if not _check_auth_rate_limit(client_ip):
+            _record_outcome("auth_rate_limited")
+            response = jsonify({
+                "error": "rate_limited",
+                "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+                "request_id": request.request_id,
+            })
+            response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
+            return response, 429
+        try:
+            identity = AUTHENTICATOR.authenticate(request.headers, request.remote_addr)
+        except AuthRejected:
+            _record_outcome("auth_rejected")
+            log.warning("req=%s authentication rejected", request.request_id)
+            return jsonify({
+                "error": "unauthorized",
+                "request_id": request.request_id,
+            }), 401
+        except AuthUnavailable:
+            _record_outcome("auth_unavailable")
+            log.warning("req=%s authentication authority unavailable", request.request_id)
+            return jsonify({
+                "error": "authentication_unavailable",
+                "request_id": request.request_id,
+            }), 503
+        request.auth_subject = identity.subject
+        request.auth_roles = identity.roles
 
     # Rate limiting (H6) — exempt observability endpoints so operators can
     # monitor health/stats even while the per-client budget is exhausted.
     # /stats is in this set (not the auth set above) deliberately: it must
     # stay reachable during a rate-limit storm so the operator can see how
-    # badly things are going, but it still requires API_TOKEN if configured.
+    # badly things are going, but it still passes the selected auth authority.
     # Skip CORS preflights too: an OPTIONS would otherwise burn 2x budget per
     # real cross-origin request, and a 429 on a preflight surfaces as a cryptic
     # CORS error in the browser instead of a rate limit the frontend can honor.
     if request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/metrics", "/ping", "/stats"):
         client_ip = _client_ip()
         if not _check_rate_limit(client_ip):
+            _record_outcome("api_rate_limited")
             log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
             response = jsonify({
                 "error": "rate_limited",
@@ -585,6 +800,7 @@ def before_request_hook():
 @app.after_request
 def after_request_hook(response):
     """Log timing, add CORS headers, add request ID header."""
+    _record_http_response(response.status_code)
     # Timing (M5)
     elapsed_ms = int((time.monotonic() - getattr(request, "start_time", time.monotonic())) * 1000)
     req_id = getattr(request, "request_id", "unknown")
@@ -603,6 +819,9 @@ def after_request_hook(response):
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         # Let cross-origin JS read the request ID and 429 Retry-After header.
         response.headers["Access-Control-Expose-Headers"] = "X-Request-ID, Retry-After"
+        response.vary.add("Origin")
+        if AUTHENTICATOR.mode == "cwa_session":
+            response.headers["Access-Control-Allow-Credentials"] = "true"
 
     return response
 
@@ -633,6 +852,7 @@ def http_error(exc: HTTPException):
 @app.errorhandler(Exception)
 def unhandled_error(exc: Exception):
     """Fail closed without returning or logging private exception strings."""
+    _record_outcome("internal_error")
     request_id = getattr(request, "request_id", None)
     log.error(
         "req=%s unhandled request error type=%s",
@@ -726,9 +946,12 @@ def stats():
 
 @app.route("/metrics")
 def metrics():
-    """Return request metrics (M5)."""
+    """Return fixed-cardinality, content-free request metrics (M5)."""
     with _metrics_lock:
-        snapshot = dict(_metrics)
+        snapshot = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in _metrics.items()
+        }
     total = snapshot["total_requests"]
     avg_latency = round(snapshot["total_latency_ms"] / total, 1) if total > 0 else 0
     total_cache = snapshot["cache_hits"] + snapshot["cache_misses"]
@@ -740,6 +963,13 @@ def metrics():
         "cache_hits": snapshot["cache_hits"],
         "cache_misses": snapshot["cache_misses"],
         "errors": snapshot["errors"],
+        "http_responses_total": sum(snapshot["http_responses"].values()),
+        "http_responses": snapshot["http_responses"],
+        "outcomes": snapshot["outcomes"],
+        "work_budget_reasons": snapshot["work_budget_reasons"],
+        "batch_partial_failure_segments": snapshot[
+            "batch_partial_failure_segments"
+        ],
         "singleflight": singleflight_stats(),
     })
 
@@ -752,7 +982,8 @@ def translate():
     POST body: {
         "text": "Hello world",
         "source_lang": "English",
-        "target_lang": "Spanish"
+        "target_lang": "Spanish",
+        "allow_cloud_fallback": false
     }
 
     Returns: {
@@ -784,6 +1015,11 @@ def translate():
     lang_error = _validate_languages(source_lang, target_lang)
     if lang_error:
         return jsonify({"error": lang_error}), 400
+
+    try:
+        allow_cloud_fallback = _cloud_fallback_consent(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     try:
         tenant, book_id, chapter_id = _request_cache_namespace(data)
@@ -820,6 +1056,7 @@ def translate():
         tenant=tenant,
         book_id=book_id,
         chapter_id=chapter_id,
+        allow_cloud_fallback=allow_cloud_fallback,
     )
     if cached is not None:
         _record_metric(0, hits=1, misses=0)
@@ -841,6 +1078,7 @@ def translate():
             operation_namespace=_operation_namespace(
                 tenant, book_id, chapter_id
             ),
+            allow_cloud_fallback=allow_cloud_fallback,
         )
     except WorkBudgetExceeded as exc:
         elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -849,6 +1087,7 @@ def translate():
     except ProviderUnavailableError:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+        _record_outcome("provider_unavailable")
         log.warning("req=%s translation provider unavailable", req_id)
         return jsonify({
             "error": "provider_unavailable",
@@ -857,6 +1096,7 @@ def translate():
     except Exception as e:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+        _record_outcome("translation_failed")
         log.error(
             "req=%s translation failed error_type=%s",
             req_id, type(e).__name__,
@@ -909,7 +1149,8 @@ def translate_batch_endpoint():
     POST body: {
         "paragraphs": ["Paragraph 1", "Paragraph 2", ...],
         "source_lang": "English",
-        "target_lang": "Spanish"
+        "target_lang": "Spanish",
+        "allow_cloud_fallback": false
     }
 
     Returns: {
@@ -964,6 +1205,11 @@ def translate_batch_endpoint():
         return jsonify({"error": lang_error}), 400
 
     try:
+        allow_cloud_fallback = _cloud_fallback_consent(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
         tenant, book_id, chapter_id = _request_cache_namespace(data)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -1002,12 +1248,14 @@ def translate_batch_endpoint():
             tenant=tenant,
             book_id=book_id,
             chapter_id=chapter_id,
+            allow_cloud_fallback=allow_cloud_fallback,
         )
     except WorkBudgetExceeded as exc:
         _record_metric(0, hits=0, misses=1, error=True)
         return _work_budget_response(exc)
     except SegmentProtocolError:
         _record_metric(0, hits=0, misses=1, error=True)
+        _record_outcome("invalid_provider_response")
         log.warning("req=%s provider returned an invalid segment envelope",
                     getattr(request, "request_id", None))
         return jsonify({
@@ -1016,6 +1264,7 @@ def translate_batch_endpoint():
         }), 502
     except ProviderUnavailableError:
         _record_metric(0, hits=0, misses=1, error=True)
+        _record_outcome("provider_unavailable")
         log.warning(
             "req=%s batch provider unavailable",
             getattr(request, "request_id", None),
@@ -1026,6 +1275,7 @@ def translate_batch_endpoint():
         }), 502
     except Exception as exc:
         _record_metric(0, hits=0, misses=1, error=True)
+        _record_outcome("translation_failed")
         log.error(
             "req=%s batch translation failed error_type=%s",
             getattr(request, "request_id", None), type(exc).__name__,
@@ -1037,6 +1287,12 @@ def translate_batch_endpoint():
     result["request_id"] = getattr(request, "request_id", None)
 
     _record_metric(result["total_elapsed_ms"], hits=result["cached_count"], misses=result["fresh_count"])
+    partial_failures = sum(
+        isinstance(value, str) and value.startswith("[TRANSLATION ERROR:")
+        for value in result["translations"]
+    )
+    if partial_failures:
+        _record_batch_partial_failure(partial_failures)
 
     return jsonify(result)
 
@@ -1054,8 +1310,8 @@ def cache_cleanup():
     (created_at < future date) and silently wipe the whole cache.
 
     Auth: always required. Two sources of truth for the token, in order:
-      1. BT_API_TOKEN env var (the recommended path; if set, this is the
-         only token accepted for the whole API)
+      1. BT_API_TOKEN env var (the recommended operator credential; in token
+         auth mode it is also the request credential)
       2. Auto-generated deployment token persisted in /app/data/cleanup_token
          (only consulted when BT_API_TOKEN is empty). The token is generated
          on first use with secrets.token_urlsafe and written to a file with
@@ -1193,8 +1449,8 @@ def _get_cleanup_token() -> str:
     """Return the active token for /cache/cleanup.
 
     Order:
-      1. If BT_API_TOKEN is set, use it (single source of truth for the
-         whole API's auth — consistent with the other endpoints).
+      1. If BT_API_TOKEN is set, use it as the operator credential. Token auth
+         mode also uses it for the general request boundary.
       2. Else, read or create /app/data/cleanup_token. Creation is serialized
          across threads and processes, then atomically persisted with mode
          0600. Subsequent calls reuse the in-process cached value.

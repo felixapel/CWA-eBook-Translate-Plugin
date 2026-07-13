@@ -13,6 +13,7 @@ API_CONTAINER="${SMOKE_PREFIX}-api"
 PROXY_CONTAINER="${SMOKE_PREFIX}-proxy"
 SMOKE_NETWORK="${SMOKE_PREFIX}-net"
 SMOKE_VOLUME="${SMOKE_PREFIX}-data"
+SMOKE_TOKEN="container-smoke-only-secret"
 
 cleanup() {
     docker rm -f -v "$PROXY_CONTAINER" "$API_CONTAINER" >/dev/null 2>&1 || true
@@ -33,10 +34,26 @@ sandbox=(
     --security-opt no-new-privileges:true
 )
 
+if invalid_output="$(docker run --rm --network "$SMOKE_NETWORK" \
+    "${sandbox[@]}" \
+    -e BT_ROLE=proxy \
+    -e "CWA_UPSTREAM=http://${API_CONTAINER}:8390" \
+    "$SMOKE_IMAGE" 2>&1)"; then
+    echo "proxy unexpectedly started without BT_PUBLIC_ORIGIN" >&2
+    exit 1
+fi
+grep -q 'BT_PUBLIC_ORIGIN' <<<"$invalid_output"
+if grep -q 'Traceback' <<<"$invalid_output"; then
+    echo "invalid proxy configuration exposed a traceback" >&2
+    exit 1
+fi
+
 docker run -d --name "$API_CONTAINER" --network "$SMOKE_NETWORK" \
     "${sandbox[@]}" \
     --mount "type=volume,source=${SMOKE_VOLUME},target=/app/data" \
     -e BT_ROLE=api \
+    -e BT_AUTH_MODE=token \
+    -e "BT_API_TOKEN=${SMOKE_TOKEN}" \
     -p 127.0.0.1::8390 \
     "$SMOKE_IMAGE" >/dev/null
 
@@ -45,6 +62,7 @@ docker run -d --name "$PROXY_CONTAINER" --network "$SMOKE_NETWORK" \
     -e BT_ROLE=proxy \
     -e "CWA_UPSTREAM=http://${API_CONTAINER}:8390" \
     -e "BT_API_UPSTREAM=http://${API_CONTAINER}:8390" \
+    -e BT_PUBLIC_ORIGIN=https://books.example.test:8443 \
     -p 127.0.0.1::8080 \
     "$SMOKE_IMAGE" >/dev/null
 
@@ -60,6 +78,33 @@ for _ in $(seq 1 30); do
 done
 curl -sf "http://127.0.0.1:${API_PORT}/ping" | grep -q '"status":"ok"'
 curl -sf "http://127.0.0.1:${PROXY_PORT}/bt-api/ping" | grep -q '"status":"ok"'
+curl -sf -H 'Host: attacker.example' -H 'X-Forwarded-Proto: javascript' \
+    -H 'X-Forwarded-For: 203.0.113.99' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/ping" | grep -q '"status":"ok"'
+
+# The generated configuration, not client-controlled forwarding headers, owns
+# the public authority and the immediate client hop.
+test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
+    'proxy_set_header Host books.example.test:8443;' /tmp/nginx/proxy.conf)" = "2"
+test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
+    'proxy_set_header X-Forwarded-Proto https;' /tmp/nginx/proxy.conf)" = "2"
+test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
+    'proxy_set_header X-Forwarded-For $remote_addr;' /tmp/nginx/proxy.conf)" = "2"
+test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
+    'proxy_set_header Remote-User "";' /tmp/nginx/proxy.conf)" = "1"
+docker exec "$PROXY_CONTAINER" grep -Fq \
+    'client_max_body_size 2g;' /tmp/nginx/proxy.conf
+
+# Protected surfaces reject anonymous callers through both published paths,
+# while the configured compatibility token succeeds.
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:${API_PORT}/metrics")" = "401"
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
+curl -sf -H "X-BT-Token: ${SMOKE_TOKEN}" \
+    "http://127.0.0.1:${API_PORT}/metrics" | grep -q '"total_requests"'
+curl -sf -H "X-BT-Token: ${SMOKE_TOKEN}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics" | grep -q '"total_requests"'
 
 for container in "$API_CONTAINER" "$PROXY_CONTAINER"; do
     test "$(docker exec "$container" id -u)" = "101"
@@ -73,6 +118,10 @@ for container in "$API_CONTAINER" "$PROXY_CONTAINER"; do
     fi
     docker exec "$container" sh -c ': > /tmp/write-probe && rm /tmp/write-probe'
 done
+if docker exec "$API_CONTAINER" sh -c 'test -e /app/test_auth.py -o -e /app/benchmark.py'; then
+    echo "published runtime unexpectedly contains tests or benchmarks" >&2
+    exit 1
+fi
 docker exec "$API_CONTAINER" sh -c \
     ': > /app/data/write-probe && rm /app/data/write-probe'
 if docker inspect "$PROXY_CONTAINER" \
