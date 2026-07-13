@@ -24,6 +24,34 @@ log = logging.getLogger("book-translator.cache")
 
 CACHE_SCHEMA_VERSION = 2
 CACHE_KEY_VERSION = "cwa-translate-cache/v2"
+CACHE_TABLE = "translations_v2"
+V1_REQUIRED_SCHEMA = {
+    "cache_key": ("TEXT", False, True),
+    "source_text": ("TEXT", True, False),
+    "source_lang": ("TEXT", True, False),
+    "target_lang": ("TEXT", True, False),
+    "translated_text": ("TEXT", True, False),
+    "model": ("TEXT", True, False),
+    "created_at": ("TEXT", True, False),
+    "hit_count": ("INTEGER", True, False),
+}
+V2_REQUIRED_SCHEMA = {
+    "cache_key": ("TEXT", False, True),
+    "tenant_hash": ("TEXT", True, False),
+    "book_hash": ("TEXT", True, False),
+    "chapter_hash": ("TEXT", True, False),
+    "context_hash": ("TEXT", True, False),
+    "source_lang": ("TEXT", True, False),
+    "target_lang": ("TEXT", True, False),
+    "translated_text": ("TEXT", True, False),
+    "provider": ("TEXT", True, False),
+    "model": ("TEXT", True, False),
+    "prompt_hash": ("TEXT", True, False),
+    "protocol_version": ("TEXT", True, False),
+    "created_at": ("TEXT", True, False),
+    "last_accessed_at": ("TEXT", True, False),
+    "hit_count": ("INTEGER", True, False),
+}
 DB_PATH = Path(os.getenv("DB_PATH", "translations.db"))
 
 
@@ -128,7 +156,11 @@ class CacheStore:
         self._init_lock = threading.Lock()
         self._initialized = False
         self._prepare_directory()
-        self.init()
+        try:
+            self.init()
+        except Exception:
+            self.close()
+            raise
 
     def _prepare_directory(self) -> None:
         parent = self.db_path.parent
@@ -162,12 +194,16 @@ class CacheStore:
         conn = sqlite3.connect(
             str(self.db_path), timeout=5.0, check_same_thread=False
         )
-        self._secure_files()
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA wal_autocheckpoint=1000")
-        self._secure_files()
+        try:
+            self._secure_files()
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
+            self._secure_files()
+        except Exception:
+            conn.close()
+            raise
         with self._connections_lock:
             self._connections.add(conn)
         return conn
@@ -185,9 +221,14 @@ class CacheStore:
                 return
             conn = self.connection()
             try:
-                self._preserve_v1(conn)
+                # sqlite3 does not start a transaction for DDL. Begin one
+                # explicitly so the two draft-layout renames and all schema
+                # initialization either commit together or leave the original
+                # rollback-compatible layout untouched.
+                conn.execute("BEGIN IMMEDIATE")
+                self._normalize_cache_tables(conn)
                 conn.execute(
-                    """CREATE TABLE IF NOT EXISTS translations (
+                    """CREATE TABLE IF NOT EXISTS translations_v2 (
                         cache_key TEXT PRIMARY KEY,
                         tenant_hash TEXT NOT NULL,
                         book_hash TEXT NOT NULL,
@@ -207,15 +248,15 @@ class CacheStore:
                 )
                 conn.execute(
                     """CREATE INDEX IF NOT EXISTS idx_cache_v2_langs
-                       ON translations(tenant_hash, source_lang, target_lang)"""
+                       ON translations_v2(tenant_hash, source_lang, target_lang)"""
                 )
                 conn.execute(
                     """CREATE INDEX IF NOT EXISTS idx_cache_v2_created
-                       ON translations(created_at)"""
+                       ON translations_v2(created_at)"""
                 )
                 conn.execute(
                     """CREATE INDEX IF NOT EXISTS idx_cache_v2_accessed
-                       ON translations(last_accessed_at, created_at)"""
+                       ON translations_v2(last_accessed_at, created_at)"""
                 )
                 conn.execute(f"PRAGMA user_version={CACHE_SCHEMA_VERSION}")
                 self._delete_expired(conn)
@@ -238,26 +279,67 @@ class CacheStore:
     def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
         return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
-    def _preserve_v1(self, conn: sqlite3.Connection) -> None:
-        columns = self._table_columns(conn, "translations")
-        if not columns or "source_text" not in columns:
-            return
-        target = "translations_v1"
-        suffix = 1
-        existing = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+    @staticmethod
+    def _table_matches_schema(
+        conn: sqlite3.Connection,
+        table: str,
+        expected: dict[str, tuple[str, bool, bool]],
+    ) -> bool:
+        actual = {
+            row[1]: (row[2].upper(), bool(row[3]), bool(row[5]))
+            for row in conn.execute(f"PRAGMA table_info({table})")
         }
-        while target in existing:
-            suffix += 1
-            target = f"translations_v1_{suffix}"
-        conn.execute(f"ALTER TABLE translations RENAME TO {target}")
-        log.warning(
-            "Preserved legacy cache as %s; v1 rows are intentionally not served",
-            target,
+        return set(actual) == set(expected) and all(
+            actual.get(column) == signature
+            for column, signature in expected.items()
         )
+
+    def _normalize_cache_tables(self, conn: sqlite3.Connection) -> None:
+        """Keep the v1 table available for an in-place rollback.
+
+        The unreleased draft schema renamed ``translations`` to
+        ``translations_v1`` and reused the old name for v2. Normalize that
+        layout atomically while it is still safe to do so before v2.2.0.
+        """
+        primary_columns = self._table_columns(conn, "translations")
+        v2_columns = self._table_columns(conn, CACHE_TABLE)
+        draft_v1_columns = self._table_columns(conn, "translations_v1")
+
+        primary_is_v1 = self._table_matches_schema(
+            conn, "translations", V1_REQUIRED_SCHEMA
+        )
+        primary_is_v2 = self._table_matches_schema(
+            conn, "translations", V2_REQUIRED_SCHEMA
+        )
+
+        if primary_columns and (primary_is_v1 == primary_is_v2):
+            raise RuntimeError("unsupported translations cache schema")
+        if v2_columns and (
+            not self._table_matches_schema(conn, CACHE_TABLE, V2_REQUIRED_SCHEMA)
+            or "source_text" in v2_columns
+        ):
+            raise RuntimeError("translations_v2 does not contain the expected v2 schema")
+        if draft_v1_columns and not self._table_matches_schema(
+            conn, "translations_v1", V1_REQUIRED_SCHEMA
+        ):
+            raise RuntimeError("translations_v1 does not contain the expected v1 schema")
+
+        if primary_is_v2:
+            if v2_columns:
+                raise RuntimeError("ambiguous duplicate v2 cache tables")
+            conn.execute("ALTER TABLE translations RENAME TO translations_v2")
+            if draft_v1_columns:
+                conn.execute("ALTER TABLE translations_v1 RENAME TO translations")
+                log.warning(
+                    "Normalized draft cache layout; v1 remains available for rollback"
+                )
+            else:
+                log.warning(
+                    "Normalized draft v2 cache layout without a preserved v1 table"
+                )
+        elif not primary_columns and draft_v1_columns:
+            conn.execute("ALTER TABLE translations_v1 RENAME TO translations")
+            log.warning("Restored the preserved v1 table name for rollback")
 
     def _utc_now(self) -> datetime:
         value = self._now()
@@ -317,7 +399,7 @@ class CacheStore:
     ) -> str | None:
         cache_key = self.compute_key(text, source_lang, target_lang, cache_scope)
         row = self.connection().execute(
-            """SELECT translated_text FROM translations
+            """SELECT translated_text FROM translations_v2
                WHERE cache_key = ? AND created_at >= ?""",
             (cache_key, self._cutoff()),
         ).fetchone()
@@ -370,7 +452,7 @@ class CacheStore:
             accessed_at = self._utc_now().isoformat()
             try:
                 conn.executemany(
-                    """UPDATE translations
+                    """UPDATE translations_v2
                        SET hit_count = hit_count + ?, last_accessed_at = ?
                        WHERE cache_key = ?""",
                     [
@@ -402,7 +484,7 @@ class CacheStore:
         conn = self.connection()
         try:
             conn.execute(
-                """INSERT INTO translations (
+                """INSERT INTO translations_v2 (
                        cache_key, tenant_hash, book_hash, chapter_hash,
                        context_hash, source_lang, target_lang, translated_text,
                        provider, model, prompt_hash, protocol_version,
@@ -443,14 +525,14 @@ class CacheStore:
 
     def _delete_expired(self, conn: sqlite3.Connection) -> int:
         cursor = conn.execute(
-            "DELETE FROM translations WHERE created_at < ?", (self._cutoff(),)
+            "DELETE FROM translations_v2 WHERE created_at < ?", (self._cutoff(),)
         )
         return max(0, cursor.rowcount)
 
     def _enforce_cap(self, conn: sqlite3.Connection) -> None:
         conn.execute(
-            """DELETE FROM translations WHERE cache_key IN (
-                   SELECT cache_key FROM translations
+            """DELETE FROM translations_v2 WHERE cache_key IN (
+                   SELECT cache_key FROM translations_v2
                    ORDER BY last_accessed_at DESC, created_at DESC, cache_key DESC
                    LIMIT -1 OFFSET ?
                )""",
@@ -469,7 +551,7 @@ class CacheStore:
         conn = self.connection()
         try:
             cursor = conn.execute(
-                "DELETE FROM translations WHERE created_at < ?",
+                "DELETE FROM translations_v2 WHERE created_at < ?",
                 (self._cutoff(retention_days),),
             )
             deleted = max(0, cursor.rowcount)
@@ -492,15 +574,17 @@ class CacheStore:
             self._delete_expired(conn)
             self._enforce_cap(conn)
             conn.commit()
-            total = conn.execute("SELECT COUNT(*) FROM translations").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM translations_v2").fetchone()[0]
             total_hits = conn.execute(
-                "SELECT COALESCE(SUM(hit_count), 0) FROM translations"
+                "SELECT COALESCE(SUM(hit_count), 0) FROM translations_v2"
             ).fetchone()[0]
             pairs = conn.execute(
                 """SELECT source_lang, target_lang, COUNT(*)
-                   FROM translations GROUP BY source_lang, target_lang"""
+                   FROM translations_v2 GROUP BY source_lang, target_lang"""
             ).fetchall()
-            legacy_tables = conn.execute(
+            legacy_tables = int(
+                "source_text" in self._table_columns(conn, "translations")
+            ) + conn.execute(
                 """SELECT COUNT(*) FROM sqlite_master
                    WHERE type='table' AND name LIKE 'translations_v1%'"""
             ).fetchone()[0]

@@ -146,11 +146,17 @@ def run():
 
     # Input text that contains the legacy marker must remain ordinary content;
     # it must never create, renumber, or truncate a segment.
-    marker_text = "literal @@SEG 99@@ marker"
+    marker_texts = [
+        "@@SEG 99@@ marker at the start",
+        "literal @@SEG 99@@ marker in the middle",
+        "@@SEG 99@@ repeated @@SEG 99@@ marker",
+        "ordinary segment",
+    ]
     translated = __import__("translator").translate_batch(
-        [marker_text, "ordinary segment"], "English", "Spanish")
+        marker_texts, "English", "Spanish")
     check("segment protocol: marker-like ebook content is preserved",
-          translated[0][0] == f"[LOCAL] {marker_text}")
+          [item[0] for item in translated]
+          == [f"[LOCAL] {text}" for text in marker_texts])
 
     # Strict JSON response envelope: exact version, exact ordered IDs, no
     # duplicate keys, missing/extra/reordered items, or surrounding prose.
@@ -522,7 +528,7 @@ def run():
     poison_key = cache_mod.compute_cache_key(
         poison, "English", "Spanish", scope=poison_scope)
     rows_for_text = conn.execute(
-        "SELECT model FROM translations WHERE cache_key = ?",
+        "SELECT model FROM translations_v2 WHERE cache_key = ?",
         (poison_key,),
     ).fetchall()
     check("audit B4: cache row is tagged with the model that produced it",

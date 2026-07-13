@@ -90,9 +90,12 @@ JS/CSS-only change *might* work, but isn't guaranteed and isn't worth the ambigu
 ## Update the Frontend
 
 ```bash
-# 1. Pull latest from Gitea
+# 1. Select the immutable release source (never update production from main)
 cd /mnt/user/appdata/book-translator-api
-git pull origin main
+RELEASE_TAG=v2.2.0
+git fetch --tags origin
+git checkout --detach "$RELEASE_TAG"
+test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
 
 # 2. Copy updated files to the CWA overlay
 cp static/translator.js  /mnt/user/appdata/calibre-web-automated/overlay/translator.js
@@ -119,7 +122,16 @@ docker restart calibre-web-automated
 
 ```bash
 cd /mnt/user/appdata/book-translator-api
-git pull origin main
+test "$(git describe --tags --exact-match)" = "v2.2.0"
+
+# Stop the only writer and snapshot every private data file before the first
+# v2.2.0 start. Keep this directory through the rollback window.
+docker stop book-translator-api
+BACKUP_DIR="/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data"
+test ! -e "$BACKUP_DIR"
+install -d -m 0700 -- "$BACKUP_DIR"
+cp -a -- /mnt/user/appdata/book-translator-api/data/. "$BACKUP_DIR/"
+python3 -c 'import sqlite3; db=sqlite3.connect("/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data/translations.db"); db.execute("PRAGMA wal_checkpoint(TRUNCATE)"); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
 
 # Rebuild the image
 docker build -t local/book-translator-api:latest .
@@ -267,7 +279,7 @@ docker run -d \
   -v "/mnt/user/appdata/calibre-web-automated/overlay/read.html:/app/calibre-web-automated/cps/templates/read.html:ro" \
   -v "/mnt/user/appdata/calibre-web-automated/overlay/translator.js:/app/calibre-web-automated/cps/static/js/translator.js:ro" \
   -v "/mnt/user/appdata/calibre-web-automated/overlay/translator.css:/app/calibre-web-automated/cps/static/css/translator.css:ro" \
-  crocodilestick/calibre-web-automated:latest
+  crocodilestick/calibre-web-automated:v4.0.6
 ```
 
 ---
@@ -296,8 +308,11 @@ curl -s http://127.0.0.1:8390/health
 
 ## Rollback
 
-The installer does not create hidden backups. To roll back, check out the
-previous immutable release tag and rerun the same fail-closed installer:
+Schema v2 uses `translations_v2` and leaves the v1 `translations` table intact,
+so the previous release can use the same `/app/data` directory. The installer
+does not create hidden backups; keep the explicit offline snapshot made before
+the upgrade. To roll back, check out the previous immutable release tag and
+rerun the same fail-closed installer:
 
 ```bash
 cd /path/to/CWA-eBook-Translate-Plugin
@@ -309,7 +324,9 @@ Then open Unraid's **Docker** tab, edit `book-translator-api`, and click
 **Apply** (or **Force Update**) so Unraid recreates the API container from the
 rebuilt local image while preserving its configured `/app/data` bind mount and
 environment. Finally restart `calibre-web-automated` so it reloads the restored
-overlay files.
+overlay files. If the database fails its integrity check or startup, move the
+v2 database aside and restore the complete `pre-v2.2.0-app-data` snapshot
+before starting the previous image; never copy a live WAL database piecemeal.
 
 ---
 

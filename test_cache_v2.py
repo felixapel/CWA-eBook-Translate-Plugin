@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import sqlite3
 import stat
 import tempfile
 import unittest
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +42,29 @@ def scope(**overrides: str) -> CacheScope:
     }
     values.update(overrides)
     return CacheScope(**values)
+
+
+def create_v1_table(
+    conn: sqlite3.Connection,
+    table: str = "translations",
+    *,
+    primary_key: bool = True,
+) -> None:
+    if table not in {"translations", "translations_v1"}:
+        raise ValueError("unsupported v1 fixture table")
+    key_constraint = "PRIMARY KEY" if primary_key else "NOT NULL"
+    conn.execute(
+        f"""CREATE TABLE {table} (
+            cache_key TEXT {key_constraint},
+            source_text TEXT NOT NULL,
+            source_lang TEXT NOT NULL,
+            target_lang TEXT NOT NULL,
+            translated_text TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 1
+        )"""
+    )
 
 
 class CacheV2Tests(unittest.TestCase):
@@ -188,7 +213,7 @@ class CacheV2Tests(unittest.TestCase):
         columns = {
             row[1]
             for row in self.store.connection().execute(
-                "PRAGMA table_info(translations)"
+                "PRAGMA table_info(translations_v2)"
             )
         }
         self.assertNotIn("source_text", columns)
@@ -217,18 +242,7 @@ class CacheV2Tests(unittest.TestCase):
         self.cache_dir.mkdir(mode=0o700)
         self.db_path = self.cache_dir / "translations.db"
         conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            """CREATE TABLE translations (
-                cache_key TEXT PRIMARY KEY,
-                source_text TEXT NOT NULL,
-                source_lang TEXT NOT NULL,
-                target_lang TEXT NOT NULL,
-                translated_text TEXT NOT NULL,
-                model TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                hit_count INTEGER NOT NULL DEFAULT 1
-            )"""
-        )
+        create_v1_table(conn)
         conn.execute(
             "INSERT INTO translations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -257,10 +271,11 @@ class CacheV2Tests(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        self.assertIn("translations_v1", names)
         self.assertIn("translations", names)
+        self.assertIn("translations_v2", names)
+        self.assertNotIn("translations_v1", names)
         legacy_count = self.store.connection().execute(
-            "SELECT COUNT(*) FROM translations_v1"
+            "SELECT COUNT(*) FROM translations"
         ).fetchone()[0]
         self.assertEqual(legacy_count, 1)
         self.assertIsNone(
@@ -268,10 +283,325 @@ class CacheV2Tests(unittest.TestCase):
                 "legacy source", "English", "Spanish", scope(model="legacy-model")
             )
         )
+        self.store.put(
+            "v2 source", "English", "Spanish", "v2 target", scope()
+        )
+        legacy_conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(
+                legacy_conn.execute(
+                    "SELECT translated_text FROM translations WHERE cache_key = ?",
+                    ("legacy-key",),
+                ).fetchone()[0],
+                "legacy target",
+            )
+            legacy_conn.execute(
+                "INSERT INTO translations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "legacy-key-2",
+                    "second legacy source",
+                    "English",
+                    "French",
+                    "second legacy target",
+                    "legacy-model",
+                    self.clock().isoformat(),
+                    1,
+                ),
+            )
+            legacy_conn.commit()
+            self.assertEqual(
+                legacy_conn.execute("PRAGMA integrity_check").fetchone()[0],
+                "ok",
+            )
+        finally:
+            legacy_conn.close()
+        self.assertEqual(
+            self.store.get("v2 source", "English", "Spanish", scope()),
+            "v2 target",
+        )
         self.assertEqual(
             self.store.connection().execute("PRAGMA user_version").fetchone()[0],
             CACHE_SCHEMA_VERSION,
         )
+
+    def test_unreleased_draft_layout_is_normalized_atomically(self) -> None:
+        self.store.put(
+            "draft v2 source", "English", "Spanish", "draft v2 target", scope()
+        )
+        self.store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE translations_v2 RENAME TO translations")
+        create_v1_table(conn, "translations_v1")
+        conn.execute(
+            "INSERT INTO translations_v1 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "draft-v1-key",
+                "draft v1 source",
+                "English",
+                "Spanish",
+                "draft v1 target",
+                "legacy-model",
+                self.clock().isoformat(),
+                2,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        self.store = CacheStore(
+            self.db_path,
+            ttl_days=30,
+            max_entries=3,
+            now=self.clock,
+        )
+        names = {
+            row[0]
+            for row in self.store.connection().execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        self.assertIn("translations", names)
+        self.assertIn("translations_v2", names)
+        self.assertNotIn("translations_v1", names)
+        self.assertEqual(
+            self.store.connection().execute(
+                "SELECT translated_text FROM translations WHERE cache_key = ?",
+                ("draft-v1-key",),
+            ).fetchone()[0],
+            "draft v1 target",
+        )
+        self.assertEqual(
+            self.store.get("draft v2 source", "English", "Spanish", scope()),
+            "draft v2 target",
+        )
+        self.assertEqual(
+            self.store.connection().execute("PRAGMA integrity_check").fetchone()[0],
+            "ok",
+        )
+
+    def test_draft_normalization_rolls_back_if_second_rename_fails(self) -> None:
+        self.store.put(
+            "draft v2 source", "English", "Spanish", "draft v2 target", scope()
+        )
+        self.store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE translations_v2 RENAME TO translations")
+        create_v1_table(conn, "translations_v1")
+        conn.commit()
+        conn.close()
+
+        class FailingSecondRenameStore(CacheStore):
+            def _new_connection(self) -> sqlite3.Connection:
+                connection = super()._new_connection()
+
+                def deny_second_rename(
+                    action: int,
+                    _database: str | None,
+                    table: str | None,
+                    _source: str | None,
+                    _trigger: str | None,
+                ) -> int:
+                    if (
+                        action == sqlite3.SQLITE_ALTER_TABLE
+                        and table == "translations_v1"
+                    ):
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                connection.set_authorizer(deny_second_rename)
+                return connection
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            FailingSecondRenameStore(
+                self.db_path,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertEqual(names, {"translations", "translations_v1"})
+            self.assertIn(
+                "tenant_hash",
+                {row[1] for row in conn.execute("PRAGMA table_info(translations)")},
+            )
+            self.assertIn(
+                "source_text",
+                {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(translations_v1)")
+                },
+            )
+        finally:
+            conn.close()
+
+    def test_incomplete_existing_schemas_fail_closed(self) -> None:
+        self.store.close()
+
+        malformed_v1 = Path(self.tmp.name) / "malformed-v1" / "translations.db"
+        malformed_v1.parent.mkdir()
+        conn = sqlite3.connect(malformed_v1)
+        conn.execute("CREATE TABLE translations (source_text TEXT)")
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "unsupported translations"):
+            CacheStore(
+                malformed_v1,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+        malformed_v2 = Path(self.tmp.name) / "malformed-v2" / "translations.db"
+        malformed_v2.parent.mkdir()
+        conn = sqlite3.connect(malformed_v2)
+        conn.execute(
+            """CREATE TABLE translations_v2 (
+                cache_key TEXT PRIMARY KEY,
+                tenant_hash TEXT,
+                source_lang TEXT,
+                target_lang TEXT,
+                created_at TEXT,
+                last_accessed_at TEXT
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "translations_v2"):
+            CacheStore(
+                malformed_v2,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+    def test_corrupt_database_closes_connection_before_pragma_failure(self) -> None:
+        self.store.close()
+        corrupt_dir = Path(self.tmp.name) / "corrupt"
+        corrupt_dir.mkdir(mode=0o700)
+        corrupt_db = corrupt_dir / "translations.db"
+        corrupt_db.write_bytes(b"not a sqlite database")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            with self.assertRaises(sqlite3.DatabaseError):
+                CacheStore(
+                    corrupt_db,
+                    ttl_days=30,
+                    max_entries=3,
+                    now=self.clock,
+                )
+            gc.collect()
+
+        self.assertFalse(
+            [warning for warning in caught if warning.category is ResourceWarning]
+        )
+
+    def test_existing_schemas_without_primary_keys_fail_closed(self) -> None:
+        self.store.close()
+
+        malformed_v1 = Path(self.tmp.name) / "unkeyed-v1" / "translations.db"
+        malformed_v1.parent.mkdir()
+        conn = sqlite3.connect(malformed_v1)
+        create_v1_table(conn, primary_key=False)
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "unsupported translations"):
+            CacheStore(
+                malformed_v1,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+        malformed_v2 = Path(self.tmp.name) / "unkeyed-v2" / "translations.db"
+        malformed_v2.parent.mkdir()
+        conn = sqlite3.connect(malformed_v2)
+        conn.execute(
+            """CREATE TABLE translations_v2 (
+                cache_key TEXT NOT NULL,
+                tenant_hash TEXT NOT NULL,
+                book_hash TEXT NOT NULL,
+                chapter_hash TEXT NOT NULL,
+                context_hash TEXT NOT NULL,
+                source_lang TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                translated_text TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                protocol_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_accessed_at TEXT NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "translations_v2"):
+            CacheStore(
+                malformed_v2,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+    def test_v2_schema_with_source_text_fails_closed(self) -> None:
+        self.store.put("private source", "English", "Spanish", "privado", scope())
+        self.store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE translations_v2 ADD COLUMN source_text TEXT")
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "translations_v2"):
+            CacheStore(
+                self.db_path,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+    def test_v2_schema_with_composite_primary_key_fails_closed(self) -> None:
+        self.store.put("private source", "English", "Spanish", "privado", scope())
+        self.store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE translations_v2 RENAME TO valid_v2")
+        definition = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='valid_v2'"
+        ).fetchone()[0]
+        columns = definition[definition.index("(") + 1 : definition.rindex(")")]
+        columns = columns.replace("cache_key TEXT PRIMARY KEY", "cache_key TEXT")
+        conn.execute(
+            f"CREATE TABLE translations_v2 ({columns}, extra_pk TEXT, "
+            "PRIMARY KEY (cache_key, extra_pk))"
+        )
+        conn.execute("DROP TABLE valid_v2")
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "translations_v2"):
+            CacheStore(
+                self.db_path,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
 
     def test_invalid_retention_configuration_fails_closed(self) -> None:
         bad_db = Path(self.tmp.name) / "bad" / "cache.db"

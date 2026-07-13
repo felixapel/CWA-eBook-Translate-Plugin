@@ -1,6 +1,7 @@
 # ADR-003: Use an atomically scoped private cache
 
-- Status: Accepted
+- Status: Accepted; migration layout amended by
+  [ADR-009](ADR-009-side-by-side-cache-schemas.md)
 - Date: 2026-07-12
 
 ## Context
@@ -27,9 +28,10 @@ enabled.
 
 ## Consequences
 
-- Existing `translations` v1 tables are renamed and preserved for rollback but
-  are cold after upgrade. Operators may remove them after accepting the new
-  release.
+- Existing `translations` v1 rows remain cold under v2. The physical table is
+  left intact for rollback; schema-v2 rows live in `translations_v2` as defined
+  by ADR-009. Operators may remove v1 only after accepting the new release and
+  its rollback window.
 - Context-sensitive correctness and tenant privacy take precedence over reuse
   across unrelated books or request groupings.
 - The server-owned authenticated subject is the tenant namespace. CWA sessions

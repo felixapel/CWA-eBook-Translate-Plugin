@@ -79,6 +79,11 @@ build/runtime smoke test. No workflow step receives a publication credential.
 5. Fast-forward the GitHub mirror and verify both `main` refs resolve to that
    exact commit.
 
+For the v1-to-v2 cache transition, `test_cache_v2` is a release blocker. It
+must prove that `translations` remains readable/writable by the v2.1.4 schema,
+that v2 uses `translations_v2`, and that the unreleased draft layout is
+normalized without losing either table.
+
 ## Create the source release
 
 Create one annotated tag object and push it to GitHub first because Gitea's
@@ -104,16 +109,112 @@ increment the version, and create a new tag.
 
 ## Install or roll back
 
-Clone or check out the desired official tag and build it locally:
+An existing reference-Compose v2.1.4 deployment must use the migration below
+**before any v2.2.0 container starts**. The old release used one combined
+`book-translator` container and the `./config/translator` bind mount; v2.2.0
+uses split API/proxy roles and a named volume. They are not interchangeable
+without an explicit copy.
+
+### Upgrade the reference Compose deployment from v2.1.4
+
+Start from the v2.1.4 checkout. Stop the only writer, then create a new offline
+snapshot outside the Git checkout so `cleanup_token` can never become an
+untracked repository file:
+
+```bash
+git checkout v2.1.4
+test "$(git describe --tags --exact-match)" = "v2.1.4"
+docker stop book-translator
+
+SOURCE_ROOT="$(pwd -P)"
+OLD_DATA_DIR="$SOURCE_ROOT/config/translator"
+OLD_IMAGE_ID="$(docker inspect book-translator --format '{{.Image}}')"
+test -d "$OLD_DATA_DIR"
+test -n "$OLD_IMAGE_ID"
+BT_BACKUP_DIR="$HOME/cwa-backups/pre-v2.2.0-app-data"
+export BT_BACKUP_DIR="$(realpath -m "$BT_BACKUP_DIR")"
+case "$BT_BACKUP_DIR/" in "$SOURCE_ROOT/"*) echo "backup must be outside the checkout" >&2; exit 1;; esac
+test ! -e "$BT_BACKUP_DIR"
+install -d -m 0700 -- "$BT_BACKUP_DIR"
+docker run --rm --user 0:0 --entrypoint /bin/sh \
+  --mount "type=bind,src=$OLD_DATA_DIR,dst=/source,readonly" \
+  --mount "type=bind,src=$BT_BACKUP_DIR,dst=/target" \
+  "$OLD_IMAGE_ID" -ec 'cp -a /source/. /target/'
+docker run --rm --user 0:0 --entrypoint python \
+  --mount "type=bind,src=$BT_BACKUP_DIR,dst=/backup" \
+  "$OLD_IMAGE_ID" -c 'import sqlite3; db=sqlite3.connect("/backup/translations.db"); db.execute("PRAGMA wal_checkpoint(TRUNCATE)"); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
+```
+
+Leave the stopped `book-translator` container in place as the exact rollback
+runtime; do not use `docker compose rm` or `--remove-orphans`. Check out the new
+tag, build its image, create its still-stopped API container and copy the
+offline snapshot into the new named volume:
 
 ```bash
 git checkout v2.2.0
+test "$(git describe --tags --exact-match)" = "v2.2.0"
+export BT_PUBLIC_ORIGIN=http://192.168.1.10:8084  # replace with your origin
+docker compose build book-translator-api
+docker compose create --no-deps book-translator-api
+API_CONTAINER="$(docker compose ps -aq book-translator-api)"
+test -n "$API_CONTAINER"
+DATA_VOLUME="$(docker inspect "$API_CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}')"
+test -n "$DATA_VOLUME"
+
+docker run --rm --user 0:0 --entrypoint /bin/sh \
+  --mount "type=bind,src=$BT_BACKUP_DIR,dst=/source,readonly" \
+  --mount "type=volume,src=$DATA_VOLUME,dst=/target" \
+  cwa-ebook-translate-plugin:local -ec '
+    test -z "$(find /target -mindepth 1 -maxdepth 1 -print -quit)"
+    cp -a /source/. /target/
+    chown -R 101:102 /target
+    chmod 0700 /target
+    find /target -mindepth 1 -maxdepth 1 -type f -exec chmod 0600 {} +
+  '
+docker run --rm --user 101:102 --entrypoint python \
+  --mount "type=volume,src=$DATA_VOLUME,dst=/app/data,readonly" \
+  cwa-ebook-translate-plugin:local -c 'import sqlite3; db=sqlite3.connect("file:/app/data/translations.db?mode=ro&immutable=1", uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
+
 docker compose up -d --build
+curl -fsS http://127.0.0.1:8084/bt-api/ping
 ```
 
-Rollback uses the same command after checking out an earlier immutable tag.
-Preserve the existing data volume unless the version's migration notes say
-otherwise.
+Schema v2 writes `translations_v2` and leaves the v1 `translations` table
+intact inside the copied database. Keep both the external snapshot and the
+stopped old container through the rollback window.
+
+To roll back, stop and remove only the new translator roles. Never add `-v` or
+run `docker compose down -v`: the named v2 volume is retained for diagnosis or
+re-upgrade. Restore the old Compose topology, then restart the preserved exact
+v2.1.4 container, which still uses the untouched v1 bind mount:
+
+```bash
+export BT_PUBLIC_ORIGIN=http://192.168.1.10:8084  # same value used above
+docker compose stop book-translator-proxy book-translator-api
+docker compose rm -f book-translator-proxy book-translator-api
+git checkout v2.1.4
+test "$(git describe --tags --exact-match)" = "v2.1.4"
+test "$(docker inspect book-translator --format '{{.State.Status}}')" = "exited"
+docker compose up -d --no-build --pull never calibre-web
+docker start book-translator
+curl -fsS http://127.0.0.1:8390/ping
+```
+
+If the old container was deleted, stop: do not use the mutable `latest` image
+in the v2.1.4 Compose file. Recreate it only from the exact v2.1.4 source and
+the recorded environment. The external snapshot is the authoritative v1
+recovery copy; the retained named volume is the authoritative v2 copy.
+
+### Fresh v2.2.0 install
+
+With no previous translator deployment, clone or check out the official tag,
+set the exact browser origin and build locally:
+
+```bash
+git checkout v2.2.0
+export BT_PUBLIC_ORIGIN=http://192.168.1.10:8084  # replace with your origin
+docker compose up -d --build
+```
 
 ## Historical split tag
 
