@@ -48,6 +48,12 @@ class ShellContractTests(unittest.TestCase):
     def test_install_reads_paths_verbatim(self):
         source = (ROOT / "install_unraid.sh").read_text()
         self.assertRegex(source, r"\bread\s+-r(?:\s+-p)?\s+")
+        self.assertIn('mkdir -p -- "$CWA_PATH/overlay"', source)
+        self.assertIn(
+            'cp -- "$SCRIPT_DIR/overlay/read.html" '
+            '"$CWA_PATH/overlay/read.html"',
+            source,
+        )
 
 
 if __name__ == "__main__":
