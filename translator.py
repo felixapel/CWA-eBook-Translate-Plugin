@@ -14,6 +14,7 @@ import math
 import os
 import re
 import secrets
+import threading as _threading
 import time
 import logging
 import requests
@@ -202,15 +203,53 @@ class SegmentProtocolError(RuntimeError):
 
 # ── Per-provider request helpers ─────────────────────────────────────────────
 
-def _read_capped_json_response(response) -> object:
-    """Decode one provider response without buffering more than the byte cap.
+def _close_provider_response(response) -> None:
+    """Best-effort close used by normal cleanup and the deadline watchdog."""
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            # Cleanup must not replace the provider/deadline failure.
+            log.debug(
+                "provider response close failed error_type=%s",
+                type(exc).__name__,
+            )
+
+
+def _read_capped_json_response(response, budget: WorkBudget) -> object:
+    """Decode a provider response within the byte and absolute time caps.
 
     Real ``requests.Response`` objects expose ``iter_content``. The ``json``
     fallback keeps the project's small in-memory test doubles compatible while
-    applying the same cap to their serialized payload.
+    applying the same cap to their serialized payload. ``requests`` read
+    timeouts only bound socket inactivity; the watchdog closes a response that
+    keeps dripping bytes beyond the request's absolute deadline.
     """
+    budget.ensure_active()
+    remaining = budget.remaining_seconds()
+    if remaining <= 0:
+        raise WorkBudgetExceeded("deadline")
+
+    deadline_reached = _threading.Event()
+
+    def abort_at_deadline() -> None:
+        deadline_reached.set()
+        _close_provider_response(response)
+
+    deadline_timer = _threading.Timer(remaining, abort_at_deadline)
+    deadline_timer.daemon = True
+    deadline_timer.start()
+
+    def ensure_response_active() -> None:
+        if deadline_reached.is_set():
+            raise WorkBudgetExceeded("deadline")
+        budget.ensure_active()
+
     try:
+        ensure_response_active()
         response.raise_for_status()
+        ensure_response_active()
         headers = getattr(response, "headers", {}) or {}
         try:
             declared_size = int(headers.get("Content-Length", "0"))
@@ -223,6 +262,7 @@ def _read_capped_json_response(response) -> object:
         if callable(iter_content):
             payload = bytearray()
             for chunk in iter_content(chunk_size=64 * 1024):
+                ensure_response_active()
                 if not chunk:
                     continue
                 if not isinstance(chunk, bytes):
@@ -231,19 +271,27 @@ def _read_capped_json_response(response) -> object:
                     raise _ProviderResponseTooLarge(
                         "provider response exceeds byte cap")
                 payload.extend(chunk)
-            return json.loads(payload.decode("utf-8", errors="strict"))
+            ensure_response_active()
+            body = json.loads(payload.decode("utf-8", errors="strict"))
+            ensure_response_active()
+            return body
 
         body = response.json()
+        ensure_response_active()
         encoded = json.dumps(
             body, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8", errors="strict")
         if len(encoded) > BT_MAX_UPSTREAM_RESPONSE_BYTES:
             raise _ProviderResponseTooLarge("provider response exceeds byte cap")
+        ensure_response_active()
         return body
+    except Exception:
+        if deadline_reached.is_set():
+            raise WorkBudgetExceeded("deadline") from None
+        raise
     finally:
-        close = getattr(response, "close", None)
-        if callable(close):
-            close()
+        deadline_timer.cancel()
+        _close_provider_response(response)
 
 
 def _validate_provider_text(value: object) -> str:
@@ -257,7 +305,14 @@ def _validate_provider_text(value: object) -> str:
         raise _ProviderResponseTooLarge("provider translation exceeds byte cap")
     return translated
 
-def _translate_openai(p: _Provider, user_content: str, system_prompt: str, timeout: int, max_tokens: int) -> str:
+def _translate_openai(
+    p: _Provider,
+    user_content: str,
+    system_prompt: str,
+    timeout: float,
+    max_tokens: int,
+    budget: WorkBudget,
+) -> str:
     headers = {"Content-Type": "application/json"}
     if p.api_key:
         headers["Authorization"] = f"Bearer {p.api_key}"
@@ -274,13 +329,20 @@ def _translate_openai(p: _Provider, user_content: str, system_prompt: str, timeo
 
     resp = requests.post(
         p.url, headers=headers, json=payload, timeout=timeout, stream=True)
-    body = _read_capped_json_response(resp)
+    body = _read_capped_json_response(resp, budget)
 
     content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
     return _validate_provider_text(content)
 
 
-def _translate_anthropic(p: _Provider, user_content: str, system_prompt: str, timeout: int, max_tokens: int) -> str:
+def _translate_anthropic(
+    p: _Provider,
+    user_content: str,
+    system_prompt: str,
+    timeout: float,
+    max_tokens: int,
+    budget: WorkBudget,
+) -> str:
     headers = {"Content-Type": "application/json"}
     if "minimax" in p.url:
         headers["Authorization"] = f"Bearer {p.api_key}"
@@ -298,7 +360,7 @@ def _translate_anthropic(p: _Provider, user_content: str, system_prompt: str, ti
 
     resp = requests.post(
         p.url, headers=headers, json=payload, timeout=timeout, stream=True)
-    body = _read_capped_json_response(resp)
+    body = _read_capped_json_response(resp, budget)
 
     content = body.get("content", [])
     translated = "".join(
@@ -316,7 +378,6 @@ def _translate_anthropic(p: _Provider, user_content: str, system_prompt: str, ti
 # is a PROCESS-WIDE cap on in-flight provider calls. Production defaults are
 # intentionally finite; zero/negative values fail startup instead of silently
 # disabling the control.
-import threading as _threading
 BT_MAX_UPSTREAM_INFLIGHT = int(os.environ.get("BT_MAX_UPSTREAM_INFLIGHT", "2"))
 BT_UPSTREAM_QUEUE_TIMEOUT = float(os.environ.get("BT_UPSTREAM_QUEUE_TIMEOUT", "2"))
 BT_REQUEST_MAX_ATTEMPTS = int(os.environ.get("BT_REQUEST_MAX_ATTEMPTS", "20"))
@@ -393,9 +454,11 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                     raise WorkBudgetExceeded("deadline")
                 if p.api_type == "openai":
                     return _translate_openai(
-                        p, user_content, system_prompt, call_timeout, max_tokens)
+                        p, user_content, system_prompt, call_timeout, max_tokens,
+                        budget)
                 return _translate_anthropic(
-                    p, user_content, system_prompt, call_timeout, max_tokens)
+                    p, user_content, system_prompt, call_timeout, max_tokens,
+                    budget)
             finally:
                 _UPSTREAM_SEM.release()
         except WorkBudgetExceeded:

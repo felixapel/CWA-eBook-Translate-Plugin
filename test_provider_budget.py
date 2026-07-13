@@ -114,6 +114,105 @@ class ProviderBudgetTests(unittest.TestCase):
         self.assertEqual(response.chunks_read, 2)
         self.assertTrue(response.closed)
 
+    def test_drip_stream_stops_at_absolute_deadline_and_releases_slot(self):
+        class FakeClock:
+            def __init__(self):
+                self.now = 10.0
+
+            def __call__(self):
+                return self.now
+
+        clock = FakeClock()
+
+        class DripStreamingResponse:
+            status_code = 200
+            headers = {}
+
+            def __init__(self):
+                self.chunks_read = 0
+                self.closed = False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                self.asserted_chunk_size = chunk_size
+                for chunk in (b"{", b'"choices"', b":", b"[]}"):
+                    clock.now += 0.4
+                    self.chunks_read += 1
+                    yield chunk
+
+            def close(self):
+                self.closed = True
+
+        budget = WorkBudget(
+            max_attempts=1,
+            max_input_bytes=1_000_000,
+            max_output_tokens=1_000_000,
+            deadline_seconds=0.9,
+            clock=clock,
+        )
+        response = DripStreamingResponse()
+        translator.requests.post = lambda *_args, **_kwargs: response
+        translator._fallback_provider = None
+        translator._UPSTREAM_SEM = threading.BoundedSemaphore(1)
+
+        with self.assertRaises(WorkBudgetExceeded) as raised:
+            translator.translate_text(
+                "hello", max_retries=1, budget=budget)
+
+        self.assertEqual(raised.exception.reason, "deadline")
+        self.assertEqual(response.chunks_read, 3)
+        self.assertTrue(response.closed)
+        slot_released = translator._UPSTREAM_SEM.acquire(blocking=False)
+        self.assertTrue(slot_released)
+        if slot_released:
+            translator._UPSTREAM_SEM.release()
+
+    def test_deadline_closes_blocked_stream_and_releases_slot(self):
+        class BlockingStreamingResponse:
+            status_code = 200
+            headers = {}
+
+            def __init__(self):
+                self.closed = False
+                self.unblocked = threading.Event()
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                self.asserted_chunk_size = chunk_size
+                self.unblocked.wait(timeout=2)
+                if not self.closed:
+                    yield b"{}"
+
+            def close(self):
+                self.closed = True
+                self.unblocked.set()
+
+        response = BlockingStreamingResponse()
+        translator.requests.post = lambda *_args, **_kwargs: response
+        translator._fallback_provider = None
+        translator._UPSTREAM_SEM = threading.BoundedSemaphore(1)
+
+        started = time.monotonic()
+        with self.assertRaises(WorkBudgetExceeded) as raised:
+            translator.translate_text(
+                "hello",
+                max_retries=1,
+                budget=self.budget(max_attempts=1, deadline_seconds=0.05),
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(raised.exception.reason, "deadline")
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(response.closed)
+        slot_released = translator._UPSTREAM_SEM.acquire(blocking=False)
+        self.assertTrue(slot_released)
+        if slot_released:
+            translator._UPSTREAM_SEM.release()
+
     def test_final_failed_attempt_does_not_sleep(self):
         sleeps = []
 
