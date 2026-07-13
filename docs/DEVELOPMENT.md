@@ -64,7 +64,10 @@ BT_RATE_LIMIT_TEST_COOKIE='session=<opaque-value>' \
 ```
 
 It exits nonzero on connection/authentication errors, unexpected statuses, or
-if it does not observe both an admitted request and a `429` response.
+if it does not observe both an admitted request and a `429` response. The probe
+ignores inherited `HTTP_PROXY`/`HTTPS_PROXY` settings, refuses redirects and URL
+credentials, streams no response body, and closes each response immediately so
+the token or CWA cookie stays bound to the explicitly selected origin.
 
 ## Frontend Development
 

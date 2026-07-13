@@ -232,5 +232,6 @@ docker inspect calibre-web-automated --format "{{range .Mounts}}{{.Source}} -> {
   token mode or `BT_RATE_LIMIT_TEST_COOKIE` through the proxy for CWA-session
   mode), a fresh limiter window, and `--requests` greater than the server's
   `BT_RATE_LIMIT_PER_MINUTE`. It uses same-language requests and does not spend
-  provider capacity.
+  provider capacity. The probe deliberately ignores shell proxy variables and
+  refuses HTTP redirects; pass the final HTTP(S) API base URL directly.
 - For mocked tests with no live server required, use `test_translation.py` instead.

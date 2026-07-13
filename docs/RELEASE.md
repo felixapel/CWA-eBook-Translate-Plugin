@@ -19,8 +19,8 @@ Complete these once before the first production release:
 - Keep normal preflight/backend/frontend jobs on the trusted `ubuntu-latest`
   label. Assign Docker smoke and publication jobs to the trusted, serialized
   `weebdb-docker` host label with a working Docker daemon, binfmt/QEMU support,
-  and outbound HTTPS to GitHub, GHCR, Docker Hub (when enabled), Sigstore
-  services, and action sources.
+  an `x86_64` host, and outbound HTTPS to GitHub, GHCR, Docker Hub (when
+  enabled), Sigstore services, and action sources.
 - Do not start another stable release until the current `publish` job has
   finished. Gitea 1.26 does not provide a release concurrency gate that this
   workflow can rely on; overlapping builds could move `latest` or `MAJOR.MINOR`
@@ -102,6 +102,16 @@ source material fields, and bind the normalized base-image identity to its
 pinned digest in `resolvedDependencies`/`materials`; values in labels or
 unrelated metadata do not satisfy policy. A missing secret, signature, tag,
 platform, package inventory, or source identity fails the release.
+The privileged publish job also installs the exact amd64 Buildx release asset
+only after checking its committed SHA-256, pins both the binfmt/QEMU and
+BuildKit images by version plus OCI index digest, limits emulation to the two
+release architectures, and replaces setup-buildx's default insecure
+entitlements with an explicit policy. Buildx 0.35 automatically authorizes
+`network.host` for its container driver, so the workflow confines that builder
+container to Docker's bridge network, verifies the exact effective daemon
+flags, forbids `security.insecure`, and never grants the matching client-side
+`allow` required to exercise the entitlement. These pins make the builder and
+emulator reviewable release inputs instead of mutable runner state.
 These checks follow Docker's documented [immutable Git context](https://docs.docker.com/build/concepts/context/#git-repositories)
 and [BuildKit SLSA field](https://docs.docker.com/build/metadata/attestations/slsa-definitions/)
 contracts.
@@ -150,13 +160,17 @@ contracts.
    ./scripts/container-smoke.sh "$CANDIDATE_IMAGE" "cwa-release-$CANDIDATE_SHA"
    ```
 
-The base image digest, Alpine package versions, third-party Action commits, and
-Python/npm locks are release inputs. Update them only in a reviewed change that
-regenerates the relevant lock/contract and proves the container build. Exact APK
-pins intentionally fail closed when an Alpine repository stops serving an
-approved version; select and review the replacement instead of loosening pins.
+The base image digest, Alpine package versions, third-party Action commits,
+Buildx asset checksum, BuildKit/binfmt image digests, and Python/npm locks are
+release inputs. Update them only in a protected change that regenerates the
+relevant lock/contract, records the maintainer's self-review, and proves the
+container build. Exact APK pins intentionally fail closed when an Alpine
+repository stops serving an approved version; select and re-audit the
+replacement instead of loosening pins.
 
-4. Merge through Gitea and wait for all required `main` checks.
+4. Record the maintainer self-review, merge through protected Gitea, and wait
+   for all required checks on the exact resulting `main` commit. No human
+   approval count is assumed for this single-maintainer repository.
 5. Mirror the exact `main` commit to GitHub and verify both remotes resolve to
    the same commit.
 

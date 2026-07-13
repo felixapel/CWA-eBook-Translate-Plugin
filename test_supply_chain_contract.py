@@ -48,6 +48,19 @@ SBOM_GENERATOR = (
     "docker.io/docker/buildkit-syft-scanner@"
     "sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
 )
+BUILDX_VERSION = "v0.35.0"
+BUILDX_COMMIT = "a319e5b15052cf6557ceb666eb8ff6e32380b782"
+BUILDX_ASSET_SHA256 = (
+    "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda"
+)
+BUILDKIT_IMAGE = (
+    "moby/buildkit:v0.30.0@"
+    "sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f"
+)
+BINFMT_IMAGE = (
+    "tonistiigi/binfmt:qemu-v10.2.3@"
+    "sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
+)
 APK_PACKAGES = {
     "libgomp": "15.2.0-r5",
     "libxml2": "2.13.9-r2",
@@ -216,6 +229,33 @@ class SupplyChainContractTests(unittest.TestCase):
         release = (ROOT / ".gitea" / "workflows" / "release.yml").read_text()
         self.assertIn(f"sbom: generator={SBOM_GENERATOR}", release)
         self.assertNotRegex(release, r"(?m)^\s+sbom:\s+true\s*$")
+
+    def test_release_builder_and_emulator_are_immutable_and_minimal(self):
+        release = (ROOT / ".gitea" / "workflows" / "release.yml").read_text()
+        self.assertIn(f"image: {BINFMT_IMAGE}", release)
+        self.assertIn("platforms: arm64,amd64", release)
+        self.assertIn(f'BUILDX_VERSION: "{BUILDX_VERSION}"', release)
+        self.assertIn(f'BUILDX_COMMIT: "{BUILDX_COMMIT}"', release)
+        self.assertIn(f'BUILDX_SHA256: "{BUILDX_ASSET_SHA256}"', release)
+        self.assertIn(
+            "https://github.com/docker/buildx/releases/download/"
+            '${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64',
+            release,
+        )
+        self.assertIn("sha256sum --check --strict", release)
+        self.assertIn("cache-binary: false", release)
+        self.assertIn(f"image={BUILDKIT_IMAGE}", release)
+        self.assertIn("network=bridge", release)
+        self.assertIn("buildkitd-flags: --log-level=info", release)
+        self.assertIn(
+            '"--log-level=info --allow-insecure-entitlement=network.host"',
+            release,
+        )
+        self.assertIn('test "$version" = "v0.30.0"', release)
+        self.assertNotRegex(release, r"(?m)^\s+allow:\s*")
+        self.assertNotIn("tonistiigi/binfmt:latest", release)
+        self.assertNotIn("moby/buildkit:latest", release)
+        self.assertNotIn("security.insecure", release)
 
 
 if __name__ == "__main__":

@@ -121,10 +121,57 @@ jobs:
         run: |
           mkdir -p "$DOCKER_CONFIG"
           chmod 700 "$DOCKER_CONFIG"
+      - name: Install the reviewed Buildx binary
+        env:
+          BUILDX_VERSION: "v0.35.0"
+          BUILDX_COMMIT: "a319e5b15052cf6557ceb666eb8ff6e32380b782"
+          BUILDX_SHA256: "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda"
+        run: |
+          set -eu
+          test "$(uname -m)" = x86_64
+          if ! command -v curl >/dev/null 2>&1; then
+            apt-get update && apt-get install -y --no-install-recommends curl
+          fi
+          plugin_dir="$DOCKER_CONFIG/cli-plugins"
+          plugin="$plugin_dir/docker-buildx"
+          mkdir -p "$plugin_dir"
+          timeout 120 curl --proto '=https' --tlsv1.2 --fail --location \
+            --silent --show-error --output "$plugin" \
+            "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
+          printf '%s  %s\n' "$BUILDX_SHA256" "$plugin" | \
+            sha256sum --check --strict
+          chmod 0755 "$plugin"
+          test "$(docker buildx version)" = \
+            "github.com/docker/buildx ${BUILDX_VERSION} ${BUILDX_COMMIT}"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64,amd64
+          cache-image: false
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          cache-binary: false
+          driver-opts: |
+            image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+            network=bridge
+          buildkitd-flags: --log-level=info
+      - name: Verify release builder authority
+        env:
+          BUILDER_NAME: ${{ steps.buildx.outputs.name }}
+        run: |
+          set -eu
+          builder_info=$(docker buildx inspect --builder "$BUILDER_NAME")
+          flags=$(printf '%s\n' "$builder_info" | \
+            sed -n 's/^BuildKit daemon flags:[[:space:]]*//p')
+          version=$(printf '%s\n' "$builder_info" | \
+            sed -n 's/^BuildKit version:[[:space:]]*//p')
+          test "$flags" = \
+            "--log-level=info --allow-insecure-entitlement=network.host"
+          test "$version" = "v0.30.0"
+          printf '%s\n' "$builder_info" | grep -F 'network="bridge"' >/dev/null
       - name: Ensure release tag renderer is available
         run: |
           if ! command -v python3 >/dev/null 2>&1 || \

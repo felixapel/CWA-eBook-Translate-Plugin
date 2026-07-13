@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Python dependencies, audit/compiler tooling, npm artifacts, the Python base
   image, direct/transitive Alpine packages, Node.js, and third-party Actions are
   pinned to reviewed versions, hashes, digests, or commits.
+- The privileged release builder no longer inherits mutable Buildx,
+  BuildKit, or binfmt/QEMU tooling: the Buildx asset is SHA-256 checked, both
+  helper images are digest-pinned, emulation is platform-scoped, and the
+  builder is bridge-confined with `security.insecure` and client-side
+  entitlement grants forbidden.
 - The published image now declares its stable non-root user; API and nginx run
   as independent roles with read-only root filesystems, zero capabilities, and
   no root ownership-repair supervisor in the recommended Compose topology.
@@ -94,7 +99,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and GitHub CI definitions remain byte-identical by contract.
 - The live rate-limit probe is import-safe, authenticated, timeout-bounded, and
   fails closed while using same-language requests that never call a provider.
-  Output-token scaling also rejects non-finite or non-positive startup values.
+  It ignores inherited HTTP proxies, refuses redirects/URL credentials, and
+  closes streamed responses without reading their bodies. Output-token scaling
+  also rejects non-finite or non-positive startup values.
 - `/ping`, `/health`, and `/ready` are cheap local probes; `/health/deep` is the
   explicit authenticated provider diagnostic.
 - Deployment helpers use strict shell mode, safe remote argument serialization,

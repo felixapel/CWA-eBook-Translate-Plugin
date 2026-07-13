@@ -21,6 +21,19 @@ is not automatically an identity trusted by the public Sigstore Fulcio service.
 
 - The release workflow signs each enabled registry repository at the exact
   multi-platform digest returned by the one Buildx publish step.
+- BuildKit's default OCI attestation manifests are members of that
+  multi-platform image index, so the Cosign signature over the exact index
+  digest also binds the attached provenance and SPDX manifests that policy
+  reads back. The workflow pins the BuildKit image digest to freeze that
+  attestation representation.
+- Buildx is installed from one versioned amd64 release asset only after its
+  committed SHA-256 is verified. The BuildKit and binfmt/QEMU images are pinned
+  by version and OCI index digest; only amd64/arm64 emulation is registered, and
+  the builder container uses Docker bridge networking. Buildx 0.35 adds the
+  daemon-side `network.host` authorization for container drivers; the workflow
+  verifies that it is the only such authorization, forbids
+  `security.insecure`, and never supplies the separate build-client `allow`
+  needed to exercise it.
 - Cosign 3.0.6 and its installer action are pinned. The installer verifies the
   downloaded binary against the reviewed release digest.
 - An encrypted self-managed private key and password live only in Gitea Actions
@@ -66,6 +79,9 @@ authenticate the publisher.
 - The public source mirror must remain reachable after preflight because
   BuildKit fetches the already-verified commit directly; its SHA prevents a
   moved branch or tag from changing the build input.
+- Updating Buildx, BuildKit, binfmt/QEMU, or their checksums/digests requires a
+  release-policy self-review and the full protected gate; silent runner-side
+  upgrades cannot alter a release build.
 - Compromise of the signing key requires immediate key rotation, removal of
   mutable aliases to affected digests, and a new version; existing tags are not
   rewritten.

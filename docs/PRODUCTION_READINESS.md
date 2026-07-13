@@ -35,7 +35,7 @@ by an authorized Gitea operator.
 | F-10 nested retries without coalescing | Implemented and gated | Absolute request budgets, bounded admission, and `singleflight.py` coalesce equivalent active work; the browser does not retry ambiguous provider work. |
 | F-11 public provider-backed health probe | Implemented and gated | `/ping`, `/health`, and `/ready` are shallow; authenticated `/health/deep` uses the normal provider budget. |
 | F-12 browser token in `localStorage` | Implemented and gated | The recommended topology validates the existing HttpOnly CWA session and browser loaders no longer recover a shared secret from storage. |
-| F-13 unsigned, weakly reproducible supply chain | Implemented and gated, plus operator prerequisites | Inputs are pinned; the release workflow requires SPDX/provenance, signs exact digests, and immediately verifies source, base image, platforms, tags, and inventories. Signing keys and registry credentials remain operator-owned. |
+| F-13 unsigned, weakly reproducible supply chain | Implemented and gated, plus operator prerequisites | Actions, Buildx, BuildKit, binfmt/QEMU, dependencies, and base inputs are pinned; the release workflow requires SPDX/provenance, signs the exact index that contains those attestation manifests, and immediately verifies source, base image, platforms, tags, and inventories. Signing keys and registry credentials remain operator-owned. |
 | F-14 CI could skip artifact and contract checks | Implemented and gated | Docker absence is fatal; backend, frontend, Chromium, dependency, proxy, and non-root artifact gates are mandatory. |
 | F-15 sensitive fallback and error leakage | Implemented and gated | Cloud fallback requires per-request consent; response sizes and error/log envelopes are bounded and sanitized. |
 | F-16 privileged combined runtime | Implemented and gated | API and proxy are independent non-root roles with read-only roots, zero capabilities, and clean independent shutdown. |
@@ -68,7 +68,7 @@ all of these outcomes without a skipped or unavailable gate:
    registries, platforms, signatures, provenance sources, base images, or SBOM
    inventories.
 
-The final local audit run on 2026-07-13 passed the backend matrix (172 contract
+The final local audit run on 2026-07-13 passed the backend matrix (184 contract
 tests plus the standalone translation and hardening suites), frontend unit
 tests, three Chromium scenarios, Python and npm vulnerability audits, the live
 rate-limit probe, the multi-platform attestation verifier, and the container
@@ -91,8 +91,10 @@ Before creating the first post-audit version tag, an authorized operator must:
   Docker Hub secrets or neither;
 - distribute the Cosign public key and record its SHA-256 fingerprint in the
   deployment trust policy;
-- merge through review, wait for all protected checks on the exact `main`
-  commit, and mirror that commit to GitHub before creating the annotated tag;
+- complete and record the single maintainer's self-review, merge through the
+  protected branch with zero assumed human approvals, wait for all checks on
+  the exact `main` commit, and mirror it to GitHub before creating the annotated
+  tag;
 - publish only through the Gitea-authoritative workflow, then deploy the
   independently verified immutable image digest rather than a mutable tag.
 

@@ -9,16 +9,28 @@ import test_ratelimit
 class _FakeResponse:
     def __init__(self, status_code):
         self.status_code = status_code
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
 
 class _FakeSession:
     def __init__(self, statuses):
         self._statuses = iter(statuses)
         self.calls = []
+        self.responses = []
+        self.closed = False
+        self.trust_env = True
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        return _FakeResponse(next(self._statuses))
+        response = _FakeResponse(next(self._statuses))
+        self.responses.append(response)
+        return response
+
+    def close(self):
+        self.closed = True
 
 
 class RateLimitLiveScriptTests(unittest.TestCase):
@@ -39,10 +51,13 @@ class RateLimitLiveScriptTests(unittest.TestCase):
         for index, (url, kwargs) in enumerate(session.calls):
             self.assertEqual(url, "http://127.0.0.1:8390/translate")
             self.assertEqual(kwargs["timeout"], 3.5)
+            self.assertTrue(kwargs["stream"])
+            self.assertFalse(kwargs["allow_redirects"])
             self.assertEqual(kwargs["headers"], {"X-BT-Token": "secret"})
             self.assertEqual(kwargs["json"]["text"], f"rate-limit-probe-{index}")
             self.assertEqual(kwargs["json"]["source_lang"], "English")
             self.assertEqual(kwargs["json"]["target_lang"], "English")
+        self.assertTrue(all(response.closed for response in session.responses))
 
     def test_unexpected_status_is_counted_without_response_body(self):
         session = _FakeSession([401, 200, 429])
@@ -60,6 +75,41 @@ class RateLimitLiveScriptTests(unittest.TestCase):
         self.assertEqual(result, test_ratelimit.RateLimitResult(0, 0, 1))
         self.assertEqual(len(session.calls), 1)
         self.assertEqual(session.calls[0][1]["headers"], {})
+        self.assertTrue(session.responses[0].closed)
+
+    def test_owned_session_ignores_environment_proxies_and_is_closed(self):
+        session = _FakeSession([200, 429])
+
+        with mock.patch.object(test_ratelimit.requests, "Session", return_value=session):
+            result = test_ratelimit.exercise_rate_limit(
+                "https://translator.example/bt-api",
+                token="secret",
+                request_count=2,
+                timeout=1,
+            )
+
+        self.assertEqual(result, test_ratelimit.RateLimitResult(1, 1, 0))
+        self.assertFalse(session.trust_env)
+        self.assertTrue(session.closed)
+        self.assertTrue(all(response.closed for response in session.responses))
+
+    def test_redirect_is_not_followed_with_authentication_headers(self):
+        session = _FakeSession([302, 200, 429])
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = test_ratelimit.exercise_rate_limit(
+                "https://translator.example/bt-api",
+                token=None,
+                cookie="session=opaque-value",
+                request_count=3,
+                timeout=1,
+                session=session,
+            )
+
+        self.assertEqual(result, test_ratelimit.RateLimitResult(0, 0, 1))
+        self.assertEqual(len(session.calls), 1)
+        self.assertFalse(session.calls[0][1]["allow_redirects"])
+        self.assertTrue(session.responses[0].closed)
 
     def test_supports_cwa_session_cookie_without_a_token(self):
         session = _FakeSession([200, 429])
@@ -111,6 +161,20 @@ class RateLimitLiveScriptTests(unittest.TestCase):
                     "--cookie", "session=cookie-value",
                 ])
         self.assertEqual(raised.exception.code, 2)
+
+    def test_main_rejects_non_http_or_ambiguous_urls(self):
+        invalid_urls = (
+            "ftp://translator.example/bt-api",
+            "https://user:password@translator.example/bt-api",
+            "https://translator.example/bt-api?target=elsewhere",
+            "https://translator.example/bt-api#fragment",
+            "https:///bt-api",
+        )
+        for url in invalid_urls:
+            with self.subTest(url=url), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    test_ratelimit.main(["--url", url])
+                self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

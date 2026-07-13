@@ -21,6 +21,7 @@ import math
 import os
 import sys
 from typing import Sequence
+from urllib.parse import urlsplit
 
 import requests
 
@@ -55,6 +56,23 @@ def _positive_float(raw: str) -> float:
     return value
 
 
+def _http_url(raw: str) -> str:
+    if not raw or raw != raw.strip() or any(character.isspace() for character in raw):
+        raise argparse.ArgumentTypeError("must be one HTTP(S) base URL")
+    try:
+        parsed = urlsplit(raw)
+        parsed.port
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a valid HTTP(S) base URL") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise argparse.ArgumentTypeError("must be an HTTP(S) base URL with a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise argparse.ArgumentTypeError("must not contain URL credentials")
+    if parsed.query or parsed.fragment:
+        raise argparse.ArgumentTypeError("must not contain a query or fragment")
+    return raw
+
+
 def exercise_rate_limit(
     base_url: str,
     *,
@@ -67,6 +85,10 @@ def exercise_rate_limit(
     """Return live-probe counts, stopping on the first 429 or error."""
     client = session if session is not None else requests.Session()
     owns_session = session is None
+    if owns_session:
+        # Tokens and session cookies must never traverse operator-configured
+        # HTTP(S)_PROXY values inherited from the shell.
+        client.trust_env = False
     headers = {}
     if token:
         headers["X-BT-Token"] = token
@@ -88,6 +110,8 @@ def exercise_rate_limit(
                         "target_lang": "English",
                     },
                     timeout=timeout,
+                    stream=True,
+                    allow_redirects=False,
                 )
             except requests.RequestException as exc:
                 unexpected += 1
@@ -97,16 +121,23 @@ def exercise_rate_limit(
                 )
                 break
 
-            if response.status_code == 200:
+            try:
+                status_code = response.status_code
+            finally:
+                # The probe never needs a response body. Closing a streamed
+                # response bounds memory and connection lifetime even on 4xx.
+                response.close()
+
+            if status_code == 200:
                 admitted += 1
-            elif response.status_code == 429:
+            elif status_code == 429:
                 rate_limited += 1
                 break
             else:
                 unexpected += 1
                 print(
                     f"request {index + 1} returned unexpected status "
-                    f"{response.status_code}",
+                    f"{status_code}",
                     file=sys.stderr,
                 )
                 break
@@ -121,6 +152,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--url",
+        type=_http_url,
         default=os.environ.get("BENCHMARK_URL", DEFAULT_URL),
         help="live API base URL (default: %(default)s)",
     )
