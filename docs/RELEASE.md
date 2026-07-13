@@ -5,6 +5,8 @@ container-registry mirror; GitHub Actions runs CI only and never publishes an
 image. The authoritative workflow is `.gitea/workflows/release.yml`.
 The rationale and rejected alternatives are recorded in
 [ADR-001](decisions/ADR-001-gitea-release-authority.md).
+The [production-readiness record](PRODUCTION_READINESS.md) maps the latest audit
+findings to these gates. Review it before promoting the first post-audit tag.
 
 ## Remote prerequisites
 
@@ -112,22 +114,24 @@ contracts.
    - `static/translator.js` `BT_UI_VERSION`
    - both `?v=` values in `overlay/read.html`
    - move the Changelog entries from `Unreleased` into a dated version section
-3. Run the deterministic local gate. Protected CI independently repeats it and
-   adds dependency audits plus the split-role non-root container smoke test:
+3. Run the deterministic local gate. Protected CI independently repeats the
+   same backend, dependency, browser, and split-role artifact gates:
 
    ```bash
    .venv/bin/python -m py_compile \
-     server.py translator.py cache.py singleflight.py work_budget.py \
+     auth.py server.py translator.py cache.py singleflight.py work_budget.py \
+     proxy/render_config.py \
      scripts/release_preflight.py scripts/release_image_tags.py \
      scripts/verify_release_attestations.py
    .venv/bin/python test_translation.py
    .venv/bin/python test_hardening.py
    .venv/bin/python -m unittest -v \
      test_work_budget test_provider_budget test_cache_v2 \
-     test_context_cache test_singleflight test_ci_contract \
+     test_context_cache test_singleflight test_auth test_ci_contract \
      test_release_contract test_release_attestations test_supply_chain_contract \
-     test_cleanup_token test_api_schema \
-     test_error_privacy
+     test_shell_contract test_container_contract test_cleanup_token \
+     test_api_schema test_error_privacy test_observability \
+     test_proxy_config test_live_scripts
    node -c static/translator.js
    node -c static/loader.js
    npm ci
@@ -138,7 +142,10 @@ contracts.
    .venv/bin/python -m pip install \
      --require-hashes --only-binary=:all: -r requirements-audit.txt
    PATH="$PWD/.venv/bin:$PATH" ./scripts/audit-deps.sh
-   docker build -t cwa-translate-release-candidate .
+   CANDIDATE_SHA="$(git rev-parse --short=12 HEAD)"
+   CANDIDATE_IMAGE="cwa-translate-release-candidate:$CANDIDATE_SHA"
+   docker build -t "$CANDIDATE_IMAGE" .
+   ./scripts/container-smoke.sh "$CANDIDATE_IMAGE" "cwa-release-$CANDIDATE_SHA"
    ```
 
 The base image digest, Alpine package versions, third-party Action commits, and
