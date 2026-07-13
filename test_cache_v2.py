@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import sqlite3
 import stat
 import tempfile
 import unittest
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -484,6 +486,28 @@ class CacheV2Tests(unittest.TestCase):
                 now=self.clock,
             )
 
+    def test_corrupt_database_closes_connection_before_pragma_failure(self) -> None:
+        self.store.close()
+        corrupt_dir = Path(self.tmp.name) / "corrupt"
+        corrupt_dir.mkdir(mode=0o700)
+        corrupt_db = corrupt_dir / "translations.db"
+        corrupt_db.write_bytes(b"not a sqlite database")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            with self.assertRaises(sqlite3.DatabaseError):
+                CacheStore(
+                    corrupt_db,
+                    ttl_days=30,
+                    max_entries=3,
+                    now=self.clock,
+                )
+            gc.collect()
+
+        self.assertFalse(
+            [warning for warning in caught if warning.category is ResourceWarning]
+        )
+
     def test_existing_schemas_without_primary_keys_fail_closed(self) -> None:
         self.store.close()
 
@@ -541,6 +565,33 @@ class CacheV2Tests(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         conn.execute("ALTER TABLE translations_v2 ADD COLUMN source_text TEXT")
+        conn.commit()
+        conn.close()
+
+        with self.assertRaisesRegex(RuntimeError, "translations_v2"):
+            CacheStore(
+                self.db_path,
+                ttl_days=30,
+                max_entries=3,
+                now=self.clock,
+            )
+
+    def test_v2_schema_with_composite_primary_key_fails_closed(self) -> None:
+        self.store.put("private source", "English", "Spanish", "privado", scope())
+        self.store.close()
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("ALTER TABLE translations_v2 RENAME TO valid_v2")
+        definition = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='valid_v2'"
+        ).fetchone()[0]
+        columns = definition[definition.index("(") + 1 : definition.rindex(")")]
+        columns = columns.replace("cache_key TEXT PRIMARY KEY", "cache_key TEXT")
+        conn.execute(
+            f"CREATE TABLE translations_v2 ({columns}, extra_pk TEXT, "
+            "PRIMARY KEY (cache_key, extra_pk))"
+        )
+        conn.execute("DROP TABLE valid_v2")
         conn.commit()
         conn.close()
 

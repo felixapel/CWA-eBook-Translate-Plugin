@@ -194,12 +194,16 @@ class CacheStore:
         conn = sqlite3.connect(
             str(self.db_path), timeout=5.0, check_same_thread=False
         )
-        self._secure_files()
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA wal_autocheckpoint=1000")
-        self._secure_files()
+        try:
+            self._secure_files()
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
+            self._secure_files()
+        except Exception:
+            conn.close()
+            raise
         with self._connections_lock:
             self._connections.add(conn)
         return conn
@@ -285,7 +289,7 @@ class CacheStore:
             row[1]: (row[2].upper(), bool(row[3]), bool(row[5]))
             for row in conn.execute(f"PRAGMA table_info({table})")
         }
-        return bool(actual) and all(
+        return set(actual) == set(expected) and all(
             actual.get(column) == signature
             for column, signature in expected.items()
         )

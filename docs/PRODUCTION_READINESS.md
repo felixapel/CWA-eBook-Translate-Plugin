@@ -70,7 +70,7 @@ all of these outcomes without a skipped or unavailable gate:
    remains read/write compatible, the unreleased draft layout normalizes
    atomically, and SQLite integrity survives v1 → v2 → v1 → v2.
 
-The final local audit run on 2026-07-13 passed the backend matrix (180 contract
+The final local audit run on 2026-07-13 passed the backend matrix (182 contract
 tests plus the standalone translation and hardening suites), frontend unit
 tests, three Chromium scenarios, Python and npm vulnerability audits, the live
 rate-limit probe, and the container smoke gate. The earlier image-publication

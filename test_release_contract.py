@@ -309,7 +309,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "/mnt/user/appdata/book-translator-api/backups", unraid
         )
         self.assertIn("/mnt/user/backups/book-translator-api/", unraid)
+        self.assertIn("PRAGMA wal_checkpoint(TRUNCATE)", unraid)
+        self.assertNotIn("mode=ro&immutable=1", unraid)
         self.assertIn("backups/", gitignore.splitlines())
+        self.assertIn("/config/translator/", gitignore.splitlines())
+        self.assertIn("/data/", gitignore.splitlines())
 
     def test_gitea_is_the_only_release_authority(self):
         self.assertTrue(GITEA_RELEASE.is_file())

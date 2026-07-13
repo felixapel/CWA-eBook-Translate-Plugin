@@ -23,6 +23,8 @@ blob-report/
 *.db-wal
 *.db-shm
 backups/
+/config/translator/
+/data/
 
 # Secrets — never commit API keys or credentials.
 .env

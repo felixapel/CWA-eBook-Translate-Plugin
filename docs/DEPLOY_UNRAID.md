@@ -131,7 +131,7 @@ BACKUP_DIR="/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data"
 test ! -e "$BACKUP_DIR"
 install -d -m 0700 -- "$BACKUP_DIR"
 cp -a -- /mnt/user/appdata/book-translator-api/data/. "$BACKUP_DIR/"
-python3 -c 'import sqlite3; db=sqlite3.connect("file:/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data/translations.db?mode=ro&immutable=1", uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
+python3 -c 'import sqlite3; db=sqlite3.connect("/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data/translations.db"); db.execute("PRAGMA wal_checkpoint(TRUNCATE)"); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
 
 # Rebuild the image
 docker build -t local/book-translator-api:latest .
