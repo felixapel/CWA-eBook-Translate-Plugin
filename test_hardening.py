@@ -10,7 +10,7 @@ Covers:
     before the per-field check)
   - /cache/cleanup requires API_TOKEN when BT_API_TOKEN is set
   - /metrics returns Prometheus-friendly counters
-  - rate-limit per-IP (X-Forwarded-For honored only when BT_TRUST_PROXY)
+  - pre-auth admission per observed client and API limits per auth subject
 
 Run with: python3 test_hardening.py
 """
@@ -177,28 +177,35 @@ def run():
                         "active_entries", "retained_entries"]))
 
     # ─────────────────────────────────────────────────────────────────────
-    # H4: rate-limit is per-IP
+    # H4: authentication admission is per observed client, while successful
+    # API work is keyed by the authenticated subject.
     # ─────────────────────────────────────────────────────────────────────
     server._rate_limit_store.clear()
+    server._auth_rate_limit_store.clear()
     server.BT_TRUST_PROXY = False
     client.post("/translate", json={"text": "h4_test_a"},
                 headers={"X-Forwarded-For": "1.2.3.4"})
-    keys = list(server._rate_limit_store.keys())
-    check("rate-limit: without BT_TRUST_PROXY, X-Forwarded-For is ignored",
-          keys and keys[0] != "1.2.3.4")
+    auth_keys = list(server._auth_rate_limit_store.keys())
+    api_keys = list(server._rate_limit_store.keys())
+    check("auth admission: without BT_TRUST_PROXY, X-Forwarded-For is ignored",
+          auth_keys and auth_keys[0] != "1.2.3.4")
+    check("API limit: successful work uses the authenticated subject",
+          api_keys == ["authenticated:legacy-anonymous"])
     server._rate_limit_store.clear()
+    server._auth_rate_limit_store.clear()
 
     server.BT_TRUST_PROXY = True
     client.post("/translate", json={"text": "h4_test_b"},
                 headers={"X-Forwarded-For": "5.6.7.8, 10.0.0.1"})
-    keys = list(server._rate_limit_store.keys())
+    keys = list(server._auth_rate_limit_store.keys())
     # LAST hop, not first: standard proxies APPEND the address they saw, so
     # the final entry is the only one a client cannot forge. Keying on the
     # first hop let clients bypass the limiter with a made-up header.
-    check("rate-limit: with BT_TRUST_PROXY, X-Forwarded-For LAST hop is key",
+    check("auth admission: with BT_TRUST_PROXY, X-Forwarded-For LAST hop is key",
           keys and keys[0] == "10.0.0.1")
     server.BT_TRUST_PROXY = False
     server._rate_limit_store.clear()
+    server._auth_rate_limit_store.clear()
 
     # ─────────────────────────────────────────────────────────────────────
     # H5: BT_TRUSTED_PROXIES allowlist path (preferred over BT_TRUST_PROXY)
@@ -212,6 +219,7 @@ def run():
     original_trusted = set(server.BT_TRUSTED_PROXIES)
     original_nets = list(server._TRUSTED_PROXY_NETS)
     original_limit = server.RATE_LIMIT_MAX
+    original_authenticator = server.AUTHENTICATOR
     try:
         # Werkzeug's test client connects from 127.0.0.1. Allowlist it.
         server.BT_TRUSTED_PROXIES = {"127.0.0.1/32"}
@@ -220,10 +228,11 @@ def run():
         ]
         client.post("/translate", json={"text": "h5_test_a"},
                     headers={"X-Forwarded-For": "9.9.9.9"})
-        keys = list(server._rate_limit_store.keys())
+        keys = list(server._auth_rate_limit_store.keys())
         check("BT_TRUSTED_PROXIES: peer in allowlist honors XFF",
               keys and keys[0] == "9.9.9.9")
         server._rate_limit_store.clear()
+        server._auth_rate_limit_store.clear()
 
         # Anti-spoof within the trusted path: a client that FORGES an XFF
         # entry gets it appended-to by the trusted proxy ("forged, real").
@@ -231,10 +240,11 @@ def run():
         # client rotates forged first hops and gets unlimited fresh buckets.
         client.post("/translate", json={"text": "h5_test_spoof"},
                     headers={"X-Forwarded-For": "6.6.6.6, 192.168.1.42"})
-        keys = list(server._rate_limit_store.keys())
+        keys = list(server._auth_rate_limit_store.keys())
         check("BT_TRUSTED_PROXIES: forged first hop ignored (keys on last hop)",
               keys and keys[0] == "192.168.1.42")
         server._rate_limit_store.clear()
+        server._auth_rate_limit_store.clear()
 
         # Now switch to an allowlist that does NOT match the peer. The
         # client is still 127.0.0.1, but the allowlist is 10.0.0.0/8. The
@@ -245,39 +255,52 @@ def run():
         ]
         client.post("/translate", json={"text": "h5_test_b"},
                     headers={"X-Forwarded-For": "9.9.9.9"})
-        keys = list(server._rate_limit_store.keys())
+        keys = list(server._auth_rate_limit_store.keys())
         check("BT_TRUSTED_PROXIES: peer NOT in allowlist ignores XFF (anti-spoof)",
               keys and keys[0] != "9.9.9.9")
 
-        # Route-level isolation contract: exhausting client A's bucket behind
-        # the trusted in-container proxy must not consume client B's budget.
+        # Route-level isolation contract: API work is isolated by opaque
+        # authenticated subject, even when both subjects share one proxy.
         server.BT_TRUSTED_PROXIES = {"127.0.0.1/32"}
         server._TRUSTED_PROXY_NETS = [
             ipaddress.ip_network("127.0.0.1/32", strict=False)
         ]
         server.RATE_LIMIT_MAX = 1
         server._rate_limit_store.clear()
+        server._auth_rate_limit_store.clear()
+        server.AUTHENTICATOR = server.RequestAuthenticator(
+            mode="forwarded",
+            identity_trusted_proxies=("127.0.0.1/32",),
+            forwarded_subject_header="X-BT-Subject",
+            forwarded_roles_header="",
+        )
         payload = {
             "text": "proxy bucket probe",
             "source_lang": "English",
             "target_lang": "English",
         }
         a_first = client.post("/translate", json=payload,
-                              headers={"X-Forwarded-For": "192.0.2.10"})
+                              headers={"X-Forwarded-For": "192.0.2.10",
+                                       "X-BT-Subject": "subject-a"})
         a_second = client.post("/translate", json=payload,
-                               headers={"X-Forwarded-For": "192.0.2.10"})
+                               headers={"X-Forwarded-For": "192.0.2.10",
+                                        "X-BT-Subject": "subject-a"})
         b_first = client.post("/translate", json=payload,
-                              headers={"X-Forwarded-For": "192.0.2.11"})
-        check("trusted proxy: exhausted client A does not block client B",
+                              headers={"X-Forwarded-For": "192.0.2.11",
+                                       "X-BT-Subject": "subject-b"})
+        check("authenticated subject A does not consume subject B's API budget",
               a_first.status_code == 200
               and a_second.status_code == 429
               and b_first.status_code == 200)
+        server.AUTHENTICATOR = original_authenticator
         server.RATE_LIMIT_MAX = original_limit
     finally:
         server.BT_TRUSTED_PROXIES = original_trusted
         server._TRUSTED_PROXY_NETS = original_nets
         server.RATE_LIMIT_MAX = original_limit
+        server.AUTHENTICATOR = original_authenticator
         server._rate_limit_store.clear()
+        server._auth_rate_limit_store.clear()
 
     # The entrypoint must export the proxy trust boundary before Gunicorn
     # imports server.py. Import-time configuration set later is ineffective.

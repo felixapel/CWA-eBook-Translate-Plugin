@@ -44,6 +44,8 @@ server {
         # route /bt-api through their allowlisted identity-aware proxy instead.
         proxy_set_header X-BT-Subject "";
         proxy_set_header X-BT-Roles "";
+        proxy_set_header X-authentik-uid "";
+        proxy_set_header X-authentik-groups "";
         # Never extend client-supplied forwarding chains. The API trusts this
         # proxy as an immediate peer and receives only the address nginx saw.
         proxy_set_header Forwarded "";
@@ -55,6 +57,13 @@ server {
         proxy_connect_timeout 2s;
         # Translation calls can legitimately take a while on slow local LLMs.
         proxy_read_timeout 180s;
+    }
+
+    location = /bt-config.json {
+        alias /tmp/nginx/browser-config.json;
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header Pragma "no-cache" always;
     }
 
     location /bt-static/ {
@@ -76,6 +85,8 @@ server {
         # CWA can treat a configurable header as a complete login assertion.
         # This proxy is not that authority and must not forward a client value.
         proxy_set_header ${BT_CWA_IDENTITY_HEADER} "";
+        proxy_set_header X-authentik-uid "";
+        proxy_set_header X-authentik-groups "";
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_connect_timeout 2s;

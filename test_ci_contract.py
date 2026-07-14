@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 CI = ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE = ROOT / ".gitea" / "workflows" / "release.yml"
 DOCKER_NAMES = ROOT / "scripts" / "ci-docker-names.sh"
 FRONTEND_WORKFLOWS = (
     CI,
@@ -24,10 +25,17 @@ class CIContractTests(unittest.TestCase):
         for command in (
             "python3 test_translation.py",
             "python3 test_hardening.py",
-            "python3 -m unittest -v test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts",
-            "python3 -m py_compile auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
+            "python3 -m unittest -v test_btctl test_btctl_compose test_btctl_unraid test_btctl_auth test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_install_docs test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts",
+            "python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
         ):
             self.assertIn(command, self.workflow)
+
+    def test_release_repeats_the_install_and_lifecycle_gates(self):
+        workflow = RELEASE.read_text()
+        for module in ("btctl_auth.py", "btctl_lifecycle.py"):
+            self.assertIn(module, workflow)
+        for suite in ("test_btctl_auth", "test_btctl_lifecycle", "test_install_docs"):
+            self.assertIn(suite, workflow)
 
     def test_node_install_and_audit_include_locked_dev_tree(self):
         self.assertRegex(self.workflow, r"(?m)^\s*- run: npm ci\s*$")
@@ -67,6 +75,10 @@ class CIContractTests(unittest.TestCase):
         )
         self.assertIn('docker build -t "$SMOKE_IMAGE" .', self.workflow)
         self.assertIn('./scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"', self.workflow)
+        self.assertIn(
+            './scripts/btctl-lifecycle-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
+            self.workflow,
+        )
         self.assertNotIn("docker build -t bt-audit:ci", self.workflow)
 
     def test_docker_names_are_isolated_across_repositories(self):

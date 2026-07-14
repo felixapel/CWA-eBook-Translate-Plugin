@@ -21,6 +21,7 @@ class CleanupTokenTests(unittest.TestCase):
         self.original_api_token = server.API_TOKEN
         self.original_path = server._CLEANUP_TOKEN_PATH
         self.original_cache = server._cleanup_token_cache
+        self.original_file_mode = server._CLEANUP_FILE_MODE
         self.tempdir = tempfile.TemporaryDirectory()
         server.API_TOKEN = ""
         server._CLEANUP_TOKEN_PATH = Path(self.tempdir.name) / "cleanup_token"
@@ -30,6 +31,7 @@ class CleanupTokenTests(unittest.TestCase):
         server.API_TOKEN = self.original_api_token
         server._CLEANUP_TOKEN_PATH = self.original_path
         server._cleanup_token_cache = self.original_cache
+        server._CLEANUP_FILE_MODE = self.original_file_mode
         self.tempdir.cleanup()
 
     def test_concurrent_first_use_creates_one_consistent_secret(self):
@@ -82,6 +84,17 @@ class CleanupTokenTests(unittest.TestCase):
         self.assertEqual(server._get_cleanup_token(), "persisted-token")
         mode = stat.S_IMODE(server._CLEANUP_TOKEN_PATH.stat().st_mode)
         self.assertEqual(mode, 0o600)
+
+    def test_operator_group_mode_keeps_persisted_credential_group_readable(self):
+        server._CLEANUP_FILE_MODE = 0o640
+
+        token = server._get_cleanup_token()
+
+        self.assertTrue(token)
+        mode = stat.S_IMODE(server._CLEANUP_TOKEN_PATH.stat().st_mode)
+        self.assertEqual(mode, 0o640)
+        lock = server._CLEANUP_TOKEN_PATH.with_name("cleanup_token.lock")
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o640)
 
     def test_concurrent_processes_share_the_same_persisted_secret(self):
         start_file = Path(self.tempdir.name) / "start"

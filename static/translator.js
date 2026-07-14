@@ -12,10 +12,13 @@
     const AUTH_MODE = ['cwa_session', 'token', 'forwarded'].includes(configuredAuthMode)
         ? configuredAuthMode
         : 'cwa_session';
+    const configuredCredentials = ['omit', 'same-origin', 'include'].includes(cfg.credentials)
+        ? cfg.credentials
+        : null;
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
         ? cfg.apiUrl
         : (window.location.protocol === 'https:' ? null : `http://${window.location.hostname}:8390`);
-    let SOURCE_LANG = cfg.sourceLang || 'English'; // Assume source is English
+    let SOURCE_LANG = localStorage.getItem('bt_source_lang') || cfg.sourceLang || 'English';
 
     // Map browser language codes to the full language name the backend expects
     // (used only to pick a sensible default target on first run).
@@ -186,10 +189,10 @@
             rateLimited: 'Waiting {n}s…',
             retrying: 'Retrying…',
             restoring: 'Restoring saved translations…',
-            cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', topLanguages: 'Most spoken', allLanguages: 'All languages (A–Z)', settings: 'Settings',
+            cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', sourceLangHint: 'Source language', topLanguages: 'Most spoken', allLanguages: 'All languages (A–Z)', settings: 'Settings',
             prefetchWhole: 'Pre-translate whole chapter', clearLang: 'Clear this language\'s cache', clearAll: 'Clear all cache',
             cached: 'Cached', cleared: 'Cache cleared',
-            bookTranslator: 'Book Translator', modeLabel: 'Mode', langLabel: 'Language',
+            bookTranslator: 'Book Translator', modeLabel: 'Mode', sourceLabel: 'Source', targetLabel: 'Target', langLabel: 'Language',
             retryPage: 'Retry current page', debug: 'Debug',
             cloudFallback: 'Allow cloud fallback',
             cloudPrivacy: 'Sends book text to the configured remote provider. This choice is not saved and applies only to this book tab.',
@@ -200,10 +203,10 @@
             translatingPage: 'Traduciendo…', translatingChapter: 'Capítulo', done: '✓ Listo', error: '⚠ Reintentar',
             rateLimited: 'Esperando {n}s…',
             retrying: 'Reintentando…',
-            cycleHint: 'Clic para cambiar: Original → Bilingüe → Traducido', langHint: 'Idioma destino', topLanguages: 'Más hablados', allLanguages: 'Todos los idiomas (A–Z)', settings: 'Ajustes',
+            cycleHint: 'Clic para cambiar: Original → Bilingüe → Traducido', langHint: 'Idioma destino', sourceLangHint: 'Idioma fuente', topLanguages: 'Más hablados', allLanguages: 'Todos los idiomas (A–Z)', settings: 'Ajustes',
             prefetchWhole: 'Pre-traducir capítulo completo', clearLang: 'Borrar caché de este idioma', clearAll: 'Borrar toda la caché',
             cached: 'En caché', cleared: 'Caché borrada',
-            bookTranslator: 'Book Translator', modeLabel: 'Modo', langLabel: 'Idioma',
+            bookTranslator: 'Book Translator', modeLabel: 'Modo', sourceLabel: 'Fuente', targetLabel: 'Destino', langLabel: 'Idioma',
             retryPage: 'Reintentar página actual', debug: 'Depuración',
             cloudFallback: 'Permitir fallback cloud',
             cloudPrivacy: 'Envía texto del libro al proveedor remoto configurado. Esta elección no se guarda y solo aplica a esta pestaña del libro.',
@@ -351,6 +354,23 @@
     ];
 
     const availableLangs = TOP_LANGUAGES.concat(MORE_LANGUAGES);
+    const availableLangCodes = new Set(availableLangs.map(language => language.code));
+    if (!availableLangCodes.has(SOURCE_LANG)) SOURCE_LANG = 'English';
+    if (!availableLangCodes.has(TARGET_LANG)) TARGET_LANG = defaultLang;
+
+    function languageOptions(selected) {
+        const option = (language, englishFirst) => {
+            const label = language.name === language.code ? language.code
+                : englishFirst
+                    ? `${language.code} — ${language.name}`
+                    : `${language.name} — ${language.code}`;
+            return `<option value="${language.code}"${language.code === selected ? ' selected' : ''}>${label}</option>`;
+        };
+        return (
+            `<optgroup label="${t.topLanguages}">${TOP_LANGUAGES.map(language => option(language, false)).join('')}</optgroup>` +
+            `<optgroup label="${t.allLanguages}">${MORE_LANGUAGES.map(language => option(language, true)).join('')}</optgroup>`
+        );
+    }
 
     // ── UI Components ──────────────────────────────────────────────────
     function setMode(mode, { silent = false } = {}) {
@@ -396,14 +416,7 @@
         //  - A-Z group: "English — Endonym", so the VISIBLE text is what the list
         //    is sorted by (endonym-first looked unsorted) and the native select's
         //    type-to-jump works with a latin keyboard for every language.
-        const opt = (l, englishFirst) => {
-            const label = l.name === l.code ? l.code
-                : englishFirst ? `${l.code} — ${l.name}` : `${l.name} — ${l.code}`;
-            return `<option value="${l.code}"${l.code === TARGET_LANG ? ' selected' : ''}>${label}</option>`;
-        };
-        const langOptions =
-            `<optgroup label="${t.topLanguages}">${TOP_LANGUAGES.map(l => opt(l, false)).join('')}</optgroup>` +
-            `<optgroup label="${t.allLanguages}">${MORE_LANGUAGES.map(l => opt(l, true)).join('')}</optgroup>`;
+        const langOptions = languageOptions(TARGET_LANG);
 
         bar.innerHTML =
             `<button type="button" id="bt-toggle" title="${t.cycleHint}">` +
@@ -485,7 +498,10 @@
         menu.innerHTML =
             `<div class="bt-menu-header">${t.bookTranslator}<span class="bt-menu-ver">v${BT_UI_VERSION}</span></div>` +
             `<div class="bt-menu-row"><span>${t.modeLabel}</span><span class="bt-menu-val">${modeLabel}</span></div>` +
-            `<div class="bt-menu-row"><span>${t.langLabel}</span><span class="bt-menu-val">${TARGET_LANG}</span></div>` +
+            `<label class="bt-menu-field" for="bt-source-lang"><span>${t.sourceLabel}</span>` +
+                `<select id="bt-source-lang" class="bt-menu-select" title="${t.sourceLangHint}" aria-label="${t.sourceLangHint}">` +
+                    `${languageOptions(SOURCE_LANG)}</select></label>` +
+            `<div class="bt-menu-row"><span>${t.targetLabel}</span><span class="bt-menu-val">${esc(TARGET_LANG)}</span></div>` +
             `<div class="bt-menu-sep"></div>` +
             `<button type="button" class="bt-menu-item" data-action="prefetch" role="switch" aria-checked="${prefetchEnabled}">` +
                 `<span>${t.prefetchWhole}</span>` +
@@ -502,6 +518,19 @@
             `<div class="bt-menu-sep"></div>` +
             `<div class="bt-menu-note">${t.cached}: ${entryCount} · ${esc(TARGET_LANG)}</div>` +
             `<div class="bt-menu-note">${t.debug}: ${t.dbgQueue} ${prefetchQueue.length} · ${t.dbgGen} ${generation} · ${t.dbgTrigger} ${esc(lastTriggerReason)}</div>`;
+
+        const sourceSelect = menu.querySelector('#bt-source-lang');
+        sourceSelect.onchange = (event) => {
+            persistCacheNow();
+            SOURCE_LANG = event.target.value;
+            localStorage.setItem('bt_source_lang', SOURCE_LANG);
+            newGeneration();
+            translatedParagraphs = loadCacheForLang(TARGET_LANG);
+            removeAllTranslations();
+            if (translationMode !== 'off') translateCurrentPage();
+            buildMenu();
+            refreshStatus();
+        };
 
         menu.querySelectorAll('.bt-menu-item').forEach(item => {
             item.onclick = (e) => {
@@ -894,12 +923,17 @@
             const headers = { 'Content-Type': 'application/json' };
             if (AUTH_MODE === 'token' && cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken;
             const scope = translationScope();
+            const requestCredentials = configuredCredentials || (
+                AUTH_MODE === 'forwarded'
+                    ? 'include'
+                    : (AUTH_MODE === 'cwa_session'
+                        ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
+                        : 'omit')
+            );
             const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
                 headers,
-                credentials: AUTH_MODE === 'cwa_session'
-                    ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
-                    : 'omit',
+                credentials: requestCredentials,
                 body: JSON.stringify({
                     paragraphs: texts,
                     source_lang: SOURCE_LANG,

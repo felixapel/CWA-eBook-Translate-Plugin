@@ -8,13 +8,13 @@ Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://gi
 
 - 🌐 **Bilingual reading** — original + translation side by side
 - 🔄 **Three modes** — Bilingual / Translation-only / Original
-- 🌍 **100+ target languages** — the picker shows the 10 most-spoken languages first, then every other supported language A–Z (type to jump). Developed and tuned against **Google's Gemma 4** as the default local model; the language set mirrors Gemma's pre-training coverage
+- 🌍 **100+ source and target languages** — choose the book language in Settings and the translation language in the toolbar. The pickers show the 10 most-spoken languages first, then every other supported language A–Z (type to jump). Developed and tuned against **Google's Gemma 4** as the default local model; the language set mirrors Gemma's pre-training coverage
 - ⚡ **Visible-First Translation** — prioritizes paragraphs visible on screen for instant rendering
 - 🚀 **Background Prefetching** — translates the rest of the chapter sequentially in the background
 - 🧠 **Context-Aware Translation** — feeds surrounding paragraphs to the LLM to improve literary quality and character voice
 - 📚 **Deep DOM Parsing** — accurately captures headings, custom title classes, and clickable TOC links
 - 💾 **Private Bounded Cache** — durable server-side SQLite uses scoped SHA-256 keys, mandatory TTL/cap, and private file modes; browser persistence is opt-in on trusted single-user devices
-- 🔒 **Rate limited & Stable** — request-size caps and per-IP rate limiting protect your API keys and GPU from runaway requests, with `AbortController` cancellation for perfectly responsive UI buttons
+- 🔒 **Rate limited & Stable** — request-size caps, per-client authentication admission, and per-subject API quotas protect your API keys and GPU from runaway requests, with `AbortController` cancellation for responsive UI buttons
 - 🔌 **Zero-touch install** — proxy-injection mode overlays a **stock** CWA container: no template mounts, nothing to re-apply when CWA updates
 
 ### A note on language quality
@@ -32,135 +32,97 @@ lower-resource tier better — switch `LLM_PROVIDER` if a language matters to yo
 
 ## 🚀 Installation
 
-### Recommended: proxy-injection mode (isolated API and proxy roles)
+The supported install is managed by `btctl`. It builds this exact clean source
+checkout into one immutable local image and creates two isolated roles: a
+browser-facing injection proxy and an unpublished translation API. CWA itself
+is never modified or owned by the installer.
 
-Two non-root containers run the same translator image. The proxy sits in front
-of CWA and injects the overlay; the private API owns translation and cache
-state. Your CWA container stays completely untouched.
+Start from either an annotated release tag or a full reviewed commit. If a
+version tag has not been published yet, use the exact candidate commit supplied
+by the maintainer; do not invent the tag or substitute a mutable `latest` image.
+
+```bash
+git clone <repository-url> cwa-translate
+cd cwa-translate
+git fetch --tags
+git switch --detach <release-tag-or-full-reviewed-commit>
+```
+
+Copy [`.env.example`](.env.example) outside the checkout, make it private, and
+edit the deployment-specific values. For a local OpenAI-compatible LLM,
+`LLM_API_KEY` stays empty: this open-source project has no project key, registry
+credential, signing secret, or browser token.
+
+```bash
+install -d -m 0700 /absolute/private/path
+cp .env.example /absolute/private/path/cwa-translate.env
+chmod 0600 /absolute/private/path/cwa-translate.env
+```
+
+Choose `BT_INSTALL_PROFILE=unraid` or `compose-existing`, then set the exact CWA
+container, its matching `http://<container>:8083` upstream, Docker network, CWA
+version, CWA reverse-proxy identity header, public reader origin, storage paths,
+and LLM endpoint. Validate first, install second, and prove the running state:
+
+```bash
+./btctl plan --env /absolute/private/path/cwa-translate.env
+./btctl install --env /absolute/private/path/cwa-translate.env --yes
+./btctl doctor --env /absolute/private/path/cwa-translate.env
+```
+
+`plan` does not mutate files or Docker. It reports the exact version+commit
+image, roles, ports, paths, CWA evidence, and ownership while redacting API
+keys. `install` writes state only after live postconditions pass. `doctor` is
+read-only and must finish with every check marked `ok`.
 
 ```text
-Browser ──► book-translator-proxy (:8084) ──► CWA (:8083, stock)
-                 │ injects overlay on /read/ pages
-                 └─ /bt-api → book-translator-api (:8390, private)
+Browser/reverse proxy -> cwa-translate-proxy -> stock CWA
+                                  |
+                                  +-> cwa-translate-api -> LLM
+                                               |
+                                               +-> private cache
 ```
+
+In normal `published` mode, only the injection proxy gets a host port; the API
+does not. Read CWA through that proxy port or point the existing domain's main
+route at it. Keep OPDS/Kobo routes pointed directly at CWA. The default
+`cwa-session` profile validates the existing HttpOnly CWA session and places no
+translator credential in JavaScript or `localStorage`.
+
+Use the guide for your host:
+
+- [Unraid deployment](docs/DEPLOY_UNRAID.md) — root-owned appdata, DockerMan
+  templates, v2.1.4 upgrade, rollback, and acceptance checks.
+- [Existing Compose deployment](docs/DEPLOY_COMPOSE.md) — the same managed
+  split topology without taking ownership of the CWA project.
+- [Compatibility matrix](docs/COMPATIBILITY.md) — tested CWA, platform,
+  browser, reverse-proxy, and LLM boundaries.
+- [Authentik forwarded identity](docs/AUTHENTIK.md) — advanced fail-closed edge
+  topology for installations where Authentik, rather than a native CWA session,
+  is the identity authority.
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — start with `btctl doctor` and
+  follow symptom-specific checks.
+
+### Lifecycle commands
+
+Use the same private environment file for every operation:
 
 ```bash
-git clone --branch v2.2.0 --depth 1 \
-  https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
-cd CWA-eBook-Translate-Plugin
-# Edit docker-compose.yml: set BT_LOCAL_URL (or a cloud provider + API key)
-# Replace this example with the exact origin you use in the browser.
-export BT_PUBLIC_ORIGIN=http://192.168.1.10:8084
-docker compose up -d --build
+./btctl doctor --env /absolute/private/path/cwa-translate.env
+./btctl adopt --env /absolute/private/path/cwa-translate.env
+./btctl upgrade --env /absolute/private/path/cwa-translate.env --yes
+./btctl rollback --env /absolute/private/path/cwa-translate.env --yes
+./btctl uninstall --env /absolute/private/path/cwa-translate.env --yes
 ```
 
-Then read your library at **`http://<host>:8084`** — the translator control
-bar appears in the ebook reader. That's the whole install. The compose file
-validates the browser's existing HttpOnly CWA session for every protected API
-request; it does not put a translator credential in JavaScript or
-`localStorage`. The API is attached to the CWA network only so it can call the
-authenticated `/ajax/emailstat` probe and remains unpublished to the host.
-The Compose file builds the exact checked-out source into the local
-`cwa-ebook-translate-plugin:local` image. Official releases are verified source
-tags, so installation needs no container-registry account, package token, or
-signing key. A fresh install can check out a new tag and rerun the command.
-Upgrading the reference v2.1.4 Compose deployment requires the one-time
-[combined-to-split data migration](docs/RELEASE.md#upgrade-the-reference-compose-deployment-from-v214)
-before v2.2.0 starts.
-
-Already have CWA running? Copy the `book-translator-api` and
-`book-translator-proxy` services plus their private network and named volume
-from [`docker-compose.yml`](docker-compose.yml), then point `CWA_UPSTREAM` at
-your existing CWA service. Keep the two roles separate in production; the
-legacy combined mode exists only for upgrade compatibility.
-
-> Removing the plugin = stop reading through the proxy port. Nothing in your
-> CWA install was modified.
-
-### Behind a reverse proxy (SWAG / Traefik / NPM / Cloudflare)
-
-If you already expose CWA on a domain, point your reverse proxy's **main
-location at the translator's proxy port instead of CWA's port** — the overlay
-then works on your domain with the API same-origin (no CORS, no extra routes).
-Verified SWAG example (only the main location changes; keep OPDS/Kobo sync
-locations pointing directly at CWA):
-
-```nginx
-    location / {
-        include /config/nginx/proxy.conf;
-        include /config/nginx/resolver.conf;
-        set $upstream_app 10.0.0.10;        # docker host (substitute your own)
-        set $upstream_port 8084;            # translator proxy port (NOT CWA's)
-        set $upstream_proto http;
-        proxy_pass $upstream_proto://$upstream_app:$upstream_port;
-    }
-```
-
-Set `BT_PUBLIC_ORIGIN=https://books.example.com` on the translator proxy
-service (use your exact reader origin). The injection proxy forwards that
-validated, fixed scheme and authority to CWA; it never trusts a browser's or
-upstream request's `Host`, `Forwarded`, or `X-Forwarded-Proto` value. HTTPS
-sessions and secure cookies therefore work without making those headers an
-implicit trust boundary.
-
-### Option 2: Unraid
-
-Clone a release tag on the Unraid host and run `./install_unraid.sh`. The script
-builds `local/book-translator-api:latest` from that checkout and installs the
-legacy API template without downloading a project-published image or requiring
-registry credentials. Docker may download the pinned public base image during
-the build. For the recommended proxy-injection topology, use the Compose
-instructions above.
-
-#### Legacy: bind-mount installer script
-
-`install_unraid.sh` copies the overlay files into your CWA appdata folder and
-installs an Unraid Docker template for the API (bind-mount method). Review the
-script, then run it **locally** (don't pipe an unreviewed remote script into
-`bash`):
-
-```bash
-git clone --branch v2.2.0 --depth 1 \
-  https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
-cd CWA-eBook-Translate-Plugin
-chmod +x install_unraid.sh
-./install_unraid.sh
-```
-
-**Post-Install Steps**:
-1. Go to your Unraid Docker tab and edit your `calibre-web-automated` container.
-2. Add the 3 paths (as instructed by the script) to inject the plugin files.
-3. Deploy the newly added `book-translator-api` container.
-
-`deploy_unraid.sh` / `verify_unraid.sh` are personal SSH-based redeploy/verify
-helpers for an existing install — read them and adapt the host/paths before use.
-
-> Tip: proxy-injection mode also works on Unraid (run the container with
-> `CWA_UPSTREAM` set and browse through its port) and avoids the 3 path
-> mappings entirely.
-
-### Advanced: bind-mount install (development / no proxy)
-
-Mount the overlay files directly into the CWA container — useful when hacking
-on the overlay itself:
-
-```yaml
-volumes:
-  - ./overlay/read.html:/app/calibre-web-automated/cps/templates/read.html:ro
-  - ./static/translator.js:/app/calibre-web-automated/cps/static/js/translator.js:ro
-  - ./static/translator.css:/app/calibre-web-automated/cps/static/css/translator.css:ro
-```
-
-Caveats: `overlay/read.html` is a full template replacement tracked against
-the **pinned CWA version in docker-compose.yml** (`v4.0.6`). A CWA update that
-changes `read.html` can drift from this copy — proxy mode does not have this
-problem. The shipped bind-mount overlay uses `cwa_session`; because its API is
-cross-origin, set one exact `BT_ALLOWED_ORIGINS` value, keep
-`BT_ALLOW_PRIVATE_LAN=false`, and configure the exact CWA auth URL. The helper
-does not place a shared API secret in browser JavaScript. Its direct `:8390`
-API route is HTTP-only, so the helper accepts only an `http://` reader origin;
-for an HTTPS reader, use the recommended same-origin proxy or provide a
-separately reviewed TLS API route and custom `apiUrl`.
+`adopt` only reconstructs lost state from an exact, already-labeled split
+runtime. Fresh `install` and `adopt` require CWA 4.x. `upgrade` is exclusively
+for the supported CWA 3.1.4/v2.1.4 migration and keeps the old container
+restartable. `rollback` restores that exact legacy runtime.
+`uninstall` removes only owned translator runtime resources and preserves CWA,
+translation data, state evidence, and backups. See
+[ADR-010](docs/decisions/ADR-010-btctl-state-and-ownership.md) for the ownership
+model.
 
 ---
 
@@ -185,14 +147,17 @@ If cold translations feel slow, see `BT_BATCH_SIZE`, `BT_OUTPUT_TOKEN_FACTOR`, a
 
 ## ⚙️ Configuration
 
-Environment variables for the translator image (set them on the role that uses
-them):
+Most operators should edit only the high-level values in [`.env.example`](.env.example).
+`btctl` derives the internal authentication, role, network, and browser values;
+do not copy low-level compatibility settings into a managed install. The table
+below documents the complete translator image interface for development and
+legacy integrations.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BT_ROLE` | `auto` | Runtime role: `api`, `proxy`, or compatibility-only `all`. `auto` selects `api` without `CWA_UPSTREAM` and `all` when it is present. The reference Compose file sets roles explicitly. |
-| `CWA_UPSTREAM` | | Required by the proxy role. Exact base URL of the stock CWA instance (e.g. `http://calibre-web:8083`); credentials, paths, queries, fragments, and non-HTTP schemes fail startup. |
-| `BT_API_UPSTREAM` | `http://127.0.0.1:$PORT` | Exact translation API base URL used by the proxy role. The split Compose topology uses the network-scoped `http://translator-api:8390` alias so traffic reaches the API through the fixed trusted-proxy network; the same URL validation applies. |
+| `CWA_UPSTREAM` | | Required by the proxy role. Exact base URL of the stock CWA instance (e.g. `http://calibre-web:8083`); credentials, paths, queries, fragments, and non-HTTP schemes fail startup. Managed installs require exactly `http://<BT_CWA_CONTAINER>:8083`, binding session validation and proxy traffic to the inspected container identity. |
+| `BT_API_UPSTREAM` | `http://127.0.0.1:$PORT` | Exact translation API base URL used by the proxy role. The managed split topology uses the network-scoped `http://<install-name>-api:8390` container identity on its private Docker network; the same URL validation applies. |
 | `BT_PROXY_PORT` | `8080` | Container port for the injection proxy (proxy mode only). |
 | `BT_PUBLIC_ORIGIN` | | **Required by proxy/all roles and by the reference Compose file.** Exact browser-facing origin, such as `http://192.168.1.10:8084` or `https://books.example.com`. Its validated host and scheme are the only values forwarded to CWA/API; there is no implicit `localhost` deployment value. |
 | `BT_CWA_MAX_BODY_SIZE` | `2g` | Finite nginx cap for CWA uploads. Use a positive nginx size such as `512m` or `4g`; `0`/unlimited and directive-like values fail startup. Translation API bodies retain a separate 3 MiB proxy cap and the stricter Flask limit. |
@@ -236,10 +201,10 @@ them):
 | `BT_REQUEST_MAX_OUTPUT_TOKENS` | `163840` | Maximum cumulative `max_tokens` reserved across every provider attempt in one API request, sized for the same bounded 20-call batch path. |
 | `BT_REQUEST_DEADLINE_SECONDS` | `90` | Absolute request-wide deadline. Once expired, no new provider attempt can start; individual provider timeouts are clamped to the remaining time. |
 | `BT_MAX_UPSTREAM_RESPONSE_BYTES` | `1048576` (1 MiB) | Maximum decompressed JSON bytes accepted from one provider call. Responses are streamed and aborted at the boundary before JSON materialization; providers that ignore `max_tokens` cannot grow memory/cache without limit. |
-| `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max requests per client IP per 60s window before the API returns `429`. |
+| `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max successful API requests per opaque authenticated subject per 60s window before the API returns `429`. Authentication attempts have the separate client-keyed limit above. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | Seconds reported in the `Retry-After` header / response body on a `429`. The frontend reads this and backs off automatically. |
-| `BT_TRUST_PROXY` | `false` | **Legacy/dev only.** When `true`, the API uses the **last** `X-Forwarded-For` hop from any peer as the rate-limit key. A client that can reach the API directly can still spoof this header, so don't rely on it in production — prefer `BT_TRUSTED_PROXIES` below. |
-| `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** rate-limit-key source. Comma-separated CIDRs/IPs of peers allowed to set `X-Forwarded-For`. The reference Compose network gives the proxy a fixed address and trusts only that `/32`. Combined compatibility mode defaults to loopback. |
+| `BT_TRUST_PROXY` | `false` | **Legacy/dev only.** When `true`, the API uses the **last** `X-Forwarded-For` hop from any peer for pre-auth client admission. A direct client can spoof it, so do not rely on this in production — prefer `BT_TRUSTED_PROXIES` below. It never changes the post-auth subject quota. |
+| `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** observed-client source for low-level deployments. Comma-separated CIDRs/IPs of exact peers allowed to set `X-Forwarded-For`; the last hop keys pre-auth attempt/inflight admission. Managed installs never trust a Docker subnet implicitly. Successful API work is always keyed by the opaque authenticated subject. |
 | `BT_ALLOWED_ORIGINS` | `http://localhost:8083,http://localhost:8383` | Comma-separated exact origins allowed for CORS (bind-mount installs; irrelevant in proxy mode, which is same-origin). Add your public reader URL here, e.g. `https://books.example.com`. |
 | `BT_ALLOW_PRIVATE_LAN` | `true` | Additionally allow localhost/RFC1918 origins (`10.*`, `192.168.*`, `172.16-31.*`) on any port for non-cookie modes. `cwa_session` always ignores this broad grant: credentialed cross-origin requests require an exact `BT_ALLOWED_ORIGINS` entry and receive `Access-Control-Allow-Credentials: true`. Same-origin proxy mode needs neither. |
 | `BT_CACHE_TTL_DAYS` | `90` | Mandatory maximum age for cached translations. Expired rows are never served and are removed during normal writes/stats/cleanup. Must be greater than zero. |
@@ -276,11 +241,13 @@ different contexts. Legacy `bt_cache_v2_*` localStorage entries are removed on
 upgrade.
 
 The bundled injection proxy replaces any inbound forwarding chain with the
-immediate peer address it actually observed. Direct LAN clients therefore keep
-per-client API limits. When SWAG/Traefik/NPM is the immediate peer, the API sees
-that edge proxy as one client; enforce client-aware admission at the trusted
-edge or size the translator's downstream limit for the aggregate. This avoids
-accepting spoofable client IPs without an explicit real-IP trust configuration.
+immediate peer address it actually observed. This client identity controls only
+the bounded authentication-attempt and in-flight admission layer. After a
+request authenticates, API work is keyed by the server-owned opaque session,
+token, or forwarded subject, so two authenticated users do not consume each
+other's API quota. When SWAG/Traefik/NPM is the immediate peer, configure only
+that reviewed peer if client-aware pre-auth admission is required; the API never
+guesses trust from a supplied forwarding chain.
 
 ---
 
@@ -295,26 +262,34 @@ Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
                                          └─ SQLite cache (/app/data)
 ```
 
-In bind-mount installs nginx never starts; the overlay files are mounted into
-CWA and call the API on `:8390` directly (CORS applies — see
+In legacy development bind-mount installs nginx never starts; the overlay files
+are mounted into CWA and call the API on `:8390` directly (CORS applies — see
 `BT_ALLOWED_ORIGINS`). The shipped helper exposes that port over HTTP and
 therefore rejects HTTPS reader origins rather than creating a browser-blocked
 mixed-content deployment. For cross-origin `cwa_session`, set
 `authMode: 'cwa_session'` and `sendCredentials: true` in
 `window.BOOK_TRANSLATOR`, disable `BT_ALLOW_PRIVATE_LAN`, and list the one exact
-CWA reader origin. In `token` and `forwarded` modes the frontend uses
-`credentials: 'omit'`, so CWA cookies are not disclosed to the API origin.
+CWA reader origin. Token compatibility omits cookies. Managed
+`authentik-forwarded` instead uses a same-origin credentialed request to the
+identity-aware edge; that edge consumes the Authentik cookie and strips it
+before contacting the API.
 
 Both image roles declare `appuser` (`101:102`), run with zero capabilities, and
-support a read-only root filesystem. If you replace the Compose named volume
-with a host bind mount, create it with ownership `101:102`; runtime ownership
-repair was intentionally removed.
+support a read-only root filesystem. The managed Compose installer prepares its
+host bind with the just-built image in a one-shot root container, retains
+private read access for the invoking operator's primary group, then keeps the
+long-running API non-root. Run later lifecycle commands with that same account;
+no host root shell or manual numeric `chown` is required. Unraid remains a
+root-operated profile. The repository's legacy/reference Compose file uses a
+Docker-managed volume.
 
 `/ping` is liveness-only and `/health` plus `/ready` are shallow readiness
 checks; none contacts an LLM. The provider-backed `/health/deep` endpoint is
-operator-only and uses the same request budget and global provider gate as a
-translation. Authenticate it with `X-BT-Token`: this is `BT_API_TOKEN` when
-configured, otherwise the persisted `/app/data/cleanup_token` value.
+protected and uses the same request budget and global provider gate as a
+translation. In a managed install, call it through the public same-origin route
+using the configured CWA-session or Authentik authority. Only low-level token
+compatibility uses `X-BT-Token`; the private cleanup token is not a browser
+credential.
 
 `/metrics` reports request/cache counters, fixed HTTP status classes, bounded
 authentication/rate-limit/provider/work-budget outcomes, partial-batch segment

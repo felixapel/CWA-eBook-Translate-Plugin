@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ class ProxyConfigRendererTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         output = Path(temporary.name) / "proxy.conf"
+        browser_output = Path(temporary.name) / "browser-config.json"
         env = os.environ.copy()
         env.update({
             "CWA_UPSTREAM": "http://calibre-web:8083",
@@ -29,6 +31,8 @@ class ProxyConfigRendererTests(unittest.TestCase):
             "BT_PUBLIC_ORIGIN": "https://books.example.test:8443",
             "BT_CWA_MAX_BODY_SIZE": "2g",
             "BT_CWA_IDENTITY_HEADER": "Remote-User",
+            "BT_BROWSER_AUTH_MODE": "cwa_session",
+            "BT_BROWSER_CREDENTIALS": "same-origin",
         })
         for name, value in (overrides or {}).items():
             if value is None:
@@ -36,16 +40,22 @@ class ProxyConfigRendererTests(unittest.TestCase):
             else:
                 env[name] = value
         result = subprocess.run(
-            [sys.executable, str(RENDERER), str(TEMPLATE), str(output)],
+            [
+                sys.executable,
+                str(RENDERER),
+                str(TEMPLATE),
+                str(output),
+                str(browser_output),
+            ],
             check=False,
             capture_output=True,
             text=True,
             env=env,
         )
-        return result, output
+        return result, output, browser_output
 
     def test_valid_contract_renders_only_validated_values(self):
-        result, output = self.render()
+        result, output, browser_output = self.render()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = output.read_text()
@@ -61,6 +71,57 @@ class ProxyConfigRendererTests(unittest.TestCase):
         self.assertNotIn("$http_x_forwarded_proto", rendered)
         self.assertNotRegex(rendered, r"\$\{(?:BT_|CWA_)")
         self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            json.loads(browser_output.read_text()),
+            {
+                "apiUrl": "/bt-api",
+                "authMode": "cwa_session",
+                "credentials": "same-origin",
+            },
+        )
+        self.assertEqual(browser_output.stat().st_mode & 0o777, 0o600)
+        self.assertIn("location = /bt-config.json", rendered)
+        self.assertIn('add_header Cache-Control "no-store" always;', rendered)
+        for header in (
+            "X-BT-Subject",
+            "X-BT-Roles",
+            "X-authentik-uid",
+            "X-authentik-groups",
+        ):
+            self.assertIn(f'proxy_set_header {header} "";', rendered)
+
+    def test_forwarded_browser_contract_sends_cookie_only_to_identity_edge(self):
+        result, _, browser_output = self.render({
+            "BT_BROWSER_AUTH_MODE": "forwarded",
+            "BT_BROWSER_CREDENTIALS": "include",
+        })
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            json.loads(browser_output.read_text()),
+            {
+                "apiUrl": "/bt-api",
+                "authMode": "forwarded",
+                "credentials": "include",
+            },
+        )
+
+    def test_browser_auth_and_credentials_must_be_a_supported_pair(self):
+        for auth_mode, credentials in (
+            ("forwarded", "omit"),
+            ("forwarded", "same-origin"),
+            ("cwa_session", "include"),
+            ("token", "omit"),
+        ):
+            with self.subTest(auth_mode=auth_mode, credentials=credentials):
+                result, output, browser_output = self.render({
+                    "BT_BROWSER_AUTH_MODE": auth_mode,
+                    "BT_BROWSER_CREDENTIALS": credentials,
+                })
+                self.assertEqual(result.returncode, 78)
+                self.assertFalse(output.exists())
+                self.assertFalse(browser_output.exists())
+                self.assertIn("BT_BROWSER", result.stderr)
 
     def test_public_origin_is_required_and_must_be_an_exact_http_origin(self):
         for value in (
@@ -75,9 +136,10 @@ class ProxyConfigRendererTests(unittest.TestCase):
             "https://books.example.test\nserver { listen 9000; }",
         ):
             with self.subTest(value=value):
-                result, output = self.render({"BT_PUBLIC_ORIGIN": value})
+                result, output, browser_output = self.render({"BT_PUBLIC_ORIGIN": value})
                 self.assertEqual(result.returncode, 78)
                 self.assertFalse(output.exists())
+                self.assertFalse(browser_output.exists())
                 self.assertIn("BT_PUBLIC_ORIGIN", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
@@ -92,9 +154,10 @@ class ProxyConfigRendererTests(unittest.TestCase):
         )
         for name, value in cases:
             with self.subTest(name=name, value=value):
-                result, output = self.render({name: value})
+                result, output, browser_output = self.render({name: value})
                 self.assertEqual(result.returncode, 78)
                 self.assertFalse(output.exists())
+                self.assertFalse(browser_output.exists())
                 self.assertIn(name, result.stderr)
                 self.assertNotIn("secret", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
@@ -114,9 +177,10 @@ class ProxyConfigRendererTests(unittest.TestCase):
         )
         for name, value in cases:
             with self.subTest(name=name, value=value):
-                result, output = self.render({name: value})
+                result, output, browser_output = self.render({name: value})
                 self.assertEqual(result.returncode, 78)
                 self.assertFalse(output.exists())
+                self.assertFalse(browser_output.exists())
                 self.assertIn(name, result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 

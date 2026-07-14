@@ -24,7 +24,7 @@ source release remains blocked until every item under
 | Audit finding | Disposition | Repository evidence |
 |---|---|---|
 | F-01 unauthenticated translation | Implemented and gated | `auth.py`, `test_auth.py`, and the private API topology in `docker-compose.yml` authenticate before cache/provider work. |
-| F-02 shared proxy rate-limit identity | Implemented and gated | Trusted peers are initialized before Gunicorn; proxy and hardening contracts exercise distinct clients and reject forged forwarding. |
+| F-02 shared proxy rate-limit identity | Implemented and gated | Spoof-safe observed clients bound pre-auth attempts/inflight work; opaque authenticated subjects bound successful API quotas. Hardening contracts cover both tiers and reject forged forwarding. |
 | F-03 unbounded work and storage | Implemented and gated | `work_budget.py`, provider-budget tests, mandatory cache TTL/cap, and bounded global upstream admission enforce finite work. |
 | F-04 release independent of authoritative CI/parity | Implemented and gated, plus operator prerequisites | `.gitea/workflows/release.yml` validates the exact Gitea/GitHub tag and commit before all backend, browser, and container gates. Official artifacts are the validated source tag and archives. |
 | F-05 divergent historical `v2.0.0` tags | Historical exception | [The release runbook](RELEASE.md#historical-split-tag) records both immutable commit identities; all future releases fail on tag divergence. |
@@ -60,23 +60,27 @@ all of these outcomes without a skipped or unavailable gate:
    real-Chromium reader tests pass without console or network failures.
 3. Python dependency auditing reports no known vulnerabilities.
 4. The image builds and the split API/proxy smoke test proves non-root identity,
-   read-only filesystems, zero capabilities, routing, and independent shutdown.
+   read-only filesystems, zero capabilities, routing, independent shutdown, and
+   the forwarded Authentik edge contract on a protected API route.
 5. Gitea and GitHub CI definitions remain byte-identical and the workflow
    contract suites pass.
 6. Release-policy contracts prove the fail-closed source workflow wiring;
    preflight rejects wrong versions, tags, commits, ancestry, or mirror parity,
    and the artifact smoke gate rejects a broken container build or runtime.
-7. Cache migration contracts prove v1 and v2 tables coexist, the prior release
-   remains read/write compatible, the unreleased draft layout normalizes
-   atomically, and SQLite integrity survives v1 → v2 → v1 → v2.
+7. A real-Docker `btctl` gate proves install, state-loss adoption, conservative
+   uninstall, reinstall, offline v2.1.4 migration, healthy rollback, and
+   journaled re-upgrade. It also verifies that v1 and v2 cache tables coexist
+   and SQLite integrity survives v1 → v2 → v1 → v2.
 
-The final local audit run on 2026-07-13 passed the backend matrix (182 contract
-tests plus the standalone translation and hardening suites), frontend unit
-tests, three Chromium scenarios, Python and npm vulnerability audits, the live
-rate-limit probe, and the container smoke gate. The earlier image-publication
-audit also exercised multi-platform attestations before that publication path
-was retired by ADR-008. Protected CI must repeat the currently maintained gates
-for the exact commit that is merged.
+The final local candidate audit on 2026-07-14 passed Python compilation, the
+standalone translation and hardening suites, the complete backend contract suite,
+frontend unit tests, four real-Chromium scenarios, Python and npm vulnerability
+audits, local Markdown-link/parity checks, and the split-role container build
+and smoke gate on Docker 29.6.1. The earlier image-publication audit also
+exercised multi-platform attestations before that publication path was retired
+by ADR-008. Protected CI must repeat the currently maintained gates for the
+exact commit that is merged; this record is not a substitute for real Unraid
+browser acceptance.
 
 ## Remote promotion prerequisites
 

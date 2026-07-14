@@ -11,6 +11,8 @@ import time
 import threading
 import uuid
 import hmac
+import ipaddress
+import socket
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -144,8 +146,19 @@ BT_TRUST_PROXY = os.environ.get("BT_TRUST_PROXY", "false").lower() in ("1", "tru
 BT_TRUSTED_PROXIES = {
     p.strip() for p in os.environ.get("BT_TRUSTED_PROXIES", "").split(",") if p.strip()
 }
-import ipaddress  # local import: used only when BT_TRUSTED_PROXIES is set
 _TRUSTED_PROXY_NETS = [ipaddress.ip_network(c, strict=False) for c in BT_TRUSTED_PROXIES]
+BT_TRUSTED_PROXY_HOST = os.environ.get("BT_TRUSTED_PROXY_HOST", "").strip()
+if BT_TRUSTED_PROXY_HOST and not re.fullmatch(
+    r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?",
+    BT_TRUSTED_PROXY_HOST,
+):
+    raise ValueError("BT_TRUSTED_PROXY_HOST must be one exact DNS hostname")
+_trusted_proxy_host_lock = threading.Lock()
+_trusted_proxy_host_cache: tuple[str, float, frozenset] = (
+    "",
+    0.0,
+    frozenset(),
+)
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -326,10 +339,14 @@ def _is_origin_allowed(origin: str | None) -> str | None:
 _rate_limit_lock = threading.Lock()
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 _auth_rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_auth_inflight_store: dict[str, int] = {}
 BT_RATE_LIMIT_PER_MINUTE = int(os.environ.get("BT_RATE_LIMIT_PER_MINUTE", "120"))
 BT_RATE_LIMIT_RETRY_AFTER = int(os.environ.get("BT_RATE_LIMIT_RETRY_AFTER", "10"))
 BT_AUTH_RATE_LIMIT_PER_MINUTE = int(
     os.environ.get("BT_AUTH_RATE_LIMIT_PER_MINUTE", "300")
+)
+BT_AUTH_MAX_INFLIGHT_PER_CLIENT = int(
+    os.environ.get("BT_AUTH_MAX_INFLIGHT_PER_CLIENT", "2")
 )
 BT_RATE_LIMIT_MAX_CLIENTS = int(os.environ.get("BT_RATE_LIMIT_MAX_CLIENTS", "10000"))
 
@@ -337,6 +354,7 @@ if min(
     BT_RATE_LIMIT_PER_MINUTE,
     BT_RATE_LIMIT_RETRY_AFTER,
     BT_AUTH_RATE_LIMIT_PER_MINUTE,
+    BT_AUTH_MAX_INFLIGHT_PER_CLIENT,
     BT_RATE_LIMIT_MAX_CLIENTS,
 ) <= 0:
     raise ValueError("rate-limit settings must be positive integers")
@@ -366,6 +384,27 @@ def _cleanup_rate_limits():
 
 threading.Thread(target=_cleanup_rate_limits, daemon=True).start()
 
+
+def _acquire_auth_inflight(client_key: str) -> bool:
+    """Reserve a bounded auth-authority slot for one observed client."""
+    with _rate_limit_lock:
+        current = _auth_inflight_store.get(client_key, 0)
+        if current >= BT_AUTH_MAX_INFLIGHT_PER_CLIENT:
+            return False
+        if current == 0 and len(_auth_inflight_store) >= BT_RATE_LIMIT_MAX_CLIENTS:
+            return False
+        _auth_inflight_store[client_key] = current + 1
+        return True
+
+
+def _release_auth_inflight(client_key: str) -> None:
+    with _rate_limit_lock:
+        current = _auth_inflight_store.get(client_key, 0)
+        if current <= 1:
+            _auth_inflight_store.pop(client_key, None)
+        else:
+            _auth_inflight_store[client_key] = current - 1
+
 def _token_matches(provided: str, expected: str) -> bool:
     """Constant-time token comparison (avoids timing side-channels on the
     shared-secret checks; hmac.compare_digest is the standard tool)."""
@@ -377,6 +416,29 @@ def _token_matches(provided: str, expected: str) -> bool:
         # compare_digest rejects non-ASCII str values. Treat malformed header
         # input as an ordinary credential rejection instead of a framework 500.
         return False
+
+
+def _resolved_trusted_proxy_addresses() -> frozenset:
+    """Resolve one managed Docker alias with a short drift-tolerant cache."""
+    global _trusted_proxy_host_cache
+    host = BT_TRUSTED_PROXY_HOST
+    if not host:
+        return frozenset()
+    now = time.monotonic()
+    with _trusted_proxy_host_lock:
+        cached_host, expires_at, addresses = _trusted_proxy_host_cache
+        if cached_host == host and now < expires_at:
+            return addresses
+    try:
+        records = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        resolved = frozenset(
+            ipaddress.ip_address(record[4][0].split("%", 1)[0]) for record in records
+        )
+    except (OSError, ValueError):
+        resolved = frozenset()
+    with _trusted_proxy_host_lock:
+        _trusted_proxy_host_cache = (host, now + 5.0, resolved)
+    return resolved
 
 
 def _client_ip() -> str:
@@ -401,13 +463,17 @@ def _client_ip() -> str:
     else:
         client_ip_from_xff = ""
 
-    # BT_TRUSTED_PROXIES path: precise allowlist of peer CIDRs.
-    if BT_TRUSTED_PROXIES and client_ip_from_xff:
+    # Exact CIDRs cover identity edges. Managed split deployments use one
+    # Docker-only DNS alias so proxy address changes do not require a subnet
+    # allowlist or an API restart.
+    if (BT_TRUSTED_PROXIES or BT_TRUSTED_PROXY_HOST) and client_ip_from_xff:
         try:
             peer_ip = ipaddress.ip_address(peer)
         except ValueError:
             return peer  # malformed peer — don't trust the XFF
-        if any(peer_ip in net for net in _TRUSTED_PROXY_NETS):
+        if any(peer_ip in net for net in _TRUSTED_PROXY_NETS) or peer_ip in (
+            _resolved_trusted_proxy_addresses()
+        ):
             return client_ip_from_xff or peer
         # Peer not in allowlist: an attacker is forging XFF. Use peer.
         return peer
@@ -746,8 +812,20 @@ def before_request_hook():
         and request.path not in ("/health", "/ready", "/ping")
     )
     if protected:
-        client_ip = _client_ip()
-        if not _check_auth_rate_limit(client_ip):
+        auth_client_key = _client_ip()
+        # Admit by the spoof-resistant observed client before calling an
+        # external authority. This prevents sequential credential churn from
+        # reaching CWA or Authentik after the client's attempt budget is spent.
+        if not _check_auth_rate_limit(auth_client_key):
+            _record_outcome("auth_rate_limited")
+            response = jsonify({
+                "error": "rate_limited",
+                "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+                "request_id": request.request_id,
+            })
+            response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
+            return response, 429
+        if not _acquire_auth_inflight(auth_client_key):
             _record_outcome("auth_rate_limited")
             response = jsonify({
                 "error": "rate_limited",
@@ -757,23 +835,33 @@ def before_request_hook():
             response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
             return response, 429
         try:
-            identity = AUTHENTICATOR.authenticate(request.headers, request.remote_addr)
-        except AuthRejected:
-            _record_outcome("auth_rejected")
-            log.warning("req=%s authentication rejected", request.request_id)
-            return jsonify({
-                "error": "unauthorized",
-                "request_id": request.request_id,
-            }), 401
-        except AuthUnavailable:
-            _record_outcome("auth_unavailable")
-            log.warning("req=%s authentication authority unavailable", request.request_id)
-            return jsonify({
-                "error": "authentication_unavailable",
-                "request_id": request.request_id,
-            }), 503
-        request.auth_subject = identity.subject
-        request.auth_roles = identity.roles
+            try:
+                identity = AUTHENTICATOR.authenticate(
+                    request.headers, request.remote_addr
+                )
+            except AuthRejected:
+                _record_outcome("auth_rejected")
+                log.warning("req=%s authentication rejected", request.request_id)
+                return jsonify({
+                    "error": "unauthorized",
+                    "request_id": request.request_id,
+                }), 401
+            except AuthUnavailable:
+                _record_outcome("auth_unavailable")
+                log.warning(
+                    "req=%s authentication authority unavailable",
+                    request.request_id,
+                )
+                return jsonify({
+                    "error": "authentication_unavailable",
+                    "request_id": request.request_id,
+                }), 503
+            authenticated_key = f"authenticated:{identity.subject}"
+            request.auth_subject = identity.subject
+            request.auth_roles = identity.roles
+            request.rate_limit_key = authenticated_key
+        finally:
+            _release_auth_inflight(auth_client_key)
 
     # Rate limiting (H6) — exempt observability endpoints so operators can
     # monitor health/stats even while the per-client budget is exhausted.
@@ -784,10 +872,13 @@ def before_request_hook():
     # real cross-origin request, and a 429 on a preflight surfaces as a cryptic
     # CORS error in the browser instead of a rate limit the frontend can honor.
     if request.method != "OPTIONS" and request.path not in ("/health", "/ready", "/metrics", "/ping", "/stats"):
-        client_ip = _client_ip()
-        if not _check_rate_limit(client_ip):
+        rate_limit_key = getattr(request, "rate_limit_key", _client_ip())
+        if not _check_rate_limit(rate_limit_key):
             _record_outcome("api_rate_limited")
-            log.warning("Rate limit exceeded for %s (req %s)", client_ip, request.request_id)
+            log.warning(
+                "Rate limit exceeded for authenticated request (req %s)",
+                request.request_id,
+            )
             response = jsonify({
                 "error": "rate_limited",
                 "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
@@ -1314,8 +1405,9 @@ def cache_cleanup():
          auth mode it is also the request credential)
       2. Auto-generated deployment token persisted in /app/data/cleanup_token
          (only consulted when BT_API_TOKEN is empty). The token is generated
-         on first use with secrets.token_urlsafe and written to a file with
-         mode 0600 (the value itself is never logged — read it with
+         on first use with secrets.token_urlsafe and written to a private file
+         (0600 by default, or 0640 for the managed Compose operator group; the
+         value itself is never logged — read it with
          `docker exec <container> cat /app/data/cleanup_token`). This is
          the fail-safe: an operator who forgets to set BT_API_TOKEN does
          NOT get an unauthenticated destructive endpoint on their LAN.
@@ -1358,6 +1450,12 @@ import secrets as _secrets  # local: small surface
 import stat as _stat
 import tempfile as _tempfile
 _CLEANUP_TOKEN_PATH = Path(os.environ.get("BT_CACHE_DIR", "/app/data")) / "cleanup_token"
+_CLEANUP_FILE_MODE = (
+    0o640
+    if os.environ.get("BT_CACHE_OPERATOR_GROUP_ACCESS", "false").lower()
+    in ("1", "true", "yes")
+    else 0o600
+)
 _cleanup_token_cache: str | None = None
 _cleanup_token_lock = threading.Lock()
 
@@ -1376,7 +1474,7 @@ def _read_cleanup_token_file() -> str:
             raise OSError("cleanup token path is not a regular file")
         with os.fdopen(fd, "r", encoding="utf-8") as token_file:
             fd = -1  # fdopen owns and closes it from this point.
-            os.fchmod(token_file.fileno(), 0o600)
+            os.fchmod(token_file.fileno(), _CLEANUP_FILE_MODE)
             # A generated token is ~43 bytes. Refuse an unexpectedly large
             # file rather than letting a corrupt volume consume unbounded RAM.
             value = token_file.read(4097)
@@ -1395,14 +1493,14 @@ def _persist_cleanup_token() -> tuple[str, bool]:
         f"{_CLEANUP_TOKEN_PATH.name}.lock")
     lock_flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
                   | getattr(os, "O_NONBLOCK", 0))
-    lock_fd = os.open(lock_path, lock_flags, 0o600)
+    lock_fd = os.open(lock_path, lock_flags, _CLEANUP_FILE_MODE)
 
     if not _stat.S_ISREG(os.fstat(lock_fd).st_mode):
         os.close(lock_fd)
         raise OSError("cleanup token lock path is not a regular file")
 
     with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_file:
-        os.fchmod(lock_file.fileno(), 0o600)
+        os.fchmod(lock_file.fileno(), _CLEANUP_FILE_MODE)
         _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
 
         existing = _read_cleanup_token_file()
@@ -1415,7 +1513,7 @@ def _persist_cleanup_token() -> tuple[str, bool]:
             dir=_CLEANUP_TOKEN_PATH.parent,
         )
         try:
-            os.fchmod(temp_fd, 0o600)
+            os.fchmod(temp_fd, _CLEANUP_FILE_MODE)
             with os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file:
                 temp_fd = -1  # fdopen owns and closes it from this point.
                 temp_file.write(token)
@@ -1452,8 +1550,9 @@ def _get_cleanup_token() -> str:
       1. If BT_API_TOKEN is set, use it as the operator credential. Token auth
          mode also uses it for the general request boundary.
       2. Else, read or create /app/data/cleanup_token. Creation is serialized
-         across threads and processes, then atomically persisted with mode
-         0600. Subsequent calls reuse the in-process cached value.
+         across threads and processes, then atomically persisted with the
+         configured private file mode. Subsequent calls reuse the in-process
+         cached value.
     """
     global _cleanup_token_cache
     if API_TOKEN:
@@ -1466,11 +1565,13 @@ def _get_cleanup_token() -> str:
             if generated:
                 log.warning(
                     "BT_API_TOKEN not set. Auto-generated a /cache/cleanup token and "
-                    "persisted it at %s (mode 0600). Read it with: "
+                    "persisted it at %s (mode %04o). Read it with: "
                     "docker exec <container> cat %s — the value is intentionally "
                     "NOT logged (logs are not secret storage). Set BT_API_TOKEN to "
                     "use a fixed value instead.",
-                    _CLEANUP_TOKEN_PATH, _CLEANUP_TOKEN_PATH,
+                    _CLEANUP_TOKEN_PATH,
+                    _CLEANUP_FILE_MODE,
+                    _CLEANUP_TOKEN_PATH,
                 )
         except Exception as exc:
             # A per-process fallback would create different credentials across

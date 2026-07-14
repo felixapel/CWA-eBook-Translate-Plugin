@@ -8,14 +8,22 @@ const loaderCode = fs.readFileSync('static/loader.js', 'utf-8');
 
 assert(!/getItem\(['"]bt_token['"]\)/.test(loaderCode),
     'The proxy loader must never recover a JavaScript-readable API token from localStorage');
-assert(/apiToken:\s*existing\.apiToken\s*\|\|\s*''/.test(loaderCode),
-    'Token compatibility must require explicit trusted bootstrap configuration');
-assert(/authMode:\s*existing\.authMode\s*\|\|\s*\(existing\.apiToken\s*\?\s*'token'\s*:\s*'cwa_session'\)/.test(loaderCode),
-    'The proxy loader must declare the browser authentication transport');
+assert(/fetch\(['"]\/bt-config\.json['"]/.test(loaderCode)
+        && /cache:\s*['"]no-store['"]/.test(loaderCode),
+    'The proxy loader must fetch its non-cacheable server-owned auth contract');
+assert(/authMode:\s*managed\.authMode/.test(loaderCode)
+        && /credentials:\s*managed\.credentials/.test(loaderCode)
+        && /apiToken:\s*''/.test(loaderCode)
+        && !/authMode:\s*existing\.authMode/.test(loaderCode),
+    'Managed authentication settings must not be overridden by page JavaScript');
 assert(/AUTH_MODE\s*===\s*'token'\s*&&\s*cfg\.apiToken/.test(code),
     'The browser must send X-BT-Token only in explicit token mode');
-assert(/AUTH_MODE\s*===\s*'cwa_session'[\s\S]{0,160}?['"]omit['"]/.test(code),
-    'Only cwa_session mode may attach browser cookies; other modes must omit them');
+assert(/AUTH_MODE\s*===\s*'forwarded'[\s\S]{0,80}?['"]include['"]/.test(code),
+    'Forwarded mode must present the browser cookie to the identity edge');
+assert(/id="bt-source-lang"/.test(code)
+        && /localStorage\.setItem\(['"]bt_source_lang['"]/.test(code)
+        && /source_lang:\s*SOURCE_LANG/.test(code),
+    'The reader must expose and persist a bounded source-language selector');
 
 let fetchCalls = [];
 let fetchResponses = [];
@@ -155,8 +163,47 @@ async function captureAuthTransport(config, enableCloudFallback = false) {
     return captured.options;
 }
 
+async function assertManagedLoaderContract() {
+    const loaderDom = new JSDOM(
+        '<!DOCTYPE html><html><head></head><body></body></html>',
+        { url: 'https://books.example.test/read/1', runScripts: 'dangerously' }
+    );
+    let request = null;
+    loaderDom.window.BOOK_TRANSLATOR = {
+        authMode: 'token', apiToken: 'page-spoof', targetLang: 'Spanish'
+    };
+    loaderDom.window.fetch = async (url, options) => {
+        request = { url, options };
+        return {
+            ok: true,
+            json: async () => ({
+                apiUrl: '/bt-api', authMode: 'forwarded', credentials: 'include'
+            })
+        };
+    };
+    const element = loaderDom.window.document.createElement('script');
+    element.textContent = loaderCode;
+    loaderDom.window.document.head.appendChild(element);
+    const deadline = Date.now() + 1000;
+    while (!loaderDom.window.document.querySelector('script[src*="translator.js"]')
+            && Date.now() < deadline) await wait(10);
+
+    assert(request, 'Loader must request the managed browser configuration');
+    assert.strictEqual(request.url, '/bt-config.json');
+    assert.strictEqual(request.options.credentials, 'same-origin');
+    assert.strictEqual(request.options.cache, 'no-store');
+    assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.authMode, 'forwarded');
+    assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.credentials, 'include');
+    assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.apiToken, '');
+    assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.targetLang, 'Spanish');
+    assert(loaderDom.window.document.querySelector('link[href*="translator.css"]'));
+    assert(loaderDom.window.document.querySelector('script[src*="translator.js"]'));
+    loaderDom.window.close();
+}
+
 async function runTest() {
     console.log("Starting frontend assertions test...");
+    await assertManagedLoaderContract();
     
     // 1. Initial page load will trigger visible queue (1 chunk) then prefetch queue (3 chunks).
     // Let's provide a 429 response first for the visible request.
@@ -336,8 +383,8 @@ async function runTest() {
         'Token mode must omit CWA cookies');
     assert.strictEqual(tokenTransport.headers['X-BT-Token'], 'browser-token',
         'Token mode must send only its explicit compatibility token');
-    assert.strictEqual(forwardedTransport.credentials, 'omit',
-        'Forwarded mode must omit CWA cookies');
+    assert.strictEqual(forwardedTransport.credentials, 'include',
+        'Forwarded mode must present the SSO cookie to the same-origin identity edge');
     assert(!('X-BT-Token' in forwardedTransport.headers),
         'Forwarded mode must not leak an accidentally configured token');
     assert.strictEqual(cwaTransport.credentials, 'include',

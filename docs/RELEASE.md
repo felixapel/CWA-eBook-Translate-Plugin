@@ -50,14 +50,18 @@ build/runtime smoke test. No workflow step receives a publication credential.
 
    ```bash
    .venv/bin/python -m py_compile \
+     btctl btctl_core.py btctl_compose.py btctl_docker.py btctl_unraid.py \
+     btctl_auth.py btctl_lifecycle.py \
      auth.py server.py translator.py cache.py singleflight.py work_budget.py \
      proxy/render_config.py scripts/release_preflight.py
    .venv/bin/python test_translation.py
    .venv/bin/python test_hardening.py
    .venv/bin/python -m unittest -v \
-     test_work_budget test_provider_budget test_cache_v2 \
+     test_btctl test_btctl_compose test_btctl_unraid test_btctl_auth \
+     test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 \
      test_context_cache test_singleflight test_auth test_ci_contract \
-     test_release_contract test_supply_chain_contract test_shell_contract \
+     test_install_docs test_release_contract test_supply_chain_contract \
+     test_shell_contract \
      test_container_contract test_cleanup_token test_api_schema \
      test_error_privacy test_observability test_proxy_config test_live_scripts
    node -c static/translator.js
@@ -72,6 +76,8 @@ build/runtime smoke test. No workflow step receives a publication credential.
    CANDIDATE_IMAGE="cwa-translate-release-candidate:$CANDIDATE_SHA"
    docker build -t "$CANDIDATE_IMAGE" .
    ./scripts/container-smoke.sh "$CANDIDATE_IMAGE" "cwa-release-$CANDIDATE_SHA"
+   ./scripts/btctl-lifecycle-smoke.sh \
+     "$CANDIDATE_IMAGE" "cwa-release-$CANDIDATE_SHA"
    ```
 
 4. Record the maintainer self-review, merge through protected Gitea, and wait
@@ -109,13 +115,37 @@ increment the version, and create a new tag.
 
 ## Install or roll back
 
-An existing reference-Compose v2.1.4 deployment must use the migration below
+An existing reference-Compose v2.1.4 deployment must use an offline migration
 **before any v2.2.0 container starts**. The old release used one combined
 `book-translator` container and the `./config/translator` bind mount; v2.2.0
-uses split API/proxy roles and a named volume. They are not interchangeable
+uses split API/proxy roles and a separate data path. They are not interchangeable
 without an explicit copy.
 
-### Upgrade the reference Compose deployment from v2.1.4
+### Managed v2.1.4 upgrade
+
+The supported operator path is the journaled lifecycle in `btctl`. Configure
+the exact old container/bind mount and a distinct new data directory, then run:
+
+```bash
+./btctl plan --env /absolute/private/path/cwa-translate.env
+./btctl upgrade --env /absolute/private/path/cwa-translate.env --yes
+./btctl doctor --env /absolute/private/path/cwa-translate.env
+```
+
+The command controls the only legacy writer, checkpoints and validates SQLite,
+creates an external snapshot and separate target copy, installs the split
+roles, and keeps the exact v2.1.4 runtime stopped and restartable. If public
+browser acceptance fails after a completed cutover:
+
+```bash
+./btctl rollback --env /absolute/private/path/cwa-translate.env --yes
+```
+
+### Manual recovery reference for the retired Compose layout
+
+The sequence below is retained as a disaster-recovery reference for the exact
+repository-provided v2.1.4 Compose layout. It is not the primary v2.2 install
+path and must not be mixed with a partially completed `btctl` journal.
 
 Start from the v2.1.4 checkout. Stop the only writer, then create a new offline
 snapshot outside the Git checkout so `cleanup_token` can never become an
@@ -173,7 +203,7 @@ docker run --rm --user 0:0 --entrypoint /bin/sh \
   '
 docker run --rm --user 101:102 --entrypoint python \
   --mount "type=volume,src=$DATA_VOLUME,dst=/app/data,readonly" \
-  cwa-ebook-translate-plugin:local -c 'import sqlite3; db=sqlite3.connect("file:/app/data/translations.db?mode=ro&immutable=1", uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
+  cwa-ebook-translate-plugin:local -c 'import sqlite3; db=sqlite3.connect("file:/app/data/translations.db?mode=ro", uri=True); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
 
 docker compose up -d --build
 curl -fsS http://127.0.0.1:8084/bt-api/ping
@@ -207,13 +237,18 @@ recovery copy; the retained named volume is the authoritative v2 copy.
 
 ### Fresh v2.2.0 install
 
-With no previous translator deployment, clone or check out the official tag,
-set the exact browser origin and build locally:
+With no previous translator deployment, check out the official annotated tag,
+copy `.env.example` to a private external path, and use the managed lifecycle:
 
 ```bash
 git checkout v2.2.0
-export BT_PUBLIC_ORIGIN=http://192.168.1.10:8084  # replace with your origin
-docker compose up -d --build
+test "$(git describe --tags --exact-match)" = "v2.2.0"
+cp .env.example /absolute/private/path/cwa-translate.env
+chmod 0600 /absolute/private/path/cwa-translate.env
+# Edit the exact CWA, storage, origin, profile, and LLM values.
+./btctl plan --env /absolute/private/path/cwa-translate.env
+./btctl install --env /absolute/private/path/cwa-translate.env --yes
+./btctl doctor --env /absolute/private/path/cwa-translate.env
 ```
 
 ## Historical split tag

@@ -93,6 +93,10 @@ class ObservabilityContractTests(unittest.TestCase):
             json={"text": "again", "source_lang": "English", "target_lang": "English"},
             environ_base={"REMOTE_ADDR": "198.51.100.20"},
         )
+        # Disabled development auth intentionally has one shared subject.
+        # Start a fresh API window so this assertion exercises validation,
+        # not the already-proven subject quota above.
+        server._rate_limit_store.clear()
         invalid = self.client.post(
             "/translate",
             json={"text": 17},

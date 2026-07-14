@@ -30,6 +30,23 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn('BT_ROLE="${BT_ROLE:-auto}"', entrypoint)
         self.assertIn('exec gunicorn --bind', entrypoint)
         self.assertIn('exec nginx -c /app/proxy/nginx-main.conf', entrypoint)
+        self.assertIn("umask 027", entrypoint)
+        self.assertIn('stat -c %a /app/data', entrypoint)
+        self.assertNotIn("chmod 700 /app/data", entrypoint)
+
+    def test_api_roles_initialize_cache_before_serving(self):
+        entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
+        self.assertIn("from cache import init_db; init_db()", entrypoint)
+        api_branch = entrypoint.split("    api)", 1)[1].split("        ;;", 1)[0]
+        self.assertLess(
+            api_branch.index("initialize_cache"),
+            api_branch.index("exec gunicorn"),
+        )
+        combined = entrypoint.split("# Legacy one-container compatibility.", 1)[1]
+        self.assertLess(
+            combined.index("initialize_cache"),
+            combined.index("start_api &"),
+        )
 
     def test_non_root_nginx_writes_only_below_tmp(self):
         config = (ROOT / "proxy" / "nginx-main.conf").read_text()
@@ -117,7 +134,14 @@ class ContainerContractTests(unittest.TestCase):
         smoke = smoke_path.read_text()
         self.assertTrue(smoke_path.stat().st_mode & 0o111)
         self.assertIn('./scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"', workflow)
-        self.assertIn('docker rm -f -v "$PROXY_CONTAINER" "$API_CONTAINER"', smoke)
+        self.assertIn("docker rm -f -v", smoke)
+        for container in (
+            "$EDGE_CONTAINER",
+            "$OUTPOST_CONTAINER",
+            "$PROXY_CONTAINER",
+            "$API_CONTAINER",
+        ):
+            self.assertIn(container, smoke)
         for token in (
             "BT_ROLE=api",
             "BT_ROLE=proxy",
@@ -130,6 +154,32 @@ class ContainerContractTests(unittest.TestCase):
         ):
             self.assertIn(token, smoke)
         self.assertNotIn("gosu", smoke)
+
+    def test_lifecycle_smoke_can_remove_non_root_managed_data(self):
+        smoke = (ROOT / "scripts" / "btctl-lifecycle-smoke.sh").read_text()
+        cleanup = smoke.split("cleanup() {", 1)[1].split("}\ntrap cleanup EXIT", 1)[0]
+        self.assertIn("docker run --rm --user 0:0", cleanup)
+        self.assertIn("type=bind,src=${ROOT_DIR},dst=/cleanup", cleanup)
+        self.assertIn("chmod -R u+rwX,g+rwX /cleanup", cleanup)
+        self.assertLess(
+            cleanup.index("chmod -R u+rwX,g+rwX /cleanup"),
+            cleanup.index('rm -rf -- "$ROOT_DIR"'),
+        )
+
+    def test_lifecycle_cwa_fixture_is_literal_compilable_python(self):
+        smoke = (ROOT / "scripts" / "btctl-lifecycle-smoke.sh").read_text()
+        marker = 'cat >"$CWA_FIXTURE" <<\'PY\'\n'
+        self.assertIn(marker, smoke)
+        fixture = smoke.split(marker, 1)[1].split("\nPY\n", 1)[0]
+        compile(fixture, "cwa-lifecycle-fixture.py", "exec")
+        self.assertIn(
+            '--mount "type=bind,src=${CWA_FIXTURE},dst=/app/cwa-fixture.py,readonly"',
+            smoke,
+        )
+        self.assertIn(
+            '--entrypoint python "$CWA_IMAGE" /app/cwa-fixture.py',
+            smoke,
+        )
 
     def test_image_auth_defaults_fail_closed_and_proxy_forwards_cwa_cookie(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
@@ -146,18 +196,26 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn('proxy_set_header X-BT-Roles "";', proxy)
 
     def test_unraid_helpers_preserve_the_non_root_sandbox(self):
-        deploy = (ROOT / "deploy_unraid.sh").read_text()
-        template = (ROOT / "my-book-translator-api.xml.tmpl").read_text()
+        adapter = (ROOT / "btctl_unraid.py").read_text()
+        api_template = (
+            ROOT / "deploy" / "unraid" / "my-cwa-translate-api.xml.tmpl"
+        ).read_text()
+        proxy_template = (
+            ROOT / "deploy" / "unraid" / "my-cwa-translate-proxy.xml.tmpl"
+        ).read_text()
         for token in (
-            "BT_ROLE=api",
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
             "uid=101,gid=102",
         ):
-            self.assertIn(token, deploy)
-            self.assertIn(token, template)
-        self.assertIn("install -d -m 0700 -o 101 -g 102 --", deploy)
+            self.assertIn(token, api_template)
+            self.assertIn(token, proxy_template)
+        self.assertIn('"BT_ROLE": "api"', adapter)
+        self.assertIn(
+            "os.chown(candidate, 101, 102, follow_symlinks=False)", adapter
+        )
+        self.assertIn("publish_port=None", adapter)
 
 
 if __name__ == "__main__":

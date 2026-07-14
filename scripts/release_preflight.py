@@ -34,6 +34,8 @@ OVERLAY_JS_VERSION_RE = re.compile(
 CHANGELOG_VERSION_RE = re.compile(
     r"(?m)^## \[(?!Unreleased\])([^\]]+)\](?: - [0-9]{4}-[0-9]{2}-[0-9]{2})?\s*$"
 )
+UNRELEASED_HEADING_RE = re.compile(r"(?m)^## \[Unreleased\]\s*$")
+VERSION_HEADING_RE = re.compile(r"(?m)^## \[")
 
 
 class PreflightError(Exception):
@@ -145,7 +147,21 @@ def _version_surfaces(repository: Path) -> dict[str, str]:
     }
 
 
+def _verify_empty_unreleased(repository: Path) -> None:
+    changelog = _read_text(repository / "CHANGELOG.md", "CHANGELOG.md")
+    headings = list(UNRELEASED_HEADING_RE.finditer(changelog))
+    if len(headings) != 1:
+        raise PreflightError("changelog must contain one Unreleased section")
+    body_start = headings[0].end()
+    next_version = VERSION_HEADING_RE.search(changelog, body_start)
+    if next_version is None:
+        raise PreflightError("changelog Unreleased section has no released successor")
+    if changelog[body_start:next_version.start()].strip():
+        raise PreflightError("changelog Unreleased section must be empty")
+
+
 def _verify_versions(repository: Path, version: str) -> None:
+    _verify_empty_unreleased(repository)
     for surface, actual in _version_surfaces(repository).items():
         if not isinstance(actual, str) or actual != version:
             raise PreflightError(

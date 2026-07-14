@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import sys
@@ -113,6 +114,44 @@ def _validated_header_name(env: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _validated_browser_config(env: Mapping[str, str]) -> dict[str, str]:
+    auth_mode = _required(env, "BT_BROWSER_AUTH_MODE")
+    credentials = _required(env, "BT_BROWSER_CREDENTIALS")
+    supported = {
+        "cwa_session": "same-origin",
+        "forwarded": "include",
+    }
+    if auth_mode not in supported or supported[auth_mode] != credentials:
+        raise ProxyConfigError(
+            "BT_BROWSER_AUTH_MODE and BT_BROWSER_CREDENTIALS are not a supported pair"
+        )
+    return {
+        "apiUrl": "/bt-api",
+        "authMode": auth_mode,
+        "credentials": credentials,
+    }
+
+
+def _atomic_write(output_path: Path, content: str) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.", dir=output_path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, output_path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> None:
     cwa_upstream, _, _ = _validated_base_url(env, "CWA_UPSTREAM")
     api_upstream, _, _ = _validated_base_url(env, "BT_API_UPSTREAM")
@@ -142,31 +181,27 @@ def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> No
     if unresolved:
         raise ProxyConfigError("proxy template contains an unresolved placeholder")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output_path.name}.", dir=output_path.parent
+    _atomic_write(output_path, rendered)
+
+
+def render_browser_config(output_path: Path, config: Mapping[str, str]) -> None:
+    _atomic_write(
+        output_path,
+        json.dumps(dict(config), sort_keys=True, separators=(",", ":")) + "\n",
     )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(rendered)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_name, 0o600)
-        os.replace(temporary_name, output_path)
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: render_config.py TEMPLATE OUTPUT", file=sys.stderr)
+    if len(argv) != 4:
+        print(
+            "usage: render_config.py TEMPLATE NGINX_OUTPUT BROWSER_CONFIG_OUTPUT",
+            file=sys.stderr,
+        )
         return 64
     try:
+        browser_config = _validated_browser_config(os.environ)
         render(Path(argv[1]), Path(argv[2]), os.environ)
+        render_browser_config(Path(argv[3]), browser_config)
     except (ProxyConfigError, OSError) as exc:
         # Never print environment values: upstream URLs may contain private
         # names, and rejected credential-bearing URLs must not reach logs.

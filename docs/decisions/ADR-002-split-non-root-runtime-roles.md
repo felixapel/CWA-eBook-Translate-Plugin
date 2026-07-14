@@ -38,9 +38,16 @@ existing one-container deployments while Compose users migrate.
 
 - A single digest still represents the complete release and architecture set.
 - API and proxy failures are independently observable and recoverable.
-- Bind-mounted `/app/data` directories must already be writable by `101:102`.
-  The reference Compose file uses a named volume; the Unraid helpers create or
-  document the required ownership.
+- Bind-mounted `/app/data` directories must be writable by uid `101` before the
+  long-running API starts. Managed Compose prepares the bind with a one-shot
+  container from the built image, uses the invoking account's primary group as
+  a private setgid read boundary for later lifecycle verification, and leaves
+  the runtime at `101:102`. Unraid creates a `101:102` tree as root. The
+  reference development Compose file continues to use a named volume.
+- Managed Compose cache files use `0640` and the bind uses `2750`; Unraid and
+  unmanaged defaults remain `0600` and `0700`. This avoids requiring root for
+  rollback or reinstall while granting no access to host users outside the
+  selected operator group.
 - The combined role remains supported for compatibility but is not the
   production recommendation.
 - nginx and the standard-library-only validated config renderer remain present

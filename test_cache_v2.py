@@ -615,6 +615,25 @@ class CacheV2Tests(unittest.TestCase):
                         now=self.clock,
                     )
 
+    def test_operator_group_access_keeps_directory_setgid_and_cache_files_group_readable(self) -> None:
+        group_dir = Path(self.tmp.name) / "operator-group-cache"
+        store = CacheStore(
+            group_dir / "cache.db",
+            ttl_days=30,
+            max_entries=3,
+            now=self.clock,
+            harden_existing_directory=True,
+            operator_group_access=True,
+        )
+        try:
+            self.assertEqual(group_dir.stat().st_mode & 0o7777, 0o2750)
+            for suffix in ("", "-wal", "-shm"):
+                path = Path(str(group_dir / "cache.db") + suffix)
+                if path.exists():
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        finally:
+            store.close()
+
 
 class CacheDeploymentContractTests(unittest.TestCase):
     def test_container_enforces_private_cache_directory(self) -> None:
@@ -622,8 +641,9 @@ class CacheDeploymentContractTests(unittest.TestCase):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
         self.assertIn("chmod 700 /app/data", dockerfile)
         self.assertIn('ENV BT_CACHE_HARDEN_EXISTING_DIR="true"', dockerfile)
-        self.assertIn("umask 077", entrypoint)
-        self.assertIn("chmod 700 /app/data", entrypoint)
+        self.assertIn("umask 027", entrypoint)
+        self.assertIn("stat -c %a /app/data", entrypoint)
+        self.assertNotIn("chmod 700 /app/data", entrypoint)
 
     def test_deployment_defaults_are_bounded(self) -> None:
         compose = (ROOT / "docker-compose.yml").read_text()

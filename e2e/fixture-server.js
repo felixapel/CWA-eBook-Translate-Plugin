@@ -34,6 +34,18 @@ const server = http.createServer((request, response) => {
         sendFile(response, 'static/translator.css');
         return;
     }
+    if (url.pathname === '/bt-config.json') {
+        response.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+        });
+        response.end(JSON.stringify({
+            apiUrl: '/bt-api',
+            authMode: 'cwa_session',
+            credentials: 'same-origin',
+        }));
+        return;
+    }
     if (url.pathname === '/chapter/1') {
         response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         response.end(`<!doctype html><html><body>

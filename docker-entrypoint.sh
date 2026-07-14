@@ -1,7 +1,7 @@
 #!/bin/sh
 # Non-root runtime dispatcher for API, proxy, or legacy combined mode.
 set -eu
-umask 077
+umask 027
 
 PORT="${PORT:-8390}"
 BT_PROXY_PORT="${BT_PROXY_PORT:-8080}"
@@ -35,12 +35,16 @@ check_data_dir() {
         echo "[entrypoint] ERROR: /app/data is missing" >&2
         exit 78
     fi
-    if ! chmod 700 /app/data 2>/dev/null; then
-        echo "[entrypoint] ERROR: /app/data must permit private mode 0700" >&2
-        exit 78
-    fi
+    data_mode="$(stat -c %a /app/data 2>/dev/null || true)"
+    case "$data_mode" in
+        700|750|2700|2750) ;;
+        *)
+            echo "[entrypoint] ERROR: /app/data must have private mode 0700 or 2750" >&2
+            exit 78
+            ;;
+    esac
     probe="/app/data/.write-probe.$$"
-    if ! (umask 077 && : > "$probe") 2>/dev/null; then
+    if ! (umask 027 && : > "$probe") 2>/dev/null; then
         echo "[entrypoint] ERROR: /app/data must be writable by uid 101 gid 102" >&2
         exit 78
     fi
@@ -82,6 +86,13 @@ validate_api_auth() {
     esac
 }
 
+initialize_cache() {
+    if ! python -c 'from cache import init_db; init_db()' >/dev/null 2>&1; then
+        echo "[entrypoint] ERROR: cache database initialization failed" >&2
+        exit 78
+    fi
+}
+
 configure_proxy() {
     if [ -z "${CWA_UPSTREAM:-}" ]; then
         echo "[entrypoint] ERROR: CWA_UPSTREAM is required for the proxy role" >&2
@@ -102,7 +113,8 @@ configure_proxy() {
         /tmp/nginx/uwsgi_temp \
         /tmp/nginx/scgi_temp
     python /app/proxy/render_config.py \
-        /app/proxy/nginx.conf.template /tmp/nginx/proxy.conf
+        /app/proxy/nginx.conf.template /tmp/nginx/proxy.conf \
+        /tmp/nginx/browser-config.json
     nginx -t -c /app/proxy/nginx-main.conf -e /dev/stderr
 }
 
@@ -119,6 +131,7 @@ case "$BT_ROLE" in
     api)
         check_data_dir
         validate_api_auth
+        initialize_cache
         echo "[entrypoint] API role on :${PORT}"
         exec gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 \
             --timeout 120 server:app
@@ -135,6 +148,7 @@ esac
 # restart lifecycle.
 check_data_dir
 validate_api_auth
+initialize_cache
 configure_proxy
 echo "[entrypoint] combined role: API :${PORT}, proxy :${BT_PROXY_PORT}"
 start_api &

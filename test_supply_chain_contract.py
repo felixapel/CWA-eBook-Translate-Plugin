@@ -85,6 +85,20 @@ class SupplyChainContractTests(unittest.TestCase):
         installed = dict(token.split("=", 1) for token in apk_add.group(1).split())
         self.assertEqual(installed, APK_PACKAGES)
 
+    def test_runtime_copy_inputs_are_exact_files_not_open_directories(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertNotIn("COPY static/ ./static/", dockerfile)
+        self.assertNotIn("COPY proxy/ ./proxy/", dockerfile)
+        self.assertIn(
+            "COPY static/loader.js static/translator.css static/translator.js ./static/",
+            dockerfile,
+        )
+        self.assertIn(
+            "COPY proxy/nginx-main.conf proxy/nginx.conf.template "
+            "proxy/render_config.py ./proxy/",
+            dockerfile,
+        )
+
     def test_python_installs_require_the_reviewed_hashes_and_wheels(self):
         expected_install = (
             "python3 -m pip install --break-system-packages "

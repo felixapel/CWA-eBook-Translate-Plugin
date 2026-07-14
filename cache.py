@@ -131,6 +131,7 @@ class CacheStore:
         hit_flush_threshold: int = 100,
         now: Callable[[], datetime] | None = None,
         harden_existing_directory: bool = False,
+        operator_group_access: bool = False,
     ) -> None:
         for name, value in (
             ("ttl_days", ttl_days),
@@ -146,6 +147,7 @@ class CacheStore:
         self.hit_flush_threshold = hit_flush_threshold
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._harden_existing_directory = harden_existing_directory
+        self._operator_group_access = operator_group_access
         self._thread_local = threading.local()
         self._connections_lock = threading.Lock()
         self._connections: set[sqlite3.Connection] = set()
@@ -165,8 +167,18 @@ class CacheStore:
     def _prepare_directory(self) -> None:
         parent = self.db_path.parent
         created = not parent.exists()
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if created or self._harden_existing_directory:
+        directory_mode = 0o2750 if self._operator_group_access else 0o700
+        parent.mkdir(mode=directory_mode, parents=True, exist_ok=True)
+        if self._operator_group_access:
+            if created:
+                os.chmod(parent, directory_mode)
+            mode = parent.stat().st_mode & 0o7777
+            if mode != directory_mode:
+                raise PermissionError(
+                    "operator-group cache access requires a preflight-prepared "
+                    "setgid directory with mode 2750"
+                )
+        elif created or self._harden_existing_directory:
             os.chmod(parent, 0o700)
         else:
             mode = parent.stat().st_mode & 0o777
@@ -179,10 +191,11 @@ class CacheStore:
                 )
 
     def _secure_files(self) -> None:
+        file_mode = 0o640 if self._operator_group_access else 0o600
         for suffix in ("", "-wal", "-shm"):
             path = Path(str(self.db_path) + suffix)
             try:
-                os.chmod(path, 0o600)
+                os.chmod(path, file_mode)
             except FileNotFoundError:
                 continue
 
@@ -635,6 +648,9 @@ class CacheStore:
 _harden_existing = os.getenv(
     "BT_CACHE_HARDEN_EXISTING_DIR", "false"
 ).lower() in ("1", "true", "yes")
+_operator_group_access = os.getenv(
+    "BT_CACHE_OPERATOR_GROUP_ACCESS", "false"
+).lower() in ("1", "true", "yes")
 
 _default_store: CacheStore | None = None
 _default_store_lock = threading.Lock()
@@ -657,6 +673,7 @@ def _store() -> CacheStore:
                     max_entries=CACHE_MAX_ENTRIES,
                     hit_flush_threshold=CACHE_HIT_FLUSH_THRESHOLD,
                     harden_existing_directory=_harden_existing,
+                    operator_group_access=_operator_group_access,
                 )
     return _default_store
 
