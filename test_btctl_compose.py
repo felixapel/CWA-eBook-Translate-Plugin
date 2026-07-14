@@ -45,6 +45,9 @@ class FakeDocker:
         self.calls.append(("build_image", str(repository), image, dict(labels)))
         self.images[image] = {"Id": "sha256:image-id", "Config": {"Labels": labels}}
 
+    def prepare_data_directory(self, image, path):
+        self.calls.append(("prepare_data_directory", image, str(path)))
+
     def compose_validate(self, document, project):
         self.calls.append(("compose_validate", str(document), project))
         json.loads(Path(document).read_text(encoding="utf-8"))
@@ -191,6 +194,8 @@ class ComposeInstallTests(unittest.TestCase):
             self.assertEqual(StateStore(root / "state").load(), state)
             call_names = [call[0] for call in docker.calls]
             self.assertLess(call_names.index("require_available"), call_names.index("build_image"))
+            self.assertLess(call_names.index("build_image"), call_names.index("prepare_data_directory"))
+            self.assertLess(call_names.index("prepare_data_directory"), call_names.index("compose_up"))
             self.assertLess(call_names.index("build_image"), call_names.index("compose_up"))
             self.assertLess(call_names.index("compose_up"), call_names.index("wait_healthy"))
             self.assertEqual(state.resources["api"]["id"], "cwa-translate-test-api-id")

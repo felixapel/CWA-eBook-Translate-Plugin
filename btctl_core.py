@@ -298,6 +298,8 @@ class InstallConfig:
         state_dir = _absolute_dir(values.get("BT_STATE_DIR", ""), "BT_STATE_DIR")
         data_dir = _absolute_dir(values.get("BT_DATA_DIR", ""), "BT_DATA_DIR")
         backup_dir = _absolute_dir(values.get("BT_BACKUP_DIR", ""), "BT_BACKUP_DIR")
+        if "," in data_dir:
+            raise ConfigError("BT_DATA_DIR must not contain a comma")
         if len({state_dir, data_dir, backup_dir}) != 3:
             raise ConfigError("BT_STATE_DIR, BT_DATA_DIR, and BT_BACKUP_DIR must differ")
         unraid_template_dir = _clean_value(
@@ -684,7 +686,13 @@ class DeploymentState:
         state = cls(**payload)
         if not _INSTALL_ID_RE.fullmatch(str(state.install_id)):
             raise ConfigError("state contains an invalid install_id")
-        if state.status not in {"installed", "adopted", "uninstalled"}:
+        if state.status not in {
+            "installed",
+            "adopted",
+            "uninstalling",
+            "uninstalled",
+            "rolled_back",
+        }:
             raise ConfigError("state contains an invalid status")
         if not isinstance(state.resources, dict):
             raise ConfigError("state resources must be an object")

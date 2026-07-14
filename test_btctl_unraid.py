@@ -193,6 +193,23 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertNotIn("LLM_API_KEY", " ".join(arguments))
         self.assertNotIn("shell", run.call_args.kwargs)
 
+    def test_data_preparation_uses_the_built_image_and_fixed_container_identity(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().prepare_data_directory(
+                "local/cwa-translate:2.2.0-abcdef012345",
+                Path("/srv/cwa-translate/data"),
+            )
+
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[:3], ["docker", "run", "--rm"])
+        self.assertIn("--user", arguments)
+        self.assertIn("0:0", arguments)
+        self.assertIn("type=bind,src=/srv/cwa-translate/data,dst=/data", arguments)
+        self.assertIn("local/cwa-translate:2.2.0-abcdef012345", arguments)
+        self.assertNotIn("shell", run.call_args.kwargs)
+
 
 class UnraidInstallTests(unittest.TestCase):
     def setUp(self):

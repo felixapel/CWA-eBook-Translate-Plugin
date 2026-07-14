@@ -18,6 +18,11 @@ from btctl_core import (
 )
 from btctl_compose import ComposeAdopter, ComposeInstaller, InstallError
 from btctl_docker import DockerCLI, DockerCommandError
+from btctl_lifecycle import (
+    DeploymentDoctor,
+    LegacyUpgrade,
+    RuntimeUninstaller,
+)
 from btctl_unraid import UnraidAdopter, UnraidInstaller
 
 
@@ -57,27 +62,61 @@ def _parser() -> argparse.ArgumentParser:
     auth_snippet.add_argument(
         "--env", required=True, type=Path, help="strict KEY=value file"
     )
+    doctor = commands.add_parser(
+        "doctor", help="read-only verification of state, ownership, auth, and runtime"
+    )
+    doctor.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    uninstall = commands.add_parser(
+        "uninstall", help="remove only owned runtime while preserving data and backups"
+    )
+    uninstall.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    uninstall.add_argument("--yes", action="store_true", help="confirm runtime removal")
+    uninstall.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    upgrade = commands.add_parser(
+        "upgrade", help="offline migration from one exact stopped v2.1.4 runtime"
+    )
+    upgrade.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    upgrade.add_argument("--yes", action="store_true", help="confirm the migration cutover")
+    upgrade.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    rollback = commands.add_parser(
+        "rollback", help="remove v2.2 roles and restart the journaled v2.1.4 runtime"
+    )
+    rollback.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    rollback.add_argument("--yes", action="store_true", help="confirm rollback")
+    rollback.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     return parser
 
 
-def _load_plan(repository: Path, env_file: Path) -> DeploymentPlan:
+def _load_values(env_file: Path) -> dict[str, str]:
     try:
         source = env_file.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise ConfigError("configuration file could not be read") from exc
+    return parse_env_text(source)
+
+
+def _load_plan(repository: Path, env_file: Path) -> DeploymentPlan:
     identity = release_identity_from_checkout(repository)
-    config = InstallConfig.from_mapping(parse_env_text(source), identity)
+    config = InstallConfig.from_mapping(_load_values(env_file), identity)
     return DeploymentPlan.from_config(config)
 
 
 def _load_config(repository: Path, env_file: Path) -> tuple[InstallConfig, DeploymentPlan]:
-    try:
-        source = env_file.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise ConfigError("configuration file could not be read") from exc
     identity = release_identity_from_checkout(repository)
-    config = InstallConfig.from_mapping(parse_env_text(source), identity)
+    config = InstallConfig.from_mapping(_load_values(env_file), identity)
     return config, DeploymentPlan.from_config(config)
+
+
+def _print_payload(payload: dict[str, object], *, compact: bool) -> None:
+    print(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":") if compact else None,
+            indent=None if compact else 2,
+        )
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -102,14 +141,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 state = UnraidInstaller(docker).install(config, plan, args.repository)
             payload = state.to_dict()
-            print(
-                json.dumps(
-                    payload,
-                    sort_keys=True,
-                    separators=(",", ":") if args.json else None,
-                    indent=None if args.json else 2,
-                )
-            )
+            _print_payload(payload, compact=args.json)
             return 0
         if args.command == "adopt":
             config, plan = _load_config(args.repository, args.env)
@@ -118,18 +150,44 @@ def main(argv: list[str] | None = None) -> int:
                 state = ComposeAdopter(docker).adopt(config, plan)
             else:
                 state = UnraidAdopter(docker).adopt(config, plan)
-            print(
-                json.dumps(
-                    state.to_dict(),
-                    sort_keys=True,
-                    separators=(",", ":") if args.json else None,
-                    indent=None if args.json else 2,
-                )
-            )
+            _print_payload(state.to_dict(), compact=args.json)
             return 0
         if args.command == "auth-snippet":
             config, plan = _load_config(args.repository, args.env)
             print(render_authentik_edge(config, plan).content, end="")
+            return 0
+        if args.command == "doctor":
+            config, plan = _load_config(args.repository, args.env)
+            report = DeploymentDoctor(DockerCLI()).run(config, plan)
+            _print_payload(report.to_dict(), compact=args.json)
+            return 0 if report.ok else 1
+        if args.command == "uninstall":
+            config, plan = _load_config(args.repository, args.env)
+            if not args.yes:
+                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
+                raise ConfigError("uninstall requires --yes after reviewing ownership")
+            state = RuntimeUninstaller(DockerCLI()).uninstall(config, plan)
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "upgrade":
+            config, plan = _load_config(args.repository, args.env)
+            if not args.yes:
+                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
+                raise ConfigError("upgrade requires --yes after reviewing the plan")
+            state = LegacyUpgrade(DockerCLI()).upgrade(
+                config,
+                plan,
+                args.repository,
+                _load_values(args.env),
+            )
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "rollback":
+            config, plan = _load_config(args.repository, args.env)
+            if not args.yes:
+                raise ConfigError("rollback requires --yes")
+            state = LegacyUpgrade(DockerCLI()).rollback(config, plan)
+            _print_payload(state.to_dict(), compact=args.json)
             return 0
         raise ConfigError("unsupported command")
     except ConfigError as exc:

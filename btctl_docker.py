@@ -77,6 +77,26 @@ class DockerCLI:
         arguments.extend(["--tag", image, str(repository)])
         self._run(arguments, timeout=1800)
 
+    def prepare_data_directory(self, image: str, path: Path) -> None:
+        """Make one bind-mounted data directory private and writable by uid 101."""
+        self._run(
+            [
+                "run",
+                "--rm",
+                "--user",
+                "0:0",
+                "--entrypoint",
+                "/bin/sh",
+                "--mount",
+                f"type=bind,src={path},dst=/data",
+                image,
+                "-ec",
+                "chown 101:102 /data; chmod 0700 /data; "
+                "test \"$(stat -c %u:%g /data)\" = 101:102",
+            ],
+            timeout=60,
+        )
+
     def compose_validate(self, document: Path, project: str) -> None:
         self._run(
             ["compose", "--project-name", project, "--file", str(document), "config", "--quiet"],
@@ -205,6 +225,9 @@ class DockerCLI:
 
     def start_container(self, name: str) -> None:
         self._run(["start", name], timeout=60)
+
+    def stop_container(self, name: str) -> None:
+        self._run(["stop", "--time", "30", name], timeout=60)
 
     def remove_container(self, name: str) -> None:
         self._run(["rm", "--force", name], timeout=60)
