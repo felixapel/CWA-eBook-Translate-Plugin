@@ -48,6 +48,16 @@ git fetch --tags
 git switch --detach <release-tag-or-full-reviewed-commit>
 ```
 
+On stock Unraid, the same public `./btctl` command starts a temporary local
+operator through Docker and does not require host Python or NerdTools. It does
+require Bash, a working Docker daemon, root, and a full Git checkout including
+its `.git` directory. If the Unraid host has no Git client, Claude Code or any
+other Git-capable machine can prepare the exact checkout and copy that complete
+directory to Unraid; extracting only a release ZIP or tarball is not sufficient
+for the source-identity checks. Obtain the public launcher from that same
+trusted commit: because it runs as root, the launcher and its embedded pinned
+source-exporter definition are the bootstrap trust root.
+
 Copy [`.env.example`](.env.example) outside the checkout, make it private, and
 edit the deployment-specific values. For a local OpenAI-compatible LLM,
 `LLM_API_KEY` stays empty: this open-source project has no project key, registry
@@ -70,10 +80,13 @@ and LLM endpoint. Validate first, install second, and prove the running state:
 ./btctl doctor --env /absolute/private/path/cwa-translate.env
 ```
 
-`plan` does not mutate files or Docker. It reports the exact version+commit
-image, roles, ports, paths, CWA evidence, and ownership while redacting API
-keys. `install` writes state only after live postconditions pass. `doctor` is
-read-only and must finish with every check marked `ok`.
+`plan` does not change deployment files, state, CWA, or running containers. On
+a host without Python, its automatic bootstrap builds and removes temporary
+helper images, forces the local `/var/run/docker.sock`, and may warm the Docker
+build cache. It reports the exact
+version+commit image, roles, ports, paths, CWA evidence, and ownership while
+redacting API keys. `install` writes state only after live postconditions pass.
+`doctor` is read-only and must finish with every check marked `ok`.
 
 ```text
 Browser/reverse proxy -> cwa-translate-proxy -> stock CWA

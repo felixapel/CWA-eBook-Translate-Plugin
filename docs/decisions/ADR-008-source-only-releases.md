@@ -49,8 +49,11 @@ images justifies the key custody, registry access, and maintenance burden.
 
 ## Consequences
 
-- Contributors and users need only Git, Docker, and the checked-out release
-  source; no project publication secret is needed.
+- Contributors and users need Docker, Bash, and a full Git checkout of the
+  release source; no project publication secret is needed. Git is required to
+  prepare that checkout but, for the Unraid profile, host Python, host Git, and
+  NerdTools are not required to execute `./btctl`. See
+  [ADR-011](ADR-011-containerized-unraid-bootstrap.md).
 - Installation performs a local Docker build and therefore takes longer than
   pulling a prebuilt image.
 - Historical registry images remain historical artifacts and are not evidence

@@ -24,6 +24,31 @@ owned containers/network, exact CWA evidence, health, runtime environment,
 authentication profile, published ports, and generated artifacts. Fix its first
 failed check before debugging the browser.
 
+## `env: python3: No such file or directory` on Unraid
+
+Current `./btctl` automatically uses Docker when host Python 3.11+ is absent;
+stock Unraid does not need Python, NerdTools, or host Git to execute it. If this
+message comes from the public launcher, confirm that the checkout is current,
+that `btctl` is executable, and that you did not invoke the internal
+`btctl.py` directly.
+
+The fallback must run as `root`, reach the Docker daemon, and see a full clean
+Git checkout including `.git`. If Unraid has no Git client, prepare the exact
+commit with Claude Code or another Git-capable machine and copy the whole
+checkout. A downloaded source archive alone is insufficient. The first command
+may fetch pinned base layers and warm Docker build cache while it prepares the
+temporary operator; that is expected even for `plan`.
+
+The fallback intentionally requires the local Unix socket at
+`/var/run/docker.sock` and ignores remote Docker contexts. If that socket is
+missing, fix the local Docker service or permissions; do not point an Unraid
+install at a remote daemon whose bind-mount paths refer to another machine.
+
+Lifecycle commands also require `/run/cwa-translate-btctl-locks` to be a real
+root-owned directory with mode `0700`. `btctl` creates it when absent. If it
+rejects an existing object there, remove or repair that object only after
+confirming no other `btctl` operation is running; do not bypass the lock.
+
 ## Toolbar is missing
 
 1. Open the reader through `BT_PUBLIC_ORIGIN`, not CWA's direct port. Stock CWA
@@ -147,7 +172,9 @@ DRM-free EPUB.
 
 ## Install, state, or migration recovery
 
-- A failed `plan` performs no mutation. Correct the named field and rerun it.
+- A failed `plan` creates no deployment state or runtime resources. On a host
+  without Python, the temporary bootstrap may still warm Docker build cache.
+  Correct the named field and rerun it.
 - A failed fresh install removes only newly created translator runtime
   resources and writes no successful `state.json`; CWA and user data stay
   external.

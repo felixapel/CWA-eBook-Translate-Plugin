@@ -2,6 +2,7 @@
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,14 +11,135 @@ ROOT = Path(__file__).parent
 
 
 class ShellContractTests(unittest.TestCase):
+    def test_bootstrap_files_are_forced_to_linux_line_endings(self):
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("btctl text eol=lf", attributes)
+        self.assertIn("Dockerfile.btctl text eol=lf", attributes)
+
     def test_operator_helpers_are_executable(self):
-        for name in ("deploy_unraid.sh", "verify_unraid.sh", "install_unraid.sh"):
+        for name in (
+            "btctl",
+            "deploy_unraid.sh",
+            "verify_unraid.sh",
+            "install_unraid.sh",
+        ):
             self.assertTrue((ROOT / name).stat().st_mode & 0o111, name)
 
     def test_bash_helpers_enable_strict_mode(self):
-        for name in ("deploy_unraid.sh", "verify_unraid.sh", "install_unraid.sh"):
+        for name in (
+            "btctl",
+            "deploy_unraid.sh",
+            "verify_unraid.sh",
+            "install_unraid.sh",
+        ):
             source = (ROOT / name).read_text()
             self.assertIn("set -euo pipefail", source, name)
+
+    def test_btctl_dispatches_to_python_or_a_hardened_local_operator(self):
+        source = (ROOT / "btctl").read_text()
+        self.assertEqual(source.splitlines()[0], "#!/usr/bin/env bash")
+        for contract in (
+            "command -v python3",
+            "git --version",
+            '"$SCRIPT_DIR/btctl.py"',
+            "Dockerfile.btctl",
+            "--target",
+            "source-exporter",
+            "--network",
+            "none",
+            "--read-only",
+            "--pids-limit",
+            "--cap-drop",
+            "ALL",
+            "no-new-privileges:true",
+            "/var/run/docker.sock",
+            "BTCTL_EXPECTED_REVISION",
+            "core.fsmonitor",
+            "GIT_NO_REPLACE_OBJECTS=1",
+            "source_exporter_dockerfile",
+            "DAC_READ_SEARCH",
+            "BTCTL_LOCK_DIRECTORY",
+            "lock:ro",
+            "DOCKER_HOST=unix:///var/run/docker.sock",
+            "[ -S /var/run/docker.sock ]",
+            "/run/cwa-translate-btctl-locks",
+            '[ "$second" = "$HOST_LOCK_DIRECTORY" ]',
+        ):
+            self.assertIn(contract, source)
+        self.assertNotRegex(source, r"(?m)^\s*(?:source|eval)\s")
+        self.assertNotIn("image rm --force", source)
+        self.assertNotIn(
+            'cp -- "$SCRIPT_DIR/Dockerfile.btctl"',
+            source,
+        )
+
+    def test_python_without_git_selects_the_container_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            (tools / "dirname").symlink_to("/usr/bin/dirname")
+            python = tools / "python3"
+            python.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = -c ]; then exit 0; fi\n"
+                "echo unexpected-native-path >&2\n"
+                "exit 42\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            completed = subprocess.run(
+                ["/bin/bash", str(ROOT / "btctl"), "--help"],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "PATH": str(tools),
+                    "BTCTL_DOCKER_BIN": "missing-docker-for-contract",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 42)
+        self.assertNotIn("unexpected-native-path", completed.stderr)
+        self.assertRegex(
+            completed.stderr,
+            r"containerized Unraid path must run as root|Docker is required",
+        )
+
+    def test_native_dispatch_clears_container_only_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            (tools / "dirname").symlink_to("/usr/bin/dirname")
+            (tools / "git").symlink_to("/usr/bin/git")
+            python = tools / "python3"
+            python.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = -c ]; then exit 0; fi\n"
+                "[ -z \"${BTCTL_EXPECTED_REVISION:-}\" ] || exit 41\n"
+                "[ -z \"${BTCTL_OPERATOR_REVISION:-}\" ] || exit 41\n"
+                "[ -z \"${BTCTL_LOCK_DIRECTORY:-}\" ] || exit 41\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            completed = subprocess.run(
+                ["/bin/bash", str(ROOT / "btctl"), "--help"],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "PATH": str(tools),
+                    "BTCTL_EXPECTED_REVISION": "a" * 40,
+                    "BTCTL_OPERATOR_REVISION": "b" * 40,
+                    "BTCTL_LOCK_DIRECTORY": "/tmp/untrusted-lock",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_remote_target_is_one_quoted_value(self):
         for name in ("deploy_unraid.sh", "verify_unraid.sh"):

@@ -1,0 +1,51 @@
+FROM python:3.11-alpine@sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4 AS source-exporter
+
+# The exporter sees the checkout read-only and never receives the Docker
+# socket. Pin Git's full installed closure to keep the bootstrap reproducible.
+RUN apk add --no-cache \
+    brotli-libs=1.2.0-r1 \
+    c-ares=1.34.8-r0 \
+    git=2.54.0-r0 \
+    git-init-template=2.54.0-r0 \
+    libcurl=8.21.0-r0 \
+    libexpat=2.8.2-r0 \
+    libidn2=2.3.8-r0 \
+    libpsl=0.21.5-r3 \
+    libunistring=1.4.2-r0 \
+    nghttp2-libs=1.69.0-r0 \
+    pcre2=10.47-r1 \
+    zstd-libs=1.5.7-r2
+
+FROM source-exporter AS operator
+
+# Docker is an operator-only dependency. It never enters the production image.
+RUN apk add --no-cache \
+    docker-cli=29.5.3-r0 \
+    docker-cli-buildx=0.34.1-r0
+
+ARG BTCTL_SOURCE_REVISION
+ARG BTCTL_SOURCE_VERSION
+
+WORKDIR /opt/btctl
+COPY VERSION ./
+COPY btctl.py btctl_auth.py btctl_compose.py btctl_container.py btctl_core.py btctl_docker.py btctl_lifecycle.py btctl_paths.py btctl_unraid.py ./
+COPY deploy/unraid/my-cwa-translate-api.xml.tmpl deploy/unraid/my-cwa-translate-proxy.xml.tmpl ./deploy/unraid/
+
+RUN python3 -c 'import os,re; revision=os.environ["BTCTL_SOURCE_REVISION"]; version=os.environ["BTCTL_SOURCE_VERSION"]; assert re.fullmatch(r"[0-9a-f]{40}", revision); assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version); assert open("VERSION", encoding="utf-8").read().strip() == version'
+
+ENV BTCTL_OPERATOR_REVISION="$BTCTL_SOURCE_REVISION"
+ENV PYTHONDONTWRITEBYTECODE=1
+
+ENTRYPOINT ["python3", "/opt/btctl/btctl.py"]
+
+# CI-only host simulator: Bash and Docker remain, while the host-side Python
+# and Git launchers are removed so the public dispatcher must exercise its
+# stock-Unraid path.
+FROM operator AS dispatcher-smoke
+RUN apk add --no-cache bash=5.3.9-r1
+RUN rm -f \
+    /usr/bin/git \
+    /usr/local/bin/python \
+    /usr/local/bin/python3 \
+    /usr/local/bin/python3.11
+ENTRYPOINT ["/bin/bash"]

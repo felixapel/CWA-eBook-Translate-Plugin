@@ -213,7 +213,18 @@ class OperationLock:
 
     def __init__(self, state_dir: Path, *, create: bool = True):
         self.state_dir = Path(state_dir)
-        self.lock_target = self.state_dir.parent
+        container_lock = os.environ.get("BTCTL_LOCK_DIRECTORY", "")
+        if container_lock:
+            lock_target = Path(container_lock)
+            if (
+                not lock_target.is_absolute()
+                or lock_target == Path("/")
+                or ".." in lock_target.parts
+            ):
+                raise ConfigError("container lifecycle lock directory is invalid")
+            self.lock_target = lock_target
+        else:
+            self.lock_target = self.state_dir.parent
         self.create = create
         self._descriptor: int | None = None
 
@@ -441,35 +452,48 @@ def release_identity_from_checkout(repository: Path) -> ReleaseIdentity:
     root = Path(repository)
     if root.is_symlink() or not root.is_dir():
         raise ConfigError("repository must be a real directory")
+    git_environment = os.environ.copy()
+    git_environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    git_environment["GIT_OPTIONAL_LOCKS"] = "0"
+    git_prefix = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-C",
+        str(root),
+    ]
     try:
         top_level = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            [*git_prefix, "rev-parse", "--show-toplevel"],
             check=True,
             capture_output=True,
             text=True,
             timeout=10,
+            env=git_environment,
         ).stdout.strip()
         if Path(top_level).resolve() != root.resolve():
             raise ConfigError("repository must be the Git checkout root")
         subprocess.run(
-            ["git", "-C", str(root), "ls-files", "--error-unmatch", "VERSION"],
+            [*git_prefix, "ls-files", "--error-unmatch", "VERSION"],
             check=True,
             capture_output=True,
             text=True,
             timeout=10,
+            env=git_environment,
         )
         sha = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            [*git_prefix, "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
             timeout=10,
+            env=git_environment,
         ).stdout.strip()
         dirty = subprocess.run(
             [
-                "git",
-                "-C",
-                str(root),
+                *git_prefix,
                 "status",
                 "--porcelain=v1",
                 "--untracked-files=all",
@@ -478,6 +502,7 @@ def release_identity_from_checkout(repository: Path) -> ReleaseIdentity:
             capture_output=True,
             text=True,
             timeout=10,
+            env=git_environment,
         ).stdout
         version_path = root / "VERSION"
         if version_path.is_symlink():

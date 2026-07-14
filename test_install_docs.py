@@ -46,6 +46,21 @@ class InstallDocumentationContractTests(unittest.TestCase):
                 self.assertIn("./btctl rollback", source)
                 self.assertIn("Acceptance checklist", source)
 
+    def test_unraid_guide_covers_the_stock_host_bootstrap_boundary(self):
+        readme = README.read_text(encoding="utf-8")
+        unraid = UNRAID.read_text(encoding="utf-8")
+        compatibility = COMPATIBILITY.read_text(encoding="utf-8")
+        for contract in (
+            "does not require host Python or NerdTools",
+            "full Git checkout",
+            "Docker socket is equivalent to root access",
+            "build cache",
+        ):
+            self.assertIn(contract, unraid)
+        self.assertIn("host Python or NerdTools", readme)
+        self.assertIn("Unraid 7.3.2", compatibility)
+        self.assertNotIn("`plan` does not mutate files or Docker", readme)
+
     def test_authentik_guide_is_fail_closed_and_edge_owned(self):
         source = AUTHENTIK.read_text(encoding="utf-8")
         for contract in (

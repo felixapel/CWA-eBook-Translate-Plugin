@@ -1,6 +1,7 @@
 # Reduce image size: drop build artefacts and the dev-only bits that should
 # never end up in a production image.
 .venv
+.git
 __pycache__
 *.pyc
 *.pyo

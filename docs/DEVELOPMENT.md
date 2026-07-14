@@ -30,7 +30,7 @@ file, so it needs no running server, no API key, and no network access:
 .venv/bin/python3 test_translation.py
 .venv/bin/python3 test_hardening.py
 .venv/bin/python3 -m unittest -v \
-  test_btctl test_btctl_compose test_btctl_unraid test_btctl_auth \
+  test_btctl test_btctl_container test_btctl_compose test_btctl_unraid test_btctl_auth \
   test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 \
   test_context_cache test_singleflight test_auth test_ci_contract \
   test_install_docs test_release_contract test_supply_chain_contract \
@@ -41,22 +41,36 @@ file, so it needs no running server, no API key, and no network access:
 
 Always also check syntax/compile before committing:
 ```bash
-python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py \
-  btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py \
+python3 -m py_compile btctl.py btctl_container.py btctl_core.py \
+  btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py \
+  btctl_lifecycle.py auth.py server.py \
   translator.py cache.py singleflight.py work_budget.py proxy/render_config.py
+bash -n btctl scripts/*.sh
 ```
 
 The installer contract is self-contained and uses disposable Git repositories;
 it never contacts Docker or a live CWA instance:
 
 ```bash
-python3 -m unittest -v test_btctl test_btctl_compose test_btctl_unraid \
+python3 -m unittest -v test_btctl test_btctl_container test_btctl_compose test_btctl_unraid \
   test_btctl_auth test_btctl_lifecycle test_install_docs
 ```
 
 Use `./btctl plan --env /absolute/path/install.env --json` to inspect a clean
-checkout. `plan` must remain deterministic and mutation-free; installation
-side effects belong behind injectable runners and require separate tests.
+checkout. `btctl.py` is the internal Python entry point; operator documentation
+and integration tests must use the public `./btctl` dispatcher. Its stock-Unraid
+fallback may build temporary helper images and warm Docker cache, but `plan`
+must not change deployment files, state, CWA, or running containers.
+
+The real-Docker regression for a host with no Python is:
+
+```bash
+./scripts/btctl-bootstrap-smoke.sh "btctl-bootstrap-$(git rev-parse --short=12 HEAD)"
+```
+
+It runs the public dispatcher in a clean checkout, removes Python and Git from
+the simulated host image, verifies that `plan --json` reports the exact commit,
+and exercises Unraid install, doctor, and uninstall through the same fallback.
 
 `test_endpoints.py`, `test_ratelimit.py`, `benchmark.py`, and
 `benchmark_realistic.py` are different — they hit a **live** API

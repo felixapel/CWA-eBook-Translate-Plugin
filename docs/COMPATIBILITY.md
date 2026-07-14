@@ -11,7 +11,7 @@ Anything else is not a promise until its acceptance checks are added.
 |---|---|---|
 | CWA 4.x | Contract-supported, Tier 1 | An exact stable version and matching running image tag/label are required. The release reference is CWA `4.0.6`; a future 4.x UI change still requires browser acceptance before promotion. |
 | CWA 3.1.4 | Legacy migration only | Accepted only as the source of `btctl upgrade`; it is not a fresh v2.2 runtime target. |
-| Other CWA 3.x or pre-release/mutable tags | Rejected | `btctl plan` fails before build or Docker mutation. |
+| Other CWA 3.x or pre-release/mutable tags | Rejected | `btctl plan` fails before a production-image build or deployment mutation. A stock-host bootstrap may still warm ordinary Docker build cache. |
 | Stock CWA container | Required | The managed proxy-injection topology does not replace templates, mount overlay files into CWA, or own the CWA container. |
 
 The project tracks the stable CWA reader contract using the
@@ -21,7 +21,7 @@ The project tracks the stable CWA reader contract using the
 
 | Environment | Status | Notes |
 |---|---|---|
-| Unraid on x86_64 | Managed and acceptance-targeted | Use `BT_INSTALL_PROFILE=unraid` as root. `btctl` creates private appdata, two DockerMan templates, and separate non-root API/proxy containers. |
+| Stock Unraid 7.3.2 on x86_64 | Managed and acceptance-targeted | The automated gate runs public `./btctl` plan/install/doctor/uninstall without host Python or Git. Use `BT_INSTALL_PROFILE=unraid` as root with Docker, Bash, and a full Git checkout; NerdTools is not required. Physical-host and browser acceptance is still required before tagging. |
 | Linux with existing Compose-managed CWA | Managed and CI contract-tested | Use `BT_INSTALL_PROFILE=compose-existing`; CWA stays external to the generated private Compose document. A Docker-capable non-root account is supported when the same account and private primary group are used for every lifecycle command. |
 | Docker Engine with `docker compose` plugin | Required for Compose profile | The current development audit used Docker `29.6.1` and Compose `5.3.1`. CI also builds and exercises the image on a real Docker runner. No lower minimum is claimed without a matching gate. |
 | ARM64 Linux/Unraid | Not yet CI-certified | The source build may work where pinned base/package inputs resolve, but promotion requires an ARM build and runtime smoke gate. |

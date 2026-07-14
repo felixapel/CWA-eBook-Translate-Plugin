@@ -164,6 +164,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `./btctl` now works on stock Unraid without host Python or NerdTools. A
+  root-only dispatcher bootstraps a socket-free exporter from its embedded
+  pinned trust root, rejects Git replacement refs and remote Docker contexts,
+  builds an exact temporary operator, and grants that operator only guarded
+  command-specific paths and Docker access. Rollback obtains its legacy path
+  from the journal, and a private `/run` lock serializes native and fallback
+  lifecycle calls without exposing appdata; the production image remains
+  non-root and contains no administration tooling.
 - API and combined containers initialize and integrity-check the translation
   cache before accepting traffic, so first-start lifecycle verification no
   longer races lazy SQLite creation.

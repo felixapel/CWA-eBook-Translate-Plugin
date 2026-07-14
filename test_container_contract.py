@@ -22,6 +22,21 @@ class ContainerContractTests(unittest.TestCase):
             "translator.py", "work_budget.py",
         ):
             self.assertIn(runtime_module, dockerfile)
+        for operator_input in (
+            "btctl.py",
+            "btctl_container.py",
+            "btctl_paths.py",
+            "docker-cli",
+            "git=",
+        ):
+            self.assertNotIn(operator_input, dockerfile)
+
+    def test_operator_image_is_distinct_from_the_production_runtime(self):
+        dockerfile = (ROOT / "Dockerfile.btctl").read_text()
+        self.assertIn("FROM source-exporter AS operator", dockerfile)
+        self.assertIn('ENTRYPOINT ["python3", "/opt/btctl/btctl.py"]', dockerfile)
+        self.assertNotIn("USER appuser", dockerfile)
+        self.assertNotIn("docker-entrypoint.sh", dockerfile)
 
     def test_entrypoint_never_changes_ownership_or_escalates(self):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
