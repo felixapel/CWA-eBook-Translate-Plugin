@@ -27,7 +27,7 @@ def values(root: Path, reverse_proxy: str) -> dict[str, str]:
         "BT_DATA_DIR": str(root / "data"),
         "BT_BACKUP_DIR": str(root / "backups"),
         "BT_IDENTITY_PROXY_IP": "172.30.50.9/32",
-        "BT_AUTHENTIK_VERSION": "2025.12.4",
+        "BT_AUTHENTIK_VERSION": "2026.5.4",
         "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
         "BT_REVERSE_PROXY": reverse_proxy,
         "LLM_PROVIDER": "local",
@@ -47,6 +47,19 @@ class AuthentikEdgeConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             base = values(Path(directory), "nginx")
             for outpost in ("", "authentik:9000", "http://user:pass@authentik:9000"):
+                with self.subTest(outpost=outpost), self.assertRaisesRegex(
+                    ConfigError, "BT_AUTHENTIK_OUTPOST_URL"
+                ):
+                    InstallConfig.from_mapping(
+                        {**base, "BT_AUTHENTIK_OUTPOST_URL": outpost}, self.identity
+                    )
+
+            for outpost in (
+                "http://$http_host",
+                "http://%24http_host",
+                "http://authentik-outpost;evil:9000",
+                "http://authentik-outpost\\evil:9000",
+            ):
                 with self.subTest(outpost=outpost), self.assertRaisesRegex(
                     ConfigError, "BT_AUTHENTIK_OUTPOST_URL"
                 ):
@@ -90,6 +103,45 @@ class AuthentikEdgeConfigTests(unittest.TestCase):
             self.assertEqual(
                 plan.resources["identity_edge_config"]["ownership"], "owned"
             )
+
+    def test_nginx_edge_preserves_authentik_login_and_cookie_refresh_flow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(values(root, "nginx"), self.identity)
+            content = render_authentik_edge(
+                config, DeploymentPlan.from_config(config)
+            ).content
+
+            self.assertIn("error_page 401 = @goauthentik_proxy_signin;", content)
+            self.assertIn(
+                "auth_request_set $bt_auth_cookie $upstream_http_set_cookie;",
+                content,
+            )
+            self.assertIn("add_header Set-Cookie $bt_auth_cookie;", content)
+            self.assertNotIn('if ($bt_authentik_uid = "")', content)
+            self.assertIn("proxy_set_header Host books.example.test;", content)
+            self.assertIn(
+                "proxy_set_header X-Original-URL https://books.example.test$request_uri;",
+                content,
+            )
+            outpost_location = content.split(
+                "location = /outpost.goauthentik.io/auth/nginx {", 1
+            )[1]
+            for header in ("X-authentik-uid", "X-BT-Subject", "X-BT-Roles"):
+                clear = f'proxy_set_header {header} "";'
+                self.assertIn(clear, outpost_location)
+                self.assertLess(
+                    outpost_location.index(clear),
+                    outpost_location.index("proxy_pass "),
+                )
+
+    def test_nginx_requires_an_internal_http_outpost_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            configured = values(Path(directory), "nginx")
+            configured["BT_AUTHENTIK_OUTPOST_URL"] = "https://authentik-outpost:9443"
+
+            with self.assertRaisesRegex(ConfigError, "Nginx.*http"):
+                InstallConfig.from_mapping(configured, self.identity)
 
 
 if __name__ == "__main__":

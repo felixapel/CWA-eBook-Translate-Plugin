@@ -52,9 +52,9 @@ from the image because unvalidated textual substitution is no longer used.
 
 - Reverse-proxy deployments must set their exact HTTPS reader origin instead
   of relying on a request header. This is an intentional fail-closed migration.
-- Direct clients retain accurate per-client API limits. Behind another edge
-  proxy, the translator sees that immediate peer as one client unless admission
-  is enforced at the trusted edge; it never guesses trust from a supplied chain.
+- The immediate observed client keys only pre-auth attempt and in-flight
+  admission. Successful API requests use an opaque authenticated-subject quota,
+  so users remain isolated without trusting a supplied forwarding chain.
 - An operator can raise the CWA upload ceiling for a known library, but cannot
   configure an unlimited body through this interface.
 - A mismatched CWA reverse-proxy header name is an unsafe deployment error;

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
+import stat
 import string
 import tempfile
 import uuid
@@ -18,12 +19,25 @@ from btctl_compose import (
     ComposeInstaller,
     InstallError,
     _container_networks,
+    _completed_uninstall_for_reinstall,
     _has_exact_cwa_version,
     _labels,
+    _probe_runtime_dependencies,
+    _validate_data_destination,
     _verify_identity_edge_artifact,
+    _verify_private_network,
 )
 from btctl_auth import render_authentik_edge
-from btctl_core import DeploymentPlan, DeploymentState, InstallConfig, StateStore
+from btctl_core import (
+    ConfigError,
+    DeploymentPlan,
+    DeploymentState,
+    InstallConfig,
+    OperationLock,
+    StateStore,
+    _fsync_directory,
+    ensure_directory_durable,
+)
 
 
 TEMPLATE_ROOT = Path(__file__).parent / "deploy" / "unraid"
@@ -53,6 +67,9 @@ class UnraidDocker(Protocol):
     def connect_network(self, network: str, container: str) -> None: ...
     def start_container(self, name: str) -> None: ...
     def wait_healthy(self, names: list[str], timeout_seconds: int) -> None: ...
+    def probe_http(self, container: str, url: str) -> None: ...
+    def probe_auth(self, container: str, url: str) -> None: ...
+    def probe_sqlite(self, container: str, database_path: str) -> None: ...
     def remove_container(self, name: str) -> None: ...
     def remove_network(self, name: str) -> None: ...
 
@@ -108,11 +125,14 @@ def render_templates(config: InstallConfig, plan: DeploymentPlan) -> dict[str, s
 def _write_private(path: Path, text: str, *, private_parent: bool = True) -> None:
     if path.parent.is_symlink() or path.is_symlink():
         raise InstallError("managed file destination must not be a symbolic link")
-    path.parent.mkdir(
-        parents=True, mode=0o700 if private_parent else 0o755, exist_ok=True
-    )
-    if private_parent:
-        os.chmod(path.parent, 0o700)
+    try:
+        ensure_directory_durable(
+            path.parent,
+            mode=0o700 if private_parent else 0o755,
+            enforce_existing_mode=private_parent,
+        )
+    except ConfigError as exc:
+        raise InstallError("managed file directory is unsafe") from exc
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -121,6 +141,7 @@ def _write_private(path: Path, text: str, *, private_parent: bool = True) -> Non
             os.fsync(handle.fileno())
         os.chmod(temporary_name, 0o600)
         os.replace(temporary_name, path)
+        _fsync_directory(path.parent)
     except BaseException:
         try:
             os.unlink(temporary_name)
@@ -141,16 +162,55 @@ def _environment_text(values: dict[str, str]) -> str:
 def prepare_data_directory(path: Path) -> None:
     if path.is_symlink():
         raise InstallError("BT_DATA_DIR must not be a symbolic link")
-    path.mkdir(parents=True, mode=0o700, exist_ok=True)
-    os.chmod(path, 0o700)
-    if os.geteuid() == 0:
-        os.chown(path, 101, 102)
-    else:
-        metadata = path.stat()
-        if (metadata.st_uid, metadata.st_gid) != (101, 102):
+    try:
+        ensure_directory_durable(path, enforce_existing_mode=False)
+    except ConfigError as exc:
+        raise InstallError("BT_DATA_DIR could not be created durably") from exc
+
+    entries: list[tuple[Path, os.stat_result, int]] = []
+    try:
+        root_metadata = path.lstat()
+        candidates = [path, *sorted(path.rglob("*"))]
+        for candidate in candidates:
+            metadata = candidate.lstat()
+            if metadata.st_dev != root_metadata.st_dev:
+                raise InstallError(
+                    "BT_DATA_DIR must contain only regular files and directories"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                mode = 0o700
+            elif stat.S_ISREG(metadata.st_mode):
+                mode = 0o600
+            else:
+                raise InstallError(
+                    "BT_DATA_DIR must contain only regular files and directories"
+                )
+            entries.append((candidate, metadata, mode))
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("BT_DATA_DIR could not be inspected safely") from exc
+
+    effective_uid = os.geteuid()
+    if effective_uid != 0:
+        if effective_uid != 101 or any(
+            (metadata.st_uid, metadata.st_gid) != (101, 102)
+            for _, metadata, _ in entries
+        ):
             raise InstallError(
-                "BT_DATA_DIR must be owned by uid 101 gid 102; run btctl as root on Unraid"
+                "BT_DATA_DIR tree must be owned by uid 101 gid 102; "
+                "run btctl as root on Unraid"
             )
+
+    try:
+        for candidate, _, mode in entries:
+            if effective_uid == 0:
+                os.chown(candidate, 101, 102, follow_symlinks=False)
+            os.chmod(candidate, mode, follow_symlinks=False)
+        _fsync_directory(path)
+        _fsync_directory(path.parent)
+    except (ConfigError, OSError) as exc:
+        raise InstallError("BT_DATA_DIR ownership could not be prepared") from exc
 
 
 def _unraid_labels(config: InstallConfig, role: str, install_id: str) -> dict[str, str]:
@@ -176,12 +236,22 @@ class UnraidInstaller:
         self.health_timeout_seconds = health_timeout_seconds
         self.prepare_data = prepare_data
 
-    def _preflight(self, config: InstallConfig, plan: DeploymentPlan) -> None:
+    def _preflight(
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        *,
+        allow_existing_data: bool = False,
+        allow_rolled_back_state: bool = False,
+    ) -> DeploymentState | None:
         if config.install_profile != "unraid":
             raise InstallError("Unraid installer requires the unraid profile")
         self.docker.require_available()
-        if StateStore(Path(config.state_dir)).path.exists():
-            raise InstallError("deployment state already exists; use doctor or upgrade")
+        previous_state = _completed_uninstall_for_reinstall(
+            config,
+            plan,
+            allow_rolled_back=allow_rolled_back_state,
+        )
         cwa = self.docker.inspect_container(config.cwa_container)
         if cwa is None or cwa.get("State", {}).get("Status") != "running":
             raise InstallError("configured CWA container is missing or stopped")
@@ -204,11 +274,38 @@ class UnraidInstaller:
             target = Path(plan.resources[f"{role}_template"]["path"])
             if target.exists() or target.is_symlink():
                 raise InstallError(f"Unraid {role} template already exists")
+        _validate_data_destination(
+            Path(config.data_dir),
+            allow_nonempty=allow_existing_data or previous_state is not None,
+        )
+        return previous_state
 
     def install(
-        self, config: InstallConfig, plan: DeploymentPlan, repository: Path
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        repository: Path,
+        *,
+        _operation_locked: bool = False,
+        _allow_existing_data: bool = False,
+        _allow_rolled_back_state: bool = False,
     ) -> DeploymentState:
-        self._preflight(config, plan)
+        if not _operation_locked:
+            with OperationLock(Path(config.state_dir)):
+                return self.install(
+                    config,
+                    plan,
+                    repository,
+                    _operation_locked=True,
+                    _allow_existing_data=_allow_existing_data,
+                    _allow_rolled_back_state=_allow_rolled_back_state,
+                )
+        previous_state = self._preflight(
+            config,
+            plan,
+            allow_existing_data=_allow_existing_data,
+            allow_rolled_back_state=_allow_rolled_back_state,
+        )
         image_labels = {
             "io.cwa-translate.version": config.identity.version,
             "io.cwa-translate.revision": config.identity.sha,
@@ -245,17 +342,18 @@ class UnraidInstaller:
 
         install_id = str(uuid.uuid4())
         private_name = str(plan.resources["private_network"]["name"])
-        created_network = False
-        created_roles: list[str] = []
+        network_attempted = False
+        attempted_roles: list[tuple[str, str]] = []
         copied_templates: list[Path] = []
         try:
+            network_attempted = True
             self.docker.create_network(
                 private_name,
                 _labels(config, "private-network", install_id),
                 internal=True,
             )
-            created_network = True
             api_name = str(plan.resources["api"]["name"])
+            attempted_roles.append(("api", api_name))
             self.docker.create_container(
                 ContainerSpec(
                     role="api",
@@ -269,7 +367,6 @@ class UnraidInstaller:
                     publish_port=None,
                 )
             )
-            created_roles.append(api_name)
             api_external = (
                 config.cwa_network
                 if config.auth_profile == "cwa-session"
@@ -280,6 +377,7 @@ class UnraidInstaller:
             self.docker.wait_healthy([api_name], self.health_timeout_seconds)
 
             proxy_name = str(plan.resources["proxy"]["name"])
+            attempted_roles.append(("proxy", proxy_name))
             self.docker.create_container(
                 ContainerSpec(
                     role="proxy",
@@ -288,17 +386,17 @@ class UnraidInstaller:
                     env_file=proxy_env,
                     labels=_unraid_labels(config, "proxy", install_id),
                     primary_network=private_name,
-                    network_alias="",
+                    network_alias="translator-proxy",
                     data_dir=None,
                     publish_port=config.proxy_port,
                 )
             )
-            created_roles.append(proxy_name)
             self.docker.connect_network(config.cwa_network, proxy_name)
             if config.edge_network:
                 self.docker.connect_network(config.edge_network, proxy_name)
             self.docker.start_container(proxy_name)
             self.docker.wait_healthy([proxy_name], self.health_timeout_seconds)
+            _probe_runtime_dependencies(self.docker, config, plan)
 
             resources = copy.deepcopy(plan.resources)
             for role in ("api", "proxy"):
@@ -307,9 +405,9 @@ class UnraidInstaller:
                 )
                 resources[role]["id"] = container_id
             private = self.docker.inspect_network(private_name)
-            if private is None or not isinstance(private.get("Id"), str):
-                raise InstallError("private network is missing after startup")
-            resources["private_network"]["id"] = private["Id"]
+            resources["private_network"]["id"] = _verify_private_network(
+                config, install_id, private
+            )
             _verify_identity_edge_artifact(config, plan, resources)
 
             for role, source in templates.items():
@@ -323,7 +421,10 @@ class UnraidInstaller:
                 DeploymentState.new(install_id=install_id, plan=plan),
                 resources=resources,
             )
-            StateStore(state_dir).save(state)
+            state_store = StateStore(state_dir)
+            if previous_state is not None:
+                state_store.archive(previous_state)
+            state_store.save(state)
             return state
         except BaseException:
             for target in reversed(copied_templates):
@@ -331,14 +432,29 @@ class UnraidInstaller:
                     target.unlink()
                 except OSError:
                     pass
-            for name in reversed(created_roles):
+            for role, name in reversed(attempted_roles):
                 try:
-                    self.docker.remove_container(name)
+                    container = self.docker.inspect_container(name)
+                    labels = (
+                        container.get("Config", {}).get("Labels", {})
+                        if container
+                        else {}
+                    )
+                    expected = _unraid_labels(config, role, install_id)
+                    if (
+                        container is not None
+                        and container.get("Config", {}).get("Image") == config.image
+                        and all(labels.get(key) == value for key, value in expected.items())
+                    ):
+                        self.docker.remove_container(name)
                 except BaseException:
                     pass
-            if created_network:
+            if network_attempted:
                 try:
-                    self.docker.remove_network(private_name)
+                    network = self.docker.inspect_network(private_name)
+                    if network is not None:
+                        _verify_private_network(config, install_id, network)
+                        self.docker.remove_network(private_name)
                 except BaseException:
                     pass
             raise
@@ -350,7 +466,16 @@ class UnraidAdopter:
     def __init__(self, docker: UnraidDocker):
         self.docker = docker
 
-    def adopt(self, config: InstallConfig, plan: DeploymentPlan) -> DeploymentState:
+    def adopt(
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        *,
+        _operation_locked: bool = False,
+    ) -> DeploymentState:
+        if not _operation_locked:
+            with OperationLock(Path(config.state_dir)):
+                return self.adopt(config, plan, _operation_locked=True)
         if config.install_profile != "unraid":
             raise InstallError("Unraid adoption requires the unraid profile")
         self.docker.require_available()
@@ -397,23 +522,13 @@ class UnraidAdopter:
                 config, plan, install_id, role, image_id
             )
             resources[role]["id"] = container_id
-            resources[role]["ownership"] = "adopted"
         private = self.docker.inspect_network(
             str(plan.resources["private_network"]["name"])
         )
-        labels = private.get("Labels", {}) if private else {}
-        if (
-            not private
-            or not isinstance(private.get("Id"), str)
-            or labels.get("io.cwa-translate.install-id") != install_id
-            or labels.get("io.cwa-translate.role") != "private-network"
-        ):
-            raise InstallError("private network ownership evidence does not match")
-        resources["private_network"]["id"] = private["Id"]
-        resources["private_network"]["ownership"] = "adopted"
+        resources["private_network"]["id"] = _verify_private_network(
+            config, install_id, private
+        )
         _verify_identity_edge_artifact(config, plan, resources)
-        if config.auth_profile == "authentik-forwarded":
-            resources["identity_edge_config"]["ownership"] = "adopted"
         for role in ("api", "proxy"):
             path = Path(plan.resources[f"{role}_template"]["path"])
             if not path.is_file() or path.is_symlink():
@@ -421,7 +536,6 @@ class UnraidAdopter:
             expected = render_templates(config, plan)[role].encode("utf-8")
             if path.read_bytes() != expected:
                 raise InstallError(f"{role} Unraid template does not match the plan")
-            resources[f"{role}_template"]["ownership"] = "adopted"
             resources[f"{role}_template"]["sha256"] = hashlib.sha256(
                 path.read_bytes()
             ).hexdigest()

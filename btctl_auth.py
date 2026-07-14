@@ -15,12 +15,15 @@ class AuthentikEdgeArtifact:
 
 
 def _nginx(config: InstallConfig, api: str) -> str:
+    public_host = urlsplit(config.public_origin).netloc
     return f"""# CWA Translate v{config.identity.version}: paste inside the existing HTTPS server block.
 # Keep the standard Authentik sign-in/outpost locations for the rest of the host.
 location ^~ /bt-api/ {{
     auth_request /outpost.goauthentik.io/auth/nginx;
+    error_page 401 = @goauthentik_proxy_signin;
+    auth_request_set $bt_auth_cookie $upstream_http_set_cookie;
+    add_header Set-Cookie $bt_auth_cookie;
     auth_request_set $bt_authentik_uid $upstream_http_x_authentik_uid;
-    if ($bt_authentik_uid = "") {{ return 401; }}
 
     proxy_pass {api}/;
     proxy_set_header X-authentik-uid $bt_authentik_uid;
@@ -33,10 +36,15 @@ location ^~ /bt-api/ {{
 
 location = /outpost.goauthentik.io/auth/nginx {{
     internal;
+    proxy_set_header X-authentik-uid "";
+    proxy_set_header X-BT-Subject "";
+    proxy_set_header X-BT-Roles "";
+    proxy_set_header Forwarded "";
     proxy_pass {config.authentik_outpost_url}/outpost.goauthentik.io/auth/nginx;
     proxy_pass_request_body off;
     proxy_set_header Content-Length "";
-    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header Host {public_host};
+    proxy_set_header X-Original-URL {config.public_origin}$request_uri;
     proxy_set_header X-Original-Method $request_method;
     proxy_set_header X-Forwarded-For $remote_addr;
     proxy_set_header Cookie $http_cookie;

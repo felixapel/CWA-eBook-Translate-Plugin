@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -89,23 +91,59 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _load_values(env_file: Path) -> dict[str, str]:
+    descriptor: int | None = None
     try:
-        source = env_file.read_text(encoding="utf-8")
+        if env_file.is_symlink():
+            raise ConfigError("environment file must not be a symbolic link")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(env_file, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ConfigError("environment file must be one regular private file")
+        if metadata.st_mode & 0o077:
+            raise ConfigError(
+                "environment file must use private mode 0600 or stricter"
+            )
+        if metadata.st_size > 1024 * 1024:
+            raise ConfigError("environment file exceeds the 1 MiB safety limit")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = None
+            source = handle.read()
+    except ConfigError:
+        raise
     except (OSError, UnicodeError) as exc:
         raise ConfigError("configuration file could not be read") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     return parse_env_text(source)
 
 
 def _load_plan(repository: Path, env_file: Path) -> DeploymentPlan:
     identity = release_identity_from_checkout(repository)
-    config = InstallConfig.from_mapping(_load_values(env_file), identity)
+    values = _load_values(env_file)
+    legacy_upgrade_plan = bool(
+        values.get("BT_LEGACY_CONTAINER") and values.get("BT_LEGACY_DATA_DIR")
+    )
+    config = InstallConfig.from_mapping(
+        values, identity, allow_legacy_cwa=legacy_upgrade_plan
+    )
     return DeploymentPlan.from_config(config)
 
 
-def _load_config(repository: Path, env_file: Path) -> tuple[InstallConfig, DeploymentPlan]:
+def _load_config(
+    repository: Path,
+    env_file: Path,
+    *,
+    allow_legacy_cwa: bool = False,
+) -> tuple[InstallConfig, DeploymentPlan, dict[str, str]]:
+    values = _load_values(env_file)
     identity = release_identity_from_checkout(repository)
-    config = InstallConfig.from_mapping(_load_values(env_file), identity)
-    return config, DeploymentPlan.from_config(config)
+    config = InstallConfig.from_mapping(
+        values, identity, allow_legacy_cwa=allow_legacy_cwa
+    )
+    return config, DeploymentPlan.from_config(config), values
 
 
 def _print_payload(payload: dict[str, object], *, compact: bool) -> None:
@@ -131,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(payload, sort_keys=True, indent=2))
             return 0
         if args.command == "install":
-            config, plan = _load_config(args.repository, args.env)
+            config, plan, _ = _load_config(args.repository, args.env)
             if not args.yes:
                 print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
                 raise ConfigError("install requires --yes after reviewing the plan")
@@ -144,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_payload(payload, compact=args.json)
             return 0
         if args.command == "adopt":
-            config, plan = _load_config(args.repository, args.env)
+            config, plan, _ = _load_config(args.repository, args.env)
             docker = DockerCLI()
             if config.install_profile == "compose-existing":
                 state = ComposeAdopter(docker).adopt(config, plan)
@@ -153,16 +191,20 @@ def main(argv: list[str] | None = None) -> int:
             _print_payload(state.to_dict(), compact=args.json)
             return 0
         if args.command == "auth-snippet":
-            config, plan = _load_config(args.repository, args.env)
+            config, plan, _ = _load_config(args.repository, args.env)
             print(render_authentik_edge(config, plan).content, end="")
             return 0
         if args.command == "doctor":
-            config, plan = _load_config(args.repository, args.env)
+            config, plan, _ = _load_config(
+                args.repository, args.env, allow_legacy_cwa=True
+            )
             report = DeploymentDoctor(DockerCLI()).run(config, plan)
             _print_payload(report.to_dict(), compact=args.json)
             return 0 if report.ok else 1
         if args.command == "uninstall":
-            config, plan = _load_config(args.repository, args.env)
+            config, plan, _ = _load_config(
+                args.repository, args.env, allow_legacy_cwa=True
+            )
             if not args.yes:
                 print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
                 raise ConfigError("uninstall requires --yes after reviewing ownership")
@@ -170,7 +212,9 @@ def main(argv: list[str] | None = None) -> int:
             _print_payload(state.to_dict(), compact=args.json)
             return 0
         if args.command == "upgrade":
-            config, plan = _load_config(args.repository, args.env)
+            config, plan, values = _load_config(
+                args.repository, args.env, allow_legacy_cwa=True
+            )
             if not args.yes:
                 print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
                 raise ConfigError("upgrade requires --yes after reviewing the plan")
@@ -178,12 +222,14 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 plan,
                 args.repository,
-                _load_values(args.env),
+                values,
             )
             _print_payload(state.to_dict(), compact=args.json)
             return 0
         if args.command == "rollback":
-            config, plan = _load_config(args.repository, args.env)
+            config, plan, _ = _load_config(
+                args.repository, args.env, allow_legacy_cwa=True
+            )
             if not args.yes:
                 raise ConfigError("rollback requires --yes")
             state = LegacyUpgrade(DockerCLI()).rollback(config, plan)

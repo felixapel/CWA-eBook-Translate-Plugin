@@ -30,6 +30,9 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn('BT_ROLE="${BT_ROLE:-auto}"', entrypoint)
         self.assertIn('exec gunicorn --bind', entrypoint)
         self.assertIn('exec nginx -c /app/proxy/nginx-main.conf', entrypoint)
+        self.assertIn("umask 027", entrypoint)
+        self.assertIn('stat -c %a /app/data', entrypoint)
+        self.assertNotIn("chmod 700 /app/data", entrypoint)
 
     def test_non_root_nginx_writes_only_below_tmp(self):
         config = (ROOT / "proxy" / "nginx-main.conf").read_text()
@@ -117,7 +120,14 @@ class ContainerContractTests(unittest.TestCase):
         smoke = smoke_path.read_text()
         self.assertTrue(smoke_path.stat().st_mode & 0o111)
         self.assertIn('./scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"', workflow)
-        self.assertIn('docker rm -f -v "$PROXY_CONTAINER" "$API_CONTAINER"', smoke)
+        self.assertIn("docker rm -f -v", smoke)
+        for container in (
+            "$EDGE_CONTAINER",
+            "$OUTPOST_CONTAINER",
+            "$PROXY_CONTAINER",
+            "$API_CONTAINER",
+        ):
+            self.assertIn(container, smoke)
         for token in (
             "BT_ROLE=api",
             "BT_ROLE=proxy",
@@ -130,6 +140,17 @@ class ContainerContractTests(unittest.TestCase):
         ):
             self.assertIn(token, smoke)
         self.assertNotIn("gosu", smoke)
+
+    def test_lifecycle_smoke_can_remove_non_root_managed_data(self):
+        smoke = (ROOT / "scripts" / "btctl-lifecycle-smoke.sh").read_text()
+        cleanup = smoke.split("cleanup() {", 1)[1].split("}\ntrap cleanup EXIT", 1)[0]
+        self.assertIn("docker run --rm --user 0:0", cleanup)
+        self.assertIn("type=bind,src=${ROOT_DIR},dst=/cleanup", cleanup)
+        self.assertIn("chmod -R u+rwX,g+rwX /cleanup", cleanup)
+        self.assertLess(
+            cleanup.index("chmod -R u+rwX,g+rwX /cleanup"),
+            cleanup.index('rm -rf -- "$ROOT_DIR"'),
+        )
 
     def test_image_auth_defaults_fail_closed_and_proxy_forwards_cwa_cookie(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
@@ -162,7 +183,9 @@ class ContainerContractTests(unittest.TestCase):
             self.assertIn(token, api_template)
             self.assertIn(token, proxy_template)
         self.assertIn('"BT_ROLE": "api"', adapter)
-        self.assertIn("os.chown(path, 101, 102)", adapter)
+        self.assertIn(
+            "os.chown(candidate, 101, 102, follow_symlinks=False)", adapter
+        )
         self.assertIn("publish_port=None", adapter)
 
 

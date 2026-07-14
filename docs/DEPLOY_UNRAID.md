@@ -53,13 +53,14 @@ CWA_UPSTREAM=http://calibre-web-automated:8083
 BT_CWA_CONTAINER=calibre-web-automated
 BT_CWA_NETWORK=cwa_default
 BT_CWA_VERSION=4.0.6
+BT_CWA_IDENTITY_HEADER=Remote-User
 BT_STATE_DIR=/mnt/user/appdata/cwa-translate/state
 BT_DATA_DIR=/mnt/user/appdata/cwa-translate/data
 BT_BACKUP_DIR=/mnt/user/backups/cwa-translate
 BT_UNRAID_TEMPLATE_DIR=/boot/config/plugins/dockerMan/templates-user
 LLM_PROVIDER=local
 LLM_MODEL=gemma4-12b
-BT_LOCAL_URL=http://192.168.0.122:2819/v1/chat/completions
+BT_LOCAL_URL=http://192.168.1.50:8000/v1/chat/completions
 LLM_API_KEY=
 ```
 
@@ -84,6 +85,12 @@ supported.
 `disabled`, a shared browser token, broad trusted CIDRs, and an API host port
 are not managed installation profiles.
 
+`CWA_UPSTREAM` is not an independent trust choice: it must be exactly
+`http://<BT_CWA_CONTAINER>:8083`. Set `BT_CWA_IDENTITY_HEADER` to the exact
+reverse-proxy login header configured in CWA (for example `Remote-User` or
+`X-Forwarded-User`); the managed proxy validates and strips that client-supplied
+credential before forwarding to CWA.
+
 ## Plan and install
 
 First validate without changing the filesystem or Docker:
@@ -96,8 +103,7 @@ Review the image name, source SHA, CWA evidence, networks, ports, paths, and
 ownership. Then run either command:
 
 ```bash
-./btctl install \
-  --env /mnt/user/appdata/cwa-translate/install.env --yes
+./btctl install --env /mnt/user/appdata/cwa-translate/install.env --yes
 
 # equivalent root-only convenience wrapper
 ./install_unraid.sh /mnt/user/appdata/cwa-translate/install.env
@@ -149,8 +155,72 @@ backups belong outside appdata under the configured directory, normally
 offline tree into a new empty target, runs `PRAGMA integrity_check`, and keeps
 the exact old image/container stopped and restartable. It does not use SQLite's
 immutable read-only URI flag, because that could ignore required WAL data.
-Until `btctl upgrade` reports a completed journal, use the audited manual
-procedure in [RELEASE.md](RELEASE.md) rather than the normal install command.
+Set both legacy fields to the exact stopped-or-running v2.1.4 container and its
+bind-mounted data directory, then let the managed migration perform the stop,
+checkpoint, integrity checks, external snapshot, target copy, and cutover:
+
+```dotenv
+BT_LEGACY_CONTAINER=book-translator-v214-rollback
+BT_LEGACY_DATA_DIR=/mnt/user/appdata/book-translator
+```
+
+```bash
+./btctl upgrade --env /mnt/user/appdata/cwa-translate/install.env --yes
+./btctl doctor --env /mnt/user/appdata/cwa-translate/install.env
+```
+
+Do not run normal `install` against live v2.1.4 data. If acceptance fails, the
+journal binds rollback to the exact legacy container, image, source manifest,
+and snapshot:
+
+```bash
+./btctl rollback --env /mnt/user/appdata/cwa-translate/install.env --yes
+```
+
+The manual sequence in [RELEASE.md](RELEASE.md) remains historical/operator
+reference; `btctl upgrade` is the supported v2.1.4 path.
+
+## Verify, diagnose, and remove
+
+Run the read-only verifier after installation, after an Unraid reboot, and
+before declaring an upgrade successful:
+
+```bash
+./btctl doctor --env /mnt/user/appdata/cwa-translate/install.env
+```
+
+It validates the private state, source/image identity, CWA evidence, role
+labels, health, environment, authentication contract, networks, published
+ports, and generated artifacts. A failed or missing check is a failed
+deployment; do not work around it by exposing the API or disabling auth.
+
+To remove only resources owned by this install:
+
+```bash
+./btctl uninstall --env /mnt/user/appdata/cwa-translate/install.env --yes
+```
+
+The operation is retryable. It preserves CWA, external networks, translation
+data, backups, the local image, and state evidence.
+
+After a completed `uninstall`, the same runtime identity and data path may be
+installed again. The new successful install archives the prior final state as
+`BT_STATE_DIR/history/<install-id>-uninstalled.json` before replacing
+`state.json`; active, partial, rolled-back, or mismatched state is still
+rejected.
+
+## Acceptance checklist
+
+- `./btctl doctor --env ...` reports success with every check `ok`.
+- `cwa-translate-api` has no host `PortBindings`; only the proxy is published
+  in `published` mode, and neither role is published in `docker-edge` mode.
+- The normal CWA URL still works directly, including OPDS/Kobo if used.
+- Through `BT_PUBLIC_ORIGIN`, sign in, open a DRM-free EPUB, choose different
+  source and target languages, translate a paragraph, change page, and reload.
+- The toolbar remains present after reload and a repeated paragraph can use the
+  private cache. Browser DevTools shows no translator token or LLM key.
+- For `authentik-forwarded`, complete the additional public-path acceptance in
+  [AUTHENTIK.md](AUTHENTIK.md); a direct request to the API remains impossible.
 
 ## Failure behavior
 

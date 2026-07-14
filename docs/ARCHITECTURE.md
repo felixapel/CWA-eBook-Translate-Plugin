@@ -67,7 +67,9 @@ Compose-compatible YAML subset), validates it with the local Compose plugin,
 and starts only the two translator services. Live image IDs, installation
 labels, networks, health, and port bindings must match before state is
 committed. Recovery adoption is read-only with respect to Docker and requires
-the same pre-existing evidence.
+the same pre-existing evidence. Migration recovery performs that adoption
+before it can preserve or rename a target tree, so a crash after runtime start
+cannot detach an active API container from its bind source.
 
 ## Component Breakdown
 

@@ -11,14 +11,22 @@ fi
 
 API_CONTAINER="${SMOKE_PREFIX}-api"
 PROXY_CONTAINER="${SMOKE_PREFIX}-proxy"
+EDGE_CONTAINER="${SMOKE_PREFIX}-edge"
+OUTPOST_CONTAINER="${SMOKE_PREFIX}-outpost"
 SMOKE_NETWORK="${SMOKE_PREFIX}-net"
 SMOKE_VOLUME="${SMOKE_PREFIX}-data"
 SMOKE_TOKEN="container-smoke-only-secret"
+EDGE_DIR=""
 
 cleanup() {
-    docker rm -f -v "$PROXY_CONTAINER" "$API_CONTAINER" >/dev/null 2>&1 || true
+    docker rm -f -v \
+        "$EDGE_CONTAINER" "$OUTPOST_CONTAINER" \
+        "$PROXY_CONTAINER" "$API_CONTAINER" >/dev/null 2>&1 || true
     docker volume rm -f "$SMOKE_VOLUME" >/dev/null 2>&1 || true
     docker network rm "$SMOKE_NETWORK" >/dev/null 2>&1 || true
+    if [ -n "$EDGE_DIR" ]; then
+        rm -rf "$EDGE_DIR"
+    fi
 }
 trap cleanup EXIT
 cleanup
@@ -38,6 +46,8 @@ if invalid_output="$(docker run --rm --network "$SMOKE_NETWORK" \
     "${sandbox[@]}" \
     -e BT_ROLE=proxy \
     -e "CWA_UPSTREAM=http://${API_CONTAINER}:8390" \
+    -e BT_BROWSER_AUTH_MODE=cwa_session \
+    -e BT_BROWSER_CREDENTIALS=same-origin \
     "$SMOKE_IMAGE" 2>&1)"; then
     echo "proxy unexpectedly started without BT_PUBLIC_ORIGIN" >&2
     exit 1
@@ -63,6 +73,8 @@ docker run -d --name "$PROXY_CONTAINER" --network "$SMOKE_NETWORK" \
     -e "CWA_UPSTREAM=http://${API_CONTAINER}:8390" \
     -e "BT_API_UPSTREAM=http://${API_CONTAINER}:8390" \
     -e BT_PUBLIC_ORIGIN=https://books.example.test:8443 \
+    -e BT_BROWSER_AUTH_MODE=cwa_session \
+    -e BT_BROWSER_CREDENTIALS=same-origin \
     -p 127.0.0.1::8080 \
     "$SMOKE_IMAGE" >/dev/null
 
@@ -105,6 +117,164 @@ curl -sf -H "X-BT-Token: ${SMOKE_TOKEN}" \
     "http://127.0.0.1:${API_PORT}/metrics" | grep -q '"total_requests"'
 curl -sf -H "X-BT-Token: ${SMOKE_TOKEN}" \
     "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics" | grep -q '"total_requests"'
+
+# Render the managed Authentik/Nginx edge fragment, validate it with the nginx
+# binary shipped in the candidate, and exercise a successful auth subrequest.
+# This catches phase-ordering bugs that textual assertions cannot detect.
+EDGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cwa-translate-edge.XXXXXX")"
+python3 - "$SMOKE_PREFIX" "$SMOKE_NETWORK" "$OUTPOST_CONTAINER" \
+    "$EDGE_DIR/authentik.conf" "$EDGE_DIR/nginx.conf" <<'PY'
+import sys
+from pathlib import Path
+
+from btctl_auth import render_authentik_edge
+from btctl_core import DeploymentPlan, InstallConfig, ReleaseIdentity
+
+prefix, network, outpost, artifact_path, nginx_path = sys.argv[1:]
+identity = ReleaseIdentity.from_checkout(
+    version=Path("VERSION").read_text(encoding="utf-8").strip(),
+    sha="a" * 40,
+    clean=True,
+)
+config = InstallConfig.from_mapping(
+    {
+        "BT_INSTALL_PROFILE": "compose-existing",
+        "BT_INSTALL_NAME": prefix,
+        "BT_INGRESS_MODE": "docker-edge",
+        "BT_PROXY_PORT": "",
+        "BT_EDGE_NETWORK": network,
+        "BT_AUTH_PROFILE": "authentik-forwarded",
+        "BT_PUBLIC_ORIGIN": "https://books.example.test",
+        "CWA_UPSTREAM": "http://calibre-web-automated:8083",
+        "BT_CWA_CONTAINER": "calibre-web-automated",
+        "BT_CWA_NETWORK": f"{network}-cwa",
+        "BT_CWA_VERSION": "4.0.6",
+        "BT_STATE_DIR": f"/tmp/{prefix}-state",
+        "BT_DATA_DIR": f"/tmp/{prefix}-data",
+        "BT_BACKUP_DIR": f"/tmp/{prefix}-backup",
+        "BT_IDENTITY_PROXY_IP": "127.0.0.1/32",
+        "BT_AUTHENTIK_VERSION": "2026.5.4",
+        "BT_AUTHENTIK_OUTPOST_URL": f"http://{outpost}:9000",
+        "BT_REVERSE_PROXY": "nginx",
+        "LLM_PROVIDER": "local",
+        "LLM_MODEL": "smoke-model",
+        "BT_LOCAL_URL": "http://host.docker.internal:2819/v1/chat/completions",
+        "LLM_API_KEY": "",
+    },
+    identity,
+)
+artifact = render_authentik_edge(config, DeploymentPlan.from_config(config))
+Path(artifact_path).write_text(artifact.content, encoding="utf-8")
+Path(nginx_path).write_text(
+    """worker_processes 1;
+error_log /dev/stderr info;
+pid /tmp/nginx.pid;
+events { worker_connections 128; }
+http {
+    access_log off;
+    client_body_temp_path /tmp/client_temp;
+    proxy_temp_path /tmp/proxy_temp;
+    fastcgi_temp_path /tmp/fastcgi_temp;
+    uwsgi_temp_path /tmp/uwsgi_temp;
+    scgi_temp_path /tmp/scgi_temp;
+    server {
+        listen 8080;
+        server_name books.example.test;
+        include /edge/authentik.conf;
+        location @goauthentik_proxy_signin { return 401; }
+    }
+}
+""",
+    encoding="utf-8",
+)
+PY
+chmod 0755 "$EDGE_DIR"
+chmod 0644 "$EDGE_DIR/authentik.conf" "$EDGE_DIR/nginx.conf"
+
+docker run -d --name "$OUTPOST_CONTAINER" --network "$SMOKE_NETWORK" \
+    --read-only --tmpfs /tmp --entrypoint python "$SMOKE_IMAGE" -c '
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if any(self.headers.get(name) for name in (
+            "X-authentik-uid", "X-BT-Subject", "X-BT-Roles"
+        )):
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        cookie = self.headers.get("Cookie", "")
+        if "authentik_session=valid" not in cookie and "authentik_session=missing" not in cookie:
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        if "authentik_session=valid" in cookie:
+            self.send_header("X-authentik-uid", "canonical-smoke-user")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+HTTPServer(("0.0.0.0", 9000), Handler).serve_forever()
+' >/dev/null
+
+docker run --rm --network "$SMOKE_NETWORK" --read-only --tmpfs /tmp \
+    --mount "type=bind,src=${EDGE_DIR},dst=/edge,readonly" \
+    --entrypoint nginx "$SMOKE_IMAGE" -t -c /edge/nginx.conf
+docker run -d --name "$EDGE_CONTAINER" --network "$SMOKE_NETWORK" \
+    --read-only --tmpfs /tmp -p 127.0.0.1::8080 \
+    --mount "type=bind,src=${EDGE_DIR},dst=/edge,readonly" \
+    --entrypoint nginx "$SMOKE_IMAGE" \
+    -c /edge/nginx.conf -g 'daemon off;' >/dev/null
+EDGE_PORT="$(docker port "$EDGE_CONTAINER" 8080/tcp | sed 's/.*://')"
+EDGE_IP="$(docker inspect "$EDGE_CONTAINER" --format \
+    "{{with index .NetworkSettings.Networks \"${SMOKE_NETWORK}\"}}{{.IPAddress}}{{end}}")"
+test -n "$EDGE_IP"
+
+# Recreate the API in the exact managed forwarded-identity mode. The edge is
+# now the sole trusted peer; direct host requests and the injection proxy are
+# untrusted even if they forge the subject header.
+docker rm -f "$API_CONTAINER" >/dev/null
+docker run -d --name "$API_CONTAINER" --network "$SMOKE_NETWORK" \
+    "${sandbox[@]}" \
+    --mount "type=volume,source=${SMOKE_VOLUME},target=/app/data" \
+    -e BT_ROLE=api \
+    -e BT_AUTH_MODE=forwarded \
+    -e "BT_IDENTITY_TRUSTED_PROXIES=${EDGE_IP}/32" \
+    -e "BT_TRUSTED_PROXIES=${EDGE_IP}/32" \
+    -e BT_FORWARDED_SUBJECT_HEADER=X-authentik-uid \
+    -e BT_FORWARDED_ROLES_HEADER= \
+    -p 127.0.0.1::8390 \
+    "$SMOKE_IMAGE" >/dev/null
+API_PORT="$(docker port "$API_CONTAINER" 8390/tcp | sed 's/.*://')"
+test -n "$API_PORT"
+
+for _ in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:${API_PORT}/ping" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'X-authentik-uid: forged-direct-user' \
+    "http://127.0.0.1:${API_PORT}/metrics")" = "401"
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'Host: books.example.test' \
+    "http://127.0.0.1:${EDGE_PORT}/bt-api/metrics")" = "401"
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'Host: books.example.test' \
+    -H 'Cookie: authentik_session=missing' \
+    "http://127.0.0.1:${EDGE_PORT}/bt-api/metrics")" = "401"
+curl -sf \
+    -H 'Host: books.example.test' \
+    -H 'Cookie: authentik_session=valid; browser_only=must-not-reach-api' \
+    -H 'X-authentik-uid: forged-browser-user' \
+    -H 'X-BT-Subject: forged-alternate-user' \
+    -H 'X-BT-Roles: admin' \
+    "http://127.0.0.1:${EDGE_PORT}/bt-api/metrics" \
+    | grep -q '"total_requests"'
 
 for container in "$API_CONTAINER" "$PROXY_CONTAINER"; do
     test "$(docker exec "$container" id -u)" = "101"

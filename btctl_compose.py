@@ -13,11 +13,109 @@ from pathlib import Path
 from typing import Protocol
 
 from btctl_auth import render_authentik_edge
-from btctl_core import DeploymentPlan, DeploymentState, InstallConfig, StateStore
+from btctl_core import (
+    ConfigError,
+    DeploymentPlan,
+    DeploymentState,
+    InstallConfig,
+    OperationLock,
+    StateStore,
+    _fsync_directory,
+    ensure_directory_durable,
+)
 
 
 class InstallError(RuntimeError):
     """A live deployment precondition or postcondition was not satisfied."""
+
+
+def _completed_uninstall_for_reinstall(
+    config: InstallConfig,
+    plan: DeploymentPlan,
+    *,
+    allow_rolled_back: bool = False,
+) -> DeploymentState | None:
+    """Allow reuse only after this exact managed runtime was fully removed."""
+    store = StateStore(Path(config.state_dir))
+    if not store.path.exists():
+        return None
+    state = store.load()
+    allowed_statuses = {"uninstalled"}
+    if allow_rolled_back:
+        allowed_statuses.add("rolled_back")
+    if state.status not in allowed_statuses:
+        raise InstallError("deployment state already exists; use doctor or upgrade")
+    if state.install_profile != config.install_profile:
+        raise InstallError("completed uninstall belongs to a different install profile")
+    identities = {
+        "api": "name",
+        "proxy": "name",
+        "private_network": "name",
+        "data": "path",
+    }
+    for resource_name, identity_key in identities.items():
+        old = state.resources.get(resource_name)
+        new = plan.resources.get(resource_name)
+        if (
+            not isinstance(old, dict)
+            or not isinstance(new, dict)
+            or old.get(identity_key) != new.get(identity_key)
+        ):
+            raise InstallError(
+                "completed uninstall does not match this runtime and data identity"
+            )
+    for resource_name in ("api", "proxy", "private_network"):
+        if state.resources[resource_name].get("removed") is not True:
+            raise InstallError("completed uninstall has incomplete removal evidence")
+    if config.install_profile == "unraid":
+        for resource_name in ("api_template", "proxy_template"):
+            old = state.resources.get(resource_name)
+            new = plan.resources.get(resource_name)
+            if (
+                not isinstance(old, dict)
+                or not isinstance(new, dict)
+                or old.get("path") != new.get("path")
+                or old.get("removed") is not True
+            ):
+                raise InstallError("completed uninstall has incomplete template evidence")
+    return state
+
+
+def _validate_data_destination(path: Path, *, allow_nonempty: bool) -> None:
+    if path.is_symlink():
+        raise InstallError("BT_DATA_DIR must not be a symbolic link")
+    if not path.exists():
+        return
+    if not path.is_dir():
+        raise InstallError("BT_DATA_DIR must be a directory")
+    try:
+        nonempty = next(path.iterdir(), None) is not None
+    except OSError as exc:
+        raise InstallError("BT_DATA_DIR could not be inspected safely") from exc
+    if nonempty and not allow_nonempty:
+        raise InstallError(
+            "BT_DATA_DIR must be empty for a fresh install; existing data requires "
+            "exact managed uninstall or migration evidence"
+        )
+
+
+def _probe_runtime_dependencies(
+    docker: "ComposeDocker",
+    config: InstallConfig,
+    plan: DeploymentPlan,
+) -> None:
+    api = str(plan.resources["api"]["name"])
+    proxy = str(plan.resources["proxy"]["name"])
+    docker.probe_http(proxy, f"{config.cwa_upstream}/")
+    if config.auth_profile == "cwa-session":
+        authority = f"{config.cwa_upstream}/ajax/emailstat"
+    else:
+        authority = (
+            f"{config.authentik_outpost_url}"
+            f"/outpost.goauthentik.io/auth/{config.reverse_proxy}"
+        )
+    docker.probe_auth(api, authority)
+    docker.probe_sqlite(api, "/app/data/translations.db")
 
 
 class ComposeDocker(Protocol):
@@ -30,6 +128,9 @@ class ComposeDocker(Protocol):
     def compose_validate(self, document: Path, project: str) -> None: ...
     def compose_up(self, document: Path, project: str) -> None: ...
     def wait_healthy(self, names: list[str], timeout_seconds: int) -> None: ...
+    def probe_http(self, container: str, url: str) -> None: ...
+    def probe_auth(self, container: str, url: str) -> None: ...
+    def probe_sqlite(self, container: str, database_path: str) -> None: ...
     def compose_down(self, document: Path, project: str) -> None: ...
 
 
@@ -43,8 +144,31 @@ def _labels(config: InstallConfig, role: str, install_id: str) -> dict[str, str]
     }
 
 
+def _verify_private_network(
+    config: InstallConfig,
+    install_id: str,
+    network: dict | None,
+    *,
+    expected_id: str | None = None,
+) -> str:
+    labels = network.get("Labels", {}) if network else {}
+    identifier = network.get("Id") if network else None
+    expected_labels = _labels(config, "private-network", install_id)
+    if (
+        not isinstance(identifier, str)
+        or not identifier
+        or (expected_id is not None and identifier != expected_id)
+        or network.get("Internal") is not True
+        or any(labels.get(key) != value for key, value in expected_labels.items())
+    ):
+        raise InstallError("private network ownership or isolation does not match")
+    return identifier
+
+
 def _service_security() -> dict[str, object]:
     return {
+        "user": "101:102",
+        "privileged": False,
         "read_only": True,
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
@@ -56,21 +180,33 @@ def render_compose(
     config: InstallConfig, plan: DeploymentPlan, install_id: str
 ) -> dict[str, object]:
     """Return a JSON-compatible Compose model with no implicit CWA ownership."""
-    api_environment = {
+    # Compose treats `$NAME` as interpolation in every string field, including
+    # environment values and bind sources. Doubling each dollar preserves the
+    # exact validated runtime value.
+    def compose_literal(value: str) -> str:
+        return value.replace("$", "$$")
+
+    def compose_environment(values: dict[str, str]) -> dict[str, str]:
+        return {key: compose_literal(value) for key, value in values.items()}
+
+    api_environment = compose_environment({
         **config.api_environment(),
         "BT_ROLE": "api",
-    }
-    proxy_environment = {
+    })
+    proxy_environment = compose_environment({
         **config.proxy_environment(),
         "BT_ROLE": "proxy",
         "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
-    }
+    })
     api_networks: dict[str, object] = {"private": {"aliases": ["translator-api"]}}
     if config.auth_profile == "cwa-session":
         api_networks["cwa"] = {}
     else:
         api_networks["edge"] = {}
-    proxy_networks: dict[str, object] = {"private": {}, "cwa": {}}
+    proxy_networks: dict[str, object] = {
+        "private": {"aliases": ["translator-proxy"]},
+        "cwa": {},
+    }
     if config.edge_network:
         proxy_networks["edge"] = {}
 
@@ -83,7 +219,7 @@ def render_compose(
         "volumes": [
             {
                 "type": "bind",
-                "source": config.data_dir,
+                "source": compose_literal(config.data_dir),
                 "target": "/app/data",
             }
         ],
@@ -135,8 +271,10 @@ def _write_private_json(path: Path, payload: object) -> None:
     directory = path.parent
     if directory.is_symlink() or path.is_symlink():
         raise InstallError("deployment artifact path must not be a symbolic link")
-    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-    os.chmod(directory, 0o700)
+    try:
+        ensure_directory_durable(directory)
+    except ConfigError as exc:
+        raise InstallError("deployment artifact directory is unsafe") from exc
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=directory)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -146,6 +284,7 @@ def _write_private_json(path: Path, payload: object) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary_name, 0o600)
         os.replace(temporary_name, path)
+        _fsync_directory(directory)
     except BaseException:
         try:
             os.unlink(temporary_name)
@@ -158,8 +297,10 @@ def _write_private_text(path: Path, content: str) -> None:
     directory = path.parent
     if directory.is_symlink() or path.is_symlink():
         raise InstallError("deployment artifact path must not be a symbolic link")
-    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-    os.chmod(directory, 0o700)
+    try:
+        ensure_directory_durable(directory)
+    except ConfigError as exc:
+        raise InstallError("deployment artifact directory is unsafe") from exc
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=directory)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -168,6 +309,7 @@ def _write_private_text(path: Path, content: str) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary_name, 0o600)
         os.replace(temporary_name, path)
+        _fsync_directory(directory)
     except BaseException:
         try:
             os.unlink(temporary_name)
@@ -213,6 +355,108 @@ def _container_environment(container: dict) -> dict[str, str]:
     return parsed
 
 
+def _verify_runtime_sandbox(container: dict, role: str) -> None:
+    """Require the complete managed sandbox, not just ownership labels."""
+    config = container.get("Config", {})
+    host = container.get("HostConfig", {})
+    limits = {
+        "api": (256, 1024 * 1024 * 1024, 2_000_000_000),
+        "proxy": (64, 128 * 1024 * 1024, 500_000_000),
+    }
+    pids, memory, nano_cpus = limits[role]
+    cap_drop = host.get("CapDrop")
+    cap_add = host.get("CapAdd")
+    security_opt = host.get("SecurityOpt")
+    restart = host.get("RestartPolicy")
+    tmpfs = host.get("Tmpfs")
+    expected_tmpfs = {
+        "rw",
+        "noexec",
+        "nosuid",
+        "uid=101",
+        "gid=102",
+        "mode=700",
+    }
+    tmpfs_options: set[str] = set()
+    if isinstance(tmpfs, dict) and set(tmpfs) == {"/tmp"}:
+        value = tmpfs.get("/tmp")
+        if isinstance(value, str):
+            tmpfs_options = set(value.split(","))
+    size_options = {item for item in tmpfs_options if item.startswith("size=")}
+    sandbox_matches = (
+        config.get("User") == "101:102"
+        and host.get("ReadonlyRootfs") is True
+        and host.get("Privileged") is False
+        and isinstance(cap_drop, list)
+        and {str(item).upper() for item in cap_drop} == {"ALL"}
+        and cap_add in (None, [])
+        and isinstance(security_opt, list)
+        and set(security_opt) == {"no-new-privileges:true"}
+        and tmpfs_options - size_options == expected_tmpfs
+        and size_options in ({"size=64m"}, {"size=67108864"})
+        and host.get("PidsLimit") == pids
+        and host.get("Memory") == memory
+        and host.get("NanoCpus") == nano_cpus
+        and isinstance(restart, dict)
+        and restart.get("Name") == "unless-stopped"
+        and restart.get("MaximumRetryCount", 0) == 0
+    )
+    if not sandbox_matches:
+        raise InstallError(f"{role} container runtime sandbox does not match")
+
+
+def _verify_port_bindings(
+    bindings: object, role: str, expected_port: int | None
+) -> None:
+    if not bindings:
+        if role == "proxy" and expected_port is not None:
+            raise InstallError("proxy host-port binding does not match the plan")
+        return
+    if not isinstance(bindings, dict):
+        raise InstallError(f"{role} host-port binding does not match the plan")
+    if role == "api" or expected_port is None or set(bindings) != {"8080/tcp"}:
+        raise InstallError(f"{role} host-port binding does not match the plan")
+    entries = bindings["8080/tcp"]
+    if (
+        not isinstance(entries, list)
+        or not 1 <= len(entries) <= 2
+        or any(
+            not isinstance(entry, dict)
+            or entry.get("HostPort") != str(expected_port)
+            or entry.get("HostIp", "") not in {"", "0.0.0.0", "::"}
+            for entry in entries
+        )
+    ):
+        raise InstallError("proxy host-port binding does not match the plan")
+
+
+def _verify_data_bind(container: dict, role: str, data_dir: str) -> None:
+    mounts = container.get("Mounts")
+    if not isinstance(mounts, list):
+        raise InstallError(f"{role} container data bind evidence is missing")
+    persistent = [
+        mount
+        for mount in mounts
+        if isinstance(mount, dict) and mount.get("Type") in {"bind", "volume"}
+    ]
+    if role == "proxy":
+        if persistent:
+            raise InstallError("proxy container has an unexpected persistent data bind")
+        return
+    if len(persistent) != 1:
+        raise InstallError("API container data bind does not match the plan")
+    mount = persistent[0]
+    source = mount.get("Source")
+    if (
+        mount.get("Type") != "bind"
+        or mount.get("Destination") != "/app/data"
+        or mount.get("RW") is not True
+        or not isinstance(source, str)
+        or Path(source).resolve() != Path(data_dir).resolve()
+    ):
+        raise InstallError("API container data bind does not match the plan")
+
+
 def _has_exact_cwa_version(container: dict, version: str) -> bool:
     image = container.get("Config", {}).get("Image", "")
     without_digest = image.split("@", 1)[0] if isinstance(image, str) else ""
@@ -236,12 +480,22 @@ class ComposeInstaller:
         self.docker = docker
         self.health_timeout_seconds = health_timeout_seconds
 
-    def _preflight(self, config: InstallConfig, plan: DeploymentPlan) -> None:
+    def _preflight(
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        *,
+        allow_existing_data: bool = False,
+        allow_rolled_back_state: bool = False,
+    ) -> DeploymentState | None:
         if config.install_profile != "compose-existing":
             raise InstallError("Compose installer requires compose-existing profile")
         self.docker.require_available()
-        if StateStore(Path(config.state_dir)).path.exists():
-            raise InstallError("deployment state already exists; use doctor or upgrade")
+        previous_state = _completed_uninstall_for_reinstall(
+            config,
+            plan,
+            allow_rolled_back=allow_rolled_back_state,
+        )
         cwa = self.docker.inspect_container(config.cwa_container)
         if cwa is None:
             raise InstallError("configured CWA container does not exist")
@@ -264,6 +518,11 @@ class ComposeInstaller:
         private_name = str(plan.resources["private_network"]["name"])
         if self.docker.inspect_network(private_name) is not None:
             raise InstallError(f"network {private_name} already exists")
+        _validate_data_destination(
+            Path(config.data_dir),
+            allow_nonempty=allow_existing_data or previous_state is not None,
+        )
+        return previous_state
 
     def _verify_image(self, config: InstallConfig, image: dict | None) -> str:
         if image is None or not isinstance(image.get("Id"), str):
@@ -310,13 +569,13 @@ class ComposeInstaller:
             for key, value in expected_environment.items()
         ) or "BT_ALLOW_INSECURE_AUTH" in live_environment:
             raise InstallError(f"{role} container runtime environment does not match")
-        bindings = container.get("HostConfig", {}).get("PortBindings") or {}
-        if role == "api" and bindings:
-            raise InstallError("API container unexpectedly publishes a host port")
-        if role == "proxy":
-            expected_binding = config.proxy_port is not None
-            if bool(bindings) != expected_binding:
-                raise InstallError("proxy host-port binding does not match the plan")
+        _verify_runtime_sandbox(container, role)
+        _verify_port_bindings(
+            container.get("HostConfig", {}).get("PortBindings"),
+            role,
+            config.proxy_port if role == "proxy" else None,
+        )
+        _verify_data_bind(container, role, config.data_dir)
         private_name = str(plan.resources["private_network"]["name"])
         expected_networks = {private_name}
         if role == "api":
@@ -329,12 +588,40 @@ class ComposeInstaller:
                 expected_networks.add(config.edge_network)
         if _container_networks(container) != expected_networks:
             raise InstallError(f"{role} container networks do not match the plan")
+        live_networks = container.get("NetworkSettings", {}).get("Networks", {})
+        private = live_networks.get(private_name, {}) if isinstance(live_networks, dict) else {}
+        aliases = private.get("Aliases", []) if isinstance(private, dict) else []
+        expected_alias = "translator-api" if role == "api" else "translator-proxy"
+        if not isinstance(aliases, list) or expected_alias not in aliases:
+            raise InstallError(f"{role} private-network alias does not match the plan")
         return container["Id"], container
 
     def install(
-        self, config: InstallConfig, plan: DeploymentPlan, repository: Path
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        repository: Path,
+        *,
+        _operation_locked: bool = False,
+        _allow_existing_data: bool = False,
+        _allow_rolled_back_state: bool = False,
     ) -> DeploymentState:
-        self._preflight(config, plan)
+        if not _operation_locked:
+            with OperationLock(Path(config.state_dir)):
+                return self.install(
+                    config,
+                    plan,
+                    repository,
+                    _operation_locked=True,
+                    _allow_existing_data=_allow_existing_data,
+                    _allow_rolled_back_state=_allow_rolled_back_state,
+                )
+        previous_state = self._preflight(
+            config,
+            plan,
+            allow_existing_data=_allow_existing_data,
+            allow_rolled_back_state=_allow_rolled_back_state,
+        )
         image_labels = {
             "io.cwa-translate.version": config.identity.version,
             "io.cwa-translate.revision": config.identity.sha,
@@ -344,11 +631,16 @@ class ComposeInstaller:
         image_id = self._verify_image(config, self.docker.inspect_image(config.image))
 
         data_dir = Path(config.data_dir)
-        if data_dir.is_symlink():
-            raise InstallError("BT_DATA_DIR must not be a symbolic link")
-        data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(data_dir, 0o700)
+        try:
+            ensure_directory_durable(data_dir, enforce_existing_mode=False)
+        except ConfigError as exc:
+            raise InstallError("BT_DATA_DIR could not be created durably") from exc
         self.docker.prepare_data_directory(config.image, data_dir)
+        try:
+            _fsync_directory(data_dir)
+            _fsync_directory(data_dir.parent)
+        except ConfigError as exc:
+            raise InstallError("BT_DATA_DIR metadata could not be made durable") from exc
 
         install_id = str(uuid.uuid4())
         document_path = Path(config.state_dir) / "deployment.compose.json"
@@ -359,13 +651,16 @@ class ComposeInstaller:
             if artifact_path.name != artifact.filename:
                 raise InstallError("identity-edge artifact name does not match the plan")
             _write_private_text(artifact_path, artifact.content)
-        started = False
+        start_attempted = False
         try:
             self.docker.compose_validate(document_path, config.install_name)
+            # `compose up` may create only a subset of the declared resources
+            # before returning non-zero. Arm scoped cleanup before invoking it.
+            start_attempted = True
             self.docker.compose_up(document_path, config.install_name)
-            started = True
             names = [str(plan.resources[role]["name"]) for role in ("api", "proxy")]
             self.docker.wait_healthy(names, self.health_timeout_seconds)
+            _probe_runtime_dependencies(self.docker, config, plan)
             resources = copy.deepcopy(plan.resources)
             for role in ("api", "proxy"):
                 container_id, _ = self._verify_container(
@@ -375,18 +670,21 @@ class ComposeInstaller:
             private = self.docker.inspect_network(
                 str(plan.resources["private_network"]["name"])
             )
-            if private is None or not isinstance(private.get("Id"), str):
-                raise InstallError("private network is missing after startup")
-            resources["private_network"]["id"] = private["Id"]
+            resources["private_network"]["id"] = _verify_private_network(
+                config, install_id, private
+            )
             _verify_identity_edge_artifact(config, plan, resources)
             state = replace(
                 DeploymentState.new(install_id=install_id, plan=plan),
                 resources=resources,
             )
-            StateStore(Path(config.state_dir)).save(state)
+            state_store = StateStore(Path(config.state_dir))
+            if previous_state is not None:
+                state_store.archive(previous_state)
+            state_store.save(state)
             return state
         except BaseException:
-            if started:
+            if start_attempted:
                 self.docker.compose_down(document_path, config.install_name)
             raise
 
@@ -397,7 +695,16 @@ class ComposeAdopter:
     def __init__(self, docker: ComposeDocker):
         self.docker = docker
 
-    def adopt(self, config: InstallConfig, plan: DeploymentPlan) -> DeploymentState:
+    def adopt(
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        *,
+        _operation_locked: bool = False,
+    ) -> DeploymentState:
+        if not _operation_locked:
+            with OperationLock(Path(config.state_dir)):
+                return self.adopt(config, plan, _operation_locked=True)
         if config.install_profile != "compose-existing":
             raise InstallError("Compose adoption requires compose-existing profile")
         self.docker.require_available()
@@ -465,25 +772,14 @@ class ComposeAdopter:
                 config, plan, install_id, role, image_id
             )
             resources[role]["id"] = container_id
-            resources[role]["ownership"] = "adopted"
 
         private = self.docker.inspect_network(
             str(plan.resources["private_network"]["name"])
         )
-        private_labels = private.get("Labels", {}) if private else {}
-        if (
-            not private
-            or not isinstance(private.get("Id"), str)
-            or private_labels.get("io.cwa-translate.install-id") != install_id
-            or private_labels.get("io.cwa-translate.role") != "private-network"
-            or private_labels.get("io.cwa-translate.revision") != config.identity.sha
-        ):
-            raise InstallError("private network ownership labels are missing or incompatible")
-        resources["private_network"]["id"] = private["Id"]
-        resources["private_network"]["ownership"] = "adopted"
+        resources["private_network"]["id"] = _verify_private_network(
+            config, install_id, private
+        )
         _verify_identity_edge_artifact(config, plan, resources)
-        if config.auth_profile == "authentik-forwarded":
-            resources["identity_edge_config"]["ownership"] = "adopted"
         state = replace(
             DeploymentState.new(install_id=install_id, plan=plan),
             status="adopted",

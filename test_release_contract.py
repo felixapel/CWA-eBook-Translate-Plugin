@@ -44,6 +44,7 @@ class ReleaseRepository:
             "overlay_css": VERSION,
             "overlay_js": VERSION,
             "changelog": VERSION,
+            "unreleased": "",
         }
         values.update(versions or {})
         self.write_version_surfaces(values)
@@ -95,6 +96,7 @@ class ReleaseRepository:
         )
         (self.repo / "CHANGELOG.md").write_text(
             "# Changelog\n\n## [Unreleased]\n\n"
+            f"{values['unreleased']}"
             f"## [{values['changelog']}] - 2026-07-12\n"
         )
 
@@ -178,6 +180,13 @@ class ReleasePreflightTests(unittest.TestCase):
                     )
                     result = fixture.preflight()
                 self.assert_failed(result, surface)
+
+    def test_rejects_release_notes_left_under_unreleased(self):
+        fixture = self.fixture({"unreleased": "### Added\n\n- pending item\n\n"})
+
+        result = fixture.preflight()
+
+        self.assert_failed(result, "Unreleased section must be empty")
 
     def test_rejects_checkout_sha_mismatch(self):
         fixture = self.fixture()
@@ -282,6 +291,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_changelog_has_one_active_unreleased_section(self):
         changelog = (ROOT / "CHANGELOG.md").read_text()
         self.assertEqual(changelog.count("\n## [Unreleased]\n"), 1)
+        unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+        self.assertFalse(unreleased.strip())
 
     def test_v214_compose_upgrade_is_offline_external_and_reversible(self):
         release = (ROOT / "docs" / "RELEASE.md").read_text()
@@ -361,10 +372,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_release_reuses_every_required_ci_contract(self):
         workflow = GITEA_RELEASE.read_text()
         for command in (
-            "python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py btctl_unraid.py auth.py server.py",
+            "python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py",
             "python3 test_translation.py",
             "python3 test_hardening.py",
-            "test_singleflight test_auth test_ci_contract",
+            "test_btctl_auth test_btctl_lifecycle",
+            "test_singleflight test_auth test_ci_contract test_install_docs",
             "test_release_contract",
             "npm ci",
             "npm audit --audit-level=high",
@@ -372,6 +384,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "docker version",
             'docker build -t "$SMOKE_IMAGE" .',
             './scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
+            './scripts/btctl-lifecycle-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
         ):
             self.assertIn(command, workflow)
 

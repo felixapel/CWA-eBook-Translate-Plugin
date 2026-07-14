@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import ipaddress
 import hashlib
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -26,6 +28,10 @@ _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 _CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,127}$")
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+_HOSTNAME_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$"
+)
 _SECRET_NAME_RE = re.compile(r"(?:KEY|PASSWORD|SECRET|TOKEN)$")
 _INSTALL_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -35,11 +41,220 @@ _INSTALL_PROFILES = frozenset({"unraid", "compose-existing"})
 _INGRESS_MODES = frozenset({"published", "docker-edge"})
 _AUTH_PROFILES = frozenset({"cwa-session", "authentik-forwarded"})
 _REVERSE_PROXIES = frozenset({"nginx", "traefik", "caddy"})
+_LLM_PROVIDERS = frozenset(
+    {
+        "local",
+        "openai",
+        "anthropic",
+        "gemini",
+        "groq",
+        "together",
+        "minimax",
+        "deepseek",
+        "openrouter",
+    }
+)
 STATE_SCHEMA_VERSION = 1
+
+_MANAGED_PROXY_HEADERS = frozenset(
+    {
+        "authorization",
+        "connection",
+        "content-length",
+        "cookie",
+        "forwarded",
+        "host",
+        "transfer-encoding",
+        "upgrade",
+        "x-authentik-groups",
+        "x-authentik-uid",
+        "x-bt-roles",
+        "x-bt-subject",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-proto",
+        "x-real-ip",
+    }
+)
 
 
 class ConfigError(ValueError):
     """An installation value is ambiguous, unsafe, or incomplete."""
+
+
+def _fsync_directory(path: Path) -> None:
+    """Flush one real directory without following its final path component."""
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ConfigError("durability target must be a directory")
+        os.fsync(descriptor)
+    except ConfigError:
+        raise
+    except OSError as exc:
+        raise ConfigError("directory metadata could not be made durable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def ensure_directory_durable(
+    path: Path,
+    *,
+    mode: int = 0o700,
+    enforce_existing_mode: bool = True,
+) -> None:
+    """Create a directory tree and durably publish every new path entry."""
+    destination = Path(path)
+    if mode not in {0o700, 0o755}:
+        raise ConfigError("managed directory mode is unsupported")
+    missing: list[Path] = []
+    cursor = destination
+    try:
+        while not cursor.exists():
+            if cursor.is_symlink():
+                raise ConfigError("managed directory must not be a symbolic link")
+            missing.append(cursor)
+            parent = cursor.parent
+            if parent == cursor:
+                raise ConfigError("managed directory has no existing ancestor")
+            cursor = parent
+        if cursor.is_symlink() or not cursor.is_dir():
+            raise ConfigError("managed directory ancestor must be a real directory")
+
+        for directory in reversed(missing):
+            try:
+                directory.mkdir(mode=mode)
+            except FileExistsError:
+                pass
+            if directory.is_symlink() or not directory.is_dir():
+                raise ConfigError("managed directory must be a real directory")
+            if enforce_existing_mode:
+                os.chmod(directory, mode)
+            _fsync_directory(directory)
+            _fsync_directory(directory.parent)
+
+        if not missing:
+            if destination.is_symlink() or not destination.is_dir():
+                raise ConfigError("managed directory must be a real directory")
+            if enforce_existing_mode:
+                os.chmod(destination, mode)
+            _fsync_directory(destination)
+    except ConfigError:
+        raise
+    except OSError as exc:
+        raise ConfigError("managed directory could not be created durably") from exc
+
+
+def read_private_text(directory: Path, filename: str, *, label: str) -> str:
+    """Read one installer-owned evidence file without following links.
+
+    Lifecycle evidence is authoritative only while both its directory and file
+    remain owned by the invoking account and exactly private. Opening the file
+    relative to the validated directory descriptor also closes the usual
+    check-then-open symlink race.
+    """
+    directory_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(directory, directory_flags)
+        directory_metadata = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+            or directory_metadata.st_uid != os.geteuid()
+        ):
+            raise ConfigError(
+                f"{label} directory must be owned by the current user with mode 0700"
+            )
+
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        file_flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(filename, file_flags, dir_fd=directory_fd)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != directory_metadata.st_uid
+        ):
+            raise ConfigError(
+                f"{label} must be one private regular file owned by the current user "
+                "with mode 0600"
+            )
+        if metadata.st_size > 1024 * 1024:
+            raise ConfigError(f"{label} exceeds the 1 MiB safety limit")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = None
+            return handle.read()
+    except ConfigError:
+        raise
+    except FileNotFoundError as exc:
+        raise ConfigError(f"{label} does not exist") from exc
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError(f"{label} could not be read securely") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+class OperationLock:
+    """Lock the state directory without creating a separate filesystem object."""
+
+    def __init__(self, state_dir: Path, *, create: bool = True):
+        self.state_dir = Path(state_dir)
+        self.lock_target = self.state_dir.parent
+        self.create = create
+        self._descriptor: int | None = None
+
+    def __enter__(self) -> "OperationLock":
+        if self.state_dir.is_symlink() or self.lock_target.is_symlink():
+            raise ConfigError("lifecycle lock destination must not be a symbolic link")
+        try:
+            if self.create:
+                self.lock_target.mkdir(parents=True, mode=0o700, exist_ok=True)
+            elif not self.lock_target.is_dir():
+                raise ConfigError(
+                    "lifecycle lock parent does not exist for read-only locking"
+                )
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.lock_target, flags)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ConfigError("lifecycle lock target must be a directory")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ConfigError(
+                    "another btctl lifecycle operation is already in progress"
+                ) from exc
+        except BaseException:
+            if "descriptor" in locals():
+                os.close(descriptor)
+            raise
+        self._descriptor = descriptor
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        descriptor = self._descriptor
+        self._descriptor = None
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _clean_value(value: object, name: str, *, allow_empty: bool = False) -> str:
@@ -59,47 +274,53 @@ def _choice(values: Mapping[str, str], name: str, allowed: frozenset[str]) -> st
     return value
 
 
-def _exact_origin(value: object, name: str) -> str:
+def _validated_http_parts(value: object, name: str):
     cleaned = _clean_value(value, name)
+    if not cleaned.isascii() or any(
+        ord(character) < 33 or ord(character) == 127 for character in cleaned
+    ):
+        raise ConfigError(f"{name} must be a clean ASCII http(s) URL")
     try:
         parsed = urlsplit(cleaned)
         port = parsed.port
     except ValueError as exc:
-        raise ConfigError(f"{name} must be an exact http(s) origin") from exc
+        raise ConfigError(f"{name} must be an http(s) URL") from exc
+    hostname = parsed.hostname or ""
     if (
         parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
+        or not hostname
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.path not in {"", "/"}
-        or parsed.query
-        or parsed.fragment
-        or any(character.isspace() for character in parsed.hostname)
         or (port is not None and not 1 <= port <= 65535)
     ):
+        raise ConfigError(f"{name} must be an http(s) URL with one exact authority")
+    try:
+        ipaddress.ip_address(hostname)
+        is_ipv6 = ":" in hostname
+    except ValueError:
+        if not _HOSTNAME_RE.fullmatch(hostname):
+            raise ConfigError(f"{name} contains an invalid hostname")
+        is_ipv6 = False
+    normalized_host = f"[{hostname}]" if is_ipv6 else hostname
+    if port is not None:
+        normalized_host += f":{port}"
+    if parsed.netloc.casefold() != normalized_host.casefold():
+        raise ConfigError(f"{name} must contain only one exact host and optional port")
+    return parsed, f"{parsed.scheme}://{normalized_host}"
+
+
+def _exact_origin(value: object, name: str) -> str:
+    parsed, normalized = _validated_http_parts(value, name)
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ConfigError(f"{name} must be an exact http(s) origin")
-    return cleaned.rstrip("/")
+    return normalized
 
 
 def _http_url(value: object, name: str) -> str:
-    cleaned = _clean_value(value, name)
-    try:
-        parsed = urlsplit(cleaned)
-        port = parsed.port
-    except ValueError as exc:
-        raise ConfigError(f"{name} must be an absolute http(s) URL") from exc
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or any(character.isspace() for character in parsed.hostname)
-        or (port is not None and not 1 <= port <= 65535)
-    ):
+    parsed, normalized = _validated_http_parts(value, name)
+    if parsed.query or parsed.fragment:
         raise ConfigError(f"{name} must be an absolute http(s) URL")
-    return cleaned
+    return f"{normalized}{parsed.path}"
 
 
 def _exact_peer(value: object) -> str:
@@ -115,12 +336,35 @@ def _exact_peer(value: object) -> str:
     return str(network)
 
 
+def _cwa_identity_header(value: object) -> str:
+    cleaned = _clean_value(value, "BT_CWA_IDENTITY_HEADER")
+    if not cleaned.isascii() or not _HEADER_NAME_RE.fullmatch(cleaned):
+        raise ConfigError(
+            "BT_CWA_IDENTITY_HEADER must be one bounded HTTP header name"
+        )
+    if cleaned.casefold() in _MANAGED_PROXY_HEADERS:
+        raise ConfigError(
+            "BT_CWA_IDENTITY_HEADER conflicts with a proxy-managed security header"
+        )
+    return cleaned
+
+
 def _absolute_dir(value: object, name: str) -> str:
     cleaned = _clean_value(value, name)
     path = Path(cleaned)
     if not path.is_absolute() or ".." in path.parts or path == Path("/"):
         raise ConfigError(f"{name} must be an absolute non-root directory")
     return str(path)
+
+
+def _require_disjoint_directories(paths: Mapping[str, str]) -> None:
+    items = [(name, Path(value)) for name, value in paths.items()]
+    for index, (left_name, left) in enumerate(items):
+        for right_name, right in items[index + 1 :]:
+            if left == right or left in right.parents or right in left.parents:
+                raise ConfigError(
+                    f"managed directories must not overlap: {left_name} and {right_name}"
+                )
 
 
 def _optional_port(value: object, name: str) -> int | None:
@@ -138,10 +382,20 @@ def _validate_authentik_version(value: object) -> str:
     if not match:
         raise ConfigError("BT_AUTHENTIK_VERSION must be YYYY.MINOR.PATCH")
     year, minor, patch = (int(part) for part in match.groups())
-    if year == 2025 and minor in {10, 12} and patch < 4:
+    # Authentik supports only its two newest release branches and only their
+    # latest patch. Keep a release-time fail-closed floor here instead of
+    # claiming that one historical CVE denylist proves an identity authority
+    # is safe. These floors match the official policy snapshot for v2.2.0.
+    supported_security_floors = {
+        (2026, 2): 5,
+        (2026, 5): 4,
+    }
+    minimum_patch = supported_security_floors.get((year, minor))
+    if minimum_patch is None or patch < minimum_patch:
         raise ConfigError(
-            "BT_AUTHENTIK_VERSION is affected by CVE-2026-25748; "
-            "use 2025.10.4, 2025.12.4, or a later maintained release"
+            "BT_AUTHENTIK_VERSION is below the v2.2.0 supported security floor; "
+            "use Authentik 2026.2.5+ or 2026.5.4+ and confirm the latest patch "
+            "in Authentik's official security policy"
         )
     return cleaned
 
@@ -249,6 +503,7 @@ class InstallConfig:
     cwa_network: str
     cwa_version: str
     compatibility_tier: str
+    cwa_identity_header: str
     edge_network: str
     state_dir: str
     data_dir: str
@@ -266,7 +521,11 @@ class InstallConfig:
 
     @classmethod
     def from_mapping(
-        cls, values: Mapping[str, str], identity: ReleaseIdentity
+        cls,
+        values: Mapping[str, str],
+        identity: ReleaseIdentity,
+        *,
+        allow_legacy_cwa: bool = False,
     ) -> "InstallConfig":
         install_profile = _choice(
             values, "BT_INSTALL_PROFILE", _INSTALL_PROFILES
@@ -286,6 +545,17 @@ class InstallConfig:
         )
         if not _CONTAINER_RE.fullmatch(cwa_container):
             raise ConfigError("BT_CWA_CONTAINER must be one exact Docker container name")
+        parsed_cwa_upstream = urlsplit(cwa_upstream)
+        if (
+            parsed_cwa_upstream.scheme != "http"
+            or parsed_cwa_upstream.hostname is None
+            or parsed_cwa_upstream.hostname.casefold() != cwa_container.casefold()
+            or parsed_cwa_upstream.port != 8083
+        ):
+            raise ConfigError(
+                "CWA_UPSTREAM must be exactly http://<BT_CWA_CONTAINER>:8083"
+            )
+        cwa_upstream = f"http://{cwa_container}:8083"
         cwa_network = _clean_value(
             values.get("BT_CWA_NETWORK", ""), "BT_CWA_NETWORK"
         )
@@ -295,13 +565,18 @@ class InstallConfig:
             values.get("BT_CWA_VERSION", ""), "BT_CWA_VERSION"
         )
         cwa_tier = compatibility_tier(cwa_version)
+        if cwa_tier == "legacy" and not allow_legacy_cwa:
+            raise ConfigError(
+                "CWA 3.1.4 is migration-only; use the explicit btctl upgrade workflow"
+            )
+        cwa_identity_header = _cwa_identity_header(
+            values.get("BT_CWA_IDENTITY_HEADER", "Remote-User")
+        )
         state_dir = _absolute_dir(values.get("BT_STATE_DIR", ""), "BT_STATE_DIR")
         data_dir = _absolute_dir(values.get("BT_DATA_DIR", ""), "BT_DATA_DIR")
         backup_dir = _absolute_dir(values.get("BT_BACKUP_DIR", ""), "BT_BACKUP_DIR")
         if "," in data_dir:
             raise ConfigError("BT_DATA_DIR must not contain a comma")
-        if len({state_dir, data_dir, backup_dir}) != 3:
-            raise ConfigError("BT_STATE_DIR, BT_DATA_DIR, and BT_BACKUP_DIR must differ")
         unraid_template_dir = _clean_value(
             values.get("BT_UNRAID_TEMPLATE_DIR", ""),
             "BT_UNRAID_TEMPLATE_DIR",
@@ -323,12 +598,18 @@ class InstallConfig:
                     raise ConfigError(
                         f"{path_name} contains characters unsafe for DockerMan"
                     )
-            if unraid_template_dir in {state_dir, data_dir, backup_dir}:
-                raise ConfigError("BT_UNRAID_TEMPLATE_DIR must be a separate directory")
         else:
             # Keep one example file switchable between profiles. This path has
             # no meaning and enters no runtime artifact outside Unraid.
             unraid_template_dir = ""
+        managed_directories = {
+            "BT_STATE_DIR": state_dir,
+            "BT_DATA_DIR": data_dir,
+            "BT_BACKUP_DIR": backup_dir,
+        }
+        if unraid_template_dir:
+            managed_directories["BT_UNRAID_TEMPLATE_DIR"] = unraid_template_dir
+        _require_disjoint_directories(managed_directories)
 
         proxy_port = _optional_port(values.get("BT_PROXY_PORT", ""), "BT_PROXY_PORT")
         edge_network = _clean_value(
@@ -349,10 +630,8 @@ class InstallConfig:
         if edge_network and edge_network == cwa_network:
             raise ConfigError("BT_EDGE_NETWORK and BT_CWA_NETWORK must be separate")
 
-        llm_provider = _clean_value(values.get("LLM_PROVIDER", ""), "LLM_PROVIDER")
+        llm_provider = _choice(values, "LLM_PROVIDER", _LLM_PROVIDERS)
         llm_model = _clean_value(values.get("LLM_MODEL", ""), "LLM_MODEL")
-        if not _TOKEN_RE.fullmatch(llm_provider):
-            raise ConfigError("LLM_PROVIDER contains unsupported characters")
         if not _TOKEN_RE.fullmatch(llm_model):
             raise ConfigError("LLM_MODEL contains unsupported characters")
         local_url = _clean_value(
@@ -367,6 +646,10 @@ class InstallConfig:
                     "local provider requires BT_LOCAL_URL and forbids LLM_API_KEY"
                 )
             local_url = _http_url(local_url, "BT_LOCAL_URL")
+            if urlsplit(local_url).path != "/v1/chat/completions":
+                raise ConfigError(
+                    "BT_LOCAL_URL must target the exact /v1/chat/completions endpoint"
+                )
         elif not llm_api_key or local_url:
             raise ConfigError(
                 "cloud providers require LLM_API_KEY and forbid BT_LOCAL_URL"
@@ -385,13 +668,21 @@ class InstallConfig:
             authentik_version = _validate_authentik_version(
                 values.get("BT_AUTHENTIK_VERSION", "")
             )
+            reverse_proxy = _choice(
+                values, "BT_REVERSE_PROXY", _REVERSE_PROXIES
+            )
             authentik_outpost_url = _exact_origin(
                 values.get("BT_AUTHENTIK_OUTPOST_URL", ""),
                 "BT_AUTHENTIK_OUTPOST_URL",
             )
-            reverse_proxy = _choice(
-                values, "BT_REVERSE_PROXY", _REVERSE_PROXIES
-            )
+            if (
+                reverse_proxy == "nginx"
+                and urlsplit(authentik_outpost_url).scheme != "http"
+            ):
+                raise ConfigError(
+                    "Nginx requires an internal http Authentik outpost origin; "
+                    "use Traefik or Caddy for a verified https upstream"
+                )
 
         return cls(
             identity=identity,
@@ -405,6 +696,7 @@ class InstallConfig:
             cwa_network=cwa_network,
             cwa_version=cwa_version,
             compatibility_tier=cwa_tier,
+            cwa_identity_header=cwa_identity_header,
             edge_network=edge_network,
             state_dir=state_dir,
             data_dir=data_dir,
@@ -437,12 +729,16 @@ class InstallConfig:
             "BT_LOCAL_URL": self.local_url,
             "LLM_API_KEY": self.llm_api_key,
         }
+        if self.install_profile == "compose-existing":
+            values["BT_CACHE_OPERATOR_GROUP_ACCESS"] = "true"
         if self.auth_profile == "cwa-session":
             values["BT_CWA_AUTH_URL"] = f"{self.cwa_upstream}/ajax/emailstat"
+            values["BT_TRUSTED_PROXY_HOST"] = "translator-proxy"
         else:
             values.update(
                 {
                     "BT_IDENTITY_TRUSTED_PROXIES": self.identity_proxy_peer,
+                    "BT_TRUSTED_PROXIES": self.identity_proxy_peer,
                     "BT_FORWARDED_SUBJECT_HEADER": "X-authentik-uid",
                     "BT_FORWARDED_ROLES_HEADER": "",
                 }
@@ -453,6 +749,7 @@ class InstallConfig:
         return {
             "BT_PUBLIC_ORIGIN": self.public_origin,
             "CWA_UPSTREAM": self.cwa_upstream,
+            "BT_CWA_IDENTITY_HEADER": self.cwa_identity_header,
             "BT_BROWSER_AUTH_MODE": (
                 "cwa_session"
                 if self.auth_profile == "cwa-session"
@@ -476,6 +773,7 @@ class InstallConfig:
             "cwa_network": self.cwa_network,
             "cwa_version": self.cwa_version,
             "compatibility_tier": self.compatibility_tier,
+            "cwa_identity_header": self.cwa_identity_header,
             "edge_network": self.edge_network,
             "state_dir": self.state_dir,
             "data_dir": self.data_dir,
@@ -714,8 +1012,7 @@ class StateStore:
 
     def save(self, state: DeploymentState) -> None:
         self._validate_destination()
-        self.state_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(self.state_dir, 0o700)
+        ensure_directory_durable(self.state_dir)
         payload = json.dumps(state.to_dict(), sort_keys=True, indent=2) + "\n"
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".state.json.", dir=self.state_dir
@@ -727,11 +1024,7 @@ class StateStore:
                 os.fsync(handle.fileno())
             os.chmod(temporary_name, 0o600)
             os.replace(temporary_name, self.path)
-            directory_fd = os.open(self.state_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _fsync_directory(self.state_dir)
         except BaseException:
             try:
                 os.unlink(temporary_name)
@@ -740,14 +1033,79 @@ class StateStore:
             raise
 
     def load(self) -> DeploymentState:
-        self._validate_destination()
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError as exc:
-            raise ConfigError("deployment state does not exist") from exc
-        except (OSError, json.JSONDecodeError) as exc:
+            payload = json.loads(
+                read_private_text(
+                    self.state_dir, self.path.name, label="deployment state"
+                )
+            )
+        except json.JSONDecodeError as exc:
             raise ConfigError("deployment state is not valid JSON") from exc
         return DeploymentState.from_dict(payload)
+
+    def archive(self, state: DeploymentState) -> Path:
+        """Preserve one final state before a later install replaces state.json."""
+        self._validate_destination()
+        if self.load() != state:
+            raise ConfigError("deployment state changed before it could be archived")
+        if state.status not in {"uninstalled", "rolled_back"}:
+            raise ConfigError(
+                "only completed uninstall or rollback state can be archived"
+            )
+
+        history = self.state_dir / "history"
+        if history.is_symlink() or (history.exists() and not history.is_dir()):
+            raise ConfigError("state history destination must be a real directory")
+        ensure_directory_durable(history)
+        target = history / f"{state.install_id}-{state.status}.json"
+        if target.is_symlink():
+            raise ConfigError("state history entry must not be a symbolic link")
+        payload = json.dumps(state.to_dict(), sort_keys=True, indent=2) + "\n"
+        if target.exists():
+            try:
+                if (
+                    not target.is_file()
+                    or target.stat().st_mode & 0o777 != 0o600
+                ):
+                    raise ConfigError("state history entry must be a private file")
+                if target.read_text(encoding="utf-8") != payload:
+                    raise ConfigError("state history entry conflicts with prior evidence")
+            except (OSError, UnicodeError) as exc:
+                raise ConfigError("state history entry could not be verified") from exc
+            return target
+
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".history.", dir=history)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary_name, 0o600)
+            try:
+                os.link(temporary_name, target)
+            except FileExistsError:
+                try:
+                    if (
+                        target.is_symlink()
+                        or not target.is_file()
+                        or target.stat().st_mode & 0o777 != 0o600
+                    ):
+                        raise ConfigError("state history entry must be a private file")
+                    if target.read_text(encoding="utf-8") != payload:
+                        raise ConfigError(
+                            "state history entry conflicts with prior evidence"
+                        )
+                except (OSError, UnicodeError) as exc:
+                    raise ConfigError(
+                        "state history entry could not be verified"
+                    ) from exc
+            _fsync_directory(history)
+        finally:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+        return target
 
 
 def redact_mapping(values: Mapping[str, str]) -> dict[str, str]:

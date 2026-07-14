@@ -5,7 +5,7 @@
   <Network>${PRIVATE_NETWORK}</Network>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=1g --cpus=2 --env-file &quot;${ENV_FILE}&quot;</ExtraParams>
+  <ExtraParams>--user=101:102 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=1g --cpus=2 --env-file &quot;${ENV_FILE}&quot;</ExtraParams>
   <Overview>This container is managed by btctl. Do not press Apply in DockerMan: btctl owns its additional network attachment and verifies it before committing state. Use btctl doctor/upgrade instead. The API has no host port.</Overview>
   <Category>Tools:Utilities</Category>
   <Config Name="Translation data" Target="/app/data" Default="${DATA_DIR}" Mode="rw" Description="Private SQLite cache; always preserved by btctl uninstall." Type="Path" Display="always" Required="true" Mask="false">${DATA_DIR}</Config>

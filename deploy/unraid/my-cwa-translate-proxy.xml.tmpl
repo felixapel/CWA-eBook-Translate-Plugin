@@ -5,7 +5,7 @@
   <Network>${PRIVATE_NETWORK}</Network>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <ExtraParams>--read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=64 --memory=128m --cpus=0.5 --env-file &quot;${ENV_FILE}&quot;</ExtraParams>
+  <ExtraParams>--user=101:102 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=64 --memory=128m --cpus=0.5 --env-file &quot;${ENV_FILE}&quot;</ExtraParams>
   <Overview>This container is managed by btctl. Do not press Apply in DockerMan: btctl owns its additional network attachments and verifies them before committing state. Browse using ${PUBLIC_ORIGIN}.</Overview>
   <Category>Tools:Utilities</Category>
   <WebUI>${PUBLIC_ORIGIN}</WebUI>

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.2.0] - 2026-07-13
+## [2.2.0] - 2026-07-14
 
 ### Security
 
@@ -20,10 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only from allowlisted proxy CIDRs, and rejected auth attempts have a separate
   rate limit.
 - CWA-session probes now require the exact authenticated endpoint and a bounded
-  JSON task-list response, including an absolute streaming deadline. The Unraid
-  overlay helper is CWA-session-only, and token/forwarded browser requests omit
-  CWA cookies. Its legacy direct-port topology also rejects HTTPS reader origins
-  because its API route is HTTP-only.
+  JSON task-list response, including an absolute streaming deadline. Native
+  CWA-session requests carry only selected CWA cookies. Authentik-forwarded
+  requests carry the browser cookie only to the identity-aware edge, which
+  removes it before the API. Legacy token compatibility omits CWA cookies.
 - Remote/cloud fallback is now fail-closed per request. The reader starts each
   book tab opted out, shows an explicit data-export warning, never persists the
   choice, and includes consent in cache and singleflight policy boundaries.
@@ -62,6 +62,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chains with its observed peer, emits relative self-generated redirects, and
   enforces a finite configurable CWA upload cap. It also strips CWA's configured
   reverse-proxy login header instead of accepting a browser-supplied identity.
+- Managed authentication exposes only `cwa-session` and the isolated
+  `authentik-forwarded` profile. Anonymous mode, shared browser tokens, broad
+  identity CIDRs, Authentik roles, and a published API are not managed
+  fallbacks.
+- Forwarded identity requires one exact `/32` or `/128` peer, a patched
+  Authentik version and exact outpost origin. Browser cookies reach the
+  identity-aware edge but are removed before the API; the injection proxy
+  strips spoofed Authentik and CWA login headers.
+- Authentication admission is bounded per observed client before any CWA or
+  identity-authority work; successful request quotas are isolated by opaque
+  authenticated subject behind the exact managed proxy alias.
+- v2.1.4 migration now requires a completed SQLite WAL checkpoint while the
+  exact legacy writer is controlled, verifies integrity, snapshots outside
+  appdata, copies into a distinct target, journals every cutover identity, and
+  restarts the legacy runtime on pre-cutover failure.
+- Lifecycle evidence and backup-directory creation are durable across newly
+  created parent paths. Recovery adopts an exact healthy v2.2 cutover before
+  moving any target, rejects partial live resources, and revalidates the exact
+  legacy container and image after stopping the writer.
 
 ### Added
 
@@ -85,6 +104,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with tenant/context isolation and pressure counters in `/metrics`.
 - Fixed-cardinality HTTP, authentication, rate-limit, work-budget, provider,
   and partial-batch failure counters without content-derived metric labels.
+- `btctl` provides a single source-only lifecycle for Unraid and existing
+  Compose deployments: mutation-free `plan`, verified split-role `install`,
+  narrow `adopt`, read-only `doctor`, ownership-bound `uninstall`, offline
+  v2.1.4 `upgrade`, exact `rollback`, and reviewed `auth-snippet` generation.
+- Managed Nginx, Traefik, and Caddy Authentik edge fragments authenticate the
+  dedicated API route, overwrite the subject, strip cookies and alternate
+  identity, and route directly to an unpublished API.
+- The reader exposes independent persisted source- and target-language choices;
+  real-Chromium tests exercise both changes and the forwarded-cookie edge
+  contract.
+- Compatibility, Authentik, Unraid, Compose, troubleshooting, acceptance, and
+  self-review documentation describe one fail-closed install path suitable for
+  a non-expert single maintainer.
 
 ### Changed
 
@@ -111,11 +143,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed health/hash checks, and the same non-root sandbox as CI.
 - The proxy renderer is a standard-library validator with atomic private output;
   gettext/envsubst and their Alpine dependency surface were removed.
-- The split Compose proxy reaches the API through a network-scoped alias on the
-  fixed trusted-proxy subnet, avoiding ambiguous multi-network DNS routing.
+- The split Compose proxy reaches the API through a managed, network-scoped DNS
+  alias; no fixed Docker subnet is trusted or required.
 - The browser retries only bounded `429` admission rejections. Ambiguous
   timeouts, network failures, and invalid responses require an explicit user
   retry so they cannot duplicate provider work still running server-side.
+- Managed installs build an immutable local
+  `local/cwa-translate:<version>-<sha12>` image from a clean checkout, create
+  independent non-root API/proxy roles, leave CWA and data external, avoid a
+  fixed Docker subnet, and publish only the injection proxy in normal mode.
+- Local OpenAI-compatible providers need no project credential or browser
+  secret. Private generated environment/deployment files contain server-side
+  provider keys only when the selected provider actually requires one.
+- A completed managed uninstall can be installed again using the same
+  runtime/data identity. The prior final state is archived atomically before a
+  new successful state replaces it; active, partial, mismatched, or
+  rolled-back evidence remains non-overwritable.
+- Normal and release CI compile the lifecycle/auth modules and run their
+  regression suites plus executable documentation contracts.
+
+### Fixed
+
+- Compose installation prepares bind-mounted data ownership with the built
+  image, removing a manual numeric-uid prerequisite that commonly caused
+  first-start failures, retains private access for a non-root operator group on
+  later lifecycle commands, and cleans up partial resources when Compose itself
+  exits unsuccessfully.
+- Interrupted migrations preserve durable evidence and restore the exact
+  originally-running legacy service on retry failures. Rollback now restores
+  v2.1.4 even when the preserved v2.2 target is unavailable, then blocks unsafe
+  automatic re-upgrade until that target is repaired.
+- Docker inspection distinguishes confirmed absence from daemon, permission,
+  and transport failures so retryable uninstall cannot record false success.
+- State and migration evidence is read only from current-user-owned `0700`
+  directories and single-link `0600` regular files without following symlinks.
+- Documentation no longer instructs users to clone a nonexistent v2.2.0 tag,
+  use the retired manual Compose path, or diagnose the managed topology through
+  a directly published API port.
+- The generated Nginx Authentik route now uses the configured public origin,
+  connects `401` to the standard sign-in handler, and returns the outpost's
+  refreshed session cookie to the browser while still stripping cookies before
+  the translation API.
 
 ## [2.1.4] - 2026-07-08
 

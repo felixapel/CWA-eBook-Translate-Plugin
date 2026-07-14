@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16,16 +17,34 @@ from typing import Protocol
 
 from btctl_auth import render_authentik_edge
 from btctl_compose import (
+    ComposeAdopter,
     ComposeInstaller,
     InstallError,
+    _completed_uninstall_for_reinstall,
     _container_networks,
     _has_exact_cwa_version,
     _labels,
+    _probe_runtime_dependencies,
     _verify_identity_edge_artifact,
+    _verify_private_network,
     render_compose,
 )
-from btctl_core import DeploymentPlan, DeploymentState, InstallConfig, StateStore
-from btctl_unraid import UnraidInstaller, _environment_text, render_templates
+from btctl_core import (
+    ConfigError,
+    DeploymentPlan,
+    DeploymentState,
+    InstallConfig,
+    OperationLock,
+    StateStore,
+    ensure_directory_durable,
+    read_private_text,
+)
+from btctl_unraid import (
+    UnraidAdopter,
+    UnraidInstaller,
+    _environment_text,
+    render_templates,
+)
 
 
 _CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -41,6 +60,12 @@ class LifecycleDocker(Protocol):
     def remove_network(self, name: str) -> None: ...
     def stop_container(self, name: str) -> None: ...
     def start_container(self, name: str) -> None: ...
+    def wait_healthy(self, names: list[str], timeout_seconds: int) -> None: ...
+    def probe_http(self, container: str, url: str) -> None: ...
+    def probe_auth(self, container: str, url: str) -> None: ...
+    def probe_sqlite(self, container: str, database_path: str) -> None: ...
+    def probe_image_version(self, image_id: str, expected_version: str) -> None: ...
+    def prepare_migration_source(self, image_id: str, path: Path) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +109,16 @@ class DeploymentDoctor:
     def __init__(self, docker: LifecycleDocker):
         self.docker = docker
 
-    def run(self, config: InstallConfig, plan: DeploymentPlan) -> DoctorReport:
+    def run(
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        *,
+        _operation_locked: bool = False,
+    ) -> DoctorReport:
+        if not _operation_locked:
+            with OperationLock(Path(config.state_dir), create=False):
+                return self.run(config, plan, _operation_locked=True)
         checks: list[dict[str, str]] = []
 
         def check(name: str, operation) -> bool:
@@ -145,26 +179,50 @@ class DeploymentDoctor:
 
                 check(f"runtime-{role}", verify_role)
 
+            check(
+                "runtime-dependencies",
+                lambda: _probe_runtime_dependencies(self.docker, config, plan),
+            )
+
         def verify_private_network() -> None:
             name = str(plan.resources["private_network"]["name"])
             network = self.docker.inspect_network(name)
-            labels = network.get("Labels", {}) if network else {}
-            if (
-                network is None
-                or network.get("Id") != state.resources["private_network"].get("id")
-                or network.get("Internal") is not True
-                or labels.get("io.cwa-translate.install-id") != state.install_id
-                or labels.get("io.cwa-translate.role") != "private-network"
-                or labels.get("io.cwa-translate.revision") != config.identity.sha
-            ):
-                raise InstallError("private network ownership or isolation has drifted")
+            _verify_private_network(
+                config,
+                state.install_id,
+                network,
+                expected_id=str(state.resources["private_network"].get("id", "")),
+            )
 
         check("private-network", verify_private_network)
 
         def verify_data() -> None:
             path = Path(config.data_dir)
-            if path.is_symlink() or not path.is_dir() or _mode(path) & 0o077:
+            if path.is_symlink() or not path.is_dir():
                 raise InstallError("translation data directory is missing or not private")
+            metadata = path.lstat()
+            expected_mode = (
+                0o2750 if config.install_profile == "compose-existing" else 0o700
+            )
+            if stat.S_IMODE(metadata.st_mode) != expected_mode:
+                raise InstallError(
+                    "translation data directory mode does not match the install profile"
+                )
+            if (
+                config.install_profile == "compose-existing"
+                and metadata.st_gid != os.getgid()
+            ):
+                raise InstallError(
+                    "translation data directory operator group does not match"
+                )
+            if (
+                config.install_profile == "unraid"
+                and os.geteuid() == 0
+                and (metadata.st_uid, metadata.st_gid) != (101, 102)
+            ):
+                raise InstallError(
+                    "translation data directory runtime ownership does not match"
+                )
 
         check("data-directory", verify_data)
 
@@ -252,18 +310,23 @@ class RuntimeUninstaller:
         network = self.docker.inspect_network(str(resource["name"]))
         if network is None and (resource.get("removed") or tolerate_missing):
             return
-        labels = network.get("Labels", {}) if network else {}
-        if (
-            network is None
-            or network.get("Id") != resource.get("id")
-            or labels.get("io.cwa-translate.install-id") != state.install_id
-            or labels.get("io.cwa-translate.role") != "private-network"
-        ):
-            raise InstallError("private network ownership evidence has drifted")
+        _verify_private_network(
+            config,
+            state.install_id,
+            network,
+            expected_id=str(resource.get("id", "")),
+        )
 
     def uninstall(
-        self, config: InstallConfig, plan: DeploymentPlan
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        *,
+        _operation_locked: bool = False,
     ) -> DeploymentState:
+        if not _operation_locked:
+            with OperationLock(Path(config.state_dir)):
+                return self.uninstall(config, plan, _operation_locked=True)
         store = StateStore(Path(config.state_dir))
         state = store.load()
         if state.status in {"uninstalled", "rolled_back"}:
@@ -271,6 +334,17 @@ class RuntimeUninstaller:
         if state.status not in {"installed", "adopted", "uninstalling"}:
             raise InstallError("deployment state cannot be uninstalled")
         _state_matches_plan(state, config, plan)
+        mutable_resources = ["proxy", "api", "private_network"]
+        if config.install_profile == "unraid":
+            mutable_resources.extend(["proxy_template", "api_template"])
+        if any(
+            state.resources.get(name, {}).get("ownership") != "owned"
+            for name in mutable_resources
+        ):
+            raise InstallError(
+                "lifecycle resource is not classified as owned; refusing removal"
+            )
+        self.docker.require_available()
         retry = state.status == "uninstalling"
         self._verify_owned_runtime(
             state, config, plan, tolerate_missing=retry
@@ -296,7 +370,12 @@ class RuntimeUninstaller:
         for role in ("proxy", "api"):
             resource = resources[role]
             name = str(resource["name"])
-            if self.docker.inspect_container(name) is not None:
+            container = self.docker.inspect_container(name)
+            if container is not None:
+                if container.get("State", {}).get("Status") == "running":
+                    self.docker.stop_container(name)
+                resource["stopped"] = True
+                store.save(current)
                 self.docker.remove_container(name)
             resource["removed"] = True
             store.save(current)
@@ -321,6 +400,31 @@ class RuntimeUninstaller:
         return completed
 
 
+def _fsync_path(path: Path, *, directory: bool) -> None:
+    """Flush one already-validated file or directory without following links."""
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        if directory:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        expected = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(
+            metadata.st_mode
+        )
+        if not expected:
+            raise InstallError("migration durability target changed type")
+        os.fsync(descriptor)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("migration data could not be made durable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 class MigrationJournalStore:
     def __init__(self, state_dir: Path):
         self.state_dir = Path(state_dir)
@@ -331,8 +435,10 @@ class MigrationJournalStore:
             raise InstallError("migration journal destination must not be a symbolic link")
         document = dict(payload)
         document["schema_version"] = _JOURNAL_SCHEMA
-        self.state_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(self.state_dir, 0o700)
+        try:
+            ensure_directory_durable(self.state_dir)
+        except ConfigError as exc:
+            raise InstallError("migration journal directory is unsafe") from exc
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".migration-v214.json.", dir=self.state_dir
         )
@@ -344,6 +450,7 @@ class MigrationJournalStore:
                 os.fsync(handle.fileno())
             os.chmod(temporary_name, 0o600)
             os.replace(temporary_name, self.path)
+            _fsync_path(self.state_dir, directory=True)
         except BaseException:
             try:
                 os.unlink(temporary_name)
@@ -352,11 +459,15 @@ class MigrationJournalStore:
             raise
 
     def load(self) -> dict[str, object]:
-        if self.path.is_symlink():
-            raise InstallError("migration journal must not be a symbolic link")
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            payload = json.loads(
+                read_private_text(
+                    self.state_dir,
+                    self.path.name,
+                    label="migration journal",
+                )
+            )
+        except (ConfigError, json.JSONDecodeError) as exc:
             raise InstallError("migration journal could not be read") from exc
         if not isinstance(payload, dict) or payload.get("schema_version") != _JOURNAL_SCHEMA:
             raise InstallError("migration journal schema is unsupported")
@@ -393,7 +504,20 @@ def _sqlite_integrity(data_dir: Path, *, checkpoint: bool) -> None:
         connection = sqlite3.connect(database_path, timeout=10)
         try:
             if checkpoint:
-                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                checkpoint_result = connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if (
+                    not checkpoint_result
+                    or len(checkpoint_result) != 3
+                    or any(
+                        not isinstance(value, int) or value < -1
+                        for value in checkpoint_result
+                    )
+                    or checkpoint_result[0] != 0
+                    or checkpoint_result[1] != checkpoint_result[2]
+                ):
+                    raise InstallError("SQLite WAL checkpoint did not complete")
             result = connection.execute("PRAGMA integrity_check").fetchone()
             if not result or result[0] != "ok":
                 raise InstallError("SQLite integrity check failed")
@@ -415,6 +539,66 @@ def _secure_copy(source: Path, target: Path) -> None:
     os.chmod(target, 0o700)
 
 
+def _make_tree_durable(root: Path) -> None:
+    """Flush copied bytes and directory entries before publishing the tree."""
+    files: list[Path] = []
+    directories: list[Path] = []
+    try:
+        for path in root.rglob("*"):
+            metadata = path.lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                files.append(path)
+            elif stat.S_ISDIR(metadata.st_mode):
+                directories.append(path)
+            else:
+                raise InstallError(
+                    "migration data must contain only directories and files"
+                )
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("migration copy could not be inspected for durability") from exc
+    for path in sorted(files):
+        _fsync_path(path, directory=False)
+    for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _fsync_path(path, directory=True)
+    _fsync_path(root, directory=True)
+
+
+def _preserve_incomplete(source: Path, destination: Path) -> None:
+    """Atomically retain an interrupted local copy without trusting its data."""
+    if not source.exists() and not source.is_symlink():
+        return
+    if source.is_symlink() or not source.is_dir():
+        raise InstallError("interrupted migration copy is not a safe directory")
+    if destination.exists() or destination.is_symlink():
+        raise InstallError("interrupted migration preservation path already exists")
+    if source.parent.resolve() != destination.parent.resolve():
+        raise InstallError("interrupted migration copy cannot cross filesystems")
+    # Reject links, devices, sockets, and FIFOs, but preserve every regular
+    # byte. The copy is evidence, not an input to the next migration attempt.
+    _tree_manifest(source)
+    _make_tree_durable(source)
+    os.replace(source, destination)
+    _fsync_path(destination.parent, directory=True)
+
+
+def _secure_copy_atomic(source: Path, target: Path, work: Path) -> None:
+    """Copy through a same-filesystem work tree and publish by atomic rename."""
+    if target.exists() or target.is_symlink() or work.exists() or work.is_symlink():
+        raise InstallError("migration copy destination must not already exist")
+    if target.parent.resolve() != work.parent.resolve():
+        raise InstallError("migration work tree must share the destination filesystem")
+    source_manifest = _tree_manifest(source)
+    _secure_copy(source, work)
+    work_manifest = _tree_manifest(work)
+    if source_manifest != work_manifest:
+        raise InstallError("migration work copy does not match its source")
+    _make_tree_durable(work)
+    os.replace(work, target)
+    _fsync_path(target.parent, directory=True)
+
+
 def _paths_overlap(first: Path, second: Path) -> bool:
     left = first.resolve()
     right = second.resolve()
@@ -424,8 +608,9 @@ def _paths_overlap(first: Path, second: Path) -> bool:
 class LegacyUpgrade:
     """Move an exact stopped v2.1.4 data snapshot into the split v2.2 runtime."""
 
-    def __init__(self, docker: LifecycleDocker):
+    def __init__(self, docker: LifecycleDocker, *, health_timeout_seconds: int = 90):
         self.docker = docker
+        self.health_timeout_seconds = health_timeout_seconds
 
     @staticmethod
     def _legacy_values(values: dict[str, str]) -> tuple[str, Path]:
@@ -456,6 +641,7 @@ class LegacyUpgrade:
         if (
             len(mounts) != 1
             or mounts[0].get("Type") != "bind"
+            or mounts[0].get("RW") is not True
             or Path(str(mounts[0].get("Source", ""))).resolve() != data_dir.resolve()
         ):
             raise InstallError("legacy /app/data bind mount does not match")
@@ -465,24 +651,243 @@ class LegacyUpgrade:
             or image_ref != expected.get("legacy_image_ref")
         ):
             raise InstallError("legacy runtime identity no longer matches the journal")
+        image_id = str(container.get("Image", ""))
+        if not image_id:
+            raise InstallError("legacy runtime image identity is incomplete")
+        self.docker.probe_image_version(image_id, "2.1.4")
         return container
 
-    def upgrade(
+    @staticmethod
+    def _verify_journal_paths(
+        journal: dict[str, object],
+        config: InstallConfig,
+        name: str,
+        legacy_data: Path,
+    ) -> None:
+        if journal.get("legacy_container") != name:
+            raise InstallError("migration journal legacy container does not match")
+        try:
+            recorded_legacy = Path(str(journal["legacy_data_dir"]))
+            recorded_target = Path(str(journal["target_data_dir"]))
+            snapshot = Path(str(journal["snapshot_path"]))
+        except KeyError as exc:
+            raise InstallError("migration journal path evidence is incomplete") from exc
+        if (
+            recorded_legacy.resolve() != legacy_data.resolve()
+            or recorded_target.resolve() != Path(config.data_dir).resolve()
+            or snapshot.parent.resolve() != Path(config.backup_dir).resolve()
+        ):
+            raise InstallError("migration journal path evidence does not match")
+        attempt = journal.get("attempt", 1)
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise InstallError("migration journal attempt counter is invalid")
+        if journal.get("legacy_initial_status") not in {"running", "exited", "created"}:
+            raise InstallError("migration journal legacy start state is invalid")
+        snapshot_work_value = journal.get("snapshot_work_path")
+        if snapshot_work_value is not None:
+            snapshot_work = Path(str(snapshot_work_value))
+            if (
+                snapshot_work.parent.resolve() != snapshot.parent.resolve()
+                or snapshot_work.name != f"{snapshot.name}.partial"
+            ):
+                raise InstallError("migration snapshot work path evidence does not match")
+        target_work_value = journal.get("target_work_path")
+        if target_work_value is not None:
+            target_work = Path(str(target_work_value))
+            expected_name = f".{recorded_target.name}.btctl-migration-r{attempt}.partial"
+            if (
+                target_work.parent.resolve() != recorded_target.parent.resolve()
+                or target_work.name != expected_name
+            ):
+                raise InstallError("migration target work path evidence does not match")
+
+    @staticmethod
+    def _verify_recorded_snapshot(journal: dict[str, object]) -> None:
+        snapshot = Path(str(journal.get("snapshot_path", "")))
+        if snapshot.is_symlink() or not snapshot.is_dir():
+            raise InstallError("migration snapshot is missing or unsafe")
+        _sqlite_integrity(snapshot, checkpoint=False)
+        manifest, files = _tree_manifest(snapshot)
+        if (
+            manifest != journal.get("snapshot_manifest")
+            or files != journal.get("snapshot_files")
+        ):
+            raise InstallError("migration snapshot integrity has drifted")
+
+    @staticmethod
+    def _verify_recorded_target(
+        journal: dict[str, object], config: InstallConfig
+    ) -> None:
+        if journal.get("target_reupgrade_status") != "verified":
+            raise InstallError(
+                "preserved v2.2 target is unavailable for automatic re-upgrade"
+            )
+        target = Path(config.data_dir)
+        if target.is_symlink() or not target.is_dir():
+            raise InstallError("preserved v2.2 data target is missing or unsafe")
+        _sqlite_integrity(target, checkpoint=False)
+        manifest, files = _tree_manifest(target)
+        if (
+            manifest != journal.get("target_manifest")
+            or files != journal.get("target_files")
+        ):
+            raise InstallError("preserved v2.2 data target integrity has drifted")
+
+    def _validated_prior_rollback(
+        self,
+        journal: dict[str, object],
+        config: InstallConfig,
+        name: str,
+        legacy_data: Path,
+    ) -> dict[str, object]:
+        prior = journal.get("prior_rollback")
+        if not isinstance(prior, dict) or prior.get("status") != "rolled_back":
+            raise InstallError(
+                "interrupted re-upgrade has no valid prior rollback evidence"
+            )
+        self._verify_journal_paths(prior, config, name, legacy_data)
+        self._verify_recorded_snapshot(prior)
+        return prior
+
+    @staticmethod
+    def _capture_target_status(config: InstallConfig) -> dict[str, object]:
+        """Classify preserved v2 data without blocking legacy restoration."""
+        target = Path(config.data_dir)
+        database = target / "translations.db"
+        if (
+            target.is_symlink()
+            or not target.is_dir()
+            or database.is_symlink()
+            or not database.is_file()
+        ):
+            return {
+                "target_reupgrade_status": "unavailable",
+                "target_reupgrade_reason": "missing-or-unsafe",
+            }
+        try:
+            _sqlite_integrity(target, checkpoint=False)
+            manifest, files = _tree_manifest(target)
+        except (InstallError, OSError):
+            return {
+                "target_reupgrade_status": "unavailable",
+                "target_reupgrade_reason": "integrity-or-read-error",
+            }
+        return {
+            "target_reupgrade_status": "verified",
+            "target_manifest": manifest,
+            "target_files": files,
+        }
+
+    def _restore_legacy_service(
+        self,
+        plan: DeploymentPlan,
+        journal: dict[str, object],
+        name: str,
+        legacy_data: Path,
+    ) -> None:
+        """Restore only the exact journaled legacy runtime and prove it healthy."""
+        for role in ("api", "proxy"):
+            candidate = self.docker.inspect_container(
+                str(plan.resources[role]["name"])
+            )
+            if (
+                candidate
+                and candidate.get("State", {}).get("Status")
+                not in {"created", "exited", "dead"}
+            ):
+                raise InstallError(
+                    "cannot restore legacy while a v2.2 runtime role is active"
+                )
+        current = self._verify_legacy(name, legacy_data, expected=journal)
+        if current.get("State", {}).get("Status") != "running":
+            self.docker.start_container(name)
+        self.docker.wait_healthy([name], self.health_timeout_seconds)
+        running = self._verify_legacy(name, legacy_data, expected=journal)
+        if (
+            running.get("State", {}).get("Status") != "running"
+            or running.get("State", {}).get("Health", {}).get("Status")
+            != "healthy"
+        ):
+            raise InstallError("legacy container did not become healthy")
+
+    @staticmethod
+    def _prepare_failed_upgrade_retry(
+        journal: dict[str, object],
+        config: InstallConfig,
+        *,
+        preserve_target: bool = False,
+    ) -> None:
+        """Preserve interrupted trees and make the exact next attempt writable."""
+        snapshot = Path(str(journal.get("snapshot_path", "")))
+        snapshot_work_value = journal.get("snapshot_work_path")
+        if snapshot_work_value is not None:
+            snapshot_work = Path(str(snapshot_work_value))
+            _preserve_incomplete(
+                snapshot_work,
+                snapshot_work.with_name(f"{snapshot_work.name}.preserved"),
+            )
+        if snapshot.exists() or snapshot.is_symlink():
+            if journal.get("snapshot_manifest") and journal.get("snapshot_files"):
+                LegacyUpgrade._verify_recorded_snapshot(journal)
+            else:
+                _preserve_incomplete(
+                    snapshot,
+                    snapshot.with_name(f"{snapshot.name}.uncommitted-preserved"),
+                )
+
+        target_work_value = journal.get("target_work_path")
+        if target_work_value is not None:
+            target_work = Path(str(target_work_value))
+            _preserve_incomplete(
+                target_work,
+                target_work.with_name(f"{target_work.name}.preserved"),
+            )
+
+        if preserve_target:
+            return
+
+        target = Path(config.data_dir)
+        if target.is_symlink():
+            raise InstallError("failed upgrade target is a symbolic link")
+        if not target.exists():
+            return
+        if not target.is_dir():
+            raise InstallError("failed upgrade target is not a directory")
+        attempt = journal.get("attempt", 1)
+        if isinstance(attempt, bool) or not isinstance(attempt, int):
+            raise InstallError("migration journal attempt counter is invalid")
+        preserved = target.with_name(
+            f".{target.name}.btctl-migration-r{attempt}.preserved"
+        )
+        _preserve_incomplete(target, preserved)
+
+    def _prepare_upgrade_attempt(
         self,
         config: InstallConfig,
         plan: DeploymentPlan,
         repository: Path,
-        values: dict[str, str],
-    ) -> DeploymentState:
-        store = StateStore(Path(config.state_dir))
-        journal_store = MigrationJournalStore(Path(config.state_dir))
-        if store.path.exists() or journal_store.path.exists():
-            raise InstallError("upgrade requires no existing state or migration journal")
-        name, legacy_data = self._legacy_values(values)
-        if legacy_data.is_symlink() or not legacy_data.is_dir():
-            raise InstallError("BT_LEGACY_DATA_DIR must be a real directory")
-        if legacy_data.resolve() == Path(config.data_dir).resolve():
-            raise InstallError("legacy and target data directories must differ")
+        journal_store: MigrationJournalStore,
+        *,
+        name: str,
+        legacy_data: Path,
+        legacy: dict,
+        initial_status: str,
+        restart_legacy_on_failure: bool,
+        previous_journal: dict[str, object] | None,
+        reupgrade: bool,
+        reupgrade_evidence: dict[str, object] | None,
+        retrying_failed_upgrade: bool,
+        retrying_reupgrade: bool,
+    ) -> tuple[
+        dict[str, object],
+        ComposeInstaller | UnraidInstaller,
+        Path,
+        Path,
+        Path,
+        Path,
+        bool,
+    ]:
+        """Prepare one numbered attempt after legacy identity is verified."""
         repository_root = Path(repository).resolve()
         configured_backup = Path(config.backup_dir)
         if configured_backup.is_symlink():
@@ -503,34 +908,61 @@ class LegacyUpgrade:
                 "legacy, target, and backup directories must not overlap"
             )
 
-        legacy = self._verify_legacy(name, legacy_data)
-        legacy_id = str(legacy.get("Id", ""))
-        legacy_image_id = str(legacy.get("Image", ""))
-        if not legacy_id or not legacy_image_id:
-            raise InstallError("legacy container identity is incomplete")
-        initial_status = legacy.get("State", {}).get("Status")
-        if initial_status not in {"running", "exited", "created"}:
-            raise InstallError("legacy container is not in a migratable state")
+        if retrying_failed_upgrade or retrying_reupgrade:
+            if previous_journal is None:
+                raise InstallError("migration retry evidence is incomplete")
+            self._prepare_failed_upgrade_retry(
+                previous_journal,
+                config,
+                preserve_target=reupgrade,
+            )
 
         installer = (
             ComposeInstaller(self.docker)
             if config.install_profile == "compose-existing"
             else UnraidInstaller(self.docker)
         )
-        installer._preflight(config, plan)
-        if target.exists() and any(target.iterdir()):
-            raise InstallError("BT_DATA_DIR must be empty before migration")
-        if target.exists():
-            target.rmdir()
+        installer._preflight(
+            config,
+            plan,
+            allow_existing_data=reupgrade,
+            allow_rolled_back_state=reupgrade,
+        )
+        if not reupgrade:
+            if target.exists() and any(target.iterdir()):
+                raise InstallError("BT_DATA_DIR must be empty before migration")
+            if target.exists():
+                target.rmdir()
 
+        legacy_id = str(legacy.get("Id", ""))
+        legacy_image_id = str(legacy.get("Image", ""))
+        if not legacy_id or not legacy_image_id:
+            raise InstallError("legacy container identity is incomplete")
         suffix = hashlib.sha256(legacy_id.encode("utf-8")).hexdigest()[:12]
-        snapshot = backup_root / f"pre-v2.2.0-{suffix}"
-        backup_root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(backup_root, 0o700)
+        if reupgrade or retrying_failed_upgrade:
+            raw_attempt = previous_journal.get("attempt", 1) if previous_journal else 1
+            if isinstance(raw_attempt, bool) or not isinstance(raw_attempt, int):
+                raise InstallError("migration journal attempt counter is invalid")
+            attempt = raw_attempt + 1
+            snapshot = backup_root / f"pre-v2.2.0-{suffix}-r{attempt}"
+        else:
+            attempt = 1
+            snapshot = backup_root / f"pre-v2.2.0-{suffix}"
+        try:
+            ensure_directory_durable(backup_root)
+        except ConfigError as exc:
+            raise InstallError("BT_BACKUP_DIR could not be created durably") from exc
         if snapshot.exists() or snapshot.is_symlink():
             raise InstallError("migration snapshot already exists")
+        snapshot_work = snapshot.with_name(f"{snapshot.name}.partial")
+        target_work = target.with_name(
+            f".{target.name}.btctl-migration-r{attempt}.partial"
+        )
+        for work in (snapshot_work, target_work):
+            if work.exists() or work.is_symlink():
+                raise InstallError("migration work path already exists")
 
-        stopped = initial_status == "running"
+        stop_before_snapshot = initial_status == "running"
         journal: dict[str, object] = {
             "status": "prepared",
             "legacy_container": name,
@@ -538,29 +970,332 @@ class LegacyUpgrade:
             "legacy_image_id": legacy_image_id,
             "legacy_image_ref": legacy["Config"]["Image"],
             "legacy_data_dir": str(legacy_data),
-            "legacy_initial_status": initial_status,
+            "legacy_initial_status": (
+                "running" if restart_legacy_on_failure else initial_status
+            ),
             "snapshot_path": str(snapshot),
+            "snapshot_work_path": str(snapshot_work),
             "target_data_dir": str(target),
+            "target_work_path": str(target_work),
+            "attempt": attempt,
         }
+        if previous_journal is not None:
+            journal["previous_snapshot_path"] = previous_journal.get("snapshot_path")
+            journal["previous_install_id"] = previous_journal.get("install_id")
+        if reupgrade:
+            if reupgrade_evidence is None:
+                raise InstallError("re-upgrade rollback evidence is incomplete")
+            journal["prior_rollback"] = copy.deepcopy(reupgrade_evidence)
         journal_store.save(journal)
+        return (
+            journal,
+            installer,
+            target,
+            snapshot,
+            snapshot_work,
+            target_work,
+            stop_before_snapshot,
+        )
+
+    def _recover_active_upgrade(
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        store: StateStore,
+        journal_store: MigrationJournalStore,
+        journal: dict[str, object],
+        name: str,
+        legacy_data: Path,
+    ) -> DeploymentState:
+        state = store.load()
+        if state.status not in {"installed", "adopted"}:
+            raise InstallError("migration recovery requires active v2.2 state")
+        _state_matches_plan(state, config, plan)
+        recorded_install_id = journal.get("install_id")
+        if recorded_install_id and recorded_install_id != state.install_id:
+            raise InstallError("migration journal install identity does not match state")
+        legacy = self._verify_legacy(name, legacy_data, expected=journal)
+        if legacy.get("State", {}).get("Status") == "running":
+            raise InstallError("active v2.2 recovery requires the legacy writer stopped")
+        self._verify_recorded_snapshot(journal)
+        target = Path(config.data_dir)
+        if target.is_symlink() or not target.is_dir():
+            raise InstallError("migration target is missing or unsafe")
+        _sqlite_integrity(target, checkpoint=False)
+        report = DeploymentDoctor(self.docker).run(
+            config,
+            plan,
+            _operation_locked=True,
+        )
+        if not report.ok:
+            raise InstallError("active v2.2 runtime failed recovery verification")
+        if journal.get("status") != "upgraded":
+            journal["status"] = "upgraded"
+            journal["install_id"] = state.install_id
+            journal_store.save(journal)
+        return state
+
+    def _recover_journal_only_runtime(
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        store: StateStore,
+        journal_store: MigrationJournalStore,
+        journal: dict[str, object],
+        name: str,
+        legacy_data: Path,
+    ) -> DeploymentState | None:
+        """Adopt an exact live cutover before any retry can move its data bind."""
+        runtime_present = any(
+            self.docker.inspect_container(str(plan.resources[role]["name"]))
+            is not None
+            for role in ("api", "proxy")
+        ) or self.docker.inspect_network(
+            str(plan.resources["private_network"]["name"])
+        ) is not None
+        if not runtime_present:
+            return None
+        if journal.get("status") != "snapshot-complete":
+            raise InstallError(
+                "journal-only recovery found unexpected v2.2 runtime resources"
+            )
+        legacy = self._verify_legacy(name, legacy_data, expected=journal)
+        if legacy.get("State", {}).get("Status") == "running":
+            raise InstallError(
+                "journal-only v2.2 recovery requires the legacy writer stopped"
+            )
+        self._verify_recorded_snapshot(journal)
+        target = Path(config.data_dir)
+        if target.is_symlink() or not target.is_dir():
+            raise InstallError("migration target is missing or unsafe")
+        _sqlite_integrity(target, checkpoint=False)
+        adopter = (
+            ComposeAdopter(self.docker)
+            if config.install_profile == "compose-existing"
+            else UnraidAdopter(self.docker)
+        )
+        adopter.adopt(config, plan, _operation_locked=True)
+        return self._recover_active_upgrade(
+            config,
+            plan,
+            store,
+            journal_store,
+            journal,
+            name,
+            legacy_data,
+        )
+
+    def upgrade(
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        repository: Path,
+        values: dict[str, str],
+        *,
+        _operation_locked: bool = False,
+    ) -> DeploymentState:
+        if not _operation_locked:
+            with OperationLock(Path(config.state_dir)):
+                return self.upgrade(
+                    config,
+                    plan,
+                    repository,
+                    values,
+                    _operation_locked=True,
+                )
+        store = StateStore(Path(config.state_dir))
+        journal_store = MigrationJournalStore(Path(config.state_dir))
+        name, legacy_data = self._legacy_values(values)
+        reupgrade = False
+        retrying_failed_upgrade = False
+        retrying_reupgrade = False
+        reupgrade_evidence: dict[str, object] | None = None
+        previous_journal: dict[str, object] | None = None
+        if journal_store.path.exists() and not store.path.exists():
+            previous_journal = journal_store.load()
+            self._verify_journal_paths(
+                previous_journal,
+                config,
+                name,
+                legacy_data,
+            )
+            if previous_journal.get("status") not in {
+                "prepared",
+                "snapshot-complete",
+                "upgrade-failed",
+            }:
+                raise InstallError(
+                    "journal-only migration is not eligible for safe upgrade retry"
+                )
+            recovered = self._recover_journal_only_runtime(
+                config,
+                plan,
+                store,
+                journal_store,
+                previous_journal,
+                name,
+                legacy_data,
+            )
+            if recovered is not None:
+                return recovered
+            retrying_failed_upgrade = True
+        elif store.path.exists() or journal_store.path.exists():
+            if not journal_store.path.exists():
+                raise InstallError(
+                    "upgrade state exists without migration journal evidence"
+                )
+            current_state = store.load()
+            previous_journal = journal_store.load()
+            self._verify_journal_paths(
+                previous_journal,
+                config,
+                name,
+                legacy_data,
+            )
+            journal_status = previous_journal.get("status")
+            if (
+                current_state.status in {"installed", "adopted"}
+                and journal_status
+                in {"snapshot-complete", "upgrade-journal-failed", "upgraded"}
+            ):
+                return self._recover_active_upgrade(
+                    config,
+                    plan,
+                    store,
+                    journal_store,
+                    previous_journal,
+                    name,
+                    legacy_data,
+                )
+            if (
+                current_state.status == "rolled_back"
+                and journal_status
+                in {
+                    "rolled_back",
+                    "prepared",
+                    "snapshot-complete",
+                    "reupgrade-failed",
+                }
+            ):
+                recovered = _completed_uninstall_for_reinstall(
+                    config,
+                    plan,
+                    allow_rolled_back=True,
+                )
+                if recovered != current_state:
+                    raise InstallError("rolled-back state changed during re-upgrade")
+                if journal_status != "rolled_back":
+                    reupgrade_evidence = self._validated_prior_rollback(
+                        previous_journal,
+                        config,
+                        name,
+                        legacy_data,
+                    )
+                    retrying_reupgrade = True
+                else:
+                    reupgrade_evidence = previous_journal
+                self._verify_recorded_snapshot(reupgrade_evidence)
+                self._verify_recorded_target(reupgrade_evidence, config)
+                reupgrade = True
+            else:
+                raise InstallError(
+                    "existing migration state is not eligible for upgrade recovery"
+                )
+        if legacy_data.is_symlink() or not legacy_data.is_dir():
+            raise InstallError("BT_LEGACY_DATA_DIR must be a real directory")
+        if legacy_data.resolve() == Path(config.data_dir).resolve():
+            raise InstallError("legacy and target data directories must differ")
+
+        legacy = self._verify_legacy(
+            name,
+            legacy_data,
+            expected=(
+                previous_journal
+                if retrying_failed_upgrade
+                else reupgrade_evidence
+            ),
+        )
+        initial_status = legacy.get("State", {}).get("Status")
+        if initial_status not in {"running", "exited", "created"}:
+            raise InstallError("legacy container is not in a migratable state")
+        restart_legacy_on_failure = initial_status == "running" or bool(
+            previous_journal
+            and previous_journal.get("legacy_initial_status") == "running"
+        )
+        try:
+            (
+                journal,
+                installer,
+                target,
+                snapshot,
+                snapshot_work,
+                target_work,
+                stop_before_snapshot,
+            ) = self._prepare_upgrade_attempt(
+                config,
+                plan,
+                repository,
+                journal_store,
+                name=name,
+                legacy_data=legacy_data,
+                legacy=legacy,
+                initial_status=initial_status,
+                restart_legacy_on_failure=restart_legacy_on_failure,
+                previous_journal=previous_journal,
+                reupgrade=reupgrade,
+                reupgrade_evidence=reupgrade_evidence,
+                retrying_failed_upgrade=retrying_failed_upgrade,
+                retrying_reupgrade=retrying_reupgrade,
+            )
+        except BaseException:
+            if (
+                restart_legacy_on_failure
+                and previous_journal is not None
+                and (retrying_failed_upgrade or retrying_reupgrade)
+            ):
+                try:
+                    self._restore_legacy_service(
+                        plan,
+                        previous_journal,
+                        name,
+                        legacy_data,
+                    )
+                except BaseException as restore_exc:
+                    raise InstallError(
+                        "upgrade retry failed and the legacy service could not be restored"
+                    ) from restore_exc
+            raise
         target_installed = False
         try:
-            if stopped:
+            if stop_before_snapshot:
                 self.docker.stop_container(name)
-            stopped_legacy = self._verify_legacy(name, legacy_data)
+            stopped_legacy = self._verify_legacy(
+                name,
+                legacy_data,
+                expected=journal,
+            )
             if stopped_legacy.get("State", {}).get("Status") == "running":
                 raise InstallError("legacy writer did not stop")
+            self.docker.prepare_migration_source(
+                str(journal["legacy_image_id"]),
+                legacy_data,
+            )
             _sqlite_integrity(legacy_data, checkpoint=True)
             source_manifest, source_files = _tree_manifest(legacy_data)
-            _secure_copy(legacy_data, snapshot)
+            _secure_copy_atomic(legacy_data, snapshot, snapshot_work)
             _sqlite_integrity(snapshot, checkpoint=False)
             snapshot_manifest, snapshot_files = _tree_manifest(snapshot)
             if (source_manifest, source_files) != (snapshot_manifest, snapshot_files):
                 raise InstallError("offline snapshot does not match the stopped source")
-            _secure_copy(snapshot, target)
+            if not reupgrade:
+                _secure_copy_atomic(snapshot, target, target_work)
             _sqlite_integrity(target, checkpoint=False)
             target_manifest, target_files = _tree_manifest(target)
-            if (snapshot_manifest, snapshot_files) != (target_manifest, target_files):
+            if (
+                not reupgrade
+                and (snapshot_manifest, snapshot_files)
+                != (target_manifest, target_files)
+            ):
                 raise InstallError("migration target does not match the snapshot")
 
             journal.update({
@@ -568,28 +1303,47 @@ class LegacyUpgrade:
                 "snapshot_manifest": snapshot_manifest,
                 "snapshot_files": snapshot_files,
                 "target_manifest": target_manifest,
+                "target_files": target_files,
             })
             journal_store.save(journal)
-            state = installer.install(config, plan, Path(repository))
+            state = installer.install(
+                config,
+                plan,
+                Path(repository),
+                _operation_locked=True,
+                _allow_existing_data=True,
+                _allow_rolled_back_state=reupgrade,
+            )
             target_installed = True
             journal.update({"status": "upgraded", "install_id": state.install_id})
             journal_store.save(journal)
             return state
         except BaseException as exc:
-            journal["status"] = (
-                "upgrade-journal-failed" if target_installed else "upgrade-failed"
-            )
-            if stopped and not target_installed:
+            if target_installed:
+                journal["status"] = "upgrade-journal-failed"
+            else:
+                journal["status"] = (
+                    "reupgrade-failed" if reupgrade else "upgrade-failed"
+                )
+            restore_error: BaseException | None = None
+            if restart_legacy_on_failure and not target_installed:
                 try:
-                    current = self.docker.inspect_container(name)
-                    if current and current.get("State", {}).get("Status") != "running":
-                        self.docker.start_container(name)
-                except BaseException:
-                    pass
+                    self._restore_legacy_service(
+                        plan,
+                        journal,
+                        name,
+                        legacy_data,
+                    )
+                except BaseException as recovery_exc:
+                    restore_error = recovery_exc
             try:
                 journal_store.save(journal)
             except BaseException:
                 pass
+            if restore_error is not None:
+                raise InstallError(
+                    "legacy upgrade failed and the legacy service could not be restored"
+                ) from restore_error
             if isinstance(exc, InstallError):
                 raise
             if target_installed:
@@ -600,42 +1354,90 @@ class LegacyUpgrade:
             raise InstallError("legacy upgrade failed") from exc
 
     def rollback(
-        self, config: InstallConfig, plan: DeploymentPlan
+        self,
+        config: InstallConfig,
+        plan: DeploymentPlan,
+        *,
+        _operation_locked: bool = False,
     ) -> DeploymentState:
+        if not _operation_locked:
+            with OperationLock(Path(config.state_dir)):
+                return self.rollback(config, plan, _operation_locked=True)
         journal_store = MigrationJournalStore(Path(config.state_dir))
         journal = journal_store.load()
         store = StateStore(Path(config.state_dir))
-        if journal.get("status") == "rolled_back":
-            return store.load()
-        if journal.get("status") not in {"upgraded", "rollback-failed"}:
-            raise InstallError("migration journal is not eligible for rollback")
+        journal_status = journal.get("status")
+        current_state = store.load()
         legacy_data = Path(str(journal.get("legacy_data_dir", "")))
         name = str(journal.get("legacy_container", ""))
+        self._verify_journal_paths(journal, config, name, legacy_data)
+
+        if journal_status == "rolled_back":
+            if current_state.status != "rolled_back":
+                raise InstallError("rolled-back journal does not match deployment state")
+            _state_matches_plan(current_state, config, plan)
+            self._restore_legacy_service(
+                plan,
+                journal,
+                name,
+                legacy_data,
+            )
+            return current_state
+
+        if journal_status in {"snapshot-complete", "upgrade-journal-failed"}:
+            if current_state.status not in {"installed", "adopted"}:
+                raise InstallError("migration recovery state is not active")
+            _state_matches_plan(current_state, config, plan)
+            recorded_install_id = journal.get("install_id")
+            if recorded_install_id and recorded_install_id != current_state.install_id:
+                raise InstallError("migration recovery install identity does not match")
+        elif journal_status not in {"upgraded", "rollback-failed"}:
+            raise InstallError("migration journal is not eligible for rollback")
+        elif current_state.status not in {
+            "installed",
+            "adopted",
+            "uninstalling",
+            "uninstalled",
+            "rolled_back",
+        }:
+            raise InstallError("deployment state is not eligible for rollback recovery")
+        _state_matches_plan(current_state, config, plan)
+
         legacy = self._verify_legacy(name, legacy_data, expected=journal)
-        source_manifest, source_files = _tree_manifest(legacy_data)
-        if (
-            source_manifest != journal.get("snapshot_manifest")
-            or source_files != journal.get("snapshot_files")
-        ):
-            raise InstallError("legacy source changed after the offline snapshot")
-        snapshot = Path(str(journal.get("snapshot_path", "")))
-        snapshot_manifest, snapshot_files = _tree_manifest(snapshot)
-        if (
-            snapshot_manifest != journal.get("snapshot_manifest")
-            or snapshot_files != journal.get("snapshot_files")
-        ):
-            raise InstallError("migration snapshot integrity has drifted")
+        if current_state.status not in {"uninstalled", "rolled_back"}:
+            if legacy.get("State", {}).get("Status") == "running":
+                raise InstallError(
+                    "rollback requires the legacy writer stopped while v2.2 is active"
+                )
+            source_manifest, source_files = _tree_manifest(legacy_data)
+            if (
+                source_manifest != journal.get("snapshot_manifest")
+                or source_files != journal.get("snapshot_files")
+            ):
+                raise InstallError("legacy source changed after the offline snapshot")
+        self._verify_recorded_snapshot(journal)
 
         try:
-            state = RuntimeUninstaller(self.docker).uninstall(config, plan)
-            current = self.docker.inspect_container(name)
-            if current is None:
-                raise InstallError("legacy container disappeared during rollback")
-            if current.get("State", {}).get("Status") != "running":
-                self.docker.start_container(name)
-            running = self._verify_legacy(name, legacy_data, expected=journal)
-            if running.get("State", {}).get("Status") != "running":
-                raise InstallError("legacy container did not restart")
+            state = RuntimeUninstaller(self.docker).uninstall(
+                config,
+                plan,
+                _operation_locked=True,
+            )
+            self._restore_legacy_service(
+                plan,
+                journal,
+                name,
+                legacy_data,
+            )
+            target_status = self._capture_target_status(config)
+            for key in (
+                "target_reupgrade_status",
+                "target_reupgrade_reason",
+                "target_manifest",
+                "target_files",
+            ):
+                journal.pop(key, None)
+            journal.update(target_status)
             completed = replace(state, status="rolled_back")
             store.save(completed)
             journal["status"] = "rolled_back"

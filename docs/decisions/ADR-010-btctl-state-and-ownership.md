@@ -25,8 +25,10 @@ durable record of what the installer may later change.
 - `plan` is deterministic, redacts credential-like values, and performs no
   filesystem or Docker mutation.
 - State is schema-versioned JSON written atomically with mode `0600` in a
-  private `0700` directory. State contains ownership and immutable identities,
-  never API keys or browser credentials.
+  private `0700` directory. New state and backup directory entries are fsynced
+  through every newly created parent before runtime mutation, and the containing
+  directory is fsynced after each evidence-file publish. State contains
+  ownership and immutable identities, never API keys or browser credentials.
 - Resources are classified as `owned`, `adopted`, or `external`. A later
   lifecycle operation may mutate only an exact allowlist of `owned` resources
   whose live IDs and installation labels still match state.
@@ -38,9 +40,9 @@ durable record of what the installer may later change.
 ## Compatibility policy
 
 CWA `4.x` is the Tier 1 proxy-injection family. Exactly CWA `3.1.4` is retained
-as a legacy source for the v2.1.4 migration path. Other CWA `3.x`, prereleases,
-mutable version labels, and unknown future majors fail closed until explicitly
-qualified.
+as a legacy source for the explicit v2.1.4 `upgrade` path; normal `install` and
+`adopt` reject it. Other CWA `3.x`, prereleases, mutable version labels, and
+unknown future majors fail closed until explicitly qualified.
 
 ## Consequences
 

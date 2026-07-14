@@ -392,20 +392,26 @@ class ServerAuthenticationIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.original_authenticator = server.AUTHENTICATOR
         self.original_auth_limit = server.BT_AUTH_RATE_LIMIT_PER_MINUTE
+        self.original_auth_inflight_limit = server.BT_AUTH_MAX_INFLIGHT_PER_CLIENT
+        self.original_api_rate_limit = server.RATE_LIMIT_MAX
         self.original_rate_client_cap = server.BT_RATE_LIMIT_MAX_CLIENTS
         self.original_origins = server.ALLOWED_ORIGINS
         self.original_allow_private = server.BT_ALLOW_PRIVATE_LAN
         server._auth_rate_limit_store.clear()
+        server._auth_inflight_store.clear()
         server._rate_limit_store.clear()
         self.client = server.app.test_client()
 
     def tearDown(self):
         server.AUTHENTICATOR = self.original_authenticator
         server.BT_AUTH_RATE_LIMIT_PER_MINUTE = self.original_auth_limit
+        server.BT_AUTH_MAX_INFLIGHT_PER_CLIENT = self.original_auth_inflight_limit
+        server.RATE_LIMIT_MAX = self.original_api_rate_limit
         server.BT_RATE_LIMIT_MAX_CLIENTS = self.original_rate_client_cap
         server.ALLOWED_ORIGINS = self.original_origins
         server.BT_ALLOW_PRIVATE_LAN = self.original_allow_private
         server._auth_rate_limit_store.clear()
+        server._auth_inflight_store.clear()
         server._rate_limit_store.clear()
 
     def test_protected_route_rejects_before_translation_or_cache_work(self):
@@ -461,9 +467,9 @@ class ServerAuthenticationIntegrationTests(unittest.TestCase):
         self.assertNotIn("private authority detail", protected.get_data(as_text=True))
 
     def test_authentication_attempts_have_a_separate_rate_limit(self):
-        server.AUTHENTICATOR = RequestAuthenticator(
-            mode="token", api_token="integration-secret"
-        )
+        authenticator = mock.Mock(mode="token")
+        authenticator.authenticate.side_effect = AuthRejected("invalid")
+        server.AUTHENTICATOR = authenticator
         server.BT_AUTH_RATE_LIMIT_PER_MINUTE = 1
 
         first = self.client.get("/metrics", environ_base={"REMOTE_ADDR": "198.51.100.9"})
@@ -471,6 +477,67 @@ class ServerAuthenticationIntegrationTests(unittest.TestCase):
         self.assertEqual(first.status_code, 401)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.get_json()["error"], "rate_limited")
+        self.assertEqual(authenticator.authenticate.call_count, 1)
+
+    def test_rejected_proxy_client_cannot_exhaust_an_authenticated_subject(self):
+        server.AUTHENTICATOR = RequestAuthenticator(
+            mode="token", api_token="integration-secret"
+        )
+        server.BT_AUTH_RATE_LIMIT_PER_MINUTE = 2
+        peer = {"REMOTE_ADDR": "172.30.39.3"}
+
+        rejected = self.client.get("/metrics", environ_base=peer)
+        accepted = self.client.get(
+            "/metrics",
+            headers={"X-BT-Token": "integration-secret"},
+            environ_base=peer,
+        )
+
+        self.assertEqual(rejected.status_code, 401)
+        self.assertEqual(accepted.status_code, 200)
+
+    def test_distinct_authenticated_subjects_behind_one_proxy_have_separate_budgets(self):
+        authenticator = mock.Mock(mode="forwarded")
+
+        def authenticate(headers, _peer):
+            return mock.Mock(
+                subject=f"forwarded:{headers['X-Test-Subject']}",
+                roles=frozenset(),
+            )
+
+        authenticator.authenticate.side_effect = authenticate
+        server.AUTHENTICATOR = authenticator
+        server.BT_AUTH_RATE_LIMIT_PER_MINUTE = 10
+        server.RATE_LIMIT_MAX = 1
+        peer = {"REMOTE_ADDR": "172.30.39.3"}
+        payload = {
+            "text": "hello",
+            "source_lang": "English",
+            "target_lang": "English",
+        }
+
+        alice = self.client.post(
+            "/translate",
+            headers={"X-Test-Subject": "alice"},
+            json=payload,
+            environ_base=peer,
+        )
+        bob = self.client.post(
+            "/translate",
+            headers={"X-Test-Subject": "bob"},
+            json=payload,
+            environ_base=peer,
+        )
+        alice_again = self.client.post(
+            "/translate",
+            headers={"X-Test-Subject": "alice"},
+            json=payload,
+            environ_base=peer,
+        )
+
+        self.assertEqual(alice.status_code, 200)
+        self.assertEqual(bob.status_code, 200)
+        self.assertEqual(alice_again.status_code, 429)
 
     def test_auth_rate_limit_identity_map_is_bounded_fail_closed(self):
         server.AUTHENTICATOR = RequestAuthenticator(
@@ -485,6 +552,67 @@ class ServerAuthenticationIntegrationTests(unittest.TestCase):
         self.assertEqual(first.status_code, 401)
         self.assertEqual(new_identity.status_code, 429)
         self.assertLessEqual(len(server._auth_rate_limit_store), 1)
+
+    def test_authentication_inflight_is_bounded_before_authority_work(self):
+        entered = threading.Event()
+        release = threading.Event()
+        authenticator = mock.Mock(mode="cwa_session")
+
+        def authenticate(_headers, _peer):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not release authentication")
+            return mock.Mock(subject="cwa-session:test", roles=frozenset())
+
+        authenticator.authenticate.side_effect = authenticate
+        server.AUTHENTICATOR = authenticator
+        server.BT_AUTH_MAX_INFLIGHT_PER_CLIENT = 1
+        first_result = {}
+
+        def first_request():
+            client = server.app.test_client()
+            first_result["response"] = client.get(
+                "/metrics", environ_base={"REMOTE_ADDR": "198.51.100.12"}
+            )
+
+        thread = threading.Thread(target=first_request)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            second = self.client.get(
+                "/metrics", environ_base={"REMOTE_ADDR": "198.51.100.12"}
+            )
+            self.assertEqual(second.status_code, 429)
+            self.assertEqual(second.get_json()["error"], "rate_limited")
+            self.assertEqual(authenticator.authenticate.call_count, 1)
+        finally:
+            release.set()
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(first_result["response"].status_code, 200)
+        self.assertEqual(server._auth_inflight_store, {})
+
+    def test_managed_proxy_alias_is_the_only_dns_peer_allowed_to_supply_xff(self):
+        trusted = server.ipaddress.ip_address("172.30.39.3")
+        with mock.patch.object(server, "BT_TRUSTED_PROXY_HOST", "translator-proxy"), \
+             mock.patch.object(server, "BT_TRUSTED_PROXIES", ""), \
+             mock.patch.object(server, "_TRUSTED_PROXY_NETS", ()), \
+             mock.patch.object(
+                 server, "_resolved_trusted_proxy_addresses", return_value=frozenset({trusted})
+             ):
+            with server.app.test_request_context(
+                "/metrics",
+                headers={"X-Forwarded-For": "203.0.113.9, 198.51.100.7"},
+                environ_base={"REMOTE_ADDR": "172.30.39.3"},
+            ):
+                self.assertEqual(server._client_ip(), "198.51.100.7")
+            with server.app.test_request_context(
+                "/metrics",
+                headers={"X-Forwarded-For": "198.51.100.8"},
+                environ_base={"REMOTE_ADDR": "172.30.39.4"},
+            ):
+                self.assertEqual(server._client_ip(), "172.30.39.4")
 
     def test_cwa_cookie_cors_requires_an_exact_origin(self):
         server.AUTHENTICATOR = RequestAuthenticator(

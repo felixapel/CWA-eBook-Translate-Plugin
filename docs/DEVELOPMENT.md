@@ -19,7 +19,7 @@ The backend is a Flask application running in python.
    ```
 3. Run the development server:
    ```bash
-   python3 server.py
+   BT_AUTH_MODE=token BT_API_TOKEN=local-development-only python3 server.py
    ```
 
 ### Running Tests
@@ -28,19 +28,30 @@ The backend test suite is self-contained — it mocks the LLM and the database
 file, so it needs no running server, no API key, and no network access:
 ```bash
 .venv/bin/python3 test_translation.py
-.venv/bin/python3 -m unittest -v test_cache_v2 test_context_cache test_singleflight
+.venv/bin/python3 test_hardening.py
+.venv/bin/python3 -m unittest -v \
+  test_btctl test_btctl_compose test_btctl_unraid test_btctl_auth \
+  test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 \
+  test_context_cache test_singleflight test_auth test_ci_contract \
+  test_install_docs test_release_contract test_supply_chain_contract \
+  test_shell_contract test_container_contract test_cleanup_token \
+  test_api_schema test_error_privacy test_observability test_proxy_config \
+  test_live_scripts
 ```
 
 Always also check syntax/compile before committing:
 ```bash
-python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py btctl_unraid.py server.py translator.py cache.py singleflight.py work_budget.py
+python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py \
+  btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py \
+  translator.py cache.py singleflight.py work_budget.py proxy/render_config.py
 ```
 
 The installer contract is self-contained and uses disposable Git repositories;
 it never contacts Docker or a live CWA instance:
 
 ```bash
-python3 -m unittest -v test_btctl test_btctl_compose test_btctl_unraid
+python3 -m unittest -v test_btctl test_btctl_compose test_btctl_unraid \
+  test_btctl_auth test_btctl_lifecycle test_install_docs
 ```
 
 Use `./btctl plan --env /absolute/path/install.env --json` to inspect a clean

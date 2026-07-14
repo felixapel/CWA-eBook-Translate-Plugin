@@ -1,7 +1,7 @@
 #!/bin/sh
 # Non-root runtime dispatcher for API, proxy, or legacy combined mode.
 set -eu
-umask 077
+umask 027
 
 PORT="${PORT:-8390}"
 BT_PROXY_PORT="${BT_PROXY_PORT:-8080}"
@@ -35,12 +35,16 @@ check_data_dir() {
         echo "[entrypoint] ERROR: /app/data is missing" >&2
         exit 78
     fi
-    if ! chmod 700 /app/data 2>/dev/null; then
-        echo "[entrypoint] ERROR: /app/data must permit private mode 0700" >&2
-        exit 78
-    fi
+    data_mode="$(stat -c %a /app/data 2>/dev/null || true)"
+    case "$data_mode" in
+        700|750|2700|2750) ;;
+        *)
+            echo "[entrypoint] ERROR: /app/data must have private mode 0700 or 2750" >&2
+            exit 78
+            ;;
+    esac
     probe="/app/data/.write-probe.$$"
-    if ! (umask 077 && : > "$probe") 2>/dev/null; then
+    if ! (umask 027 && : > "$probe") 2>/dev/null; then
         echo "[entrypoint] ERROR: /app/data must be writable by uid 101 gid 102" >&2
         exit 78
     fi

@@ -18,8 +18,8 @@ RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requireme
 # belong in the published execution artifact.
 COPY auth.py cache.py server.py singleflight.py translator.py work_budget.py ./
 COPY VERSION ./
-COPY static/ ./static/
-COPY proxy/ ./proxy/
+COPY static/loader.js static/translator.css static/translator.js ./static/
+COPY proxy/nginx-main.conf proxy/nginx.conf.template proxy/render_config.py ./proxy/
 COPY docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh
 
