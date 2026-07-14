@@ -34,6 +34,20 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn('stat -c %a /app/data', entrypoint)
         self.assertNotIn("chmod 700 /app/data", entrypoint)
 
+    def test_api_roles_initialize_cache_before_serving(self):
+        entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
+        self.assertIn("from cache import init_db; init_db()", entrypoint)
+        api_branch = entrypoint.split("    api)", 1)[1].split("        ;;", 1)[0]
+        self.assertLess(
+            api_branch.index("initialize_cache"),
+            api_branch.index("exec gunicorn"),
+        )
+        combined = entrypoint.split("# Legacy one-container compatibility.", 1)[1]
+        self.assertLess(
+            combined.index("initialize_cache"),
+            combined.index("start_api &"),
+        )
+
     def test_non_root_nginx_writes_only_below_tmp(self):
         config = (ROOT / "proxy" / "nginx-main.conf").read_text()
         for directive in (

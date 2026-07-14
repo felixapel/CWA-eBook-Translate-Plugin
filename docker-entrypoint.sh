@@ -86,6 +86,13 @@ validate_api_auth() {
     esac
 }
 
+initialize_cache() {
+    if ! python -c 'from cache import init_db; init_db()' >/dev/null 2>&1; then
+        echo "[entrypoint] ERROR: cache database initialization failed" >&2
+        exit 78
+    fi
+}
+
 configure_proxy() {
     if [ -z "${CWA_UPSTREAM:-}" ]; then
         echo "[entrypoint] ERROR: CWA_UPSTREAM is required for the proxy role" >&2
@@ -124,6 +131,7 @@ case "$BT_ROLE" in
     api)
         check_data_dir
         validate_api_auth
+        initialize_cache
         echo "[entrypoint] API role on :${PORT}"
         exec gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 \
             --timeout 120 server:app
@@ -140,6 +148,7 @@ esac
 # restart lifecycle.
 check_data_dir
 validate_api_auth
+initialize_cache
 configure_proxy
 echo "[entrypoint] combined role: API :${PORT}, proxy :${BT_PROXY_PORT}"
 start_api &
