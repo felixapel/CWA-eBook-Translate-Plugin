@@ -48,6 +48,18 @@ API keys. CWA `4.x` is the Tier 1 compatibility family; exactly `3.1.4` is a
 legacy migration source. See [ADR-010](docs/decisions/ADR-010-btctl-state-and-ownership.md)
 for the state and ownership guarantees.
 
+For an existing Compose-managed CWA, set
+`BT_INSTALL_PROFILE=compose-existing`, then run:
+
+```bash
+./btctl install --env /absolute/private/path/cwa-translate.env --yes
+```
+
+The generated deployment contains exactly the translator API and injection
+proxy; it never owns CWA. See the complete [Compose deployment guide](docs/DEPLOY_COMPOSE.md),
+including data-directory permissions, private state, recovery with `adopt`,
+and fail-closed behavior.
+
 ### Recommended: proxy-injection mode (isolated API and proxy roles)
 
 Two non-root containers run the same translator image. The proxy sits in front

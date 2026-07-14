@@ -31,7 +31,7 @@ _INSTALL_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 
-_INSTALL_PROFILES = frozenset({"unraid", "compose-existing", "compose-bundled"})
+_INSTALL_PROFILES = frozenset({"unraid", "compose-existing"})
 _INGRESS_MODES = frozenset({"published", "docker-edge"})
 _AUTH_PROFILES = frozenset({"cwa-session", "authentik-forwarded"})
 _REVERSE_PROXIES = frozenset({"nginx", "traefik", "caddy"})
@@ -240,6 +240,7 @@ def release_identity_from_checkout(repository: Path) -> ReleaseIdentity:
 class InstallConfig:
     identity: ReleaseIdentity
     install_profile: str
+    install_name: str
     ingress_mode: str
     auth_profile: str
     public_origin: str
@@ -268,6 +269,11 @@ class InstallConfig:
         install_profile = _choice(
             values, "BT_INSTALL_PROFILE", _INSTALL_PROFILES
         )
+        install_name = _clean_value(
+            values.get("BT_INSTALL_NAME", "cwa-translate"), "BT_INSTALL_NAME"
+        )
+        if not _NETWORK_RE.fullmatch(install_name):
+            raise ConfigError("BT_INSTALL_NAME must be a bounded Docker-safe name")
         ingress_mode = _choice(values, "BT_INGRESS_MODE", _INGRESS_MODES)
         auth_profile = _choice(values, "BT_AUTH_PROFILE", _AUTH_PROFILES)
         public_origin = _exact_origin(values.get("BT_PUBLIC_ORIGIN", ""), "BT_PUBLIC_ORIGIN")
@@ -354,6 +360,7 @@ class InstallConfig:
         return cls(
             identity=identity,
             install_profile=install_profile,
+            install_name=install_name,
             ingress_mode=ingress_mode,
             auth_profile=auth_profile,
             public_origin=public_origin,
@@ -422,6 +429,7 @@ class InstallConfig:
         """Return stable non-secret settings suitable for plans and audit logs."""
         return {
             "install_profile": self.install_profile,
+            "install_name": self.install_name,
             "ingress_mode": self.ingress_mode,
             "auth_profile": self.auth_profile,
             "public_origin": self.public_origin,
@@ -469,21 +477,18 @@ class DeploymentPlan:
         canonical = json.dumps(public, sort_keys=True, separators=(",", ":"))
         fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         suffix = fingerprint[:12]
-        cwa_ownership = (
-            "owned" if config.install_profile == "compose-bundled" else "external"
-        )
         proxy_ports = [config.proxy_port] if config.proxy_port is not None else []
         resources: dict[str, dict[str, object]] = {
             "cwa": {
                 "name": config.cwa_container,
-                "ownership": cwa_ownership,
+                "ownership": "external",
             },
             "cwa_network": {
                 "name": config.cwa_network,
                 "ownership": "external",
             },
             "private_network": {
-                "name": f"cwa-translate-{suffix}-private",
+                "name": f"{config.install_name}-private",
                 "ownership": "owned",
             },
             "data": {
@@ -492,13 +497,13 @@ class DeploymentPlan:
                 "retention": "always-preserve",
             },
             "api": {
-                "name": f"cwa-translate-{suffix}-api",
+                "name": f"{config.install_name}-api",
                 "ownership": "owned",
                 "role": "api",
                 "published_ports": [],
             },
             "proxy": {
-                "name": f"cwa-translate-{suffix}-proxy",
+                "name": f"{config.install_name}-proxy",
                 "ownership": "owned",
                 "role": "proxy",
                 "published_ports": proxy_ports,

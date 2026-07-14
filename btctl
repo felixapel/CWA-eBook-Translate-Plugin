@@ -15,6 +15,8 @@ from btctl_core import (
     parse_env_text,
     release_identity_from_checkout,
 )
+from btctl_compose import ComposeAdopter, ComposeInstaller, InstallError
+from btctl_docker import DockerCLI, DockerCommandError
 
 
 EX_USAGE = 64
@@ -35,6 +37,17 @@ def _parser() -> argparse.ArgumentParser:
     plan = commands.add_parser("plan", help="validate and print a mutation-free plan")
     plan.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
     plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    install = commands.add_parser("install", help="build and install the validated plan")
+    install.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    install.add_argument(
+        "--yes",
+        action="store_true",
+        help="acknowledge the displayed source and resource identities",
+    )
+    install.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    adopt = commands.add_parser("adopt", help="recover state for an existing labeled split runtime")
+    adopt.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    adopt.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     return parser
 
 
@@ -48,6 +61,16 @@ def _load_plan(repository: Path, env_file: Path) -> DeploymentPlan:
     return DeploymentPlan.from_config(config)
 
 
+def _load_config(repository: Path, env_file: Path) -> tuple[InstallConfig, DeploymentPlan]:
+    try:
+        source = env_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError("configuration file could not be read") from exc
+    identity = release_identity_from_checkout(repository)
+    config = InstallConfig.from_mapping(parse_env_text(source), identity)
+    return config, DeploymentPlan.from_config(config)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     try:
@@ -59,10 +82,45 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(json.dumps(payload, sort_keys=True, indent=2))
             return 0
+        if args.command == "install":
+            config, plan = _load_config(args.repository, args.env)
+            if not args.yes:
+                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
+                raise ConfigError("install requires --yes after reviewing the plan")
+            if config.install_profile != "compose-existing":
+                raise ConfigError("the Unraid installer is not available in this build step")
+            state = ComposeInstaller(DockerCLI()).install(config, plan, args.repository)
+            payload = state.to_dict()
+            print(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":") if args.json else None,
+                    indent=None if args.json else 2,
+                )
+            )
+            return 0
+        if args.command == "adopt":
+            config, plan = _load_config(args.repository, args.env)
+            if config.install_profile != "compose-existing":
+                raise ConfigError("the Unraid adopter is not available in this build step")
+            state = ComposeAdopter(DockerCLI()).adopt(config, plan)
+            print(
+                json.dumps(
+                    state.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":") if args.json else None,
+                    indent=None if args.json else 2,
+                )
+            )
+            return 0
         raise ConfigError("unsupported command")
     except ConfigError as exc:
         print(f"btctl: configuration error: {exc}", file=sys.stderr)
         return EX_USAGE
+    except (InstallError, DockerCommandError, OSError) as exc:
+        print(f"btctl: deployment failed: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

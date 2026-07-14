@@ -62,6 +62,13 @@ Lifecycle state is private, atomic, schema-versioned, and contains no secrets.
 This separates source, configuration, mutable translation data, and backups so
 an update of one cannot silently replace another.
 
+The Compose adapter writes a private JSON-form Compose document (JSON is a
+Compose-compatible YAML subset), validates it with the local Compose plugin,
+and starts only the two translator services. Live image IDs, installation
+labels, networks, health, and port bindings must match before state is
+committed. Recovery adoption is read-only with respect to Docker and requires
+the same pre-existing evidence.
+
 ## Component Breakdown
 
 ### Frontend (`translator.js`)

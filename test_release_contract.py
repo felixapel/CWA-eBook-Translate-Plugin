@@ -361,7 +361,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_release_reuses_every_required_ci_contract(self):
         workflow = GITEA_RELEASE.read_text()
         for command in (
-            "python3 -m py_compile btctl btctl_core.py auth.py server.py",
+            "python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py auth.py server.py",
             "python3 test_translation.py",
             "python3 test_hardening.py",
             "test_singleflight test_auth test_ci_contract",

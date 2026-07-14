@@ -174,6 +174,10 @@ class InstallConfigTests(unittest.TestCase):
                 InstallConfig.from_mapping(
                     {**self.base, "BT_AUTH_PROFILE": profile}, self.identity
                 )
+        with self.assertRaisesRegex(ConfigError, "BT_INSTALL_PROFILE"):
+            InstallConfig.from_mapping(
+                {**self.base, "BT_INSTALL_PROFILE": "compose-bundled"}, self.identity
+            )
 
     def test_provider_contract_requires_exactly_one_credential_path(self):
         with self.assertRaisesRegex(ConfigError, "BT_LOCAL_URL"):
