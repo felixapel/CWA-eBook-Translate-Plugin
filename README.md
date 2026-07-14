@@ -32,6 +32,22 @@ lower-resource tier better — switch `LLM_PROVIDER` if a language matters to yo
 
 ## 🚀 Installation
 
+Managed v2.2.0 installs start from a reviewed source checkout and a strict
+configuration file. No registry account, package token, signing key, or shared
+browser secret is required. Copy [`.env.example`](.env.example) outside the
+checkout, edit it, and validate the complete topology before any mutation:
+
+```bash
+cp .env.example /absolute/private/path/cwa-translate.env
+./btctl plan --env /absolute/private/path/cwa-translate.env
+```
+
+The plan names an immutable local image from the exact version and commit,
+shows the two managed roles, marks CWA and user data as external, and redacts
+API keys. CWA `4.x` is the Tier 1 compatibility family; exactly `3.1.4` is a
+legacy migration source. See [ADR-010](docs/decisions/ADR-010-btctl-state-and-ownership.md)
+for the state and ownership guarantees.
+
 ### Recommended: proxy-injection mode (isolated API and proxy roles)
 
 Two non-root containers run the same translator image. The proxy sits in front

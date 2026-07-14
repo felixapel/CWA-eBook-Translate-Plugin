@@ -29,6 +29,7 @@ backups/
 # Secrets — never commit API keys or credentials.
 .env
 .env.*
+!.env.example
 auth.json
 *.b64
 

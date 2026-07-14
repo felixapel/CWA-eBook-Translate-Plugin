@@ -13,6 +13,7 @@ This document details the architecture of the `book-translator` plugin.
 - [ADR-007: Sign and verify release digests with a self-managed key (superseded)](decisions/ADR-007-sign-release-digests.md)
 - [ADR-008: Publish verified source releases without registry credentials](decisions/ADR-008-source-only-releases.md)
 - [ADR-009: Keep cache schemas side by side for rollback](decisions/ADR-009-side-by-side-cache-schemas.md)
+- [ADR-010: Make `btctl` the fail-closed deployment authority](decisions/ADR-010-btctl-state-and-ownership.md)
 
 ## Overview
 
@@ -51,6 +52,15 @@ Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
                                          │
                                          └── SQLite volume (/app/data)
 ```
+
+## Deployment control plane
+
+`btctl` validates a strict environment file and derives an immutable local
+image identity from `VERSION` plus the clean checkout SHA. Its deterministic
+`plan` declares every resource and its ownership before Docker is touched.
+Lifecycle state is private, atomic, schema-versioned, and contains no secrets.
+This separates source, configuration, mutable translation data, and backups so
+an update of one cannot silently replace another.
 
 ## Component Breakdown
 

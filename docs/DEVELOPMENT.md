@@ -33,8 +33,19 @@ file, so it needs no running server, no API key, and no network access:
 
 Always also check syntax/compile before committing:
 ```bash
-python3 -m py_compile server.py translator.py cache.py singleflight.py work_budget.py
+python3 -m py_compile btctl btctl_core.py server.py translator.py cache.py singleflight.py work_budget.py
 ```
+
+The installer contract is self-contained and uses disposable Git repositories;
+it never contacts Docker or a live CWA instance:
+
+```bash
+python3 -m unittest -v test_btctl
+```
+
+Use `./btctl plan --env /absolute/path/install.env --json` to inspect a clean
+checkout. `plan` must remain deterministic and mutation-free; installation
+side effects belong behind injectable runners and require separate tests.
 
 `test_endpoints.py`, `test_ratelimit.py`, `benchmark.py`, and
 `benchmark_realistic.py` are different — they hit a **live** API

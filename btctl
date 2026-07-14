@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Source-only lifecycle CLI for CWA Translate deployments."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from btctl_core import (
+    ConfigError,
+    DeploymentPlan,
+    InstallConfig,
+    parse_env_text,
+    release_identity_from_checkout,
+)
+
+
+EX_USAGE = 64
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="btctl",
+        description="Plan and manage a source-only CWA Translate installation.",
+    )
+    parser.add_argument(
+        "--repository",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="clean CWA Translate Git checkout (default: this checkout)",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    plan = commands.add_parser("plan", help="validate and print a mutation-free plan")
+    plan.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    return parser
+
+
+def _load_plan(repository: Path, env_file: Path) -> DeploymentPlan:
+    try:
+        source = env_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError("configuration file could not be read") from exc
+    identity = release_identity_from_checkout(repository)
+    config = InstallConfig.from_mapping(parse_env_text(source), identity)
+    return DeploymentPlan.from_config(config)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    try:
+        args = parser.parse_args(argv)
+        if args.command == "plan":
+            payload = _load_plan(args.repository, args.env).to_dict()
+            if args.json:
+                print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            else:
+                print(json.dumps(payload, sort_keys=True, indent=2))
+            return 0
+        raise ConfigError("unsupported command")
+    except ConfigError as exc:
+        print(f"btctl: configuration error: {exc}", file=sys.stderr)
+        return EX_USAGE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
