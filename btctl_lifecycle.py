@@ -496,12 +496,34 @@ def _tree_manifest(root: Path) -> tuple[str, int]:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), len(entries)
 
 
-def _sqlite_integrity(data_dir: Path, *, checkpoint: bool) -> None:
+def _sqlite_integrity(
+    data_dir: Path,
+    *,
+    checkpoint: bool,
+    closed_readonly: bool = False,
+) -> None:
     database_path = data_dir / "translations.db"
     if database_path.is_symlink() or not database_path.is_file():
         raise InstallError("legacy translations.db is missing")
+    if checkpoint and closed_readonly:
+        raise InstallError("a read-only SQLite database cannot be checkpointed")
+    if closed_readonly:
+        # SQLite's ordinary read-only mode can still need to create WAL shared
+        # memory. A stopped managed target is safe to inspect immutably only
+        # when no recovery sidecar exists; otherwise ignoring the WAL could
+        # silently validate stale base pages.
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(f"{database_path}{suffix}")
+            if sidecar.exists() or sidecar.is_symlink():
+                raise InstallError(
+                    "closed SQLite database has an unresolved recovery sidecar"
+                )
     try:
-        connection = sqlite3.connect(database_path, timeout=10)
+        if closed_readonly:
+            database_uri = f"{database_path.absolute().as_uri()}?mode=ro&immutable=1"
+            connection = sqlite3.connect(database_uri, uri=True, timeout=10)
+        else:
+            connection = sqlite3.connect(database_path, timeout=10)
         try:
             if checkpoint:
                 checkpoint_result = connection.execute(
@@ -725,7 +747,7 @@ class LegacyUpgrade:
         target = Path(config.data_dir)
         if target.is_symlink() or not target.is_dir():
             raise InstallError("preserved v2.2 data target is missing or unsafe")
-        _sqlite_integrity(target, checkpoint=False)
+        _sqlite_integrity(target, checkpoint=False, closed_readonly=True)
         manifest, files = _tree_manifest(target)
         if (
             manifest != journal.get("target_manifest")
@@ -765,7 +787,7 @@ class LegacyUpgrade:
                 "target_reupgrade_reason": "missing-or-unsafe",
             }
         try:
-            _sqlite_integrity(target, checkpoint=False)
+            _sqlite_integrity(target, checkpoint=False, closed_readonly=True)
             manifest, files = _tree_manifest(target)
         except (InstallError, OSError):
             return {
@@ -1021,7 +1043,6 @@ class LegacyUpgrade:
         target = Path(config.data_dir)
         if target.is_symlink() or not target.is_dir():
             raise InstallError("migration target is missing or unsafe")
-        _sqlite_integrity(target, checkpoint=False)
         report = DeploymentDoctor(self.docker).run(
             config,
             plan,
@@ -1068,7 +1089,6 @@ class LegacyUpgrade:
         target = Path(config.data_dir)
         if target.is_symlink() or not target.is_dir():
             raise InstallError("migration target is missing or unsafe")
-        _sqlite_integrity(target, checkpoint=False)
         adopter = (
             ComposeAdopter(self.docker)
             if config.install_profile == "compose-existing"
@@ -1289,7 +1309,11 @@ class LegacyUpgrade:
                 raise InstallError("offline snapshot does not match the stopped source")
             if not reupgrade:
                 _secure_copy_atomic(snapshot, target, target_work)
-            _sqlite_integrity(target, checkpoint=False)
+            _sqlite_integrity(
+                target,
+                checkpoint=False,
+                closed_readonly=reupgrade,
+            )
             target_manifest, target_files = _tree_manifest(target)
             if (
                 not reupgrade

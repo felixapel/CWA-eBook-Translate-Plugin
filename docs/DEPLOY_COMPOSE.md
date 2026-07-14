@@ -107,7 +107,11 @@ versions against the same database.
 Rollback prioritizes restoring and health-checking the exact v2.1.4 container.
 If the preserved v2.2 data tree is missing, unreadable, or corrupt, rollback
 still completes but records that target as unavailable; automatic re-upgrade is
-then blocked until the target is explicitly repaired or restored.
+then blocked until the target is explicitly repaired or restored. A stopped
+target may be checked through the operator group's read-only access. That check
+uses immutable SQLite access only after proving that no WAL, SHM, or rollback
+journal sidecar exists; a sidecar blocks automatic re-upgrade so pending data
+can never be silently skipped.
 
 ## Verify, diagnose, and remove
 

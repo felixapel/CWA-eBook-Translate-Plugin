@@ -364,6 +364,43 @@ class LifecycleTests(unittest.TestCase):
                     reader.close()
                 writer.close()
 
+    def test_closed_sqlite_integrity_accepts_read_only_wal_database_without_sidecars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            database_path = data_dir / "translations.db"
+            with closing(sqlite3.connect(database_path)) as database:
+                self.assertEqual(
+                    database.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+                    "wal",
+                )
+                database.execute("CREATE TABLE translations (value TEXT)")
+                database.execute("INSERT INTO translations VALUES ('safe')")
+                database.commit()
+            for suffix in ("-wal", "-shm", "-journal"):
+                self.assertFalse(Path(str(database_path) + suffix).exists())
+            os.chmod(database_path, 0o400)
+
+            _sqlite_integrity(
+                data_dir,
+                checkpoint=False,
+                closed_readonly=True,
+            )
+
+    def test_closed_sqlite_integrity_rejects_recovery_sidecars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            database_path = data_dir / "translations.db"
+            with closing(sqlite3.connect(database_path)) as database:
+                database.execute("CREATE TABLE translations (value TEXT)")
+            Path(str(database_path) + "-wal").write_bytes(b"pending")
+
+            with self.assertRaisesRegex(InstallError, "sidecar"):
+                _sqlite_integrity(
+                    data_dir,
+                    checkpoint=False,
+                    closed_readonly=True,
+                )
+
     def test_legacy_runtime_proves_version_inside_immutable_image(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

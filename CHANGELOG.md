@@ -164,6 +164,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- API and combined containers initialize and integrity-check the translation
+  cache before accepting traffic, so first-start lifecycle verification no
+  longer races lazy SQLite creation.
+- A stopped, preserved v2.2 rollback target can be verified through deliberate
+  group-read-only Compose access. Immutable SQLite inspection is used only
+  after proving that no WAL, SHM, or rollback-journal sidecar exists; any
+  unresolved recovery sidecar blocks automatic re-upgrade instead of being
+  ignored.
 - Compose installation prepares bind-mounted data ownership with the built
   image, removing a manual numeric-uid prerequisite that commonly caused
   first-start failures, retains private access for a non-root operator group on
