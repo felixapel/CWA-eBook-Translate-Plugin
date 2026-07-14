@@ -88,7 +88,14 @@ The project is open source, so no project key or registry credential exists.
 the same-origin proxy, and the API validates selected cookies against CWA's
 exact `/ajax/emailstat` endpoint. An Authentik cookie by itself is not a CWA
 session. If CWA is configured for OIDC and ultimately creates a native CWA
-session, the normal profile works.
+session, the normal profile works. CWA `config_session=1` is supported: the
+managed proxy sends the same exact browser `User-Agent` and observed peer on
+the login and API paths, while the API replays that context during validation.
+`btctl` configures the proxy's private Docker alias as the sole authority for
+that address. Keep CWA's default `TRUSTED_PROXY_COUNT=1`; a custom hop count
+changes the address CWA binds into its session and is outside the certified
+topology. Do not publish the API port or insert a different route that bypasses
+the generated injection proxy.
 
 `authentik-forwarded` is an advanced separate topology. It requires
 `docker-edge`, no host port, an exact identity-proxy `/32` or `/128`, and a

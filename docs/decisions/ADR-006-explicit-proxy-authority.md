@@ -34,8 +34,14 @@ Both upstream locations:
   public origin;
 - remove the standardized `Forwarded` header and any forwarded port;
 - replace `X-Forwarded-For`/`X-Real-IP` with nginx's observed `$remote_addr`;
+- explicitly preserve the browser's exact `User-Agent` on both the CWA and API
+  paths so CWA strong-session fingerprints remain identical;
 - use relative nginx-generated redirects (`absolute_redirect off`);
 - retain bounded connection/read timeouts.
+
+The managed nginx access format records only method, status, byte count, and
+timing fields. It deliberately omits addresses, User-Agents, cookies, referrers,
+and request URLs so the strong-session context is not copied into access logs.
 
 The CWA location also removes `BT_CWA_IDENTITY_HEADER` (default
 `Remote-User`). CWA treats its configured reverse-proxy header as a complete
@@ -53,8 +59,10 @@ from the image because unvalidated textual substitution is no longer used.
 - Reverse-proxy deployments must set their exact HTTPS reader origin instead
   of relying on a request header. This is an intentional fail-closed migration.
 - The immediate observed client keys only pre-auth attempt and in-flight
-  admission. Successful API requests use an opaque authenticated-subject quota,
-  so users remain isolated without trusting a supplied forwarding chain.
+  admission. In CWA-session mode it also becomes authentication context only
+  when supplied by the exact managed proxy peer as one clean IP; chained or
+  client-supplied values fail closed. Successful API requests use an opaque
+  authenticated-subject quota.
 - An operator can raise the CWA upload ceiling for a known library, but cannot
   configure an unlimited body through this interface.
 - A mismatched CWA reverse-proxy header name is an unsafe deployment error;

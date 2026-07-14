@@ -164,6 +164,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Native CWA sessions with `config_session=1` no longer fail every validation
+  probe. The managed proxy preserves the browser `User-Agent` and overwrites
+  both upstream paths with the same observed peer; the API replays that exact
+  strong-session context to CWA. Validation cache and singleflight decisions
+  include the context without changing the per-session tenant, and untrusted,
+  chained, malformed, or bypassed forwarding data fails closed before a probe.
 - `./btctl` now works on stock Unraid without host Python or NerdTools. A
   root-only dispatcher bootstraps a socket-free exporter from its embedded
   pinned trust root, rejects Git replacement refs and remote Docker contexts,
