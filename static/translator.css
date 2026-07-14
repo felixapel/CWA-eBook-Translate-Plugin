@@ -250,6 +250,17 @@
     padding: 5px 10px; font-size: 12px; opacity: 0.85;
 }
 .bt-menu-val { font-weight: 600; }
+.bt-menu-field {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 5px 10px; font-size: 12px;
+}
+.bt-menu-select {
+    max-width: 175px; padding: 4px 7px; border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: rgba(255, 255, 255, 0.10); color: #fff; font: inherit;
+}
+.bt-menu-select option { color: #111; background: #fff; }
+.bt-menu-select optgroup { color: #555; background: #f4f4f6; }
 .bt-menu-item {
     display: flex; align-items: center; justify-content: space-between;
     gap: 10px;

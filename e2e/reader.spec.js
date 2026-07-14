@@ -87,11 +87,54 @@ test('the real overlay translates, reports state, and keeps cloud consent explic
     expect(payloads.at(-1).allow_cloud_fallback).toBe(true);
     expect(payloads.at(-1).target_lang).toBe('French');
 
+    await page.locator('#bt-source-lang').selectOption('Spanish');
+    await expect.poll(() => payloads.at(-1).source_lang).toBe('Spanish');
+    expect(payloads.at(-1).target_lang).toBe('French');
+
     const snapshot = await toolbar.ariaSnapshot();
     expect(snapshot).toContain('button');
     expect(snapshot).toContain('combobox');
     const screenshot = await page.screenshot({ animations: 'disabled' });
     expect(screenshot.byteLength).toBeGreaterThan(1000);
+    expect(failures).toEqual([]);
+});
+
+test('forwarded auth presents the SSO cookie to the identity edge without a token', async ({ page, context }) => {
+    const failures = observeBrowserFailures(page);
+    await context.addCookies([{
+        name: 'authentik_session',
+        value: 'browser-edge-proof',
+        domain: '127.0.0.1',
+        path: '/',
+        httpOnly: true,
+        sameSite: 'Lax',
+    }]);
+    await page.route('**/bt-config.json', route => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+            apiUrl: '/bt-api', authMode: 'forwarded', credentials: 'include',
+        }),
+    }));
+    let requestHeaders = null;
+    await page.route('**/bt-api/translate/batch', async route => {
+        requestHeaders = route.request().headers();
+        const payload = route.request().postDataJSON();
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                translations: payload.paragraphs.map(text => `ES: ${text}`),
+            }),
+        });
+    });
+
+    await page.goto('/read/42');
+    await page.locator('#bt-toggle').click();
+    await expect.poll(() => requestHeaders).not.toBeNull();
+
+    expect(requestHeaders.cookie).toContain('authentik_session=browser-edge-proof');
+    expect(requestHeaders['x-bt-token']).toBeUndefined();
     expect(failures).toEqual([]);
 });
 

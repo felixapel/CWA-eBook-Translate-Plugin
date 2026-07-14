@@ -20,6 +20,10 @@ assert(/AUTH_MODE\s*===\s*'token'\s*&&\s*cfg\.apiToken/.test(code),
     'The browser must send X-BT-Token only in explicit token mode');
 assert(/AUTH_MODE\s*===\s*'forwarded'[\s\S]{0,80}?['"]include['"]/.test(code),
     'Forwarded mode must present the browser cookie to the identity edge');
+assert(/id="bt-source-lang"/.test(code)
+        && /localStorage\.setItem\(['"]bt_source_lang['"]/.test(code)
+        && /source_lang:\s*SOURCE_LANG/.test(code),
+    'The reader must expose and persist a bounded source-language selector');
 
 let fetchCalls = [];
 let fetchResponses = [];
