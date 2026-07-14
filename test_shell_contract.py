@@ -87,38 +87,26 @@ class ShellContractTests(unittest.TestCase):
         self.assertIsNotNone(mismatch)
         self.assertRegex(mismatch.group("body"), r"\bexit\s+1\b")
 
-    def test_install_reads_paths_verbatim(self):
+    def test_install_is_a_root_only_btctl_wrapper(self):
         source = (ROOT / "install_unraid.sh").read_text()
-        self.assertRegex(source, r"\bread\s+-r(?:\s+-p)?\s+")
-        self.assertIn('mkdir -p -- "$CWA_PATH/overlay"', source)
-        self.assertIn(
-            'cp -- "$SCRIPT_DIR/overlay/read.html" '
-            '"$CWA_PATH/overlay/read.html"',
-            source,
-        )
-
-    def test_install_builds_the_checked_out_source_without_registry_access(self):
-        source = (ROOT / "install_unraid.sh").read_text()
-        self.assertIn(
-            'docker build -t local/book-translator-api:latest "$SCRIPT_DIR"',
-            source,
-        )
+        self.assertIn('if [ "$#" -ne 1 ]', source)
+        self.assertIn('"${EUID:-$(id -u)}" -ne 0', source)
+        self.assertIn('"$SCRIPT_DIR/btctl" --repository "$SCRIPT_DIR" plan', source)
+        self.assertIn('install --env "$ENV_FILE" --yes', source)
+        self.assertNotRegex(source, r"\bread\s+-r(?:\s+-p)?\s+")
+        self.assertNotIn("CWA_PATH", source)
+        self.assertNotIn("overlay/read.html", source)
+        self.assertNotIn("docker build", source)
         self.assertNotIn("docker pull", source)
         self.assertNotIn("ghcr.io", source)
-        self.assertLess(
-            source.index("docker build -t local/book-translator-api:latest"),
-            source.index('mkdir -p -- "$CWA_PATH/overlay"'),
-        )
-        missing_docker = re.search(
-            r"if ! command -v docker.*?fi", source, re.DOTALL
-        )
-        self.assertIsNotNone(missing_docker)
-        self.assertRegex(missing_docker.group(0), r"\bexit\s+1\b")
+
+    def test_legacy_unraid_template_is_hard_gated_to_v214_migration(self):
         template = (ROOT / "my-book-translator-api.xml.tmpl").read_text()
-        self.assertIn(
-            "<Repository>local/book-translator-api:latest</Repository>",
-            template,
-        )
+        self.assertIn("2.1.4", template)
+        self.assertIn("LEGACY ONLY", template)
+        self.assertIn("migration", template)
+        self.assertNotIn("latest", template)
+        self.assertNotIn('Type="Port"', template)
 
 
 if __name__ == "__main__":

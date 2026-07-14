@@ -17,6 +17,7 @@ from btctl_core import (
 )
 from btctl_compose import ComposeAdopter, ComposeInstaller, InstallError
 from btctl_docker import DockerCLI, DockerCommandError
+from btctl_unraid import UnraidAdopter, UnraidInstaller
 
 
 EX_USAGE = 64
@@ -87,9 +88,11 @@ def main(argv: list[str] | None = None) -> int:
             if not args.yes:
                 print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
                 raise ConfigError("install requires --yes after reviewing the plan")
-            if config.install_profile != "compose-existing":
-                raise ConfigError("the Unraid installer is not available in this build step")
-            state = ComposeInstaller(DockerCLI()).install(config, plan, args.repository)
+            docker = DockerCLI()
+            if config.install_profile == "compose-existing":
+                state = ComposeInstaller(docker).install(config, plan, args.repository)
+            else:
+                state = UnraidInstaller(docker).install(config, plan, args.repository)
             payload = state.to_dict()
             print(
                 json.dumps(
@@ -102,9 +105,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "adopt":
             config, plan = _load_config(args.repository, args.env)
-            if config.install_profile != "compose-existing":
-                raise ConfigError("the Unraid adopter is not available in this build step")
-            state = ComposeAdopter(DockerCLI()).adopt(config, plan)
+            docker = DockerCLI()
+            if config.install_profile == "compose-existing":
+                state = ComposeAdopter(docker).adopt(config, plan)
+            else:
+                state = UnraidAdopter(docker).adopt(config, plan)
             print(
                 json.dumps(
                     state.to_dict(),

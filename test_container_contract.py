@@ -146,18 +146,24 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn('proxy_set_header X-BT-Roles "";', proxy)
 
     def test_unraid_helpers_preserve_the_non_root_sandbox(self):
-        deploy = (ROOT / "deploy_unraid.sh").read_text()
-        template = (ROOT / "my-book-translator-api.xml.tmpl").read_text()
+        adapter = (ROOT / "btctl_unraid.py").read_text()
+        api_template = (
+            ROOT / "deploy" / "unraid" / "my-cwa-translate-api.xml.tmpl"
+        ).read_text()
+        proxy_template = (
+            ROOT / "deploy" / "unraid" / "my-cwa-translate-proxy.xml.tmpl"
+        ).read_text()
         for token in (
-            "BT_ROLE=api",
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges:true",
             "uid=101,gid=102",
         ):
-            self.assertIn(token, deploy)
-            self.assertIn(token, template)
-        self.assertIn("install -d -m 0700 -o 101 -g 102 --", deploy)
+            self.assertIn(token, api_template)
+            self.assertIn(token, proxy_template)
+        self.assertIn('"BT_ROLE": "api"', adapter)
+        self.assertIn("os.chown(path, 101, 102)", adapter)
+        self.assertIn("publish_port=None", adapter)
 
 
 if __name__ == "__main__":

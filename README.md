@@ -133,39 +133,17 @@ implicit trust boundary.
 
 ### Option 2: Unraid
 
-Clone a release tag on the Unraid host and run `./install_unraid.sh`. The script
-builds `local/book-translator-api:latest` from that checkout and installs the
-legacy API template without downloading a project-published image or requiring
-registry credentials. Docker may download the pinned public base image during
-the build. For the recommended proxy-injection topology, use the Compose
-instructions above.
-
-#### Legacy: bind-mount installer script
-
-`install_unraid.sh` copies the overlay files into your CWA appdata folder and
-installs an Unraid Docker template for the API (bind-mount method). Review the
-script, then run it **locally** (don't pipe an unreviewed remote script into
-`bash`):
+Copy `.env.example` outside the checkout, set
+`BT_INSTALL_PROFILE=unraid`, review `./btctl plan`, and install locally as root:
 
 ```bash
-git clone --branch v2.2.0 --depth 1 \
-  https://github.com/felixapel/CWA-eBook-Translate-Plugin.git
-cd CWA-eBook-Translate-Plugin
-chmod +x install_unraid.sh
-./install_unraid.sh
+./install_unraid.sh /mnt/user/appdata/cwa-translate/install.env
 ```
 
-**Post-Install Steps**:
-1. Go to your Unraid Docker tab and edit your `calibre-web-automated` container.
-2. Add the 3 paths (as instructed by the script) to inject the plugin files.
-3. Deploy the newly added `book-translator-api` container.
-
-`deploy_unraid.sh` / `verify_unraid.sh` are personal SSH-based redeploy/verify
-helpers for an existing install — read them and adapt the host/paths before use.
-
-> Tip: proxy-injection mode also works on Unraid (run the container with
-> `CWA_UPSTREAM` set and browse through its port) and avoids the 3 path
-> mappings entirely.
+The wrapper delegates to `btctl`: it builds an immutable version+SHA image,
+creates the separate API/proxy roles, publishes only the proxy, leaves stock
+CWA untouched, and writes state only after live verification. It neither uses
+`latest` nor copies a CWA overlay. See the [full Unraid guide](docs/DEPLOY_UNRAID.md).
 
 ### Advanced: bind-mount install (development / no proxy)
 

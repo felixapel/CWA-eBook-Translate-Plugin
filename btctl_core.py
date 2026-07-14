@@ -253,6 +253,7 @@ class InstallConfig:
     state_dir: str
     data_dir: str
     backup_dir: str
+    unraid_template_dir: str
     proxy_port: int | None
     identity_proxy_peer: str
     authentik_version: str
@@ -298,6 +299,33 @@ class InstallConfig:
         backup_dir = _absolute_dir(values.get("BT_BACKUP_DIR", ""), "BT_BACKUP_DIR")
         if len({state_dir, data_dir, backup_dir}) != 3:
             raise ConfigError("BT_STATE_DIR, BT_DATA_DIR, and BT_BACKUP_DIR must differ")
+        unraid_template_dir = _clean_value(
+            values.get("BT_UNRAID_TEMPLATE_DIR", ""),
+            "BT_UNRAID_TEMPLATE_DIR",
+            allow_empty=True,
+        )
+        if install_profile == "unraid":
+            unraid_template_dir = _absolute_dir(
+                unraid_template_dir or "/boot/config/plugins/dockerMan/templates-user",
+                "BT_UNRAID_TEMPLATE_DIR",
+            )
+            safe_unraid_path = re.compile(r"^/[A-Za-z0-9_./@:+-]+$")
+            for path_name, path_value in (
+                ("BT_STATE_DIR", state_dir),
+                ("BT_DATA_DIR", data_dir),
+                ("BT_BACKUP_DIR", backup_dir),
+                ("BT_UNRAID_TEMPLATE_DIR", unraid_template_dir),
+            ):
+                if not safe_unraid_path.fullmatch(path_value):
+                    raise ConfigError(
+                        f"{path_name} contains characters unsafe for DockerMan"
+                    )
+            if unraid_template_dir in {state_dir, data_dir, backup_dir}:
+                raise ConfigError("BT_UNRAID_TEMPLATE_DIR must be a separate directory")
+        else:
+            # Keep one example file switchable between profiles. This path has
+            # no meaning and enters no runtime artifact outside Unraid.
+            unraid_template_dir = ""
 
         proxy_port = _optional_port(values.get("BT_PROXY_PORT", ""), "BT_PROXY_PORT")
         edge_network = _clean_value(
@@ -373,6 +401,7 @@ class InstallConfig:
             state_dir=state_dir,
             data_dir=data_dir,
             backup_dir=backup_dir,
+            unraid_template_dir=unraid_template_dir,
             proxy_port=proxy_port,
             identity_proxy_peer=identity_proxy_peer,
             authentik_version=authentik_version,
@@ -442,6 +471,7 @@ class InstallConfig:
             "state_dir": self.state_dir,
             "data_dir": self.data_dir,
             "backup_dir": self.backup_dir,
+            "unraid_template_dir": self.unraid_template_dir,
             "proxy_port": self.proxy_port,
             "reverse_proxy": self.reverse_proxy,
             "identity_proxy_peer": self.identity_proxy_peer,
@@ -476,7 +506,6 @@ class DeploymentPlan:
         public = config.public_contract()
         canonical = json.dumps(public, sort_keys=True, separators=(",", ":"))
         fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        suffix = fingerprint[:12]
         proxy_ports = [config.proxy_port] if config.proxy_port is not None else []
         resources: dict[str, dict[str, object]] = {
             "cwa": {
@@ -513,6 +542,19 @@ class DeploymentPlan:
             resources["edge_network"] = {
                 "name": config.edge_network,
                 "ownership": "external",
+            }
+        if config.install_profile == "unraid":
+            resources["api_template"] = {
+                "path": str(
+                    Path(config.unraid_template_dir) / "my-cwa-translate-api.xml"
+                ),
+                "ownership": "owned",
+            }
+            resources["proxy_template"] = {
+                "path": str(
+                    Path(config.unraid_template_dir) / "my-cwa-translate-proxy.xml"
+                ),
+                "ownership": "owned",
             }
         return cls(
             version=config.identity.version,

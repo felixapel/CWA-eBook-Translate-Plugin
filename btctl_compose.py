@@ -156,6 +156,18 @@ def _container_networks(container: dict) -> set[str]:
     return set(networks) if isinstance(networks, dict) else set()
 
 
+def _container_environment(container: dict) -> dict[str, str]:
+    environment = container.get("Config", {}).get("Env", [])
+    if not isinstance(environment, list):
+        return {}
+    parsed: dict[str, str] = {}
+    for item in environment:
+        if isinstance(item, str) and "=" in item:
+            name, value = item.split("=", 1)
+            parsed[name] = value
+    return parsed
+
+
 def _has_exact_cwa_version(container: dict, version: str) -> bool:
     image = container.get("Config", {}).get("Image", "")
     without_digest = image.split("@", 1)[0] if isinstance(image, str) else ""
@@ -238,6 +250,21 @@ class ComposeInstaller:
         expected_labels = _labels(config, role, install_id)
         if any(labels.get(key) != value for key, value in expected_labels.items()):
             raise InstallError(f"{role} container ownership labels do not match")
+        expected_environment = (
+            {**config.api_environment(), "BT_ROLE": "api"}
+            if role == "api"
+            else {
+                **config.proxy_environment(),
+                "BT_ROLE": "proxy",
+                "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
+            }
+        )
+        live_environment = _container_environment(container)
+        if any(
+            live_environment.get(key) != value
+            for key, value in expected_environment.items()
+        ) or "BT_ALLOW_INSECURE_AUTH" in live_environment:
+            raise InstallError(f"{role} container runtime environment does not match")
         bindings = container.get("HostConfig", {}).get("PortBindings") or {}
         if role == "api" and bindings:
             raise InstallError("API container unexpectedly publishes a host port")

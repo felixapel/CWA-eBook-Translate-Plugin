@@ -1,340 +1,161 @@
-# Deploying to Unraid
+# Managed Unraid deployment
 
-> **Proxy injection is the recommended integration.** The repository Compose
-> file runs the shared image as isolated `api` and `proxy` roles. Existing
-> Unraid one-container proxy deployments remain compatible through
-> `BT_ROLE=auto`, while the rest of this document covers the classic API plus
-> bind-mounted overlay deployment.
+The supported v2.2.0 Unraid path is local and source-only. It does not SSH into
+the server, download a project image, publish the API, copy a CWA template, or
+mount an overlay into CWA. One clean checkout builds one immutable local image;
+that image runs as two separate non-root containers.
 
-The image no longer starts an anonymous production API. The recommended proxy
-topology uses `BT_AUTH_MODE=cwa_session` and validates the browser's existing
-HttpOnly CWA session. For the legacy cross-origin bind-mount topology in this
-document, the shipped overlay and `deploy_unraid.sh` intentionally support the
-same mode only, with an exact **HTTP** CWA origin. The helper exposes `:8390`
-without TLS, so it rejects HTTPS reader origins that browsers would block as
-mixed content. HTTPS readers must use the recommended same-origin injection
-proxy (or a separately reviewed TLS API route and matching custom `apiUrl`).
-`overlay/read.html` opts into cookie-bearing fetches; CORS still rejects every
-origin except the exact configured value. Token/forwarded deployments require
-a separately reviewed custom bootstrap and routing contract; the helper will
-refuse them.
-
-A concrete, worked example of a two-container deployment (translator API +
-Calibre-Web-Automated with the overlay bind-mounts). The hostnames, IPs
-(`10.0.0.10` below is an example), and paths below are from one real setup
-— substitute your own. The general shape (API container + 3 overlay bind
-mounts into CWA) applies to any Unraid/Docker host.
-
----
-
-## Real Architecture
-
-```
-Unraid Host
-├── /mnt/user/appdata/book-translator-api/        ← Git checkout (source of truth)
-│   ├── server.py, translator.py, cache.py
-│   ├── static/translator.js                      ← Build output: backend API + frontend
-│   ├── static/translator.css
-│   ├── overlay/read.html
-│   └── data/                                     ← Mounted into container as /app/data
-│
-├── /mnt/user/appdata/calibre-web-automated/
-│   └── overlay/                                  ← Deploy target for CWA files
-│       ├── translator.js   ─── bind-mounted ──→  container: /app/.../static/js/translator.js
-│       ├── translator.css  ─── bind-mounted ──→  container: /app/.../static/css/translator.css
-│       └── read.html       ─── bind-mounted ──→  container: /app/.../templates/read.html
-│
-Containers
-├── calibre-web-automated  (port 8383→8083)       ← Reads plugin files via file bind mounts
-├── book-translator-api    (port 8390)            ← Translation API
-└── vLLM                   (port 2819)            ← LLM backend (gemma4-12b)
+```text
+browser/reverse proxy -> cwa-translate-proxy -> stock CWA
+                                  |
+                                  +-> cwa-translate-api -> local/cloud LLM
+                                               |
+                                               +-> private appdata cache
 ```
 
-### How the frontend is deployed
+## What you need
 
-The CWA container (`crocodilestick/calibre-web-automated`) has **file-level bind mounts**
-defined in its Unraid template (`/boot/config/plugins/dockerMan/templates-user/my-calibre-web-automated.xml`):
+- Run these commands in a clean release checkout on the Unraid host.
+- Run as `root`; the API image writes as uid `101`, gid `102` and `btctl`
+  creates its appdata directory with those exact owners.
+- Use an exact CWA image tag such as
+  `crocodilestick/calibre-web-automated:v4.0.6`. A mutable `latest` CWA tag is
+  not enough evidence for compatibility and installation stops before build.
+- CWA `4.x` is Tier 1. Exactly `3.1.4` is accepted only by the v2.1.4 migration
+  workflow.
+- Know the running CWA container name and one Docker network it already joins.
+- For a local provider, expose an OpenAI-compatible
+  `/v1/chat/completions` endpoint to Docker. Do not use `localhost` unless the
+  LLM really runs inside the translator API container.
 
-```xml
-<Config Name="Plugin JS"  Target="/app/calibre-web-automated/cps/static/js/translator.js"
-        Mode="ro" Type="Path">/mnt/user/appdata/calibre-web-automated/overlay/translator.js</Config>
-<Config Name="Plugin CSS" Target="/app/calibre-web-automated/cps/static/css/translator.css"
-        Mode="ro" Type="Path">/mnt/user/appdata/calibre-web-automated/overlay/translator.css</Config>
-<Config Name="Plugin Read HTML" Target="/app/calibre-web-automated/cps/templates/read.html"
-        Mode="ro" Type="Path">/mnt/user/appdata/calibre-web-automated/overlay/read.html</Config>
-```
+## Configure
 
-Because these are bind mounts (not files baked into the image), editing them on the host
-changes what the container sees on disk immediately — but that's not the whole story for
-whether the *running app* picks it up without a restart:
-
-- **`translator.js` / `translator.css`** — Flask serves static files fresh from disk on
-  every request (no app-level caching), so these are typically picked up live.
-- **`read.html`** — this is a Jinja2 **template**, not a static file. Flask/Jinja2 caches
-  compiled templates in memory after first render, and CWA does not set
-  `TEMPLATES_AUTO_RELOAD` / run in debug mode, so a change to `read.html` (e.g. bumping
-  the cache-busting version, editing `window.BOOK_TRANSLATOR`) may **not** take effect
-  until the process restarts.
-
-**Restart `calibre-web-automated` after any overlay change to be safe** — that's the
-practice used throughout this project's actual deploys. Skipping the restart for a
-JS/CSS-only change *might* work, but isn't guaranteed and isn't worth the ambiguity.
-
-> ⚠️ `docker restart calibre-web-automated` does NOT pick up changes to the XML template
-> itself (the bind-mount definitions). If you change *which paths* are mounted, you must
-> use Unraid's Docker Manager UI to apply the template, or stop/rm/run the container
-> manually — a plain restart only re-runs the existing container with its existing mounts.
-
----
-
-## Update the Frontend
+Keep configuration, deployment state, translation data, and backups outside
+the Git checkout:
 
 ```bash
-# 1. Select the immutable release source (never update production from main)
-cd /mnt/user/appdata/book-translator-api
-RELEASE_TAG=v2.2.0
-git fetch --tags origin
-git checkout --detach "$RELEASE_TAG"
-test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
-
-# 2. Copy updated files to the CWA overlay
-cp static/translator.js  /mnt/user/appdata/calibre-web-automated/overlay/translator.js
-cp static/translator.css /mnt/user/appdata/calibre-web-automated/overlay/translator.css
-cp overlay/read.html     /mnt/user/appdata/calibre-web-automated/overlay/read.html
-
-# 3. Verify version marker
-grep "BT_UI_VERSION" /mnt/user/appdata/calibre-web-automated/overlay/translator.js
-# Should print the current version string — see the latest entry in CHANGELOG.md.
-
-# 4. Restart so the read.html template (Jinja2, may be cached in memory) is
-#    definitely re-rendered with the new cache-busting version / config:
-docker restart calibre-web-automated
+install -d -m 0700 /mnt/user/appdata/cwa-translate
+cp .env.example /mnt/user/appdata/cwa-translate/install.env
+chmod 0600 /mnt/user/appdata/cwa-translate/install.env
 ```
 
----
+Edit the copy. A typical local-provider configuration has:
 
-## Update the Backend API
+```dotenv
+BT_INSTALL_PROFILE=unraid
+BT_INSTALL_NAME=cwa-translate
+BT_INGRESS_MODE=published
+BT_PROXY_PORT=8385
+BT_EDGE_NETWORK=
+BT_AUTH_PROFILE=cwa-session
+BT_PUBLIC_ORIGIN=https://books.example.com
+CWA_UPSTREAM=http://calibre-web-automated:8083
+BT_CWA_CONTAINER=calibre-web-automated
+BT_CWA_NETWORK=cwa_default
+BT_CWA_VERSION=4.0.6
+BT_STATE_DIR=/mnt/user/appdata/cwa-translate/state
+BT_DATA_DIR=/mnt/user/appdata/cwa-translate/data
+BT_BACKUP_DIR=/mnt/user/backups/cwa-translate
+BT_UNRAID_TEMPLATE_DIR=/boot/config/plugins/dockerMan/templates-user
+LLM_PROVIDER=local
+LLM_MODEL=gemma4-12b
+BT_LOCAL_URL=http://192.168.0.122:2819/v1/chat/completions
+LLM_API_KEY=
+```
 
-> ⚠️ `docker restart` does **not** pick up a rebuilt image — it re-runs the
-> existing container with the image it was created from. After rebuilding you
-> must **recreate** the container. In the Unraid UI this is just editing the
-> container and clicking *Apply*. From the shell:
+The project is open source, so no project key or registry credential exists.
+`LLM_API_KEY` is only for a cloud model provider; it must stay empty when
+`LLM_PROVIDER=local`.
+
+## Authentication profiles
+
+`cwa-session` is the safe default. The browser sends its native CWA session to
+the same-origin proxy, and the API validates selected cookies against CWA's
+exact `/ajax/emailstat` endpoint. An Authentik cookie by itself is not a CWA
+session. If CWA is configured for OIDC and ultimately creates a native CWA
+session, the normal profile works.
+
+`authentik-forwarded` is an advanced separate topology. It requires
+`docker-edge`, no host port, an exact identity-proxy `/32` or `/128`, and a
+patched Authentik version. Follow [AUTHENTIK.md](AUTHENTIK.md); merely enabling
+forwarded headers on the browser-facing injection proxy is intentionally not
+supported.
+
+`disabled`, a shared browser token, broad trusted CIDRs, and an API host port
+are not managed installation profiles.
+
+## Plan and install
+
+First validate without changing the filesystem or Docker:
 
 ```bash
-cd /mnt/user/appdata/book-translator-api
-test "$(git describe --tags --exact-match)" = "v2.2.0"
-
-# Stop the only writer and snapshot every private data file before the first
-# v2.2.0 start. Keep this directory through the rollback window.
-docker stop book-translator-api
-BACKUP_DIR="/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data"
-test ! -e "$BACKUP_DIR"
-install -d -m 0700 -- "$BACKUP_DIR"
-cp -a -- /mnt/user/appdata/book-translator-api/data/. "$BACKUP_DIR/"
-python3 -c 'import sqlite3; db=sqlite3.connect("/mnt/user/backups/book-translator-api/pre-v2.2.0-app-data/translations.db"); db.execute("PRAGMA wal_checkpoint(TRUNCATE)"); assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"'
-
-# Rebuild the image
-docker build -t local/book-translator-api:latest .
-
-# The image runs as the stable uid/gid 101:102 and never changes host
-# ownership at startup.
-install -d -m 0700 -o 101 -g 102 -- \
-  /mnt/user/appdata/book-translator-api/data
-
-# Recreate the container so it runs the NEW image (the /app/data bind mount
-# keeps the SQLite cache). Re-use your exact env — see "Initial Setup" below,
-# or copy the flags from `docker inspect book-translator-api` first.
-docker rm -f book-translator-api
-docker run -d --name book-translator-api --restart unless-stopped --net bridge \
-  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 \
-  --cap-drop=ALL --security-opt=no-new-privileges:true \
-  -p 8390:8390 -v /mnt/user/appdata/book-translator-api/data:/app/data \
-  -l net.unraid.docker.managed=dockerman \
-  -e BT_ROLE=api \
-  -e BT_AUTH_MODE=cwa_session \
-  -e BT_CWA_AUTH_URL=http://<YOUR-HOST-IP>:8383/ajax/emailstat \
-  -e BT_ALLOWED_ORIGINS=http://<YOUR-HOST-IP>:8383 \
-  -e BT_ALLOW_PRIVATE_LAN=false \
-  -e LLM_PROVIDER=local -e LLM_MODEL=gemma4-12b \
-  -e BT_LOCAL_URL=http://<YOUR-HOST-IP>:2819/v1/chat/completions \
-  -e BT_BATCH_SIZE=3 -e BT_MAX_CONCURRENT=1 -e BT_TIMEOUT=60 \
-  -e BT_MAX_UPSTREAM_INFLIGHT=2 \
-  -e BT_CONTEXT_WINDOW=1 -e BT_MAX_TOKENS=640 -e BT_BATCH_MAX_TOKENS=1200 \
-  local/book-translator-api:latest
-
-# Verify process liveness and shallow readiness (neither contacts the LLM)
-curl -s http://127.0.0.1:8390/ping
-curl -s http://127.0.0.1:8390/health
-
-# Optional provider-backed operator probe. BT_API_TOKEN remains the preferred
-# separately-provisioned operator credential even in cwa_session mode. Without
-# one, create/read the private persisted credential inside the container:
-TOKEN="$(docker exec book-translator-api python -c \
-  'import server; print(server._get_cleanup_token())')"
-curl -s -H "X-BT-Token: $TOKEN" http://127.0.0.1:8390/health/deep
+./btctl plan --env /mnt/user/appdata/cwa-translate/install.env
 ```
 
----
-
-## Initial Setup (First Deploy)
-
-If the containers don't exist yet:
-
-### 1. Backend container
-
-**Recommended: run it as an Unraid-managed container.** The installer builds
-the checked-out source as `local/book-translator-api:latest` and installs a
-hardened API template. Docker may download the pinned public base image, but no
-project registry or publication credential is used.
-
-1. Run `install_unraid.sh` from a checked-out release tag — it builds the image
-   before modifying the installation, prepares `/app/data` ownership, and
-   installs the template (from
-   `my-book-translator-api.xml.tmpl`) into
-   `/boot/config/plugins/dockerMan/templates-user/`.
-2. In the Unraid **Docker** tab → *Add Container* → pick `book-translator-api`
-   from the Template dropdown → set your `BT_LOCAL_URL` and an authentication
-   contract → **Apply**. For `cwa_session`, set `CWA Auth URL` to the full
-   reachable `http(s)://.../ajax/emailstat` URL, set `Exact CWA Origin` to the
-   browser-visible scheme/host/port with no path, and keep broad private-LAN
-   CORS disabled. The supplied bind-mount overlay is CWA-session-only. A manual
-   compatibility-token deployment must customize `authMode`, omit browser
-   cookies, provision its long random secret out of band, and never store that
-   secret in `localStorage`; `deploy_unraid.sh` deliberately will not do this.
-
-Applying via the UI gives the container the `net.unraid.docker.managed=dockerman`
-label and an autostart entry, so Unraid treats it as a first-class managed
-container (it won't be seen as an "orphan" and removed, and it starts with the
-array).
-
-**Manual `docker run` alternative.** If you create it by hand, include the
-management label and autostart it yourself, otherwise Unraid may treat it as an
-orphan:
+Review the image name, source SHA, CWA evidence, networks, ports, paths, and
+ownership. Then run either command:
 
 ```bash
-docker run -d \
-  --name book-translator-api \
-  --restart unless-stopped \
-  --net bridge \
-  --read-only \
-  --tmpfs /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700 \
-  --cap-drop=ALL \
-  --security-opt=no-new-privileges:true \
-  -p 8390:8390 \
-  -e BT_ROLE=api \
-  -e BT_AUTH_MODE=cwa_session \
-  -e BT_CWA_AUTH_URL=http://<YOUR-HOST-IP>:8383/ajax/emailstat \
-  -e BT_ALLOWED_ORIGINS=http://<YOUR-HOST-IP>:8383 \
-  -e BT_ALLOW_PRIVATE_LAN=false \
-  -e LLM_PROVIDER=local \
-  -e LLM_MODEL=gemma4-12b \
-  -e BT_LOCAL_URL=http://<YOUR-HOST-IP>:2819/v1/chat/completions \
-  -e BT_BATCH_SIZE=3 \
-  -e BT_MAX_CONCURRENT=1 \
-  -e BT_MAX_UPSTREAM_INFLIGHT=2 \
-  -e BT_TIMEOUT=60 \
-  -e BT_CONTEXT_WINDOW=1 \
-  -e BT_MAX_TOKENS=640 \
-  -e BT_BATCH_MAX_TOKENS=1200 \
-  -v /mnt/user/appdata/book-translator-api/data:/app/data \
-  -l net.unraid.docker.managed=dockerman \
-  local/book-translator-api:latest
+./btctl install \
+  --env /mnt/user/appdata/cwa-translate/install.env --yes
 
-# Make it start with the array (Unraid autostart is a plain name list):
-grep -qxF book-translator-api /var/lib/docker/unraid-autostart \
-  || echo book-translator-api >> /var/lib/docker/unraid-autostart
+# equivalent root-only convenience wrapper
+./install_unraid.sh /mnt/user/appdata/cwa-translate/install.env
 ```
 
-Before a manual run, create the data directory with
-`install -d -m 0700 -o 101 -g 102 -- /mnt/user/appdata/book-translator-api/data`.
-An older bind mount with different ownership must be migrated once; the
-container deliberately has no root path that could repair it silently.
+Docker may fetch the digest-pinned public Python/Alpine base image during the
+local build. It never pulls a CWA Translate project image. The resulting image
+name is `local/cwa-translate:<version>-<sha12>` and both roles must resolve to
+the same full image ID.
 
-> ⚠️ Do NOT use `localhost` as `BT_LOCAL_URL` inside Docker.
-> `localhost` inside a container refers to the container itself, not the host.
-> Use the host's LAN IP (e.g. `10.0.0.10`) or `host.docker.internal`.
+The API has no `PortBindings`. In `published` mode only the proxy maps
+`BT_PROXY_PORT` to container port `8080`. In `docker-edge` mode neither role is
+published. The private network uses no fixed subnet; Docker chooses a
+non-conflicting range.
 
-> Official releases are source tags. `local/book-translator-api:latest` is
-> built from the checked-out tag and is never pulled from a registry. It
-> persists across reboots, but if you recreate the Docker image (`docker.img`)
-> you must rebuild it: `cd /mnt/user/appdata/book-translator-api && docker build
-> -t local/book-translator-api:latest .`
+## Docker tab and generated templates
 
-### 2. CWA container recreation with plugin mounts
+After every live postcondition passes, `btctl` writes
+`my-cwa-translate-api.xml` and `my-cwa-translate-proxy.xml` into DockerMan's
+user-template directory. They contain the immutable image and reference a
+private `api.env`/`proxy.env`; no LLM key is copied into XML.
 
-If the CWA container is already running but lacks the file bind mounts:
+The live containers use an additional external network that DockerMan's
+single-network form cannot represent. The template overview therefore says
+not to press **Apply**. Use `btctl` for lifecycle changes; DockerMan remains
+useful for status, logs, and start/stop visibility.
+
+## State recovery
+
+If only `state.json` was lost but both containers, their private network,
+image, templates, environment, health, ports, networks, install ID, version,
+and revision still match, recover state with:
 
 ```bash
-docker stop calibre-web-automated && docker rm calibre-web-automated
-
-docker run -d \
-  --name calibre-web-automated \
-  --restart unless-stopped \
-  --network media-net \
-  -p 8383:8083 \
-  -e PUID=99 -e PGID=100 -e TZ=UTC \
-  -v "/mnt/user/MEDIA/Books/Calibre Library:/calibre-library:rw" \
-  -v "/mnt/user/appdata/calibre-web-automated:/config:rw" \
-  -v "/mnt/user/downloads/completed/cwa-book-ingest:/cwa-book-ingest:rw" \
-  -v "/mnt/user/appdata/calibre-web-automated/overlay/read.html:/app/calibre-web-automated/cps/templates/read.html:ro" \
-  -v "/mnt/user/appdata/calibre-web-automated/overlay/translator.js:/app/calibre-web-automated/cps/static/js/translator.js:ro" \
-  -v "/mnt/user/appdata/calibre-web-automated/overlay/translator.css:/app/calibre-web-automated/cps/static/css/translator.css:ro" \
-  crocodilestick/calibre-web-automated:v4.0.6
+./btctl adopt --env /mnt/user/appdata/cwa-translate/install.env
 ```
 
----
+Adoption performs no Docker mutation. Any ambiguity or insecure drift stops it.
+It does not adopt arbitrary manual containers and does not reinterpret a
+combined v2.1.4 container as v2.2.0.
 
-## Verify Deployment
+## Existing v2.1.4 data
 
-```bash
-# Version in overlay
-grep -n "BT_UI_VERSION" /mnt/user/appdata/calibre-web-automated/overlay/translator.js
+Do not point a normal install at the live v2.1.4 appdata directory. The legacy
+container is the only writer and must be stopped before a snapshot. Migration
+backups belong outside appdata under the configured directory, normally
+`/mnt/user/backups/cwa-translate/`. The migration gate performs
+`PRAGMA wal_checkpoint(TRUNCATE)` while the source is controlled, copies the
+offline tree into a new empty target, runs `PRAGMA integrity_check`, and keeps
+the exact old image/container stopped and restartable. It does not use SQLite's
+immutable read-only URI flag, because that could ignore required WAL data.
+Until `btctl upgrade` reports a completed journal, use the audited manual
+procedure in [RELEASE.md](RELEASE.md) rather than the normal install command.
 
-# Cache-busting in read.html
-grep -n "?v=" /mnt/user/appdata/calibre-web-automated/overlay/read.html
+## Failure behavior
 
-# Version in container (must match overlay)
-docker exec calibre-web-automated grep -n "BT_UI_VERSION" /app/calibre-web-automated/cps/static/js/translator.js
-
-# Hashes must match
-sha256sum /mnt/user/appdata/calibre-web-automated/overlay/translator.js
-docker exec calibre-web-automated sha256sum /app/calibre-web-automated/cps/static/js/translator.js
-
-# Backend shallow readiness (no provider call)
-curl -s http://127.0.0.1:8390/health
-```
-
----
-
-## Rollback
-
-Schema v2 uses `translations_v2` and leaves the v1 `translations` table intact,
-so the previous release can use the same `/app/data` directory. The installer
-does not create hidden backups; keep the explicit offline snapshot made before
-the upgrade. To roll back, check out the previous immutable release tag and
-rerun the same fail-closed installer:
-
-```bash
-cd /path/to/CWA-eBook-Translate-Plugin
-git checkout v<previous-version>
-./install_unraid.sh
-```
-
-Then open Unraid's **Docker** tab, edit `book-translator-api`, and click
-**Apply** (or **Force Update**) so Unraid recreates the API container from the
-rebuilt local image while preserving its configured `/app/data` bind mount and
-environment. Finally restart `calibre-web-automated` so it reloads the restored
-overlay files. If the database fails its integrity check or startup, move the
-v2 database aside and restore the complete `pre-v2.2.0-app-data` snapshot
-before starting the previous image; never copy a live WAL database piecemeal.
-
----
-
-## LLM Endpoint Reference
-
-| Backend | Correct BT_LOCAL_URL |
-|---------|----------------------|
-| vLLM on translation host | `http://10.0.0.10:2819/v1/chat/completions` |
-| Ollama on translation host | `http://10.0.0.10:11434/v1/chat/completions` |
-| LM Studio (separate host) | `http://10.0.0.20:1234/v1/chat/completions` |
-| ❌ Wrong | `http://localhost:2819/...` (broken inside Docker) |
+Name/template collisions, missing networks, stopped or unversioned CWA, and
+invalid configuration stop before the image build. A later startup failure
+removes only the newly created proxy, API, and private network, in that order.
+CWA, external networks, appdata, environment files, and backups are preserved;
+`state.json` is not written.

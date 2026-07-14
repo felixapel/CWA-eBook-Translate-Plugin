@@ -65,7 +65,11 @@ class FakeDocker:
                 "Id": f"{name}-id",
                 "Image": "sha256:image-id",
                 "State": {"Status": "running", "Health": {"Status": "healthy"}},
-                "Config": {"Image": service["image"], "Labels": service["labels"]},
+                "Config": {
+                    "Image": service["image"],
+                    "Labels": service["labels"],
+                    "Env": [f"{key}={value}" for key, value in service["environment"].items()],
+                },
                 "HostConfig": {"PortBindings": ports},
                 "NetworkSettings": {
                     "Networks": {
@@ -296,6 +300,22 @@ class ComposeAdoptTests(unittest.TestCase):
             }
 
             with self.assertRaisesRegex(InstallError, "upgrade"):
+                ComposeAdopter(docker).adopt(config, plan)
+
+    def test_adopt_rejects_disabled_auth_even_when_labels_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(values(root), self.identity)
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker()
+            ComposeInstaller(docker).install(config, plan, root)
+            (root / "state" / "state.json").unlink()
+            api = docker.containers["cwa-translate-test-api"]
+            api["Config"]["Env"] = [
+                item for item in api["Config"]["Env"] if not item.startswith("BT_AUTH_MODE=")
+            ] + ["BT_AUTH_MODE=disabled", "BT_ALLOW_INSECURE_AUTH=true"]
+
+            with self.assertRaisesRegex(InstallError, "runtime environment"):
                 ComposeAdopter(docker).adopt(config, plan)
 
 

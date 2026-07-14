@@ -308,7 +308,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertNotIn(
             "/mnt/user/appdata/book-translator-api/backups", unraid
         )
-        self.assertIn("/mnt/user/backups/book-translator-api/", unraid)
+        self.assertIn("/mnt/user/backups/cwa-translate/", unraid)
         self.assertIn("PRAGMA wal_checkpoint(TRUNCATE)", unraid)
         self.assertNotIn("mode=ro&immutable=1", unraid)
         self.assertIn("backups/", gitignore.splitlines())
@@ -361,7 +361,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_release_reuses_every_required_ci_contract(self):
         workflow = GITEA_RELEASE.read_text()
         for command in (
-            "python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py auth.py server.py",
+            "python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py btctl_unraid.py auth.py server.py",
             "python3 test_translation.py",
             "python3 test_hardening.py",
             "test_singleflight test_auth test_ci_contract",

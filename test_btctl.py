@@ -165,6 +165,16 @@ class InstallConfigTests(unittest.TestCase):
             InstallConfig.from_mapping(
                 {**self.base, "BT_STATE_DIR": "./state"}, self.identity
             )
+        with self.assertRaisesRegex(ConfigError, "unsafe for DockerMan"):
+            InstallConfig.from_mapping(
+                {
+                    **self.base,
+                    "BT_INSTALL_PROFILE": "unraid",
+                    "BT_STATE_DIR": "/mnt/user/appdata/cwa;--privileged",
+                    "BT_UNRAID_TEMPLATE_DIR": "/boot/config/plugins/dockerMan/templates-user",
+                },
+                self.identity,
+            )
 
     def test_install_contract_never_accepts_disabled_or_shared_token_auth(self):
         for profile in ("disabled", "token", "forwarded"):

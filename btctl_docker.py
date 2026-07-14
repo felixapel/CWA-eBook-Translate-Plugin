@@ -132,3 +132,82 @@ class DockerCLI:
                 return
             time.sleep(1)
         raise DockerCommandError("containers did not become healthy before the deadline")
+
+    def create_network(
+        self, name: str, labels: dict[str, str], *, internal: bool
+    ) -> None:
+        arguments = ["network", "create", "--driver", "bridge"]
+        if internal:
+            arguments.append("--internal")
+        for key, value in sorted(labels.items()):
+            arguments.extend(["--label", f"{key}={value}"])
+        arguments.append(name)
+        self._run(arguments, timeout=60)
+
+    def create_container(self, spec) -> None:
+        arguments = [
+            "create",
+            "--name",
+            spec.name,
+            "--network",
+            spec.primary_network,
+            "--env-file",
+            str(spec.env_file),
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--restart",
+            "unless-stopped",
+        ]
+        if spec.network_alias:
+            arguments.extend(["--network-alias", spec.network_alias])
+        if spec.role == "api":
+            arguments.extend(
+                [
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700",
+                    "--pids-limit",
+                    "256",
+                    "--memory",
+                    "1g",
+                    "--cpus",
+                    "2",
+                    "--add-host",
+                    "host.docker.internal:host-gateway",
+                    "--mount",
+                    f"type=bind,src={spec.data_dir},dst=/app/data",
+                ]
+            )
+        else:
+            arguments.extend(
+                [
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700",
+                    "--pids-limit",
+                    "64",
+                    "--memory",
+                    "128m",
+                    "--cpus",
+                    "0.5",
+                ]
+            )
+        if spec.publish_port is not None:
+            arguments.extend(["--publish", f"{spec.publish_port}:8080/tcp"])
+        for key, value in sorted(spec.labels.items()):
+            arguments.extend(["--label", f"{key}={value}"])
+        arguments.append(spec.image)
+        self._run(arguments, timeout=120)
+
+    def connect_network(self, network: str, container: str) -> None:
+        self._run(["network", "connect", network, container], timeout=60)
+
+    def start_container(self, name: str) -> None:
+        self._run(["start", name], timeout=60)
+
+    def remove_container(self, name: str) -> None:
+        self._run(["rm", "--force", name], timeout=60)
+
+    def remove_network(self, name: str) -> None:
+        self._run(["network", "rm", name], timeout=60)

@@ -690,13 +690,15 @@ class DeploymentBudgetContractTests(unittest.TestCase):
         for name, value in expected.items():
             self.assertIn(f"- {name}={value}", compose)
 
-    def test_readme_and_unraid_template_do_not_document_unlimited_default(self):
+    def test_readme_and_unraid_templates_do_not_document_unlimited_default(self):
         readme = (ROOT / "README.md").read_text()
-        template = (ROOT / "my-book-translator-api.xml.tmpl").read_text()
+        templates = "\n".join(
+            path.read_text()
+            for path in (ROOT / "deploy" / "unraid").glob("*.xml.tmpl")
+        )
         self.assertIn("| `BT_MAX_UPSTREAM_INFLIGHT` | `2` |", readme)
         self.assertNotIn("| `BT_MAX_UPSTREAM_INFLIGHT` | `0` |", readme)
-        self.assertIn('Target="BT_MAX_UPSTREAM_INFLIGHT" Default="2"', template)
-        self.assertNotIn("(0 = unlimited)", template)
+        self.assertNotIn("(0 = unlimited)", templates)
 
 
 if __name__ == "__main__":
