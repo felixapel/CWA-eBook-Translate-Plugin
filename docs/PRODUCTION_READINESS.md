@@ -46,6 +46,7 @@ source release remains blocked until every item under
 | F-21 avoidable cache contention | Implemented and gated | Schema v2 uses indexed expiry/maintenance paths, WAL/busy-timeout handling, bounded maintenance, and concurrency contracts. |
 | F-22 brittle limits, scripts, and metadata | Implemented and gated | Extreme numeric inputs fail closed, deployment helpers use strict quoting, dependencies/metadata are locked, and shell/workflow contracts are enforced. |
 | F-23 ref and authenticity hygiene | Partially operator-owned | Protected annotated tags and exact Gitea/GitHub object parity bind official source releases. Remote branch cleanup and optional Git commit/tag signing remain deliberate maintainer operations. |
+| F-24 stock Unraid lacked host Python | Implemented and gated | The public Bash `btctl` dispatcher with its embedded pinned exporter, separately verified `Dockerfile.btctl`, least-privilege mount planner, and real-Docker bootstrap smoke run the Unraid profile without host Python or NerdTools while preserving exact source identity. |
 
 ## Reproducible acceptance gate
 
@@ -71,6 +72,10 @@ all of these outcomes without a skipped or unavailable gate:
    uninstall, reinstall, offline v2.1.4 migration, healthy rollback, and
    journaled re-upgrade. It also verifies that v1 and v2 cache tables coexist
    and SQLite integrity survives v1 → v2 → v1 → v2.
+8. A separate real-Docker stock-Unraid gate invokes the public `./btctl` from a
+   simulated host with no Python, verifies the clean full Git commit through a
+   socket-free exporter, proves `plan --json` reports that exact identity, and
+   completes install, doctor, and conservative uninstall through the fallback.
 
 The final local candidate audit on 2026-07-14 passed Python compilation, the
 standalone translation and hardening suites, the complete backend contract suite,
@@ -78,9 +83,10 @@ frontend unit tests, four real-Chromium scenarios, Python and npm vulnerability
 audits, local Markdown-link/parity checks, and the split-role container build
 and smoke gate on Docker 29.6.1. The earlier image-publication audit also
 exercised multi-platform attestations before that publication path was retired
-by ADR-008. Protected CI must repeat the currently maintained gates for the
-exact commit that is merged; this record is not a substitute for real Unraid
-browser acceptance.
+by ADR-008. The stock-Unraid bootstrap gate additionally requires a full Git
+checkout but no host Python or NerdTools. Protected CI must repeat the currently
+maintained gates for the exact commit that is merged; this record is not a
+substitute for physical Unraid 7.3.2 and browser acceptance.
 
 ## Remote promotion prerequisites
 

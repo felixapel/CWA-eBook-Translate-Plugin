@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Source-only lifecycle CLI for CWA Translate deployments."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+from btctl_auth import render_authentik_edge
+from btctl_core import (
+    ConfigError,
+    DeploymentPlan,
+    InstallConfig,
+    parse_env_text,
+    release_identity_from_checkout,
+)
+from btctl_compose import ComposeAdopter, ComposeInstaller, InstallError
+from btctl_docker import DockerCLI, DockerCommandError
+from btctl_lifecycle import (
+    DeploymentDoctor,
+    LegacyUpgrade,
+    RuntimeUninstaller,
+)
+from btctl_paths import validate_unraid_config_paths
+from btctl_unraid import UnraidAdopter, UnraidInstaller
+
+
+EX_USAGE = 64
+_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_UNRAID_LOCK_DIRECTORY = Path("/run/cwa-translate-btctl-locks")
+_CONTAINER_LOCK_DIRECTORY = Path("/run/btctl-lock")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="btctl",
+        description="Plan and manage a source-only CWA Translate installation.",
+    )
+    parser.add_argument(
+        "--repository",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="clean CWA Translate Git checkout (default: this checkout)",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    plan = commands.add_parser("plan", help="validate and print a mutation-free plan")
+    plan.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    install = commands.add_parser("install", help="build and install the validated plan")
+    install.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    install.add_argument(
+        "--yes",
+        action="store_true",
+        help="acknowledge the displayed source and resource identities",
+    )
+    install.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    adopt = commands.add_parser("adopt", help="recover state for an existing labeled split runtime")
+    adopt.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    adopt.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    auth_snippet = commands.add_parser(
+        "auth-snippet",
+        help="print the reviewed Authentik edge fragment without mutating state",
+    )
+    auth_snippet.add_argument(
+        "--env", required=True, type=Path, help="strict KEY=value file"
+    )
+    doctor = commands.add_parser(
+        "doctor", help="read-only verification of state, ownership, auth, and runtime"
+    )
+    doctor.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    uninstall = commands.add_parser(
+        "uninstall", help="remove only owned runtime while preserving data and backups"
+    )
+    uninstall.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    uninstall.add_argument("--yes", action="store_true", help="confirm runtime removal")
+    uninstall.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    upgrade = commands.add_parser(
+        "upgrade", help="offline migration from one exact stopped v2.1.4 runtime"
+    )
+    upgrade.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    upgrade.add_argument("--yes", action="store_true", help="confirm the migration cutover")
+    upgrade.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    rollback = commands.add_parser(
+        "rollback", help="remove v2.2 roles and restart the journaled v2.1.4 runtime"
+    )
+    rollback.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    rollback.add_argument("--yes", action="store_true", help="confirm rollback")
+    rollback.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    return parser
+
+
+def _load_values(env_file: Path) -> dict[str, str]:
+    descriptor: int | None = None
+    try:
+        if env_file.is_symlink():
+            raise ConfigError("environment file must not be a symbolic link")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(env_file, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ConfigError("environment file must be one regular private file")
+        if metadata.st_mode & 0o077:
+            raise ConfigError(
+                "environment file must use private mode 0600 or stricter"
+            )
+        if metadata.st_size > 1024 * 1024:
+            raise ConfigError("environment file exceeds the 1 MiB safety limit")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = None
+            source = handle.read()
+    except ConfigError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError("configuration file could not be read") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return parse_env_text(source)
+
+
+def _release_identity(repository: Path):
+    """Bind a containerized operator to its archived checkout revision."""
+    identity = release_identity_from_checkout(repository)
+    expected = os.environ.get("BTCTL_EXPECTED_REVISION", "")
+    if not expected:
+        return identity
+    operator = os.environ.get("BTCTL_OPERATOR_REVISION", "")
+    if not _REVISION_RE.fullmatch(expected):
+        raise ConfigError("expected checkout revision is invalid")
+    if operator != expected:
+        raise ConfigError("operator image revision does not match the expected revision")
+    if identity.sha != expected:
+        raise ConfigError("checkout revision changed after the operator image was built")
+    return identity
+
+
+def _load_plan(repository: Path, env_file: Path) -> DeploymentPlan:
+    identity = _release_identity(repository)
+    values = _load_values(env_file)
+    legacy_upgrade_plan = bool(
+        values.get("BT_LEGACY_CONTAINER") and values.get("BT_LEGACY_DATA_DIR")
+    )
+    config = InstallConfig.from_mapping(
+        values, identity, allow_legacy_cwa=legacy_upgrade_plan
+    )
+    if not os.environ.get("BTCTL_EXPECTED_REVISION"):
+        validate_unraid_config_paths(config, values, repository)
+    return DeploymentPlan.from_config(config)
+
+
+def _load_config(
+    repository: Path,
+    env_file: Path,
+    *,
+    allow_legacy_cwa: bool = False,
+    validate_legacy_data: bool = True,
+) -> tuple[InstallConfig, DeploymentPlan, dict[str, str]]:
+    values = _load_values(env_file)
+    identity = _release_identity(repository)
+    config = InstallConfig.from_mapping(
+        values, identity, allow_legacy_cwa=allow_legacy_cwa
+    )
+    if not os.environ.get("BTCTL_EXPECTED_REVISION"):
+        path_values = values
+        if not validate_legacy_data:
+            path_values = {**values, "BT_LEGACY_DATA_DIR": ""}
+        validate_unraid_config_paths(config, path_values, repository)
+    return config, DeploymentPlan.from_config(config), values
+
+
+def _print_payload(payload: dict[str, object], *, compact: bool) -> None:
+    print(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":") if compact else None,
+            indent=None if compact else 2,
+        )
+    )
+
+
+def _docker_for(config: InstallConfig) -> DockerCLI:
+    if config.install_profile == "unraid":
+        if os.geteuid() != 0:
+            raise ConfigError("managed Unraid lifecycle commands must run as root")
+        socket_path = Path("/var/run/docker.sock")
+        try:
+            metadata = socket_path.lstat()
+        except OSError as exc:
+            raise ConfigError(
+                "the local Docker socket /var/run/docker.sock is unavailable"
+            ) from exc
+        if not stat.S_ISSOCK(metadata.st_mode):
+            raise ConfigError(
+                "the local Docker socket /var/run/docker.sock is unavailable"
+            )
+        for name in ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
+            os.environ.pop(name, None)
+        os.environ["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+        containerized = bool(os.environ.get("BTCTL_EXPECTED_REVISION"))
+        lock_directory = (
+            _CONTAINER_LOCK_DIRECTORY if containerized else _UNRAID_LOCK_DIRECTORY
+        )
+        if containerized:
+            if os.environ.get("BTCTL_LOCK_DIRECTORY") != str(lock_directory):
+                raise ConfigError("container lifecycle lock directory is invalid")
+        else:
+            os.environ.pop("BTCTL_LOCK_DIRECTORY", None)
+            try:
+                lock_directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ConfigError(
+                    "the Unraid lifecycle lock directory could not be created"
+                ) from exc
+        try:
+            lock_metadata = lock_directory.lstat()
+        except OSError as exc:
+            raise ConfigError(
+                "the Unraid lifecycle lock directory is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISDIR(lock_metadata.st_mode)
+            or stat.S_ISLNK(lock_metadata.st_mode)
+            or lock_metadata.st_uid != 0
+            or stat.S_IMODE(lock_metadata.st_mode) != 0o700
+        ):
+            raise ConfigError(
+                "the Unraid lifecycle lock directory must be root-owned mode 0700"
+            )
+        os.environ["BTCTL_LOCK_DIRECTORY"] = str(lock_directory)
+    else:
+        os.environ.pop("BTCTL_LOCK_DIRECTORY", None)
+    return DockerCLI()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    try:
+        args = parser.parse_args(argv)
+        if args.command == "plan":
+            payload = _load_plan(args.repository, args.env).to_dict()
+            if args.json:
+                print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            else:
+                print(json.dumps(payload, sort_keys=True, indent=2))
+            return 0
+        if args.command == "install":
+            config, plan, _ = _load_config(args.repository, args.env)
+            if not args.yes:
+                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
+                raise ConfigError("install requires --yes after reviewing the plan")
+            docker = _docker_for(config)
+            if config.install_profile == "compose-existing":
+                state = ComposeInstaller(docker).install(config, plan, args.repository)
+            else:
+                state = UnraidInstaller(docker).install(config, plan, args.repository)
+            payload = state.to_dict()
+            _print_payload(payload, compact=args.json)
+            return 0
+        if args.command == "adopt":
+            config, plan, _ = _load_config(args.repository, args.env)
+            docker = _docker_for(config)
+            if config.install_profile == "compose-existing":
+                state = ComposeAdopter(docker).adopt(config, plan)
+            else:
+                state = UnraidAdopter(docker).adopt(config, plan)
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "auth-snippet":
+            config, plan, _ = _load_config(args.repository, args.env)
+            print(render_authentik_edge(config, plan).content, end="")
+            return 0
+        if args.command == "doctor":
+            config, plan, _ = _load_config(
+                args.repository, args.env, allow_legacy_cwa=True
+            )
+            report = DeploymentDoctor(_docker_for(config)).run(config, plan)
+            _print_payload(report.to_dict(), compact=args.json)
+            return 0 if report.ok else 1
+        if args.command == "uninstall":
+            config, plan, _ = _load_config(
+                args.repository, args.env, allow_legacy_cwa=True
+            )
+            if not args.yes:
+                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
+                raise ConfigError("uninstall requires --yes after reviewing ownership")
+            state = RuntimeUninstaller(_docker_for(config)).uninstall(config, plan)
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "upgrade":
+            config, plan, values = _load_config(
+                args.repository, args.env, allow_legacy_cwa=True
+            )
+            if not args.yes:
+                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
+                raise ConfigError("upgrade requires --yes after reviewing the plan")
+            state = LegacyUpgrade(_docker_for(config)).upgrade(
+                config,
+                plan,
+                args.repository,
+                values,
+            )
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "rollback":
+            config, plan, _ = _load_config(
+                args.repository,
+                args.env,
+                allow_legacy_cwa=True,
+                validate_legacy_data=False,
+            )
+            if not args.yes:
+                raise ConfigError("rollback requires --yes")
+            state = LegacyUpgrade(_docker_for(config)).rollback(config, plan)
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        raise ConfigError("unsupported command")
+    except ConfigError as exc:
+        print(f"btctl: configuration error: {exc}", file=sys.stderr)
+        return EX_USAGE
+    except (InstallError, DockerCommandError, OSError) as exc:
+        print(f"btctl: deployment failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

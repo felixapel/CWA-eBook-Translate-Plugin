@@ -372,7 +372,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_release_reuses_every_required_ci_contract(self):
         workflow = GITEA_RELEASE.read_text()
         for command in (
-            "python3 -m py_compile btctl btctl_core.py btctl_compose.py btctl_docker.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py",
+            "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py",
             "python3 test_translation.py",
             "python3 test_hardening.py",
             "test_btctl_auth test_btctl_lifecycle",
@@ -385,6 +385,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             'docker build -t "$SMOKE_IMAGE" .',
             './scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
             './scripts/btctl-lifecycle-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
+            './scripts/btctl-bootstrap-smoke.sh "$SMOKE_PREFIX"',
         ):
             self.assertIn(command, workflow)
 

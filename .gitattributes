@@ -12,4 +12,6 @@
 *.yaml text eol=lf
 *.json text eol=lf
 Dockerfile text eol=lf
+Dockerfile.btctl text eol=lf
+btctl text eol=lf
 VERSION text eol=lf

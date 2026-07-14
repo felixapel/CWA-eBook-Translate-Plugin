@@ -1,248 +1,449 @@
-#!/usr/bin/env python3
-"""Source-only lifecycle CLI for CWA Translate deployments."""
+#!/usr/bin/env bash
+set -euo pipefail
 
-from __future__ import annotations
+# This public dispatcher keeps the normal Python path fast while allowing a
+# stock Unraid host to run the same CLI through a short-lived local image.
 
-import argparse
-import json
-import os
-import stat
-import sys
-from pathlib import Path
+EX_USAGE=64
+EX_NOPERM=77
+SCRIPT_DIR="$(CDPATH= cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DOCKER_BIN="${BTCTL_DOCKER_BIN:-docker}"
+HOST_LOCK_DIRECTORY=/run/cwa-translate-btctl-locks
 
-from btctl_auth import render_authentik_edge
-from btctl_core import (
-    ConfigError,
-    DeploymentPlan,
-    InstallConfig,
-    parse_env_text,
-    release_identity_from_checkout,
+fail() {
+    local status="$1"
+    shift
+    printf 'btctl: %s\n' "$*" >&2
+    exit "$status"
+}
+
+native_tools_are_compatible() {
+    command -v python3 >/dev/null 2>&1 \
+        && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+            >/dev/null 2>&1 \
+        && command -v git >/dev/null 2>&1 \
+        && git --version >/dev/null 2>&1
+}
+
+if [ "${BTCTL_FORCE_CONTAINER:-0}" != "1" ] && native_tools_are_compatible; then
+    unset BTCTL_EXPECTED_REVISION BTCTL_OPERATOR_REVISION BTCTL_LOCK_DIRECTORY
+    exec python3 "$SCRIPT_DIR/btctl.py" "$@"
+fi
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    fail "$EX_NOPERM" \
+        "the containerized Unraid path must run as root (compatible host Python 3.11+ and Git were not both available)"
+fi
+command -v "$DOCKER_BIN" >/dev/null 2>&1 \
+    || fail 1 "Docker is required for the stock-Unraid bootstrap"
+[ -S /var/run/docker.sock ] \
+    || fail 1 "the local Docker socket /var/run/docker.sock is unavailable"
+unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+export DOCKER_HOST=unix:///var/run/docker.sock
+"$DOCKER_BIN" version --format '{{.Server.Version}}' >/dev/null 2>&1 \
+    || fail 1 "the Docker daemon is unavailable"
+
+repository="$SCRIPT_DIR"
+repository_argument=0
+env_file=""
+command=""
+help_requested=0
+arguments=("$@")
+
+for ((index = 0; index < ${#arguments[@]}; index += 1)); do
+    argument="${arguments[$index]}"
+    case "$argument" in
+        --repository)
+            ((index += 1))
+            [ "$index" -lt "${#arguments[@]}" ] \
+                || fail "$EX_USAGE" "--repository requires one path"
+            repository="${arguments[$index]}"
+            repository_argument=1
+            ;;
+        --repository=*)
+            repository="${argument#--repository=}"
+            repository_argument=1
+            ;;
+        --env)
+            ((index += 1))
+            [ "$index" -lt "${#arguments[@]}" ] \
+                || fail "$EX_USAGE" "--env requires one path"
+            env_file="${arguments[$index]}"
+            ;;
+        --env=*)
+            env_file="${argument#--env=}"
+            ;;
+        plan|install|adopt|auth-snippet|doctor|uninstall|upgrade|rollback)
+            if [ -z "$command" ]; then
+                command="$argument"
+            fi
+            ;;
+        -h|--help)
+            help_requested=1
+            ;;
+    esac
+done
+
+operator_arguments=("${arguments[@]}")
+if [ "$repository_argument" -eq 0 ]; then
+    operator_arguments=(--repository "$SCRIPT_DIR" "${operator_arguments[@]}")
+fi
+
+canonical_existing_file() {
+    local candidate="$1"
+    local label="$2"
+    local parent base canonical
+    [ "${candidate#/}" != "$candidate" ] \
+        || fail "$EX_USAGE" "$label must be an absolute path"
+    [ ! -L "$candidate" ] && [ -f "$candidate" ] \
+        || fail "$EX_USAGE" "$label must be one real regular file"
+    parent="$(CDPATH= cd -P -- "$(dirname -- "$candidate")" && pwd -P)" \
+        || fail "$EX_USAGE" "$label parent could not be resolved"
+    base="$(basename -- "$candidate")"
+    canonical="$parent/$base"
+    [ "$canonical" = "$candidate" ] \
+        || fail "$EX_USAGE" "$label must use one canonical path without symbolic components"
+    case "$canonical" in
+        *','*|*$'\n'*|*$'\r'*|*$'\t'*)
+            fail "$EX_USAGE" "$label contains a character unsupported by Docker --mount"
+            ;;
+    esac
+    printf '%s\n' "$canonical"
+}
+
+prepare_host_lock_directory() {
+    if [ ! -e "$HOST_LOCK_DIRECTORY" ]; then
+        if ! mkdir -m 0700 -- "$HOST_LOCK_DIRECTORY" 2>/dev/null \
+            && [ ! -d "$HOST_LOCK_DIRECTORY" ]; then
+            fail 1 "the Unraid lifecycle lock directory could not be created"
+        fi
+    fi
+    [ -d "$HOST_LOCK_DIRECTORY" ] && [ ! -L "$HOST_LOCK_DIRECTORY" ] \
+        || fail 1 "the Unraid lifecycle lock directory must be one real directory"
+    [ "$(stat -c '%u:%a' -- "$HOST_LOCK_DIRECTORY")" = "0:700" ] \
+        || fail 1 "the Unraid lifecycle lock directory must be root-owned mode 0700"
+}
+
+source_exporter_dockerfile() {
+    printf '%s\n' \
+        'FROM python:3.11-alpine@sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4 AS source-exporter' \
+        'RUN apk add --no-cache \' \
+        '    brotli-libs=1.2.0-r1 \' \
+        '    c-ares=1.34.8-r0 \' \
+        '    git=2.54.0-r0 \' \
+        '    git-init-template=2.54.0-r0 \' \
+        '    libcurl=8.21.0-r0 \' \
+        '    libexpat=2.8.2-r0 \' \
+        '    libidn2=2.3.8-r0 \' \
+        '    libpsl=0.21.5-r3 \' \
+        '    libunistring=1.4.2-r0 \' \
+        '    nghttp2-libs=1.69.0-r0 \' \
+        '    pcre2=10.47-r1 \' \
+        '    zstd-libs=1.5.7-r2'
+}
+
+[ "$repository" = "$SCRIPT_DIR" ] \
+    || fail "$EX_USAGE" \
+        "the stock-Unraid fallback requires --repository to be this btctl checkout"
+[ -d "$SCRIPT_DIR/.git" ] && [ ! -L "$SCRIPT_DIR/.git" ] \
+    || fail "$EX_USAGE" "the stock-Unraid fallback requires a full Git checkout"
+case "$SCRIPT_DIR" in
+    *','*|*$'\n'*|*$'\r'*|*$'\t'*)
+        fail "$EX_USAGE" "repository path contains a character unsupported by Docker --mount"
+        ;;
+esac
+
+if [ -n "$env_file" ]; then
+    env_file="$(canonical_existing_file "$env_file" "environment file")"
+fi
+
+case "$command" in
+    install|adopt|doctor|uninstall|upgrade|rollback)
+        prepare_host_lock_directory
+        ;;
+esac
+
+temporary="$(mktemp -d "${TMPDIR:-/tmp}/btctl-bootstrap.XXXXXX")" \
+    || fail 1 "could not create a private bootstrap directory"
+chmod 700 "$temporary"
+exporter_image=""
+operator_image=""
+bootstrap_tag="${temporary##*.}"
+exporter_ref="local/cwa-translate-btctl-exporter:bootstrap-${bootstrap_tag}"
+operator_ref="local/cwa-translate-btctl-operator:bootstrap-${bootstrap_tag}"
+exporter_tagged=0
+operator_tagged=0
+
+cleanup() {
+    local status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$operator_tagged" -eq 1 ]; then
+        "$DOCKER_BIN" image rm "$operator_ref" >/dev/null 2>&1 || true
+    fi
+    if [ "$exporter_tagged" -eq 1 ]; then
+        "$DOCKER_BIN" image rm "$exporter_ref" >/dev/null 2>&1 || true
+    fi
+    rm -rf -- "$temporary"
+    exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+
+printf 'btctl: preparing the local stock-Unraid operator image\n' >&2
+source_exporter_dockerfile | "$DOCKER_BIN" build \
+    --pull=false \
+    --target source-exporter \
+    --tag "$exporter_ref" \
+    --iidfile "$temporary/exporter.iid" \
+    --file - \
+    "$temporary" >&2 \
+    || fail 1 "source exporter image could not be built"
+exporter_tagged=1
+exporter_image="$(<"$temporary/exporter.iid")"
+[[ "$exporter_image" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail 1 "Docker returned an invalid source exporter image ID"
+[ "$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$exporter_ref")" = "$exporter_image" ] \
+    || fail 1 "source exporter tag does not resolve to the built image"
+
+git_environment=(
+    --env GIT_NO_REPLACE_OBJECTS=1
+    --env GIT_OPTIONAL_LOCKS=0
+    --env GIT_CONFIG_NOSYSTEM=1
+    --env GIT_CONFIG_GLOBAL=/dev/null
+    --env GIT_CONFIG_COUNT=3
+    --env GIT_CONFIG_KEY_0=safe.directory
+    --env "GIT_CONFIG_VALUE_0=$SCRIPT_DIR"
+    --env GIT_CONFIG_KEY_1=core.fsmonitor
+    --env GIT_CONFIG_VALUE_1=false
+    --env GIT_CONFIG_KEY_2=core.untrackedCache
+    --env GIT_CONFIG_VALUE_2=false
 )
-from btctl_compose import ComposeAdopter, ComposeInstaller, InstallError
-from btctl_docker import DockerCLI, DockerCommandError
-from btctl_lifecycle import (
-    DeploymentDoctor,
-    LegacyUpgrade,
-    RuntimeUninstaller,
+readonly_runtime=(
+    --rm
+    --user 0:0
+    --network none
+    --read-only
+    --pids-limit 64
+    --cap-drop ALL
+    --cap-add DAC_READ_SEARCH
+    --security-opt no-new-privileges:true
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m
 )
-from btctl_unraid import UnraidAdopter, UnraidInstaller
+repository_mount=(
+    --mount "type=bind,src=$SCRIPT_DIR,dst=$SCRIPT_DIR,readonly"
+)
 
+"$DOCKER_BIN" run \
+    "${readonly_runtime[@]}" \
+    "${git_environment[@]}" \
+    "${repository_mount[@]}" \
+    "$exporter_image" \
+    /bin/sh -ec '
+        repository="$1"
+        top="$(git -C "$repository" rev-parse --show-toplevel)"
+        test "$top" = "$repository"
+        git -C "$repository" ls-files --error-unmatch VERSION >/dev/null
+        test ! -L "$repository/VERSION"
+        revision="$(git -C "$repository" rev-parse HEAD)"
+        test -z "$(git -C "$repository" status --porcelain=v1 --untracked-files=all)"
+        version="$(tr -d "\r\n" < "$repository/VERSION")"
+        python3 -c '\''import re,sys; valid_revision=re.fullmatch(r"[0-9a-f]{40}",sys.argv[1]); valid_version=re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",sys.argv[2]); raise SystemExit(0 if valid_revision and valid_version else 65)'\'' "$revision" "$version"
+        printf "%s\n%s\n" "$revision" "$version"
+    ' sh "$SCRIPT_DIR" >"$temporary/identity" \
+    || fail "$EX_USAGE" "installation requires one exact clean Git checkout"
 
-EX_USAGE = 64
+mapfile -t identity <"$temporary/identity"
+[ "${#identity[@]}" -eq 2 ] \
+    || fail 1 "source exporter returned an invalid identity"
+revision="${identity[0]}"
+version="${identity[1]}"
+[[ "$revision" =~ ^[0-9a-f]{40}$ ]] \
+    || fail 1 "source exporter returned an invalid revision"
 
+"$DOCKER_BIN" run \
+    "${readonly_runtime[@]}" \
+    "${git_environment[@]}" \
+    "${repository_mount[@]}" \
+    "$exporter_image" \
+    /bin/sh -ec '
+        repository="$1"
+        expected="$2"
+        test "$(git -C "$repository" rev-parse HEAD)" = "$expected"
+        test -z "$(git -C "$repository" status --porcelain=v1 --untracked-files=all)"
+        exec git -C "$repository" archive --format=tar "$expected"
+    ' sh "$SCRIPT_DIR" "$revision" \
+| "$DOCKER_BIN" build \
+    --pull=false \
+    --target operator \
+    --build-arg "BTCTL_SOURCE_REVISION=$revision" \
+    --build-arg "BTCTL_SOURCE_VERSION=$version" \
+    --label "io.cwa-translate.btctl.revision=$revision" \
+    --label "io.cwa-translate.btctl.version=$version" \
+    --tag "$operator_ref" \
+    --iidfile "$temporary/operator.iid" \
+    --file Dockerfile.btctl \
+    - >&2 \
+    || fail 1 "verified operator image could not be built"
+operator_tagged=1
+operator_image="$(<"$temporary/operator.iid")"
+[[ "$operator_image" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail 1 "Docker returned an invalid operator image ID"
+[ "$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$operator_ref")" = "$operator_image" ] \
+    || fail 1 "operator tag does not resolve to the built image"
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="btctl",
-        description="Plan and manage a source-only CWA Translate installation.",
-    )
-    parser.add_argument(
-        "--repository",
-        type=Path,
-        default=Path(__file__).resolve().parent,
-        help="clean CWA Translate Git checkout (default: this checkout)",
-    )
-    commands = parser.add_subparsers(dest="command", required=True)
-    plan = commands.add_parser("plan", help="validate and print a mutation-free plan")
-    plan.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
-    plan.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    install = commands.add_parser("install", help="build and install the validated plan")
-    install.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
-    install.add_argument(
-        "--yes",
-        action="store_true",
-        help="acknowledge the displayed source and resource identities",
-    )
-    install.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    adopt = commands.add_parser("adopt", help="recover state for an existing labeled split runtime")
-    adopt.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
-    adopt.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    auth_snippet = commands.add_parser(
-        "auth-snippet",
-        help="print the reviewed Authentik edge fragment without mutating state",
-    )
-    auth_snippet.add_argument(
-        "--env", required=True, type=Path, help="strict KEY=value file"
-    )
-    doctor = commands.add_parser(
-        "doctor", help="read-only verification of state, ownership, auth, and runtime"
-    )
-    doctor.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
-    doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    uninstall = commands.add_parser(
-        "uninstall", help="remove only owned runtime while preserving data and backups"
-    )
-    uninstall.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
-    uninstall.add_argument("--yes", action="store_true", help="confirm runtime removal")
-    uninstall.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    upgrade = commands.add_parser(
-        "upgrade", help="offline migration from one exact stopped v2.1.4 runtime"
-    )
-    upgrade.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
-    upgrade.add_argument("--yes", action="store_true", help="confirm the migration cutover")
-    upgrade.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    rollback = commands.add_parser(
-        "rollback", help="remove v2.2 roles and restart the journaled v2.1.4 runtime"
-    )
-    rollback.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
-    rollback.add_argument("--yes", action="store_true", help="confirm rollback")
-    rollback.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    return parser
+operator_revision="$(
+    "$DOCKER_BIN" image inspect \
+        --format '{{index .Config.Labels "io.cwa-translate.btctl.revision"}}' \
+        "$operator_image"
+)" || fail 1 "operator image identity could not be inspected"
+[ "$operator_revision" = "$revision" ] \
+    || fail 1 "operator image revision does not match the verified checkout"
 
+operator_environment=(
+    --env HOME=/tmp/home
+    --env DOCKER_CONFIG=/tmp/docker
+    --env PYTHONDONTWRITEBYTECODE=1
+    --env "BTCTL_EXPECTED_REVISION=$revision"
+    "${git_environment[@]}"
+)
 
-def _load_values(env_file: Path) -> dict[str, str]:
-    descriptor: int | None = None
-    try:
-        if env_file.is_symlink():
-            raise ConfigError("environment file must not be a symbolic link")
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(env_file, flags)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise ConfigError("environment file must be one regular private file")
-        if metadata.st_mode & 0o077:
-            raise ConfigError(
-                "environment file must use private mode 0600 or stricter"
+run_operator_without_plan() {
+    "$DOCKER_BIN" run \
+        "${readonly_runtime[@]}" \
+        "${operator_environment[@]}" \
+        "${repository_mount[@]}" \
+        "$operator_image" \
+        "$@"
+}
+
+if [ "$help_requested" -eq 1 ] || [ -z "$command" ] || [ -z "$env_file" ]; then
+    run_operator_without_plan "${operator_arguments[@]}"
+    exit $?
+fi
+
+planner_mounts=("${repository_mount[@]}")
+planner_mounts+=(--mount "type=bind,src=$env_file,dst=$env_file,readonly")
+if [ -d /mnt ]; then
+    planner_mounts+=(--mount type=bind,src=/mnt,dst=/mnt,readonly)
+fi
+if [ -d /boot ]; then
+    planner_mounts+=(--mount type=bind,src=/boot,dst=/boot,readonly)
+fi
+
+"$DOCKER_BIN" run \
+    "${readonly_runtime[@]}" \
+    "${operator_environment[@]}" \
+    "${planner_mounts[@]}" \
+    --entrypoint python3 \
+    "$operator_image" \
+    /opt/btctl/btctl_container.py \
+    --repository "$SCRIPT_DIR" \
+    --env "$env_file" \
+    --command "$command" \
+    --expected-revision "$revision" >"$temporary/mount-plan" \
+    || fail "$EX_USAGE" "the Unraid mount plan was rejected"
+
+final_mounts=()
+socket_required=0
+socket_records=0
+lock_records=0
+line_number=0
+validate_planned_path() {
+    local candidate="$1"
+    [ "${candidate#/}" != "$candidate" ] && [ "$candidate" != "/" ] \
+        || fail 1 "mount planner emitted a non-absolute path"
+    case "$candidate" in
+        *','*|*$'\n'*|*$'\r'*|*$'\t'*)
+            fail 1 "mount planner emitted an unsafe Docker mount path"
+            ;;
+    esac
+}
+while IFS=$'\t' read -r record first second fourth; do
+    ((line_number += 1))
+    if [ "$line_number" -eq 1 ]; then
+        [ "$record" = "BTCTL_MOUNT_PLAN" ] \
+            && [ "$first" = "1" ] \
+            && [ "$second" = "$command" ] \
+            && [ "$fourth" = "unraid" ] \
+            || fail 1 "mount planner emitted an invalid header"
+        continue
+    fi
+    case "$record:$first" in
+        mount:ro)
+            [ -z "$fourth" ] || fail 1 "mount planner emitted an invalid mount record"
+            [ -n "$second" ] || fail 1 "mount planner emitted an empty path"
+            validate_planned_path "$second"
+            final_mounts+=(--mount "type=bind,src=$second,dst=$second,readonly")
+            ;;
+        mount:rw)
+            [ -z "$fourth" ] || fail 1 "mount planner emitted an invalid mount record"
+            [ -n "$second" ] || fail 1 "mount planner emitted an empty path"
+            validate_planned_path "$second"
+            final_mounts+=(--mount "type=bind,src=$second,dst=$second")
+            ;;
+        lock:ro)
+            [ -n "$second" ] || fail 1 "mount planner emitted an empty lock source"
+            validate_planned_path "$second"
+            [ "$second" = "$HOST_LOCK_DIRECTORY" ] \
+                || fail 1 "mount planner emitted an invalid lock source"
+            [ "$fourth" = "/run/btctl-lock" ] \
+                || fail 1 "mount planner emitted an invalid lock destination"
+            final_mounts+=(
+                --mount "type=bind,src=$second,dst=$fourth,readonly"
             )
-        if metadata.st_size > 1024 * 1024:
-            raise ConfigError("environment file exceeds the 1 MiB safety limit")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            descriptor = None
-            source = handle.read()
-    except ConfigError:
-        raise
-    except (OSError, UnicodeError) as exc:
-        raise ConfigError("configuration file could not be read") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    return parse_env_text(source)
+            operator_environment+=(--env "BTCTL_LOCK_DIRECTORY=$fourth")
+            ((lock_records += 1))
+            ;;
+        socket:yes)
+            [ -z "$fourth" ] || fail 1 "mount planner emitted an invalid socket record"
+            [ -z "$second" ] || fail 1 "mount planner emitted an invalid socket record"
+            socket_required=1
+            ((socket_records += 1))
+            ;;
+        socket:no)
+            [ -z "$fourth" ] || fail 1 "mount planner emitted an invalid socket record"
+            [ -z "$second" ] || fail 1 "mount planner emitted an invalid socket record"
+            ((socket_records += 1))
+            ;;
+        *)
+            fail 1 "mount planner emitted an unsupported record"
+            ;;
+    esac
+done <"$temporary/mount-plan"
+[ "$line_number" -ge 2 ] || fail 1 "mount planner emitted an incomplete plan"
+[ "$socket_records" -eq 1 ] || fail 1 "mount planner emitted an invalid socket policy"
+case "$command:$socket_required" in
+    plan:0|auth-snippet:0|install:1|adopt:1|doctor:1|uninstall:1|upgrade:1|rollback:1) ;;
+    *) fail 1 "mount planner emitted an invalid command socket policy" ;;
+esac
+case "$command:$lock_records" in
+    plan:0|auth-snippet:0|install:1|adopt:1|doctor:1|uninstall:1|upgrade:1|rollback:1) ;;
+    *) fail 1 "mount planner emitted an invalid lifecycle lock policy" ;;
+esac
 
-
-def _load_plan(repository: Path, env_file: Path) -> DeploymentPlan:
-    identity = release_identity_from_checkout(repository)
-    values = _load_values(env_file)
-    legacy_upgrade_plan = bool(
-        values.get("BT_LEGACY_CONTAINER") and values.get("BT_LEGACY_DATA_DIR")
+final_runtime=(
+    --rm
+    --user 0:0
+    --network none
+    --read-only
+    --pids-limit 128
+    --cap-drop ALL
+    --cap-add CHOWN
+    --cap-add DAC_OVERRIDE
+    --cap-add FOWNER
+    --cap-add FSETID
+    --security-opt no-new-privileges:true
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m
+    --tmpfs /run:rw,nosuid,nodev,noexec,size=16m
+)
+if [ "$socket_required" -eq 1 ]; then
+    final_mounts+=(
+        --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock
     )
-    config = InstallConfig.from_mapping(
-        values, identity, allow_legacy_cwa=legacy_upgrade_plan
-    )
-    return DeploymentPlan.from_config(config)
+fi
 
-
-def _load_config(
-    repository: Path,
-    env_file: Path,
-    *,
-    allow_legacy_cwa: bool = False,
-) -> tuple[InstallConfig, DeploymentPlan, dict[str, str]]:
-    values = _load_values(env_file)
-    identity = release_identity_from_checkout(repository)
-    config = InstallConfig.from_mapping(
-        values, identity, allow_legacy_cwa=allow_legacy_cwa
-    )
-    return config, DeploymentPlan.from_config(config), values
-
-
-def _print_payload(payload: dict[str, object], *, compact: bool) -> None:
-    print(
-        json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":") if compact else None,
-            indent=None if compact else 2,
-        )
-    )
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = _parser()
-    try:
-        args = parser.parse_args(argv)
-        if args.command == "plan":
-            payload = _load_plan(args.repository, args.env).to_dict()
-            if args.json:
-                print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-            else:
-                print(json.dumps(payload, sort_keys=True, indent=2))
-            return 0
-        if args.command == "install":
-            config, plan, _ = _load_config(args.repository, args.env)
-            if not args.yes:
-                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
-                raise ConfigError("install requires --yes after reviewing the plan")
-            docker = DockerCLI()
-            if config.install_profile == "compose-existing":
-                state = ComposeInstaller(docker).install(config, plan, args.repository)
-            else:
-                state = UnraidInstaller(docker).install(config, plan, args.repository)
-            payload = state.to_dict()
-            _print_payload(payload, compact=args.json)
-            return 0
-        if args.command == "adopt":
-            config, plan, _ = _load_config(args.repository, args.env)
-            docker = DockerCLI()
-            if config.install_profile == "compose-existing":
-                state = ComposeAdopter(docker).adopt(config, plan)
-            else:
-                state = UnraidAdopter(docker).adopt(config, plan)
-            _print_payload(state.to_dict(), compact=args.json)
-            return 0
-        if args.command == "auth-snippet":
-            config, plan, _ = _load_config(args.repository, args.env)
-            print(render_authentik_edge(config, plan).content, end="")
-            return 0
-        if args.command == "doctor":
-            config, plan, _ = _load_config(
-                args.repository, args.env, allow_legacy_cwa=True
-            )
-            report = DeploymentDoctor(DockerCLI()).run(config, plan)
-            _print_payload(report.to_dict(), compact=args.json)
-            return 0 if report.ok else 1
-        if args.command == "uninstall":
-            config, plan, _ = _load_config(
-                args.repository, args.env, allow_legacy_cwa=True
-            )
-            if not args.yes:
-                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
-                raise ConfigError("uninstall requires --yes after reviewing ownership")
-            state = RuntimeUninstaller(DockerCLI()).uninstall(config, plan)
-            _print_payload(state.to_dict(), compact=args.json)
-            return 0
-        if args.command == "upgrade":
-            config, plan, values = _load_config(
-                args.repository, args.env, allow_legacy_cwa=True
-            )
-            if not args.yes:
-                print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
-                raise ConfigError("upgrade requires --yes after reviewing the plan")
-            state = LegacyUpgrade(DockerCLI()).upgrade(
-                config,
-                plan,
-                args.repository,
-                values,
-            )
-            _print_payload(state.to_dict(), compact=args.json)
-            return 0
-        if args.command == "rollback":
-            config, plan, _ = _load_config(
-                args.repository, args.env, allow_legacy_cwa=True
-            )
-            if not args.yes:
-                raise ConfigError("rollback requires --yes")
-            state = LegacyUpgrade(DockerCLI()).rollback(config, plan)
-            _print_payload(state.to_dict(), compact=args.json)
-            return 0
-        raise ConfigError("unsupported command")
-    except ConfigError as exc:
-        print(f"btctl: configuration error: {exc}", file=sys.stderr)
-        return EX_USAGE
-    except (InstallError, DockerCommandError, OSError) as exc:
-        print(f"btctl: deployment failed: {exc}", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+"$DOCKER_BIN" run \
+    "${final_runtime[@]}" \
+    "${operator_environment[@]}" \
+    "${final_mounts[@]}" \
+    "$operator_image" \
+    "${operator_arguments[@]}"

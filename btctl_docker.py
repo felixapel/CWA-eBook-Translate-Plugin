@@ -94,10 +94,17 @@ class DockerCLI:
         revision = labels.get("io.cwa-translate.revision", "")
         if not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise DockerCommandError("image build requires one exact source revision")
+        git_environment = os.environ.copy()
+        git_environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+        git_environment["GIT_OPTIONAL_LOCKS"] = "0"
         try:
             archive = subprocess.run(
                 [
                     "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.untrackedCache=false",
                     "-C",
                     str(repository),
                     "archive",
@@ -107,6 +114,7 @@ class DockerCLI:
                 check=False,
                 capture_output=True,
                 timeout=120,
+                env=git_environment,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise DockerCommandError("Git archive could not be executed") from exc

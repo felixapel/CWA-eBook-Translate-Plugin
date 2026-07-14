@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -7,6 +8,8 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
+
+from btctl import _docker_for
 
 from btctl_core import (
     ConfigError,
@@ -19,11 +22,12 @@ from btctl_core import (
     compatibility_tier,
     parse_env_text,
     redact_mapping,
+    release_identity_from_checkout,
 )
 
 
 ROOT = Path(__file__).parent
-BTCTL = ROOT / "btctl"
+BTCTL = ROOT / "btctl.py"
 
 
 class ReleaseIdentityTests(unittest.TestCase):
@@ -41,6 +45,91 @@ class ReleaseIdentityTests(unittest.TestCase):
             ReleaseIdentity.from_checkout(version="2.2.0", sha="a" * 40, clean=False)
         with self.assertRaisesRegex(ConfigError, "VERSION"):
             ReleaseIdentity.from_checkout(version="latest", sha="a" * 40, clean=True)
+
+    def test_replacement_ref_cannot_substitute_another_tree_for_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+
+            def git(*arguments: str) -> str:
+                return subprocess.run(
+                    ["git", *arguments],
+                    cwd=repository,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            git("init", "-b", "main")
+            git("config", "user.name", "Replacement Test")
+            git("config", "user.email", "replacement@example.invalid")
+            (repository / "VERSION").write_text("2.2.0\n", encoding="utf-8")
+            (repository / "payload.txt").write_text("canonical\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-m", "canonical")
+            canonical = git("rev-parse", "HEAD")
+
+            (repository / "payload.txt").write_text("replacement\n", encoding="utf-8")
+            git("add", "payload.txt")
+            replacement_tree = git("write-tree")
+            replacement = subprocess.run(
+                ["git", "commit-tree", replacement_tree],
+                cwd=repository,
+                check=True,
+                input="replacement\n",
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            git("replace", canonical, replacement)
+            git("reset", "--hard", canonical)
+            self.assertEqual(git("status", "--porcelain=v1"), "")
+
+            with self.assertRaisesRegex(ConfigError, "clean checkout"):
+                release_identity_from_checkout(repository)
+
+
+class DockerEnvironmentTests(unittest.TestCase):
+    def test_unraid_native_path_forces_the_local_socket(self):
+        config = mock.Mock(install_profile="unraid")
+        with tempfile.TemporaryDirectory() as directory:
+            lock_directory = Path(directory) / "lock"
+            socket_metadata = mock.Mock(st_mode=stat.S_IFSOCK)
+            lock_metadata = mock.Mock(
+                st_mode=stat.S_IFDIR | 0o700,
+                st_uid=0,
+            )
+
+            def metadata(path: Path):
+                if path == Path("/var/run/docker.sock"):
+                    return socket_metadata
+                self.assertEqual(path, lock_directory)
+                return lock_metadata
+
+            with (
+                mock.patch("btctl.os.geteuid", return_value=0),
+                mock.patch("btctl._UNRAID_LOCK_DIRECTORY", lock_directory),
+                mock.patch("btctl.Path.lstat", autospec=True, side_effect=metadata),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "DOCKER_HOST": "tcp://remote.example:2376",
+                        "DOCKER_CONTEXT": "remote",
+                        "DOCKER_TLS_VERIFY": "1",
+                        "DOCKER_CERT_PATH": "/tmp/certs",
+                    },
+                    clear=False,
+                ),
+            ):
+                _docker_for(config)
+
+                self.assertEqual(
+                    os.environ["DOCKER_HOST"], "unix:///var/run/docker.sock"
+                )
+                self.assertEqual(
+                    os.environ["BTCTL_LOCK_DIRECTORY"], str(lock_directory)
+                )
+                self.assertNotIn("DOCKER_CONTEXT", os.environ)
+                self.assertNotIn("DOCKER_TLS_VERIFY", os.environ)
+                self.assertNotIn("DOCKER_CERT_PATH", os.environ)
 
 
 class OperationLockTests(unittest.TestCase):
@@ -65,6 +154,26 @@ class OperationLockTests(unittest.TestCase):
 
             self.assertFalse(state_dir.exists())
             self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_container_lock_mount_serializes_without_exposing_state_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_directory = root / "mounted-lock-parent"
+            lock_directory.mkdir()
+            first_state = root / "first-parent" / "state"
+            second_state = root / "second-parent" / "state"
+
+            with mock.patch.dict(
+                os.environ,
+                {"BTCTL_LOCK_DIRECTORY": str(lock_directory)},
+            ):
+                with OperationLock(first_state):
+                    with self.assertRaisesRegex(ConfigError, "already in progress"):
+                        with OperationLock(second_state):
+                            self.fail("the dedicated container lock was bypassed")
+
+            self.assertFalse(first_state.exists())
+            self.assertFalse(second_state.exists())
 
 
 class InstallConfigTests(unittest.TestCase):
@@ -611,6 +720,60 @@ class CLIPlanTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(result.returncode, 64)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_container_operator_rejects_checkout_revision_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repo"
+            repository.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main"], cwd=repository, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "btctl test"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "btctl@example.invalid"],
+                cwd=repository,
+                check=True,
+            )
+            (repository / "VERSION").write_text("2.2.0\n", encoding="utf-8")
+            subprocess.run(["git", "add", "VERSION"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "fixture"],
+                cwd=repository,
+                check=True,
+            )
+            env_file = Path(directory) / "bad.env"
+            env_file.write_text("BT_AUTH_PROFILE=disabled\n", encoding="utf-8")
+            env_file.chmod(0o600)
+            environment = {
+                **os.environ,
+                "BTCTL_EXPECTED_REVISION": "0" * 40,
+                "BTCTL_OPERATOR_REVISION": "0" * 40,
+            }
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(BTCTL),
+                    "--repository",
+                    str(repository),
+                    "plan",
+                    "--env",
+                    str(env_file),
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 64)
+            self.assertIn("revision", result.stderr)
             self.assertNotIn("Traceback", result.stderr)
 
     def test_cli_rejects_symlinked_or_group_readable_environment_files(self):

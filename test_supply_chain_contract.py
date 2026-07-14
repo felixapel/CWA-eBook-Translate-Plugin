@@ -27,6 +27,7 @@ BASE_IMAGE = (
     "python:3.11-alpine@"
     "sha256:25976e9d34a0fab1f278cae931f34c8303d97bf0c0d7f85b6b4dcf641d7702a4"
 )
+OPERATOR_DOCKERFILE = ROOT / "Dockerfile.btctl"
 NODE_VERSION = "24.18.0"
 APK_PACKAGES = {
     "libgomp": "15.2.0-r5",
@@ -84,6 +85,70 @@ class SupplyChainContractTests(unittest.TestCase):
         self.assertIsNotNone(apk_add)
         installed = dict(token.split("=", 1) for token in apk_add.group(1).split())
         self.assertEqual(installed, APK_PACKAGES)
+
+    def test_operator_image_uses_reviewed_pinned_inputs(self):
+        dockerfile = OPERATOR_DOCKERFILE.read_text()
+        dispatcher = (ROOT / "btctl").read_text()
+        self.assertEqual(
+            dockerfile.splitlines()[0], f"FROM {BASE_IMAGE} AS source-exporter"
+        )
+        flattened = dockerfile.replace("\\\n", " ")
+        additions = re.findall(r"RUN apk add --no-cache\s+([^\n]+)", flattened)
+        self.assertEqual(len(additions), 3)
+        installed = {
+            token.split("=", 1)[0]: token.split("=", 1)[1]
+            for addition in additions
+            for token in addition.split()
+        }
+        self.assertEqual(installed["git"], "2.54.0-r0")
+        self.assertEqual(installed["docker-cli"], "29.5.3-r0")
+        self.assertEqual(installed["docker-cli-buildx"], "0.34.1-r0")
+        self.assertEqual(installed["bash"], "5.3.9-r1")
+        self.assertTrue(all("=" in token for addition in additions for token in addition.split()))
+        self.assertIn(BASE_IMAGE, dispatcher)
+        for package, version in installed.items():
+            if package not in {"docker-cli", "docker-cli-buildx", "bash"}:
+                self.assertIn(f"{package}={version}", dispatcher)
+        self.assertNotIn("pip install", dockerfile)
+        self.assertNotIn("COPY . ", dockerfile)
+        self.assertNotIn("COPY *.py", dockerfile)
+        for source in (
+            "btctl.py",
+            "btctl_container.py",
+            "btctl_paths.py",
+            "VERSION",
+            "deploy/unraid/my-cwa-translate-api.xml.tmpl",
+            "deploy/unraid/my-cwa-translate-proxy.xml.tmpl",
+        ):
+            self.assertIn(source, dockerfile)
+
+    def test_embedded_exporter_is_exactly_the_reviewed_socket_free_stage(self):
+        dockerfile = OPERATOR_DOCKERFILE.read_text()
+        dispatcher = (ROOT / "btctl").read_text()
+        function = re.search(
+            r"(?ms)^source_exporter_dockerfile\(\) \{\n(?P<body>.*?)^\}",
+            dispatcher,
+        )
+        self.assertIsNotNone(function)
+        embedded_lines = []
+        for line in function.group("body").splitlines():
+            literal = re.fullmatch(r"\s*'(?P<text>.*)'(?: \\)?", line)
+            if literal:
+                embedded_lines.append(literal.group("text"))
+        embedded = "\n".join(embedded_lines) + "\n"
+
+        exporter_stage = dockerfile.split(
+            "\nFROM source-exporter AS operator", 1
+        )[0]
+        reviewed = "\n".join(
+            line
+            for line in exporter_stage.splitlines()
+            if line and not line.startswith("#")
+        ) + "\n"
+
+        self.assertEqual(embedded, reviewed)
+        for forbidden in ("COPY ", "ADD ", "ENTRYPOINT", "CMD "):
+            self.assertNotIn(forbidden, embedded)
 
     def test_runtime_copy_inputs_are_exact_files_not_open_directories(self):
         dockerfile = (ROOT / "Dockerfile").read_text()

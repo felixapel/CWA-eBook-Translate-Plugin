@@ -15,7 +15,17 @@ browser/reverse proxy -> cwa-translate-proxy -> stock CWA
 
 ## What you need
 
-- Run these commands in a clean release checkout on the Unraid host.
+- Keep a full Git checkout, including its `.git` directory, on the Unraid host
+  and run commands from that exact clean release commit. A release ZIP or
+  tarball by itself cannot prove the commit identity and is not supported.
+- Stock Unraid needs Bash and a working Docker daemon. It does not require host Python or NerdTools.
+  Host Git is not required to execute `./btctl`; if it is
+  absent, Claude Code or another Git-capable machine may prepare the exact
+  checkout and copy the complete directory, including `.git`, to Unraid.
+- Obtain the checkout and its public `btctl` launcher from the trusted Gitea
+  repository/commit. The launcher plus its embedded pinned exporter definition
+  are the bootstrap trust root; no self-check can make an arbitrary malicious
+  root script safe to execute.
 - Run as `root`; the API image writes as uid `101`, gid `102` and `btctl`
   creates its appdata directory with those exact owners.
 - Use an exact CWA image tag such as
@@ -38,6 +48,10 @@ install -d -m 0700 /mnt/user/appdata/cwa-translate
 cp .env.example /mnt/user/appdata/cwa-translate/install.env
 chmod 0600 /mnt/user/appdata/cwa-translate/install.env
 ```
+
+`/mnt/user/appdata` and `/mnt/user/backups` must already exist as Unraid user
+shares. For a named pool, `/mnt/<pool>` must already exist. `btctl` refuses a
+misspelled `/mnt/user/<share>` instead of creating an unintended share.
 
 Edit the copy. A typical local-provider configuration has:
 
@@ -93,7 +107,8 @@ credential before forwarding to CWA.
 
 ## Plan and install
 
-First validate without changing the filesystem or Docker:
+First validate without changing deployment state, data, CWA, or running
+containers:
 
 ```bash
 ./btctl plan --env /mnt/user/appdata/cwa-translate/install.env
@@ -109,10 +124,36 @@ ownership. Then run either command:
 ./install_unraid.sh /mnt/user/appdata/cwa-translate/install.env
 ```
 
-Docker may fetch the digest-pinned public Python/Alpine base image during the
-local build. It never pulls a CWA Translate project image. The resulting image
-name is `local/cwa-translate:<version>-<sha12>` and both roles must resolve to
-the same full image ID.
+On a host without Python 3.11+, `./btctl` automatically builds a short-lived
+source exporter from the launcher's embedded pinned definition and a separate
+operator image containing Python, Git, and the Docker CLI. No unverified
+checkout Dockerfile is used to create the exporter. The exporter receives the
+checkout read-only and never receives the Docker socket. It disables Git
+replacement refs, verifies the clean full commit, and streams a Git archive
+into the exact operator build. Only that verified operator receives the
+command-specific paths and, when required, the Docker socket. `plan` and
+`auth-snippet` receive no socket.
+
+This bootstrap may fetch the digest-pinned public Python/Alpine base image,
+creates and removes temporary helper images, and can warm Docker's build cache,
+including during the first `plan`. It never pulls a CWA Translate project image
+and does not change deployment files or runtime resources during `plan`. The
+production image remains separate and runs both roles as uid `101`, gid `102`;
+it contains none of the operator's Git or Docker administration tools. Its name
+is `local/cwa-translate:<version>-<sha12>` and both roles must resolve to the
+same full image ID.
+
+If Python 3.11+ exists but host Git does not, the same fallback is selected;
+installing an unrelated Python plugin cannot make the documented path depend
+on Git accidentally. Lifecycle commands share an empty root-owned lock under
+`/run/cwa-translate-btctl-locks`, preventing concurrent native/containerized
+mutations without mounting the surrounding appdata into the operator.
+
+The Docker socket is equivalent to root access. For that reason the fallback
+launcher is root-only, mounts only the paths required by the selected command,
+forces the local Unix socket at `/var/run/docker.sock` instead of honoring a
+remote Docker context, and never exposes the socket to the source exporter or
+to socket-free commands.
 
 The API has no `PortBindings`. In `published` mode only the proxy maps
 `BT_PROXY_PORT` to container port `8080`. In `docker-edge` mode neither role is
@@ -177,6 +218,10 @@ and snapshot:
 ./btctl rollback --env /mnt/user/appdata/cwa-translate/install.env --yes
 ```
 
+The two `BT_LEGACY_*` values are upgrade inputs. Rollback reads the authoritative
+legacy data path from the private migration journal, so stale or removed legacy
+path fields in the environment cannot redirect restoration.
+
 The manual sequence in [RELEASE.md](RELEASE.md) remains historical/operator
 reference; `btctl upgrade` is the supported v2.1.4 path.
 
@@ -224,8 +269,11 @@ rejected.
 
 ## Failure behavior
 
-Name/template collisions, missing networks, stopped or unversioned CWA, and
-invalid configuration stop before the image build. A later startup failure
-removes only the newly created proxy, API, and private network, in that order.
-CWA, external networks, appdata, environment files, and backups are preserved;
-`state.json` is not written.
+An invalid checkout stops before any operator gets the Docker socket. Because
+the stock-host fallback must first create the verified parser environment,
+invalid deployment configuration can still leave ordinary Docker build cache;
+it does not create deployment state or runtime resources. Name/template
+collisions, missing networks, and stopped or unversioned CWA stop before the
+production image build. A later startup failure removes only the newly created
+proxy, API, and private network, in that order. CWA, external networks, appdata,
+environment files, and backups are preserved; `state.json` is not written.

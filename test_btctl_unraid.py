@@ -390,9 +390,16 @@ class DockerCLIContractTests(unittest.TestCase):
 
         archive_arguments = run.call_args_list[0].args[0]
         build_arguments = run.call_args_list[1].args[0]
+        self.assertEqual(archive_arguments[0], "git")
+        self.assertIn("core.fsmonitor=false", archive_arguments)
+        self.assertIn("core.untrackedCache=false", archive_arguments)
         self.assertEqual(
-            archive_arguments,
-            ["git", "-C", "/checkout", "archive", "--format=tar", "a" * 40],
+            archive_arguments[-5:],
+            ["-C", "/checkout", "archive", "--format=tar", "a" * 40],
+        )
+        self.assertEqual(
+            run.call_args_list[0].kwargs["env"]["GIT_NO_REPLACE_OBJECTS"],
+            "1",
         )
         self.assertEqual(build_arguments[0:2], ["docker", "build"])
         self.assertEqual(build_arguments[-1], "-")

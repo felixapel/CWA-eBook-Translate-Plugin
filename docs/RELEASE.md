@@ -46,18 +46,23 @@ build/runtime smoke test. No workflow step receives a publication credential.
 2. Update `VERSION`, `package.json`, both package-lock version fields,
    `BT_UI_VERSION`, both `?v=` values in `overlay/read.html`, and move the
    Changelog entries from `Unreleased` into a dated version section.
-3. Run the maintained local gate:
+3. Commit the complete candidate so `HEAD`, `VERSION`, and every archived build
+   input identify one clean immutable revision. Do not run the bootstrap smoke
+   against uncommitted release edits.
+4. Run the maintained local gate:
 
    ```bash
    .venv/bin/python -m py_compile \
-     btctl btctl_core.py btctl_compose.py btctl_docker.py btctl_unraid.py \
-     btctl_auth.py btctl_lifecycle.py \
+     btctl.py btctl_container.py btctl_core.py btctl_compose.py \
+     btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py \
      auth.py server.py translator.py cache.py singleflight.py work_budget.py \
      proxy/render_config.py scripts/release_preflight.py
+   bash -n btctl scripts/*.sh
    .venv/bin/python test_translation.py
    .venv/bin/python test_hardening.py
    .venv/bin/python -m unittest -v \
-     test_btctl test_btctl_compose test_btctl_unraid test_btctl_auth \
+     test_btctl test_btctl_container test_btctl_compose test_btctl_unraid \
+     test_btctl_auth \
      test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 \
      test_context_cache test_singleflight test_auth test_ci_contract \
      test_install_docs test_release_contract test_supply_chain_contract \
@@ -78,11 +83,12 @@ build/runtime smoke test. No workflow step receives a publication credential.
    ./scripts/container-smoke.sh "$CANDIDATE_IMAGE" "cwa-release-$CANDIDATE_SHA"
    ./scripts/btctl-lifecycle-smoke.sh \
      "$CANDIDATE_IMAGE" "cwa-release-$CANDIDATE_SHA"
+   ./scripts/btctl-bootstrap-smoke.sh "cwa-bootstrap-$CANDIDATE_SHA"
    ```
 
-4. Record the maintainer self-review, merge through protected Gitea, and wait
+5. Record the maintainer self-review, merge through protected Gitea, and wait
    for all required checks on the exact merged `main` commit.
-5. Fast-forward the GitHub mirror and verify both `main` refs resolve to that
+6. Fast-forward the GitHub mirror and verify both `main` refs resolve to that
    exact commit.
 
 For the v1-to-v2 cache transition, `test_cache_v2` is a release blocker. It

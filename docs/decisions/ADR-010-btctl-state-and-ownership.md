@@ -23,7 +23,11 @@ durable record of what the installer may later change.
   SHA. The local image name is `local/cwa-translate:<version>-<sha12>`; mutable
   tags such as `latest` are not part of the managed path.
 - `plan` is deterministic, redacts credential-like values, and performs no
-  filesystem or Docker mutation.
+  deployment-file, state, CWA, or runtime-resource mutation. On stock Unraid,
+  the containerized bootstrap accepted by
+  [ADR-011](ADR-011-containerized-unraid-bootstrap.md) may build/remove
+  temporary helper images and warm ordinary Docker build cache before the plan
+  can run.
 - State is schema-versioned JSON written atomically with mode `0600` in a
   private `0700` directory. New state and backup directory entries are fsynced
   through every newly created parent before runtime mutation, and the containing
