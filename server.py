@@ -19,7 +19,12 @@ from urllib.parse import urlsplit
 from flask import Flask, request, jsonify
 from werkzeug.exceptions import HTTPException
 
-from auth import AuthRejected, AuthUnavailable, RequestAuthenticator
+from auth import (
+    AuthRejected,
+    AuthUnavailable,
+    CwaSessionBinding,
+    RequestAuthenticator,
+)
 from translator import (
     translate_text, translate_batch, check_backend_health,
     BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
@@ -485,6 +490,71 @@ def _client_ip() -> str:
     return peer
 
 
+def _clean_single_ip(value: object) -> str:
+    """Validate one IP while preserving the exact text CWA fingerprints."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or value != value.strip()
+        or "," in value
+        or "%" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise AuthRejected("authentication rejected")
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        raise AuthRejected("authentication rejected") from None
+    return value
+
+
+def _cwa_session_binding() -> CwaSessionBinding:
+    """Reconstruct CWA's login-time peer context from an authenticated path.
+
+    X-Forwarded-For is authentication material here, not merely routing
+    metadata. Only one managed DNS peer or an exact /32 or /128 allowlist
+    entry may supply it. The legacy BT_TRUST_PROXY rate-limit switch never
+    grants that authority.
+    """
+    peer_text = _clean_single_ip(request.remote_addr or "")
+    peer = ipaddress.ip_address(peer_text)
+    exact_networks = tuple(
+        network
+        for network in _TRUSTED_PROXY_NETS
+        if network.prefixlen == network.max_prefixlen
+    )
+    explicit_proxy_authority = bool(BT_TRUSTED_PROXY_HOST or exact_networks)
+    peer_is_exact_proxy = any(peer in network for network in exact_networks)
+    if BT_TRUSTED_PROXY_HOST:
+        peer_is_exact_proxy = peer_is_exact_proxy or peer in (
+            _resolved_trusted_proxy_addresses()
+        )
+
+    if "X-Forwarded-For" in request.headers:
+        if not peer_is_exact_proxy:
+            raise AuthRejected("authentication rejected")
+        cwa_remote_addr = _clean_single_ip(
+            request.headers.get("X-Forwarded-For", "")
+        )
+    else:
+        # A managed proxy must always overwrite XFF. Falling back to its socket
+        # address would destroy a strong session and could cache a false verdict.
+        if explicit_proxy_authority:
+            raise AuthRejected("authentication rejected")
+        cwa_remote_addr = peer_text
+
+    user_agent = (
+        request.headers.get("User-Agent")
+        if "User-Agent" in request.headers
+        else None
+    )
+    return CwaSessionBinding(
+        cwa_remote_addr=cwa_remote_addr,
+        user_agent=user_agent,
+    )
+
+
 def _check_window_rate_limit(
     store: dict[str, list[float]], ip: str, limit: int
 ) -> bool:
@@ -836,8 +906,13 @@ def before_request_hook():
             return response, 429
         try:
             try:
+                auth_kwargs = {}
+                if AUTHENTICATOR.mode == "cwa_session":
+                    auth_kwargs["cwa_binding"] = _cwa_session_binding()
                 identity = AUTHENTICATOR.authenticate(
-                    request.headers, request.remote_addr
+                    request.headers,
+                    request.remote_addr,
+                    **auth_kwargs,
                 )
             except AuthRejected:
                 _record_outcome("auth_rejected")

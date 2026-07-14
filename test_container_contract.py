@@ -72,11 +72,23 @@ class ContainerContractTests(unittest.TestCase):
             "fastcgi_temp_path /tmp/nginx/fastcgi_temp;",
             "uwsgi_temp_path /tmp/nginx/uwsgi_temp;",
             "scgi_temp_path /tmp/nginx/scgi_temp;",
-            "access_log /dev/stdout;",
+            "access_log /dev/stdout bt_privacy;",
             "error_log /dev/stderr warn;",
             "include /tmp/nginx/proxy.conf;",
         ):
             self.assertIn(directive, config)
+        self.assertIn("log_format bt_privacy", config)
+        for sensitive_value in (
+            "$remote_addr",
+            "$http_user_agent",
+            "$http_cookie",
+            "$http_referer",
+            "$request_uri",
+            "$query_string",
+            "$args",
+        ):
+            self.assertNotIn(sensitive_value, config)
+        self.assertNotRegex(config, r"\$request(?:\s|['\"])")
         self.assertNotRegex(config, r"(?m)^\s*user\s+")
 
     def test_proxy_backend_connections_have_a_bounded_timeout(self):
@@ -103,6 +115,11 @@ class ContainerContractTests(unittest.TestCase):
         self.assertEqual(
             template.count("proxy_set_header X-Forwarded-For $remote_addr;"), 2
         )
+        self.assertEqual(
+            template.count("proxy_set_header User-Agent $http_user_agent;"), 2
+        )
+        self.assertNotIn("$proxy_add_x_forwarded_for", template)
+        self.assertNotIn("$http_x_forwarded_for", template)
         self.assertIn("proxy/render_config.py", entrypoint)
         self.assertNotIn("envsubst", entrypoint)
         self.assertIn(

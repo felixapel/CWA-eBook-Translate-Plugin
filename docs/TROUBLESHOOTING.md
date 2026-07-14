@@ -68,6 +68,26 @@ The default profile accepts a native CWA session, not merely an Authentik edge
 cookie. Sign out and back into CWA, then verify the browser sends the CWA
 session cookie to the same public origin.
 
+CWA with `config_session=1` binds that session to both the address it observed
+at login and the browser `User-Agent`. The managed v2.2 proxy deliberately
+overwrites `X-Forwarded-For` with one observed address on the CWA and API paths,
+and the API replays that same address and `User-Agent` to the auth probe. Check
+that all reader traffic—including login—uses the managed proxy, that no other
+proxy rewrites `User-Agent` between those paths, and that the API has no direct
+public/LAN bypass. A configured managed proxy with missing, chained, malformed,
+or untrusted `X-Forwarded-For` fails closed with `401` before contacting CWA.
+`BT_TRUST_PROXY=true` cannot authorize this header.
+
+The certified CWA v4.0.6 topology uses its default
+`TRUSTED_PROXY_COUNT=1`. A custom value makes CWA select a different address
+from the forwarding chain and can invalidate every strong session; restore the
+default or validate that custom topology separately before relying on it.
+
+If the installed checkout predates this strong-session fix, rebuild both roles
+from the current exact commit before testing again. Do not work around the
+problem with `BT_AUTH_MODE=disabled`; that removes the API authentication
+boundary instead of repairing it.
+
 If Authentik authenticates the browser but CWA never creates a session that its
 `/ajax/emailstat` endpoint accepts, use the separate
 `authentik-forwarded` topology in [AUTHENTIK.md](AUTHENTIK.md). Do not switch to

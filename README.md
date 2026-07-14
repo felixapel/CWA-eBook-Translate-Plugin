@@ -100,7 +100,11 @@ In normal `published` mode, only the injection proxy gets a host port; the API
 does not. Read CWA through that proxy port or point the existing domain's main
 route at it. Keep OPDS/Kobo routes pointed directly at CWA. The default
 `cwa-session` profile validates the existing HttpOnly CWA session and places no
-translator credential in JavaScript or `localStorage`.
+translator credential in JavaScript or `localStorage`. It supports CWA's
+`config_session=1` strong session protection by replaying the browser's exact
+`User-Agent` and the single client address observed by the managed proxy. This
+certified topology uses CWA's default `TRUSTED_PROXY_COUNT=1`; custom hop counts
+change the address CWA binds into the session and require separate validation.
 
 Use the guide for your host:
 
@@ -177,12 +181,12 @@ legacy integrations.
 | `BT_CWA_IDENTITY_HEADER` | `Remote-User` | Header CWA is configured to trust for reverse-proxy login. The bundled injection proxy always strips this client-supplied credential before forwarding to CWA because it is not an identity authority. If CWA uses a custom header name, set the same exact name here; leaving them mismatched can permit header-forgery login through a directly exposed proxy. Use a separate identity-aware proxy and the documented `forwarded` API mode when header-based SSO is required. |
 | `BT_AUTH_MODE` | `token` | Authentication authority: `cwa_session` (recommended proxy topology), `forwarded` (identity-aware reverse proxy), `token` (shared-secret compatibility), or development-only `disabled`. The default fails startup unless `BT_API_TOKEN` is present. Disabled mode additionally requires `BT_ALLOW_INSECURE_AUTH=true`. `/ping`, `/health`, and `/ready` stay unauthenticated; every other route is protected. |
 | `BT_ALLOW_INSECURE_AUTH` | `false` | Required second acknowledgement for `BT_AUTH_MODE=disabled`. Never enable it in production. |
-| `BT_CWA_AUTH_URL` | | Required for `cwa_session`, e.g. `http://calibre-web:8083/ajax/emailstat`. Only that exact path is accepted. The API forwards selected cookies, refuses redirects, and requires CWA's bounded JSON task-list response; it returns `503` when the authority cannot be evaluated. |
+| `BT_CWA_AUTH_URL` | | Required for `cwa_session`, e.g. `http://calibre-web:8083/ajax/emailstat`. Only that exact path is accepted. The API forwards selected cookies plus the validated login-time address/User-Agent context, refuses redirects, and requires CWA's bounded JSON task-list response; it returns `503` when the authority cannot be evaluated. |
 | `BT_CWA_AUTH_COOKIE_NAMES` | `session,remember_token` | CWA cookie names allowed to leave the API for the configured auth probe. All other browser cookies are dropped. |
 | `BT_CWA_AUTH_TIMEOUT_SECONDS` | `2` | Bounded CWA session-probe timeout. |
-| `BT_CWA_AUTH_CACHE_TTL_SECONDS` | `15` | Short positive/negative validation-cache TTL. Keys are one-way session hashes; raw cookies are never cached or logged. |
+| `BT_CWA_AUTH_CACHE_TTL_SECONDS` | `15` | Short positive/negative validation-cache TTL. Decisions are keyed by a one-way digest of the session and its address/User-Agent context, so one context cannot poison another. Raw cookies, addresses, and User-Agents are never retained in the cache or emitted by the authentication layer; the managed proxy access log also omits client context and URLs. |
 | `BT_CWA_AUTH_CACHE_MAX_ENTRIES` | `10000` | Maximum cached session-validation decisions. Oldest entries are evicted. |
-| `BT_CWA_AUTH_MAX_INFLIGHT` | `8` | Maximum distinct CWA probes active at once; concurrent checks of the same session are coalesced. Saturation fails closed with `503`. |
+| `BT_CWA_AUTH_MAX_INFLIGHT` | `8` | Maximum distinct CWA probes active at once; concurrent checks of the same session context are coalesced. Saturation fails closed with `503`. |
 | `BT_CWA_AUTH_MAX_RESPONSE_BYTES` | `262144` | Maximum decompressed bytes read from the CWA auth probe before JSON parsing. Oversized responses fail closed with `503`. |
 | `BT_IDENTITY_TRUSTED_PROXIES` | | Required for `forwarded`. Comma-separated CIDRs/IPs allowed to set `X-BT-Subject` and optional `X-BT-Roles`; direct client headers are rejected. The subject is hashed before use as a tenant. The identity proxy must strip client-supplied copies before setting its own and be the API's immediate peer. The bundled injection proxy deliberately strips these headers and is not an identity authority; route `/bt-api` directly through the allowlisted identity proxy with no public bypass. |
 | `BT_AUTH_RATE_LIMIT_PER_MINUTE` | `300` | Separate per-client limit for protected-route authentication attempts, including rejected credentials and observability endpoints. |
@@ -216,8 +220,9 @@ legacy integrations.
 | `BT_MAX_UPSTREAM_RESPONSE_BYTES` | `1048576` (1 MiB) | Maximum decompressed JSON bytes accepted from one provider call. Responses are streamed and aborted at the boundary before JSON materialization; providers that ignore `max_tokens` cannot grow memory/cache without limit. |
 | `BT_RATE_LIMIT_PER_MINUTE` | `120` | Max successful API requests per opaque authenticated subject per 60s window before the API returns `429`. Authentication attempts have the separate client-keyed limit above. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | Seconds reported in the `Retry-After` header / response body on a `429`. The frontend reads this and backs off automatically. |
-| `BT_TRUST_PROXY` | `false` | **Legacy/dev only.** When `true`, the API uses the **last** `X-Forwarded-For` hop from any peer for pre-auth client admission. A direct client can spoof it, so do not rely on this in production — prefer `BT_TRUSTED_PROXIES` below. It never changes the post-auth subject quota. |
-| `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** observed-client source for low-level deployments. Comma-separated CIDRs/IPs of exact peers allowed to set `X-Forwarded-For`; the last hop keys pre-auth attempt/inflight admission. Managed installs never trust a Docker subnet implicitly. Successful API work is always keyed by the opaque authenticated subject. |
+| `BT_TRUST_PROXY` | `false` | **Legacy/dev rate-limit compatibility only.** When `true`, the API uses the **last** `X-Forwarded-For` hop from any peer for pre-auth client admission. A direct client can spoof it. It never grants CWA-session authentication authority and never changes the post-auth subject quota. |
+| `BT_TRUSTED_PROXIES` | (empty) | **Production-safe** observed-client source for low-level deployments. Comma-separated CIDRs/IPs whose peers may supply the last `X-Forwarded-For` hop for pre-auth admission. In `cwa_session`, only an exact `/32` or `/128` entry may supply the single login-time address; broad CIDRs are deliberately ignored for authentication. Successful API work is keyed by the opaque authenticated subject. |
+| `BT_TRUSTED_PROXY_HOST` | (empty) | Managed `cwa_session` DNS authority for one immediate injection-proxy container. When set, that resolved peer must overwrite `X-Forwarded-For` with one clean IP on every protected request; missing, chained, malformed, or bypassed values fail with `401`. `btctl` sets this automatically—do not use a public hostname or a Docker subnet. |
 | `BT_ALLOWED_ORIGINS` | `http://localhost:8083,http://localhost:8383` | Comma-separated exact origins allowed for CORS (bind-mount installs; irrelevant in proxy mode, which is same-origin). Add your public reader URL here, e.g. `https://books.example.com`. |
 | `BT_ALLOW_PRIVATE_LAN` | `true` | Additionally allow localhost/RFC1918 origins (`10.*`, `192.168.*`, `172.16-31.*`) on any port for non-cookie modes. `cwa_session` always ignores this broad grant: credentialed cross-origin requests require an exact `BT_ALLOWED_ORIGINS` entry and receive `Access-Control-Allow-Credentials: true`. Same-origin proxy mode needs neither. |
 | `BT_CACHE_TTL_DAYS` | `90` | Mandatory maximum age for cached translations. Expired rows are never served and are removed during normal writes/stats/cleanup. Must be greater than zero. |
@@ -316,7 +321,9 @@ Authentication-derived tenant behavior is intentional:
 
 - `cwa_session` isolates by the current session hash. Logging out/re-authenticating
   creates a cold tenant because CWA v4.0.6 does not expose a stable supported
-  current-user JSON identity at this boundary.
+  current-user JSON identity at this boundary. Validation decisions additionally
+  include the strong-session address/User-Agent context, but those context values
+  do not change the tenant for a valid session.
 - `forwarded` isolates by the stable subject asserted by an allowlisted identity
   proxy and is the mode to use when cache continuity across sessions matters.
 - `token` is one shared tenant. `disabled` is one anonymous tenant and must not

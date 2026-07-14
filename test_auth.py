@@ -6,6 +6,7 @@ import threading
 import time
 import os
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 import requests
@@ -14,8 +15,10 @@ from auth import (
     AuthConfigError,
     AuthRejected,
     AuthUnavailable,
+    CwaSessionBinding,
     RequestAuthenticator,
 )
+from test_cwa_strong_fixture import create_cwa_strong_app, session_cookie_from
 
 os.environ.setdefault("BT_AUTH_MODE", "disabled")
 os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
@@ -225,12 +228,110 @@ class CWASessionAuthenticationTests(unittest.TestCase):
             http_get=get,
         )
 
+    @staticmethod
+    def authenticate(
+        authenticator,
+        headers,
+        remote_addr="127.0.0.1",
+        *,
+        cwa_remote_addr=None,
+        user_agent="Test-Browser/1.0",
+    ):
+        return authenticator.authenticate(
+            headers,
+            remote_addr,
+            cwa_binding=CwaSessionBinding(
+                cwa_remote_addr=cwa_remote_addr or remote_addr,
+                user_agent=user_agent,
+            ),
+        )
+
+    @staticmethod
+    def fixture_transport(client, *, remote_addr="172.30.39.4"):
+        def get(_url, *, headers, **_kwargs):
+            response = client.get(
+                "/ajax/emailstat",
+                headers=headers,
+                environ_base={"REMOTE_ADDR": remote_addr},
+            )
+            return FakeResponse(
+                status_code=response.status_code,
+                content_type=response.content_type,
+                body=response.data,
+            )
+
+        return get
+
+    def test_cwa_v406_strong_fixture_requires_address_and_user_agent(self):
+        client = create_cwa_strong_app().test_client(use_cookies=False)
+        browser_user_agent = "Regression-Browser/1.0"
+        observed_peer = "198.51.100.7"
+        login = client.get(
+            "/fixture/login",
+            headers={
+                "User-Agent": browser_user_agent,
+                "X-Forwarded-For": observed_peer,
+            },
+            environ_base={"REMOTE_ADDR": "172.30.39.3"},
+        )
+        cookie = session_cookie_from(login)
+
+        no_context = client.get(
+            "/ajax/emailstat",
+            headers={"Cookie": cookie},
+            environ_base={"REMOTE_ADDR": "172.30.39.4"},
+        )
+        matching = client.get(
+            "/ajax/emailstat",
+            headers={
+                "Cookie": cookie,
+                "User-Agent": browser_user_agent,
+                "X-Forwarded-For": observed_peer,
+            },
+            environ_base={"REMOTE_ADDR": "172.30.39.4"},
+        )
+        user_agent_only = client.get(
+            "/ajax/emailstat",
+            headers={"Cookie": cookie, "User-Agent": browser_user_agent},
+            environ_base={"REMOTE_ADDR": "172.30.39.4"},
+        )
+
+        self.assertEqual(no_context.content_type, "text/html; charset=utf-8")
+        self.assertEqual(matching.content_type, "application/json")
+        self.assertEqual(user_agent_only.content_type, "text/html; charset=utf-8")
+
+    def test_authenticator_replays_the_strong_session_binding(self):
+        client = create_cwa_strong_app().test_client(use_cookies=False)
+        browser_user_agent = "Regression-Browser/1.0"
+        observed_peer = "198.51.100.7"
+        login = client.get(
+            "/fixture/login",
+            headers={
+                "User-Agent": browser_user_agent,
+                "X-Forwarded-For": observed_peer,
+            },
+            environ_base={"REMOTE_ADDR": "172.30.39.3"},
+        )
+        cookie = session_cookie_from(login)
+        auth = self.make_auth(self.fixture_transport(client))
+
+        identity = self.authenticate(
+            auth,
+            {"Cookie": cookie},
+            "172.30.39.3",
+            cwa_remote_addr=observed_peer,
+            user_agent=browser_user_agent,
+        )
+
+        self.assertTrue(identity.subject.startswith("cwa-session:"))
+
     def test_valid_session_forwards_only_selected_cookies_without_redirects(self):
         response = FakeResponse()
         get = mock.Mock(return_value=response)
         auth = self.make_auth(get)
 
-        identity = auth.authenticate(
+        identity = self.authenticate(
+            auth,
             {"Cookie": "ignored=private; session=session-secret; remember_token=remember"},
             "172.18.0.4",
         )
@@ -242,6 +343,8 @@ class CWASessionAuthenticationTests(unittest.TestCase):
             headers={
                 "Accept": "application/json",
                 "Cookie": "session=session-secret; remember_token=remember",
+                "X-Forwarded-For": "172.18.0.4",
+                "User-Agent": "Test-Browser/1.0",
             },
             timeout=0.5,
             allow_redirects=False,
@@ -260,7 +363,7 @@ class CWASessionAuthenticationTests(unittest.TestCase):
             with self.subTest(body=response.body, content_type=response.headers["Content-Type"]):
                 auth = self.make_auth(mock.Mock(return_value=response))
                 with self.assertRaises(AuthRejected):
-                    auth.authenticate({"Cookie": "session=wrong-endpoint"}, "127.0.0.1")
+                    self.authenticate(auth, {"Cookie": "session=wrong-endpoint"})
 
     def test_success_body_is_bounded_before_json_parsing(self):
         response = FakeResponse(body=b"[{}]", content_length=2048)
@@ -268,7 +371,7 @@ class CWASessionAuthenticationTests(unittest.TestCase):
             mock.Mock(return_value=response), cwa_max_response_bytes=1024
         )
         with self.assertRaises(AuthUnavailable):
-            auth.authenticate({"Cookie": "session=oversized"}, "127.0.0.1")
+            self.authenticate(auth, {"Cookie": "session=oversized"})
         self.assertTrue(response.closed)
 
         response = FakeResponse(body=b"[" + (b" " * 1024) + b"]")
@@ -276,7 +379,7 @@ class CWASessionAuthenticationTests(unittest.TestCase):
             mock.Mock(return_value=response), cwa_max_response_bytes=1024
         )
         with self.assertRaises(AuthUnavailable):
-            auth.authenticate({"Cookie": "session=streamed-oversized"}, "127.0.0.1")
+            self.authenticate(auth, {"Cookie": "session=streamed-oversized"})
         self.assertTrue(response.closed)
 
     def test_streamed_body_has_an_absolute_deadline(self):
@@ -293,7 +396,7 @@ class CWASessionAuthenticationTests(unittest.TestCase):
         )
 
         with self.assertRaises(AuthUnavailable):
-            auth.authenticate({"Cookie": "session=slow-drip"}, "127.0.0.1")
+            self.authenticate(auth, {"Cookie": "session=slow-drip"})
 
         self.assertTrue(response.closed)
 
@@ -301,10 +404,10 @@ class CWASessionAuthenticationTests(unittest.TestCase):
         get = mock.Mock(return_value=FakeResponse(status_code=302, content_type="text/html"))
         auth = self.make_auth(get)
         with self.assertRaises(AuthRejected):
-            auth.authenticate({}, "127.0.0.1")
+            self.authenticate(auth, {})
         get.assert_not_called()
         with self.assertRaises(AuthRejected):
-            auth.authenticate({"Cookie": "session=expired"}, "127.0.0.1")
+            self.authenticate(auth, {"Cookie": "session=expired"})
 
     def test_upstream_failures_are_sanitized_as_unavailable(self):
         def failed(*_args, **_kwargs):
@@ -312,25 +415,199 @@ class CWASessionAuthenticationTests(unittest.TestCase):
 
         auth = self.make_auth(failed)
         with self.assertRaises(AuthUnavailable) as captured:
-            auth.authenticate({"Cookie": "session=secret"}, "127.0.0.1")
+            self.authenticate(auth, {"Cookie": "session=secret"})
         self.assertNotIn("private upstream detail", str(captured.exception))
 
         auth = self.make_auth(lambda *_args, **_kwargs: FakeResponse(status_code=500))
         with self.assertRaises(AuthUnavailable):
-            auth.authenticate({"Cookie": "session=secret"}, "127.0.0.1")
+            self.authenticate(auth, {"Cookie": "session=secret"})
 
     def test_validation_is_cached_but_distinct_sessions_stay_isolated(self):
         get = mock.Mock(return_value=FakeResponse())
         auth = self.make_auth(get)
-        first = auth.authenticate({"Cookie": "session=one"}, "127.0.0.1")
-        repeat = auth.authenticate({"Cookie": "session=one"}, "127.0.0.1")
-        second = auth.authenticate({"Cookie": "session=two"}, "127.0.0.1")
+        first = self.authenticate(auth, {"Cookie": "session=one"})
+        repeat = self.authenticate(auth, {"Cookie": "session=one"})
+        second = self.authenticate(auth, {"Cookie": "session=two"})
         self.assertEqual(first.subject, repeat.subject)
         self.assertNotEqual(first.subject, second.subject)
         self.assertEqual(get.call_count, 2)
 
-        auth.authenticate({"Cookie": "session=three"}, "127.0.0.1")
+        self.authenticate(auth, {"Cookie": "session=three"})
         self.assertLessEqual(auth.cache_entries, 2)
+
+    def test_validation_cache_is_scoped_to_the_strong_session_context(self):
+        def context_sensitive_get(_url, *, headers, **_kwargs):
+            if (
+                headers.get("User-Agent") == "Browser-A/1.0"
+                and headers.get("X-Forwarded-For") == "198.51.100.7"
+            ):
+                return FakeResponse()
+            return FakeResponse(status_code=302, content_type="text/html")
+
+        expected_subject = None
+        rejected_contexts = (
+            ("198.51.100.7", "Browser-B/1.0"),
+            ("198.51.100.8", "Browser-A/1.0"),
+        )
+        for rejected_addr, rejected_user_agent in rejected_contexts:
+            with self.subTest(
+                rejected_addr=rejected_addr,
+                rejected_user_agent=rejected_user_agent,
+            ):
+                positive_first = mock.Mock(side_effect=context_sensitive_get)
+                auth = self.make_auth(positive_first)
+                accepted = self.authenticate(
+                    auth,
+                    {"Cookie": "session=shared"},
+                    cwa_remote_addr="198.51.100.7",
+                    user_agent="Browser-A/1.0",
+                )
+                with self.assertRaises(AuthRejected):
+                    self.authenticate(
+                        auth,
+                        {"Cookie": "session=shared"},
+                        cwa_remote_addr=rejected_addr,
+                        user_agent=rejected_user_agent,
+                    )
+                self.assertEqual(positive_first.call_count, 2)
+
+                negative_first = mock.Mock(side_effect=context_sensitive_get)
+                auth = self.make_auth(negative_first)
+                with self.assertRaises(AuthRejected):
+                    self.authenticate(
+                        auth,
+                        {"Cookie": "session=shared"},
+                        cwa_remote_addr=rejected_addr,
+                        user_agent=rejected_user_agent,
+                    )
+                recovered = self.authenticate(
+                    auth,
+                    {"Cookie": "session=shared"},
+                    cwa_remote_addr="198.51.100.7",
+                    user_agent="Browser-A/1.0",
+                )
+                self.assertEqual(negative_first.call_count, 2)
+                expected_subject = expected_subject or accepted.subject
+                self.assertEqual(accepted.subject, expected_subject)
+                self.assertEqual(recovered.subject, expected_subject)
+
+    def test_absent_and_empty_user_agents_are_distinct_on_the_wire(self):
+        observed_user_agents = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                observed_user_agents.append(self.headers.get("User-Agent"))
+                body = b"[]"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        authority = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=authority.serve_forever, daemon=True)
+        thread.start()
+        try:
+            auth = RequestAuthenticator(
+                mode="cwa_session",
+                cwa_auth_url=(
+                    f"http://127.0.0.1:{authority.server_port}/ajax/emailstat"
+                ),
+                cwa_cache_ttl_seconds=10,
+                http_get=None,
+            )
+            absent = self.authenticate(
+                auth,
+                {"Cookie": "session=shared"},
+                user_agent=None,
+            )
+            empty = self.authenticate(
+                auth,
+                {"Cookie": "session=shared"},
+                user_agent="",
+            )
+        finally:
+            authority.shutdown()
+            authority.server_close()
+            thread.join(2)
+
+        self.assertEqual(absent.subject, empty.subject)
+        self.assertEqual(observed_user_agents, [None, ""])
+
+    def test_singleflight_coalesces_only_identical_strong_session_contexts(self):
+        lock = threading.Lock()
+        two_contexts_entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def slow_get(_url, *, headers, **_kwargs):
+            with lock:
+                calls.append(
+                    (headers.get("X-Forwarded-For"), headers.get("User-Agent"))
+                )
+                if len(calls) == 2:
+                    two_contexts_entered.set()
+            release.wait(2)
+            return FakeResponse()
+
+        auth = self.make_auth(slow_get)
+        identities = []
+        errors = []
+
+        def validate(remote_addr, user_agent):
+            try:
+                identities.append(
+                    self.authenticate(
+                        auth,
+                        {"Cookie": "session=shared"},
+                        cwa_remote_addr=remote_addr,
+                        user_agent=user_agent,
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - assertion evidence
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=validate, args=("198.51.100.7", "Browser-A/1.0")),
+            threading.Thread(target=validate, args=("198.51.100.8", "Browser-B/1.0")),
+        ]
+        for thread in threads:
+            thread.start()
+        both_entered = two_contexts_entered.wait(1)
+        release.set()
+        for thread in threads:
+            thread.join(2)
+
+        self.assertTrue(both_entered)
+        self.assertFalse(errors)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len({identity.subject for identity in identities}), 1)
+
+    def test_invalid_strong_session_bindings_fail_before_the_probe(self):
+        get = mock.Mock(return_value=FakeResponse())
+        auth = self.make_auth(get)
+        invalid_bindings = (
+            None,
+            CwaSessionBinding("198.51.100.7, 203.0.113.8", "Browser/1.0"),
+            CwaSessionBinding(" 198.51.100.7", "Browser/1.0"),
+            CwaSessionBinding("not-an-ip", "Browser/1.0"),
+            CwaSessionBinding("198.51.100.7", "Browser\rInjected"),
+            CwaSessionBinding("198.51.100.7", "Browser-☃"),
+            CwaSessionBinding("198.51.100.7", "A" * 4097),
+        )
+
+        for binding in invalid_bindings:
+            with self.subTest(binding=binding), self.assertRaises(AuthRejected):
+                auth.authenticate(
+                    {"Cookie": "session=secret"},
+                    "127.0.0.1",
+                    cwa_binding=binding,
+                )
+
+        get.assert_not_called()
 
     def test_default_transport_ignores_environment_proxies_and_closes_session(self):
         response = FakeResponse()
@@ -340,9 +617,7 @@ class CWASessionAuthenticationTests(unittest.TestCase):
         auth = self.make_auth(None)
 
         with mock.patch.object(requests, "Session", return_value=fake_session):
-            identity = auth.authenticate(
-                {"Cookie": "session=direct-only"}, "127.0.0.1"
-            )
+            identity = self.authenticate(auth, {"Cookie": "session=direct-only"})
 
         self.assertTrue(identity.subject.startswith("cwa-session:"))
         self.assertFalse(fake_session.trust_env)
@@ -368,7 +643,7 @@ class CWASessionAuthenticationTests(unittest.TestCase):
         def validate():
             try:
                 identities.append(
-                    auth.authenticate({"Cookie": "session=same"}, "127.0.0.1")
+                    self.authenticate(auth, {"Cookie": "session=same"})
                 )
             except Exception as exc:  # pragma: no cover - assertion evidence
                 errors.append(exc)
@@ -558,7 +833,7 @@ class ServerAuthenticationIntegrationTests(unittest.TestCase):
         release = threading.Event()
         authenticator = mock.Mock(mode="cwa_session")
 
-        def authenticate(_headers, _peer):
+        def authenticate(_headers, _peer, **_kwargs):
             entered.set()
             if not release.wait(2):
                 raise AssertionError("test did not release authentication")
@@ -613,6 +888,160 @@ class ServerAuthenticationIntegrationTests(unittest.TestCase):
                 environ_base={"REMOTE_ADDR": "172.30.39.4"},
             ):
                 self.assertEqual(server._client_ip(), "172.30.39.4")
+
+    @staticmethod
+    def successful_cwa_authenticator():
+        authenticator = mock.Mock(mode="cwa_session")
+        authenticator.authenticate.return_value = mock.Mock(
+            subject="cwa-session:test",
+            roles=frozenset(),
+        )
+        return authenticator
+
+    def test_cwa_session_binding_uses_the_managed_proxy_observed_peer(self):
+        authenticator = self.successful_cwa_authenticator()
+        server.AUTHENTICATOR = authenticator
+        trusted_peer = server.ipaddress.ip_address("172.30.39.3")
+
+        with mock.patch.object(server, "BT_TRUSTED_PROXY_HOST", "translator-proxy"), \
+             mock.patch.object(server, "BT_TRUSTED_PROXIES", frozenset()), \
+             mock.patch.object(server, "_TRUSTED_PROXY_NETS", ()), \
+             mock.patch.object(
+                 server,
+                 "_resolved_trusted_proxy_addresses",
+                 return_value=frozenset({trusted_peer}),
+             ):
+            response = self.client.get(
+                "/metrics",
+                headers={
+                    "Cookie": "session=secret",
+                    "User-Agent": "Regression-Browser/1.0",
+                    "X-Forwarded-For": "198.51.100.7",
+                },
+                environ_base={"REMOTE_ADDR": "172.30.39.3"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            authenticator.authenticate.call_args.kwargs["cwa_binding"],
+            CwaSessionBinding(
+                cwa_remote_addr="198.51.100.7",
+                user_agent="Regression-Browser/1.0",
+            ),
+        )
+
+    def test_cwa_session_binding_allows_an_exact_trusted_proxy_address(self):
+        authenticator = self.successful_cwa_authenticator()
+        server.AUTHENTICATOR = authenticator
+        exact_network = server.ipaddress.ip_network("172.30.39.3/32")
+
+        with mock.patch.object(server, "BT_TRUSTED_PROXY_HOST", ""), \
+             mock.patch.object(
+                 server, "BT_TRUSTED_PROXIES", frozenset({"172.30.39.3/32"})
+             ), \
+             mock.patch.object(server, "_TRUSTED_PROXY_NETS", (exact_network,)):
+            response = self.client.get(
+                "/metrics",
+                headers={
+                    "User-Agent": "Regression-Browser/1.0",
+                    "X-Forwarded-For": "198.51.100.7",
+                },
+                environ_base={"REMOTE_ADDR": "172.30.39.3"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            authenticator.authenticate.call_args.kwargs["cwa_binding"].cwa_remote_addr,
+            "198.51.100.7",
+        )
+
+    def test_cwa_session_direct_binding_rejects_spoofed_xff_and_legacy_trust(self):
+        authenticator = self.successful_cwa_authenticator()
+        server.AUTHENTICATOR = authenticator
+
+        with mock.patch.object(server, "BT_TRUSTED_PROXY_HOST", ""), \
+             mock.patch.object(server, "BT_TRUSTED_PROXIES", frozenset()), \
+             mock.patch.object(server, "_TRUSTED_PROXY_NETS", ()), \
+             mock.patch.object(server, "BT_TRUST_PROXY", True):
+            response = self.client.get(
+                "/metrics",
+                headers={"X-Forwarded-For": "203.0.113.99"},
+                environ_base={"REMOTE_ADDR": "198.51.100.55"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        authenticator.authenticate.assert_not_called()
+
+    def test_cwa_session_rejects_a_broad_rate_limit_cidr_as_auth_authority(self):
+        authenticator = self.successful_cwa_authenticator()
+        server.AUTHENTICATOR = authenticator
+        broad_network = server.ipaddress.ip_network("172.30.0.0/16")
+
+        with mock.patch.object(server, "BT_TRUSTED_PROXY_HOST", ""), \
+             mock.patch.object(
+                 server, "BT_TRUSTED_PROXIES", frozenset({"172.30.0.0/16"})
+             ), \
+             mock.patch.object(server, "_TRUSTED_PROXY_NETS", (broad_network,)):
+            response = self.client.get(
+                "/metrics",
+                headers={"X-Forwarded-For": "198.51.100.7"},
+                environ_base={"REMOTE_ADDR": "172.30.39.3"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        authenticator.authenticate.assert_not_called()
+
+    def test_cwa_session_direct_binding_uses_the_socket_peer_without_xff(self):
+        authenticator = self.successful_cwa_authenticator()
+        server.AUTHENTICATOR = authenticator
+
+        with mock.patch.object(server, "BT_TRUSTED_PROXY_HOST", ""), \
+             mock.patch.object(server, "BT_TRUSTED_PROXIES", frozenset()), \
+             mock.patch.object(server, "_TRUSTED_PROXY_NETS", ()), \
+             mock.patch.object(server, "BT_TRUST_PROXY", True):
+            response = self.client.get(
+                "/metrics",
+                headers={"User-Agent": "Direct-Browser/1.0"},
+                environ_base={"REMOTE_ADDR": "198.51.100.55"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            authenticator.authenticate.call_args.kwargs["cwa_binding"],
+            CwaSessionBinding(
+                cwa_remote_addr="198.51.100.55",
+                user_agent="Direct-Browser/1.0",
+            ),
+        )
+
+    def test_cwa_session_managed_proxy_path_fails_closed_without_clean_xff(self):
+        trusted_peer = server.ipaddress.ip_address("172.30.39.3")
+        for xff in (None, "198.51.100.7, 203.0.113.8", "not-an-ip"):
+            with self.subTest(xff=xff):
+                authenticator = self.successful_cwa_authenticator()
+                server.AUTHENTICATOR = authenticator
+                headers = {"User-Agent": "Regression-Browser/1.0"}
+                if xff is not None:
+                    headers["X-Forwarded-For"] = xff
+                with mock.patch.object(
+                    server, "BT_TRUSTED_PROXY_HOST", "translator-proxy"
+                ), mock.patch.object(
+                    server, "BT_TRUSTED_PROXIES", frozenset()
+                ), mock.patch.object(
+                    server, "_TRUSTED_PROXY_NETS", ()
+                ), mock.patch.object(
+                    server,
+                    "_resolved_trusted_proxy_addresses",
+                    return_value=frozenset({trusted_peer}),
+                ):
+                    response = self.client.get(
+                        "/metrics",
+                        headers=headers,
+                        environ_base={"REMOTE_ADDR": "172.30.39.3"},
+                    )
+
+                self.assertEqual(response.status_code, 401)
+                authenticator.authenticate.assert_not_called()
 
     def test_cwa_cookie_cors_requires_an_exact_origin(self):
         server.AUTHENTICATOR = RequestAuthenticator(

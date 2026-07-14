@@ -23,6 +23,7 @@ from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
 import requests
+from urllib3.util import SKIP_HEADER
 
 from singleflight import (
     SingleFlight,
@@ -56,6 +57,14 @@ class AuthIdentity:
     subject: str
     roles: frozenset[str]
     mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class CwaSessionBinding:
+    """Request context CWA used to bind a strong-protected session."""
+
+    cwa_remote_addr: str
+    user_agent: str | None
 
 
 def _opaque_subject(prefix: str, material: str) -> str:
@@ -102,6 +111,58 @@ def _is_safe_token(value: str) -> bool:
     )
 
 
+def _validated_cwa_binding(binding: object) -> CwaSessionBinding:
+    if not isinstance(binding, CwaSessionBinding):
+        raise AuthRejected("authentication rejected")
+
+    remote_addr = binding.cwa_remote_addr
+    if (
+        not isinstance(remote_addr, str)
+        or not remote_addr
+        or len(remote_addr) > 64
+        or remote_addr != remote_addr.strip()
+        or "," in remote_addr
+        or "%" in remote_addr
+        or any(ord(character) < 32 or ord(character) == 127 for character in remote_addr)
+    ):
+        raise AuthRejected("authentication rejected")
+    try:
+        ipaddress.ip_address(remote_addr)
+    except ValueError:
+        raise AuthRejected("authentication rejected") from None
+
+    user_agent = binding.user_agent
+    if user_agent is not None:
+        if not isinstance(user_agent, str) or any(
+            ord(character) < 32 or ord(character) == 127 for character in user_agent
+        ):
+            raise AuthRejected("authentication rejected")
+        try:
+            encoded_user_agent = user_agent.encode("latin-1", errors="strict")
+        except UnicodeEncodeError:
+            raise AuthRejected("authentication rejected") from None
+        if len(encoded_user_agent) > 4096:
+            raise AuthRejected("authentication rejected")
+
+    return binding
+
+
+def _cwa_decision_key(session_key: str, binding: CwaSessionBinding) -> str:
+    """Hash session context without retaining cookies, addresses, or user agents."""
+
+    user_agent = binding.user_agent
+    parts = (
+        bytes.fromhex(session_key),
+        binding.cwa_remote_addr.encode("ascii", errors="strict"),
+        b"\x00" if user_agent is None else b"\x01" + user_agent.encode("latin-1"),
+    )
+    digest = hashlib.sha256(b"book-translator:cwa-validation:v1\x00")
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return digest.hexdigest()
+
+
 def _validate_http_url(value: str) -> str:
     if (
         not isinstance(value, str)
@@ -131,7 +192,7 @@ def _validate_http_url(value: str) -> str:
 
 
 class _ValidationCache:
-    """Small TTL/LRU cache containing only opaque session hashes and booleans."""
+    """Small TTL/LRU cache containing only opaque decision hashes and booleans."""
 
     def __init__(self, *, ttl_seconds: float, max_entries: int) -> None:
         self.ttl_seconds = ttl_seconds
@@ -337,7 +398,11 @@ class RequestAuthenticator:
         return len(self._validation_cache)
 
     def authenticate(
-        self, headers: Mapping[str, str], remote_addr: str | None
+        self,
+        headers: Mapping[str, str],
+        remote_addr: str | None,
+        *,
+        cwa_binding: CwaSessionBinding | None = None,
     ) -> AuthIdentity:
         if self.mode == "disabled":
             return AuthIdentity("legacy-anonymous", frozenset(), self.mode)
@@ -345,7 +410,7 @@ class RequestAuthenticator:
             return self._authenticate_token(headers)
         if self.mode == "forwarded":
             return self._authenticate_forwarded(headers, remote_addr)
-        return self._authenticate_cwa_session(headers)
+        return self._authenticate_cwa_session(headers, cwa_binding)
 
     def _authenticate_token(self, headers: Mapping[str, str]) -> AuthIdentity:
         provided = _header_value(headers, "X-BT-Token")
@@ -425,22 +490,26 @@ class RequestAuthenticator:
         return cookie_header, canonical
 
     def _authenticate_cwa_session(
-        self, headers: Mapping[str, str]
+        self,
+        headers: Mapping[str, str],
+        binding: CwaSessionBinding | None,
     ) -> AuthIdentity:
+        validated_binding = _validated_cwa_binding(binding)
         cookie_header, canonical = self._selected_cookies(headers)
         session_key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        valid = self._validation_cache.get(session_key)
+        decision_key = _cwa_decision_key(session_key, validated_binding)
+        valid = self._validation_cache.get(decision_key)
         if valid is None:
             try:
                 result = self._validation_flights.run(
-                    session_key,
-                    lambda: self._probe_cwa(cookie_header),
+                    decision_key,
+                    lambda: self._probe_cwa(cookie_header, validated_binding),
                     timeout=self._cwa_timeout_seconds + 0.25,
                 )
             except (SingleFlightCapacityError, SingleFlightTimeout):
                 raise AuthUnavailable("authentication authority unavailable") from None
             valid = result.value
-            self._validation_cache.put(session_key, valid)
+            self._validation_cache.put(decision_key, valid)
         if not valid:
             raise AuthRejected("authentication rejected")
         return AuthIdentity(
@@ -449,7 +518,9 @@ class RequestAuthenticator:
             self.mode,
         )
 
-    def _probe_cwa(self, cookie_header: str) -> bool:
+    def _probe_cwa(
+        self, cookie_header: str, binding: CwaSessionBinding
+    ) -> bool:
         response = None
         session = None
         deadline = time.monotonic() + self._cwa_timeout_seconds
@@ -458,10 +529,24 @@ class RequestAuthenticator:
             if http_get is None:
                 session = requests.Session()
                 session.trust_env = False
+                if binding.user_agent is None:
+                    session.headers.pop("User-Agent", None)
                 http_get = session.get
+            probe_headers = {
+                "Accept": "application/json",
+                "Cookie": cookie_header,
+                "X-Forwarded-For": binding.cwa_remote_addr,
+            }
+            if binding.user_agent is not None:
+                probe_headers["User-Agent"] = binding.user_agent
+            elif session is not None:
+                # urllib3 otherwise synthesizes python-urllib3/<version> at
+                # write time even after Requests' default header is removed.
+                # Its public sentinel is the only way to preserve true absence.
+                probe_headers["User-Agent"] = SKIP_HEADER
             response = http_get(
                 self._cwa_auth_url,
-                headers={"Accept": "application/json", "Cookie": cookie_header},
+                headers=probe_headers,
                 timeout=self._cwa_timeout_seconds,
                 allow_redirects=False,
                 stream=True,

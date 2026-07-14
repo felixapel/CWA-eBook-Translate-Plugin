@@ -11,21 +11,27 @@ fi
 
 API_CONTAINER="${SMOKE_PREFIX}-api"
 PROXY_CONTAINER="${SMOKE_PREFIX}-proxy"
+CWA_CONTAINER="${SMOKE_PREFIX}-cwa-strong"
 EDGE_CONTAINER="${SMOKE_PREFIX}-edge"
 OUTPOST_CONTAINER="${SMOKE_PREFIX}-outpost"
 SMOKE_NETWORK="${SMOKE_PREFIX}-net"
 SMOKE_VOLUME="${SMOKE_PREFIX}-data"
 SMOKE_TOKEN="container-smoke-only-secret"
 EDGE_DIR=""
+CWA_COOKIE_JAR=""
 
 cleanup() {
     docker rm -f -v \
         "$EDGE_CONTAINER" "$OUTPOST_CONTAINER" \
-        "$PROXY_CONTAINER" "$API_CONTAINER" >/dev/null 2>&1 || true
+        "$PROXY_CONTAINER" "$API_CONTAINER" "$CWA_CONTAINER" \
+        >/dev/null 2>&1 || true
     docker volume rm -f "$SMOKE_VOLUME" >/dev/null 2>&1 || true
     docker network rm "$SMOKE_NETWORK" >/dev/null 2>&1 || true
     if [ -n "$EDGE_DIR" ]; then
         rm -rf "$EDGE_DIR"
+    fi
+    if [ -n "$CWA_COOKIE_JAR" ]; then
+        rm -f "$CWA_COOKIE_JAR"
     fi
 }
 trap cleanup EXIT
@@ -41,6 +47,33 @@ sandbox=(
     --cap-drop ALL
     --security-opt no-new-privileges:true
 )
+
+# Run a dependency-free, minimal CWA v4.0.6 strong-session model from the
+# checkout inside the candidate image. It exercises ProxyFix(x_for=1), the
+# address/User-Agent session fingerprint, and /ajax/emailstat's HTML-vs-JSON
+# contract without pulling another mutable application image into this gate.
+FIXTURE_SOURCE="$(pwd)/test_cwa_strong_fixture.py"
+test -r "$FIXTURE_SOURCE"
+docker run -d --name "$CWA_CONTAINER" --network "$SMOKE_NETWORK" \
+    "${sandbox[@]}" \
+    --mount "type=bind,src=${FIXTURE_SOURCE},dst=/fixture/test_cwa_strong_fixture.py,readonly" \
+    --entrypoint python \
+    "$SMOKE_IMAGE" /fixture/test_cwa_strong_fixture.py >/dev/null
+
+cwa_ready=false
+for _ in $(seq 1 30); do
+    if docker exec "$CWA_CONTAINER" python -c \
+        'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8083/ajax/emailstat", timeout=1).read()' \
+        >/dev/null 2>&1; then
+        cwa_ready=true
+        break
+    fi
+    sleep 1
+done
+if [ "$cwa_ready" != true ]; then
+    echo "CWA strong-session fixture did not become ready" >&2
+    exit 1
+fi
 
 if invalid_output="$(docker run --rm --network "$SMOKE_NETWORK" \
     "${sandbox[@]}" \
@@ -70,7 +103,7 @@ docker run -d --name "$API_CONTAINER" --network "$SMOKE_NETWORK" \
 docker run -d --name "$PROXY_CONTAINER" --network "$SMOKE_NETWORK" \
     "${sandbox[@]}" \
     -e BT_ROLE=proxy \
-    -e "CWA_UPSTREAM=http://${API_CONTAINER}:8390" \
+    -e "CWA_UPSTREAM=http://${CWA_CONTAINER}:8083" \
     -e "BT_API_UPSTREAM=http://${API_CONTAINER}:8390" \
     -e BT_PUBLIC_ORIGIN=https://books.example.test:8443 \
     -e BT_BROWSER_AUTH_MODE=cwa_session \
@@ -103,6 +136,8 @@ test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
 test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
     'proxy_set_header X-Forwarded-For $remote_addr;' /tmp/nginx/proxy.conf)" = "2"
 test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
+    'proxy_set_header User-Agent $http_user_agent;' /tmp/nginx/proxy.conf)" = "2"
+test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
     'proxy_set_header Remote-User "";' /tmp/nginx/proxy.conf)" = "1"
 docker exec "$PROXY_CONTAINER" grep -Fq \
     'client_max_body_size 2g;' /tmp/nginx/proxy.conf
@@ -117,6 +152,44 @@ curl -sf -H "X-BT-Token: ${SMOKE_TOKEN}" \
     "http://127.0.0.1:${API_PORT}/metrics" | grep -q '"total_requests"'
 curl -sf -H "X-BT-Token: ${SMOKE_TOKEN}" \
     "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics" | grep -q '"total_requests"'
+
+# Recreate the API in the default managed CWA-session mode, log in through the
+# exact same injection proxy, and prove that a strong session succeeds only
+# when both the proxy-observed peer and browser User-Agent are replayed. A
+# negative verdict for another User-Agent must not poison the valid context.
+docker rm -f "$API_CONTAINER" >/dev/null
+docker run -d --name "$API_CONTAINER" --network "$SMOKE_NETWORK" \
+    "${sandbox[@]}" \
+    --mount "type=volume,source=${SMOKE_VOLUME},target=/app/data" \
+    -e BT_ROLE=api \
+    -e BT_AUTH_MODE=cwa_session \
+    -e "BT_CWA_AUTH_URL=http://${CWA_CONTAINER}:8083/ajax/emailstat" \
+    -e "BT_TRUSTED_PROXY_HOST=${PROXY_CONTAINER}" \
+    -p 127.0.0.1::8390 \
+    "$SMOKE_IMAGE" >/dev/null
+API_PORT="$(docker port "$API_CONTAINER" 8390/tcp | sed 's/.*://')"
+test -n "$API_PORT"
+for _ in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:${API_PORT}/ping" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+CWA_COOKIE_JAR="$(mktemp "${TMPDIR:-/tmp}/cwa-strong-cookie.XXXXXX")"
+BROWSER_UA='Container-Smoke-Browser/1.0'
+curl -sf -c "$CWA_COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/fixture/login" \
+    | grep -q '"authenticated":true'
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -b "$CWA_COOKIE_JAR" -H 'User-Agent: Wrong-Browser/1.0' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
+curl -sf -b "$CWA_COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics" \
+    | grep -q '"total_requests"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -b "$CWA_COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${API_PORT}/metrics")" = "401"
 
 # Render the managed Authentik/Nginx edge fragment, validate it with the nginx
 # binary shipped in the candidate, and exercise a successful auth subrequest.
