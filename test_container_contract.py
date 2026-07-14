@@ -152,6 +152,21 @@ class ContainerContractTests(unittest.TestCase):
             cleanup.index('rm -rf -- "$ROOT_DIR"'),
         )
 
+    def test_lifecycle_cwa_fixture_is_literal_compilable_python(self):
+        smoke = (ROOT / "scripts" / "btctl-lifecycle-smoke.sh").read_text()
+        marker = 'cat >"$CWA_FIXTURE" <<\'PY\'\n'
+        self.assertIn(marker, smoke)
+        fixture = smoke.split(marker, 1)[1].split("\nPY\n", 1)[0]
+        compile(fixture, "cwa-lifecycle-fixture.py", "exec")
+        self.assertIn(
+            '--mount "type=bind,src=${CWA_FIXTURE},dst=/app/cwa-fixture.py,readonly"',
+            smoke,
+        )
+        self.assertIn(
+            '--entrypoint python "$CWA_IMAGE" /app/cwa-fixture.py',
+            smoke,
+        )
+
     def test_image_auth_defaults_fail_closed_and_proxy_forwards_cwa_cookie(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()

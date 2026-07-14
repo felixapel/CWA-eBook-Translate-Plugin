@@ -13,6 +13,7 @@ ROOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cwa-translate-lifecycle.XXXXXX")"
 CWA_NETWORK="${SMOKE_PREFIX}-cwa-net"
 CWA_CONTAINER="${SMOKE_PREFIX}-cwa"
 CWA_IMAGE="${SMOKE_PREFIX}-fixture-cwa:4.0.6"
+CWA_FIXTURE="$ROOT_DIR/cwa-fixture.py"
 LEGACY_IMAGE="${SMOKE_PREFIX}-fixture-legacy:2.1.4"
 LEGACY_CONTAINER="${SMOKE_PREFIX}-legacy"
 FRESH_INSTALL="${SMOKE_PREFIX}-fresh"
@@ -120,8 +121,7 @@ mkdir -m 0700 "$LEGACY_CONTEXT"
 test "$(git show v2.1.4:VERSION | tr -d '\r\n')" = "2.1.4"
 git archive --format=tar v2.1.4 | tar -xf - -C "$LEGACY_CONTEXT"
 docker build --pull=false --tag "$LEGACY_IMAGE" "$LEGACY_CONTEXT" >/dev/null
-docker run -d --name "$CWA_CONTAINER" --network "$CWA_NETWORK" \
-    --read-only --tmpfs /tmp --entrypoint python "$CWA_IMAGE" -c '
+cat >"$CWA_FIXTURE" <<'PY'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -144,7 +144,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 HTTPServer(("0.0.0.0", 8083), Handler).serve_forever()
-' >/dev/null
+PY
+chmod 0644 "$CWA_FIXTURE"
+docker run -d --name "$CWA_CONTAINER" --network "$CWA_NETWORK" \
+    --read-only --tmpfs /tmp \
+    --mount "type=bind,src=${CWA_FIXTURE},dst=/app/cwa-fixture.py,readonly" \
+    --entrypoint python "$CWA_IMAGE" /app/cwa-fixture.py >/dev/null
 for _ in $(seq 1 30); do
     if docker exec "$CWA_CONTAINER" python -c \
         'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8083/", timeout=1).close()' \
