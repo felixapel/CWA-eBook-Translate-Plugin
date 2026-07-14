@@ -117,6 +117,7 @@ def values(root: Path, *, forwarded=False):
                 "BT_AUTH_PROFILE": "authentik-forwarded",
                 "BT_IDENTITY_PROXY_IP": "172.30.50.9/32",
                 "BT_AUTHENTIK_VERSION": "2025.12.4",
+                "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
                 "BT_REVERSE_PROXY": "nginx",
             }
         )
@@ -195,6 +196,25 @@ class ComposeInstallTests(unittest.TestCase):
             self.assertEqual(state.resources["api"]["id"], "cwa-translate-test-api-id")
             self.assertEqual(state.resources["proxy"]["id"], "cwa-translate-test-proxy-id")
             self.assertEqual(os.stat(root / "state" / "deployment.compose.json").st_mode & 0o777, 0o600)
+
+    def test_forwarded_install_writes_the_exact_private_identity_edge_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, forwarded=True), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker()
+
+            state = ComposeInstaller(docker).install(config, plan, root)
+
+            artifact = root / "state" / "authentik-edge.nginx.conf"
+            self.assertTrue(artifact.is_file())
+            self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+            content = artifact.read_text(encoding="utf-8")
+            self.assertIn("proxy_set_header Cookie \"\";", content)
+            self.assertIn("X-authentik-uid $bt_authentik_uid", content)
+            self.assertIn("sha256", state.resources["identity_edge_config"])
 
     def test_failed_health_removes_owned_runtime_and_never_writes_state(self):
         with tempfile.TemporaryDirectory() as directory:

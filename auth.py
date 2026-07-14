@@ -35,6 +35,7 @@ log = logging.getLogger("book-translator.auth")
 
 _SUPPORTED_MODES = frozenset({"token", "cwa_session", "forwarded", "disabled"})
 _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+-]{0,63}$")
 
 
@@ -174,6 +175,8 @@ class RequestAuthenticator:
         cwa_auth_url: str = "",
         cwa_cookie_names: tuple[str, ...] = ("session", "remember_token"),
         identity_trusted_proxies: tuple[str, ...] = (),
+        forwarded_subject_header: str = "X-BT-Subject",
+        forwarded_roles_header: str = "X-BT-Roles",
         cwa_timeout_seconds: float = 2.0,
         cwa_cache_ttl_seconds: float = 15.0,
         cwa_cache_max_entries: int = 10_000,
@@ -249,6 +252,29 @@ class RequestAuthenticator:
             raise AuthConfigError(
                 "BT_IDENTITY_TRUSTED_PROXIES is required in forwarded mode"
             )
+        if self.mode == "forwarded" and any(
+            network.prefixlen != network.max_prefixlen
+            for network in self._identity_proxy_networks
+        ):
+            raise AuthConfigError(
+                "BT_IDENTITY_TRUSTED_PROXIES must contain only exact /32 or /128 peers"
+            )
+
+        if not isinstance(forwarded_subject_header, str) or not _HEADER_NAME_RE.fullmatch(
+            forwarded_subject_header
+        ):
+            raise AuthConfigError(
+                "BT_FORWARDED_SUBJECT_HEADER must be a bounded HTTP header name"
+            )
+        if not isinstance(forwarded_roles_header, str) or (
+            forwarded_roles_header
+            and not _HEADER_NAME_RE.fullmatch(forwarded_roles_header)
+        ):
+            raise AuthConfigError(
+                "BT_FORWARDED_ROLES_HEADER must be empty or a bounded HTTP header name"
+            )
+        self._forwarded_subject_header = forwarded_subject_header
+        self._forwarded_roles_header = forwarded_roles_header
 
     @classmethod
     def from_environment(
@@ -285,6 +311,12 @@ class RequestAuthenticator:
             cwa_auth_url=source.get("BT_CWA_AUTH_URL", ""),
             cwa_cookie_names=cookie_names,
             identity_trusted_proxies=trusted_proxies,
+            forwarded_subject_header=source.get(
+                "BT_FORWARDED_SUBJECT_HEADER", "X-BT-Subject"
+            ),
+            forwarded_roles_header=source.get(
+                "BT_FORWARDED_ROLES_HEADER", "X-BT-Roles"
+            ),
             cwa_timeout_seconds=source.get("BT_CWA_AUTH_TIMEOUT_SECONDS", "2"),
             cwa_cache_ttl_seconds=source.get("BT_CWA_AUTH_CACHE_TTL_SECONDS", "15"),
             cwa_cache_max_entries=source.get("BT_CWA_AUTH_CACHE_MAX_ENTRIES", "10000"),
@@ -330,6 +362,10 @@ class RequestAuthenticator:
     def _authenticate_forwarded(
         self, headers: Mapping[str, str], remote_addr: str | None
     ) -> AuthIdentity:
+        # The browser cookie belongs only at the identity edge. Its presence
+        # here proves that the edge did not apply the required sanitization.
+        if _header_value(headers, "Cookie"):
+            raise AuthRejected("authentication rejected")
         try:
             peer = ipaddress.ip_address(remote_addr or "")
         except ValueError:
@@ -337,7 +373,7 @@ class RequestAuthenticator:
         if not any(peer in network for network in self._identity_proxy_networks):
             raise AuthRejected("authentication rejected")
 
-        subject = _header_value(headers, "X-BT-Subject")
+        subject = _header_value(headers, self._forwarded_subject_header)
         if (
             not subject
             or subject != subject.strip()
@@ -346,7 +382,11 @@ class RequestAuthenticator:
         ):
             raise AuthRejected("authentication rejected")
 
-        roles_header = _header_value(headers, "X-BT-Roles")
+        roles_header = (
+            _header_value(headers, self._forwarded_roles_header)
+            if self._forwarded_roles_header
+            else ""
+        )
         if len(roles_header) > 2048:
             raise AuthRejected("authentication rejected")
         roles = tuple(

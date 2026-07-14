@@ -12,6 +12,9 @@
     const AUTH_MODE = ['cwa_session', 'token', 'forwarded'].includes(configuredAuthMode)
         ? configuredAuthMode
         : 'cwa_session';
+    const configuredCredentials = ['omit', 'same-origin', 'include'].includes(cfg.credentials)
+        ? cfg.credentials
+        : null;
     const TRANSLATOR_URL = (cfg.apiUrl && cfg.apiUrl.length)
         ? cfg.apiUrl
         : (window.location.protocol === 'https:' ? null : `http://${window.location.hostname}:8390`);
@@ -894,12 +897,17 @@
             const headers = { 'Content-Type': 'application/json' };
             if (AUTH_MODE === 'token' && cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken;
             const scope = translationScope();
+            const requestCredentials = configuredCredentials || (
+                AUTH_MODE === 'forwarded'
+                    ? 'include'
+                    : (AUTH_MODE === 'cwa_session'
+                        ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
+                        : 'omit')
+            );
             const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
                 headers,
-                credentials: AUTH_MODE === 'cwa_session'
-                    ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
-                    : 'omit',
+                credentials: requestCredentials,
                 body: JSON.stringify({
                     paragraphs: texts,
                     source_lang: SOURCE_LANG,

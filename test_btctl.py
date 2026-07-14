@@ -91,6 +91,7 @@ class InstallConfigTests(unittest.TestCase):
             "BT_AUTH_PROFILE": "authentik-forwarded",
             "BT_IDENTITY_PROXY_IP": "172.30.50.9/32",
             "BT_AUTHENTIK_VERSION": "2025.12.4",
+            "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
             "BT_REVERSE_PROXY": "nginx",
         }
 
@@ -119,6 +120,7 @@ class InstallConfigTests(unittest.TestCase):
                         "BT_AUTH_PROFILE": "authentik-forwarded",
                         "BT_IDENTITY_PROXY_IP": peer,
                         "BT_AUTHENTIK_VERSION": "2025.12.4",
+                        "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
                         "BT_REVERSE_PROXY": "traefik",
                     },
                     self.identity,
@@ -134,6 +136,7 @@ class InstallConfigTests(unittest.TestCase):
                     "BT_AUTH_PROFILE": "authentik-forwarded",
                     "BT_IDENTITY_PROXY_IP": "2001:db8::9/128",
                     "BT_AUTHENTIK_VERSION": "2025.10.3",
+                    "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
                     "BT_REVERSE_PROXY": "caddy",
                 },
                 self.identity,
@@ -157,6 +160,7 @@ class InstallConfigTests(unittest.TestCase):
                     "BT_AUTH_PROFILE": "authentik-forwarded",
                     "BT_IDENTITY_PROXY_IP": "172.30.50.9/32",
                     "BT_AUTHENTIK_VERSION": "2025.12.4",
+                    "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
                     "BT_REVERSE_PROXY": "nginx",
                 },
                 self.identity,

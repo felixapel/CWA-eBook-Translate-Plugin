@@ -8,6 +8,7 @@ import json
 import sys
 from pathlib import Path
 
+from btctl_auth import render_authentik_edge
 from btctl_core import (
     ConfigError,
     DeploymentPlan,
@@ -49,6 +50,13 @@ def _parser() -> argparse.ArgumentParser:
     adopt = commands.add_parser("adopt", help="recover state for an existing labeled split runtime")
     adopt.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
     adopt.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    auth_snippet = commands.add_parser(
+        "auth-snippet",
+        help="print the reviewed Authentik edge fragment without mutating state",
+    )
+    auth_snippet.add_argument(
+        "--env", required=True, type=Path, help="strict KEY=value file"
+    )
     return parser
 
 
@@ -118,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
                     indent=None if args.json else 2,
                 )
             )
+            return 0
+        if args.command == "auth-snippet":
+            config, plan = _load_config(args.repository, args.env)
+            print(render_authentik_edge(config, plan).content, end="")
             return 0
         raise ConfigError("unsupported command")
     except ConfigError as exc:

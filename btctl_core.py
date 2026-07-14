@@ -257,6 +257,7 @@ class InstallConfig:
     proxy_port: int | None
     identity_proxy_peer: str
     authentik_version: str
+    authentik_outpost_url: str
     reverse_proxy: str
     llm_provider: str
     llm_model: str
@@ -371,6 +372,7 @@ class InstallConfig:
 
         identity_proxy_peer = ""
         authentik_version = ""
+        authentik_outpost_url = ""
         reverse_proxy = ""
         if auth_profile == "authentik-forwarded":
             if ingress_mode != "docker-edge":
@@ -380,6 +382,10 @@ class InstallConfig:
             identity_proxy_peer = _exact_peer(values.get("BT_IDENTITY_PROXY_IP", ""))
             authentik_version = _validate_authentik_version(
                 values.get("BT_AUTHENTIK_VERSION", "")
+            )
+            authentik_outpost_url = _exact_origin(
+                values.get("BT_AUTHENTIK_OUTPOST_URL", ""),
+                "BT_AUTHENTIK_OUTPOST_URL",
             )
             reverse_proxy = _choice(
                 values, "BT_REVERSE_PROXY", _REVERSE_PROXIES
@@ -405,6 +411,7 @@ class InstallConfig:
             proxy_port=proxy_port,
             identity_proxy_peer=identity_proxy_peer,
             authentik_version=authentik_version,
+            authentik_outpost_url=authentik_outpost_url,
             reverse_proxy=reverse_proxy,
             llm_provider=llm_provider,
             llm_model=llm_model,
@@ -476,6 +483,7 @@ class InstallConfig:
             "reverse_proxy": self.reverse_proxy,
             "identity_proxy_peer": self.identity_proxy_peer,
             "authentik_version": self.authentik_version,
+            "authentik_outpost_url": self.authentik_outpost_url,
             "llm_provider": self.llm_provider,
             "llm_model": self.llm_model,
             "local_url": self.local_url,
@@ -542,6 +550,16 @@ class DeploymentPlan:
             resources["edge_network"] = {
                 "name": config.edge_network,
                 "ownership": "external",
+            }
+        if config.auth_profile == "authentik-forwarded":
+            suffix = {
+                "nginx": "nginx.conf",
+                "traefik": "traefik.yml",
+                "caddy": "caddy",
+            }[config.reverse_proxy]
+            resources["identity_edge_config"] = {
+                "path": str(Path(config.state_dir) / f"authentik-edge.{suffix}"),
+                "ownership": "owned",
             }
         if config.install_profile == "unraid":
             resources["api_template"] = {

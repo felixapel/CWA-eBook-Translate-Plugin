@@ -145,8 +145,16 @@ class ForwardedIdentityTests(unittest.TestCase):
     def setUp(self):
         self.auth = RequestAuthenticator(
             mode="forwarded",
-            identity_trusted_proxies=("10.42.0.0/16", "127.0.0.1/32"),
+            identity_trusted_proxies=("10.42.8.9/32", "127.0.0.1/32"),
         )
+
+    def test_forwarded_mode_requires_exact_single_peer_addresses(self):
+        for peer in ("10.42.0.0/16", "2001:db8::/64"):
+            with self.subTest(peer=peer), self.assertRaises(AuthConfigError):
+                RequestAuthenticator(
+                    mode="forwarded",
+                    identity_trusted_proxies=(peer,),
+                )
 
     def test_direct_client_cannot_forge_identity_headers(self):
         with self.assertRaises(AuthRejected):
@@ -163,6 +171,35 @@ class ForwardedIdentityTests(unittest.TestCase):
         self.assertTrue(identity.subject.startswith("forwarded:"))
         self.assertNotIn("user@example.test", identity.subject)
         self.assertEqual(identity.roles, frozenset({"reader", "admin"}))
+
+    def test_configured_identity_header_is_used_and_roles_can_be_disabled(self):
+        auth = RequestAuthenticator.from_environment({
+            "BT_AUTH_MODE": "forwarded",
+            "BT_IDENTITY_TRUSTED_PROXIES": "10.42.8.9/32",
+            "BT_FORWARDED_SUBJECT_HEADER": "X-authentik-uid",
+            "BT_FORWARDED_ROLES_HEADER": "",
+        })
+
+        identity = auth.authenticate(
+            {
+                "X-authentik-uid": "stable-user-id",
+                "X-authentik-groups": "admin",
+            },
+            "10.42.8.9",
+        )
+
+        self.assertTrue(identity.subject.startswith("forwarded:"))
+        self.assertEqual(identity.roles, frozenset())
+
+    def test_forwarded_request_must_arrive_without_browser_cookies(self):
+        with self.assertRaises(AuthRejected):
+            self.auth.authenticate(
+                {
+                    "X-BT-Subject": "user@example.test",
+                    "Cookie": "authentik_session=must-be-stripped-at-edge",
+                },
+                "10.42.8.9",
+            )
 
     def test_missing_or_malformed_subject_and_roles_are_rejected(self):
         for headers in (

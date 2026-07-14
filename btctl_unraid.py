@@ -20,7 +20,9 @@ from btctl_compose import (
     _container_networks,
     _has_exact_cwa_version,
     _labels,
+    _verify_identity_edge_artifact,
 )
+from btctl_auth import render_authentik_edge
 from btctl_core import DeploymentPlan, DeploymentState, InstallConfig, StateStore
 
 
@@ -234,6 +236,12 @@ class UnraidInstaller:
         templates = render_templates(config, plan)
         for role, source in templates.items():
             _write_private(state_dir / f"{role}.template.xml", source)
+        if config.auth_profile == "authentik-forwarded":
+            artifact = render_authentik_edge(config, plan)
+            artifact_path = Path(str(plan.resources["identity_edge_config"]["path"]))
+            if artifact_path.name != artifact.filename:
+                raise InstallError("identity-edge artifact name does not match the plan")
+            _write_private(artifact_path, artifact.content)
 
         install_id = str(uuid.uuid4())
         private_name = str(plan.resources["private_network"]["name"])
@@ -302,6 +310,7 @@ class UnraidInstaller:
             if private is None or not isinstance(private.get("Id"), str):
                 raise InstallError("private network is missing after startup")
             resources["private_network"]["id"] = private["Id"]
+            _verify_identity_edge_artifact(config, plan, resources)
 
             for role, source in templates.items():
                 target = Path(plan.resources[f"{role}_template"]["path"])
@@ -402,6 +411,9 @@ class UnraidAdopter:
             raise InstallError("private network ownership evidence does not match")
         resources["private_network"]["id"] = private["Id"]
         resources["private_network"]["ownership"] = "adopted"
+        _verify_identity_edge_artifact(config, plan, resources)
+        if config.auth_profile == "authentik-forwarded":
+            resources["identity_edge_config"]["ownership"] = "adopted"
         for role in ("api", "proxy"):
             path = Path(plan.resources[f"{role}_template"]["path"])
             if not path.is_file() or path.is_symlink():

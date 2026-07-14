@@ -17,8 +17,8 @@ from btctl_unraid import (
 )
 
 
-def values(root: Path):
-    return {
+def values(root: Path, *, forwarded=False):
+    result = {
         "BT_INSTALL_PROFILE": "unraid",
         "BT_INSTALL_NAME": "cwa-translate-test",
         "BT_INGRESS_MODE": "published",
@@ -38,6 +38,18 @@ def values(root: Path):
         "BT_LOCAL_URL": "",
         "LLM_API_KEY": "do-not-copy-to-xml",
     }
+    if forwarded:
+        result.update({
+            "BT_INGRESS_MODE": "docker-edge",
+            "BT_PROXY_PORT": "",
+            "BT_EDGE_NETWORK": "authentik_backend",
+            "BT_AUTH_PROFILE": "authentik-forwarded",
+            "BT_IDENTITY_PROXY_IP": "172.30.50.9/32",
+            "BT_AUTHENTIK_VERSION": "2025.12.4",
+            "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
+            "BT_REVERSE_PROXY": "caddy",
+        })
+    return result
 
 
 class FakeDocker:
@@ -45,7 +57,10 @@ class FakeDocker:
         self.calls = []
         self.fail_proxy_health = fail_proxy_health
         self.images = {}
-        self.networks = {"cwa_default": {"Id": "cwa-network"}}
+        self.networks = {
+            "cwa_default": {"Id": "cwa-network"},
+            "authentik_backend": {"Id": "edge-network"},
+        }
         self.containers = {
             "calibre-web-automated": {
                 "Id": "cwa-id",
@@ -229,6 +244,25 @@ class UnraidInstallTests(unittest.TestCase):
             )
             self.assertIn("calibre-web-automated", docker.containers)
             self.assertFalse((root / "state" / "state.json").exists())
+
+    def test_forwarded_install_writes_a_private_caddy_identity_edge_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, forwarded=True), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker()
+
+            state = UnraidInstaller(
+                docker, prepare_data=lambda path: path.mkdir()
+            ).install(config, plan, root)
+
+            artifact = root / "state" / "authentik-edge.caddy"
+            self.assertTrue(artifact.is_file())
+            self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+            self.assertIn("request_header -Cookie", artifact.read_text())
+            self.assertIn("sha256", state.resources["identity_edge_config"])
 
     def test_template_collision_stops_before_image_build(self):
         with tempfile.TemporaryDirectory() as directory:

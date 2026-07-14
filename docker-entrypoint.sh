@@ -102,7 +102,8 @@ configure_proxy() {
         /tmp/nginx/uwsgi_temp \
         /tmp/nginx/scgi_temp
     python /app/proxy/render_config.py \
-        /app/proxy/nginx.conf.template /tmp/nginx/proxy.conf
+        /app/proxy/nginx.conf.template /tmp/nginx/proxy.conf \
+        /tmp/nginx/browser-config.json
     nginx -t -c /app/proxy/nginx-main.conf -e /dev/stderr
 }
 

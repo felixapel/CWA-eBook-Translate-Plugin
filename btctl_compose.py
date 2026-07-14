@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -11,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 
+from btctl_auth import render_authentik_edge
 from btctl_core import DeploymentPlan, DeploymentState, InstallConfig, StateStore
 
 
@@ -149,6 +151,48 @@ def _write_private_json(path: Path, payload: object) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    directory = path.parent
+    if directory.is_symlink() or path.is_symlink():
+        raise InstallError("deployment artifact path must not be a symbolic link")
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _verify_identity_edge_artifact(
+    config: InstallConfig,
+    plan: DeploymentPlan,
+    resources: dict[str, dict[str, object]],
+) -> None:
+    if config.auth_profile != "authentik-forwarded":
+        return
+    artifact = render_authentik_edge(config, plan)
+    path = Path(str(plan.resources["identity_edge_config"]["path"]))
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.read_text(encoding="utf-8") != artifact.content
+    ):
+        raise InstallError("identity-edge configuration does not match the plan")
+    resources["identity_edge_config"]["sha256"] = hashlib.sha256(
+        artifact.content.encode("utf-8")
+    ).hexdigest()
 
 
 def _container_networks(container: dict) -> set[str]:
@@ -307,6 +351,12 @@ class ComposeInstaller:
         install_id = str(uuid.uuid4())
         document_path = Path(config.state_dir) / "deployment.compose.json"
         _write_private_json(document_path, render_compose(config, plan, install_id))
+        if config.auth_profile == "authentik-forwarded":
+            artifact = render_authentik_edge(config, plan)
+            artifact_path = Path(str(plan.resources["identity_edge_config"]["path"]))
+            if artifact_path.name != artifact.filename:
+                raise InstallError("identity-edge artifact name does not match the plan")
+            _write_private_text(artifact_path, artifact.content)
         started = False
         try:
             self.docker.compose_validate(document_path, config.install_name)
@@ -326,6 +376,7 @@ class ComposeInstaller:
             if private is None or not isinstance(private.get("Id"), str):
                 raise InstallError("private network is missing after startup")
             resources["private_network"]["id"] = private["Id"]
+            _verify_identity_edge_artifact(config, plan, resources)
             state = replace(
                 DeploymentState.new(install_id=install_id, plan=plan),
                 resources=resources,
@@ -428,6 +479,9 @@ class ComposeAdopter:
             raise InstallError("private network ownership labels are missing or incompatible")
         resources["private_network"]["id"] = private["Id"]
         resources["private_network"]["ownership"] = "adopted"
+        _verify_identity_edge_artifact(config, plan, resources)
+        if config.auth_profile == "authentik-forwarded":
+            resources["identity_edge_config"]["ownership"] = "adopted"
         state = replace(
             DeploymentState.new(install_id=install_id, plan=plan),
             status="adopted",
