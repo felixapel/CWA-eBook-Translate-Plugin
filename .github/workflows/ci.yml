@@ -71,11 +71,11 @@ jobs:
   # USER appuser) that pure Python tests can't. Docker is a required artifact
   # gate: runners without a working daemon fail instead of reporting a green
   # workflow whose build and runtime checks never executed.
-  # The global runner maps ubuntu-latest to a node job container without a
-  # Docker client. Its host-capable label runs on the isolated runner VM and
-  # is already proven by the WeebDB Docker gates on the same runner.
+  # Provider-specific Docker runner:
+  # GitHub-hosted ubuntu-latest includes an isolated Docker daemon. Keep public
+  # pull requests off homelab runners; Gitea binds this same gate separately.
   docker-smoke:
-    runs-on: weebdb-docker
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

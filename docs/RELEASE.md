@@ -14,15 +14,17 @@ policy in [ADR-008](decisions/ADR-008-source-only-releases.md).
   frontend, and Docker smoke contexts.
 - Protect `v*` tags from updates/deletion and restrict creation to the
   maintainer.
-- Keep the normal jobs on the trusted `ubuntu-latest` runner label and Docker
-  smoke on the trusted `weebdb-docker` label.
+- Keep Gitea Docker smoke on the trusted `weebdb-docker` label. The public
+  GitHub mirror uses GitHub-hosted `ubuntu-latest` for Docker smoke; do not
+  attach its public pull-request workflow to a homelab runner.
 
 No GHCR, Docker Hub, Cosign, package-registry, or release-specific Actions
 secret is required.
 
 Gitea uses the first configured workflow directory that exists. Both
 `.gitea/workflows/ci.yml` and `.gitea/workflows/release.yml` must remain
-present; the contract tests also keep the Gitea and GitHub CI copies identical.
+present. The Gitea and GitHub CI copies remain semantically identical except
+for the provider-specific Docker runner binding, which contract tests enforce.
 
 ## What a release proves
 

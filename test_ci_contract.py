@@ -7,11 +7,13 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-CI = ROOT / ".github" / "workflows" / "ci.yml"
+GITHUB_CI = ROOT / ".github" / "workflows" / "ci.yml"
+GITEA_CI = ROOT / ".gitea" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".gitea" / "workflows" / "release.yml"
 DOCKER_NAMES = ROOT / "scripts" / "ci-docker-names.sh"
 FRONTEND_WORKFLOWS = (
-    CI,
+    GITHUB_CI,
+    GITEA_CI,
     ROOT / ".gitea" / "workflows" / "release.yml",
 )
 
@@ -19,7 +21,7 @@ FRONTEND_WORKFLOWS = (
 class CIContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workflow = CI.read_text()
+        cls.workflow = GITHUB_CI.read_text()
 
     def test_all_backend_contract_suites_are_required(self):
         for command in (
@@ -56,15 +58,21 @@ class CIContractTests(unittest.TestCase):
             self.assertNotIn("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", source)
 
     def test_docker_gate_cannot_report_success_when_docker_is_missing(self):
-        self.assertNotIn("Detect Docker", self.workflow)
-        self.assertNotIn("docker.outputs.available", self.workflow)
-        self.assertNotIn("skipping docker-smoke", self.workflow)
-        self.assertRegex(
-            self.workflow,
-            r"(?m)^  docker-smoke:\n    runs-on: weebdb-docker$",
-        )
-        self.assertRegex(self.workflow, r"(?m)^\s*run: docker version\s*$")
-        self.assertRegex(self.workflow, r"(?m)^\s*run: docker build ")
+        workflows = {
+            GITHUB_CI: "ubuntu-latest",
+            GITEA_CI: "weebdb-docker",
+        }
+        for path, runner in workflows.items():
+            workflow = path.read_text()
+            self.assertNotIn("Detect Docker", workflow)
+            self.assertNotIn("docker.outputs.available", workflow)
+            self.assertNotIn("skipping docker-smoke", workflow)
+            self.assertRegex(
+                workflow,
+                rf"(?m)^  docker-smoke:\n    runs-on: {runner}$",
+            )
+            self.assertRegex(workflow, r"(?m)^\s*run: docker version\s*$")
+            self.assertRegex(workflow, r"(?m)^\s*run: docker build ")
 
     def test_docker_smoke_exercises_the_built_proxy_path(self):
         self.assertIn("./scripts/container-smoke.sh", self.workflow)

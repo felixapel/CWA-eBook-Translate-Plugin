@@ -131,8 +131,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyboard-operable settings actions, synchronized popover/switch state, and
   a visible non-fatal wait message while the API is rate limiting requests.
 - CI and release gates now run every backend contract suite, the complete locked
-  npm tree audit, and a required proxy/API/non-root container smoke test. Gitea
-  and GitHub CI definitions remain byte-identical by contract.
+  npm tree audit, and a required proxy/API/non-root container smoke test. Their
+  semantics remain equivalent by contract, while Gitea uses its trusted Docker
+  runner and public GitHub pull requests use an isolated GitHub-hosted runner.
 - The live rate-limit probe is import-safe, authenticated, timeout-bounded, and
   fails closed while using same-language requests that never call a provider.
   It ignores inherited HTTP proxies, refuses redirects/URL credentials, and
