@@ -90,6 +90,12 @@ build/runtime smoke test. No workflow step receives a publication credential.
    for all required checks on the exact merged `main` commit.
 6. Fast-forward the GitHub mirror and verify both `main` refs resolve to that
    exact commit.
+7. On physical stock Unraid 7.3.2 with no host Python or NerdTools, use the
+   exact clean merged commit to run the public `./btctl plan`, `install`, and
+   `doctor` path. Then verify one real browser translation through the managed
+   public route and record the commit plus result. This physical acceptance is
+   mandatory before any `v2.2.0` tag; the simulated Docker bootstrap gate is
+   not a substitute.
 
 For the v1-to-v2 cache transition, `test_cache_v2` is a release blocker. It
 must prove that `translations` remains readable/writable by the v2.1.4 schema,
@@ -97,6 +103,10 @@ that v2 uses `translations_v2`, and that the unreleased draft layout is
 normalized without losing either table.
 
 ## Create the source release
+
+Stop here if physical Unraid and browser acceptance has not passed on the exact
+merged commit, or if any protected Gitea check is missing, skipped, or stale.
+Do not create a tag to make a candidate appear complete.
 
 Create one annotated tag object and push it to GitHub first because Gitea's
 preflight verifies the public mirror. Push the same local object to Gitea
@@ -243,8 +253,11 @@ recovery copy; the retained named volume is the authoritative v2 copy.
 
 ### Fresh v2.2.0 install
 
-With no previous translator deployment, check out the official annotated tag,
-copy `.env.example` to a private external path, and use the managed lifecycle:
+These commands apply only after the official annotated tag exists and its
+natural Gitea tag workflow has passed. Before tagging, physical acceptance uses
+the exact clean merged commit as required under Prepare a release. With no
+previous translator deployment, check out the official tag, copy `.env.example`
+to a private external path, and use the managed lifecycle:
 
 ```bash
 git checkout v2.2.0

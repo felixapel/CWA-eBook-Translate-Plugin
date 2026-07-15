@@ -26,6 +26,7 @@ class ProviderBudgetTests(unittest.TestCase):
         self.original_post = translator._provider_post
         self.original_sleep = translator.time.sleep
         self.original_batch_size = translator.BT_BATCH_SIZE
+        self.original_context_window = translator.BT_CONTEXT_WINDOW
         self.original_primary = translator._primary_provider
         self.original_fallback = translator._fallback_provider
         self.original_sem = translator._UPSTREAM_SEM
@@ -53,6 +54,7 @@ class ProviderBudgetTests(unittest.TestCase):
         translator._provider_post = self.original_post
         translator.time.sleep = self.original_sleep
         translator.BT_BATCH_SIZE = self.original_batch_size
+        translator.BT_CONTEXT_WINDOW = self.original_context_window
         translator._primary_provider = self.original_primary
         translator._fallback_provider = self.original_fallback
         translator._UPSTREAM_SEM = self.original_sem
@@ -609,26 +611,27 @@ class ProviderBudgetTests(unittest.TestCase):
         self.assertTrue(all(provider == "minimax" for _, provider in results))
         self.assertEqual(calls, {"primary": 10, "fallback": 10})
 
-    def test_invalid_segment_cancels_queued_groups_without_waiting(self):
-        calls = 0
-        calls_lock = threading.Lock()
-        slow_done = threading.Event()
-        first_wave = threading.Barrier(2)
+    def test_invalid_segment_retries_once_with_fresh_ids_and_shared_budget(self):
+        envelopes = []
 
         class OpenAIResponse:
             status_code = 200
-            text = ""
+            headers = {}
 
-            def __init__(self, payload, malformed=False):
-                user_content = payload["messages"][1]["content"]
-                request_body = translator.json.loads(user_content)
-                if malformed:
+            def __init__(self, payload):
+                request_body = translator.json.loads(
+                    payload["messages"][1]["content"])
+                envelopes.append(request_body)
+                if len(envelopes) == 1:
                     output = "not-json"
                 else:
                     output = translator.json.dumps({
                         "protocol": translator.SEGMENT_PROTOCOL,
                         "translations": [
-                            {"id": segment["id"], "text": "translated"}
+                            {
+                                "id": segment["id"],
+                                "text": f"translated:{segment['text']}",
+                            }
                             for segment in request_body["segments"]
                         ],
                     })
@@ -642,37 +645,406 @@ class ProviderBudgetTests(unittest.TestCase):
             def json(self):
                 return self._body
 
-        def one_malformed_others_slow(_url, **kwargs):
-            nonlocal calls
-            request_body = translator.json.loads(
-                kwargs["json"]["messages"][1]["content"])
-            malformed = request_body["segments"][0]["text"] == "bad-0"
-            with calls_lock:
-                calls += 1
-            first_wave.wait(timeout=1)
-            if not malformed:
-                time.sleep(0.25)
-                slow_done.set()
-            return OpenAIResponse(kwargs["json"], malformed=malformed)
+        translator._provider_post = (
+            lambda _url, **kwargs: OpenAIResponse(kwargs["json"])
+        )
+        translator._fallback_provider = None
+        translator.BT_BATCH_SIZE = 2
+        translator.BT_CONTEXT_WINDOW = 1
+        budget = self.budget(max_attempts=2)
+        recovery = translator.BatchRecoveryTracker()
+        texts = ["before", "one", "two", "after"]
 
-        translator._provider_post = one_malformed_others_slow
+        results = translator.translate_batch_detailed(
+            texts,
+            selected_groups=[[1, 2]],
+            max_concurrent=1,
+            budget=budget,
+            recovery_tracker=recovery,
+        )
+
+        self.assertEqual(
+            [(item.text, item.provider) for item in results[1:3]],
+            [("translated:one", "local"), ("translated:two", "local")],
+        )
+        self.assertEqual(
+            [item.recovery_path for item in results[1:3]],
+            ["envelope_retry", "envelope_retry"],
+        )
+        self.assertTrue(all(item.server_cacheable for item in results[1:3]))
+        self.assertEqual(len(envelopes), 2)
+        self.assertEqual(
+            [segment["text"] for segment in envelopes[0]["segments"]],
+            ["one", "two"],
+        )
+        self.assertEqual(envelopes[0].get("context"), envelopes[1].get("context"))
+        first_ids = [segment["id"] for segment in envelopes[0]["segments"]]
+        second_ids = [segment["id"] for segment in envelopes[1]["segments"]]
+        self.assertTrue(set(first_ids).isdisjoint(second_ids))
+        self.assertEqual(budget.snapshot()["attempts"], 2)
+        self.assertEqual(recovery.snapshot(), {
+            "envelope_retry_groups": 1,
+            "envelope_retry_recovered_groups": 1,
+            "paragraph_fallback_groups": 0,
+            "paragraph_fallback_recovered_segments": 0,
+            "paragraph_fallback_failed_segments": 0,
+        })
+
+    def test_two_invalid_segments_fall_back_sequentially_within_budget(self):
+        calls = []
+
+        class OpenAIResponse:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, payload):
+                system = payload["messages"][0]["content"]
+                user_content = payload["messages"][1]["content"]
+                if translator.SEGMENT_PROTOCOL in system:
+                    calls.append("batch")
+                    output = "not-json"
+                else:
+                    calls.append(f"single:{user_content}")
+                    output = f"translated:{user_content}"
+                self._body = {
+                    "choices": [{"message": {"content": output}}],
+                }
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        translator._provider_post = (
+            lambda _url, **kwargs: OpenAIResponse(kwargs["json"])
+        )
+        translator._fallback_provider = None
+        translator.BT_BATCH_SIZE = 3
+        budget = self.budget(max_attempts=5)
+        recovery = translator.BatchRecoveryTracker()
+
+        results = translator.translate_batch_detailed(
+            ["one", "two", "three"],
+            max_concurrent=1,
+            budget=budget,
+            recovery_tracker=recovery,
+        )
+
+        self.assertEqual(
+            [(item.text, item.provider) for item in results],
+            [
+                ("translated:one", "local"),
+                ("translated:two", "local"),
+                ("translated:three", "local"),
+            ],
+        )
+        self.assertTrue(all(not item.server_cacheable for item in results))
+        self.assertEqual(
+            [item.recovery_path for item in results],
+            ["paragraph_fallback"] * 3,
+        )
+        self.assertEqual(
+            calls,
+            ["batch", "batch", "single:one", "single:two", "single:three"],
+        )
+        self.assertEqual(budget.snapshot()["attempts"], 5)
+        self.assertEqual(recovery.snapshot(), {
+            "envelope_retry_groups": 1,
+            "envelope_retry_recovered_groups": 0,
+            "paragraph_fallback_groups": 1,
+            "paragraph_fallback_recovered_segments": 3,
+            "paragraph_fallback_failed_segments": 0,
+        })
+
+    def test_individual_recovery_failure_is_isolated_to_its_segment(self):
+        calls = []
+
+        class OpenAIResponse:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, output):
+                self._body = {
+                    "choices": [{"message": {"content": output}}],
+                }
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        def malformed_then_partial_recovery(_url, **kwargs):
+            payload = kwargs["json"]
+            system = payload["messages"][0]["content"]
+            user_content = payload["messages"][1]["content"]
+            if translator.SEGMENT_PROTOCOL in system:
+                calls.append("batch")
+                return OpenAIResponse("not-json")
+            calls.append(f"single:{user_content}")
+            if user_content == "two":
+                raise translator.requests.exceptions.ConnectionError(
+                    "synthetic recovery outage"
+                )
+            return OpenAIResponse(f"translated:{user_content}")
+
+        translator._provider_post = malformed_then_partial_recovery
+        translator._fallback_provider = None
+        translator.BT_BATCH_SIZE = 3
+        budget = self.budget(max_attempts=5)
+
+        results = translator.translate_batch_detailed(
+            ["one", "two", "three"],
+            max_concurrent=1,
+            budget=budget,
+        )
+
+        self.assertEqual(
+            [item.text for item in results],
+            [
+                "translated:one",
+                "[TRANSLATION ERROR: provider_unavailable]",
+                "translated:three",
+            ],
+        )
+        self.assertEqual(
+            [item.recovery_path for item in results],
+            [
+                "paragraph_fallback",
+                "paragraph_fallback_failed",
+                "paragraph_fallback",
+            ],
+        )
+        self.assertTrue(all(not item.server_cacheable for item in results))
+        self.assertEqual(
+            calls,
+            ["batch", "batch", "single:one", "single:two", "single:three"],
+        )
+        self.assertEqual(budget.snapshot()["attempts"], 5)
+
+    def test_individual_recovery_preserves_remote_fallback_consent(self):
+        calls = {"primary": 0, "fallback": 0}
+
+        class OpenAIResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": "not-json"}}],
+                }
+
+        class AnthropicResponse:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, output):
+                self.output = output
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "content": [{"type": "text", "text": self.output}],
+                }
+
+        def malformed_primary_and_healthy_cloud(url, **kwargs):
+            payload = kwargs["json"]
+            if "minimax" in url:
+                calls["fallback"] += 1
+                user_content = payload["messages"][0]["content"]
+                return AnthropicResponse(f"cloud:{user_content}")
+            calls["primary"] += 1
+            system = payload["messages"][0]["content"]
+            if translator.SEGMENT_PROTOCOL in system:
+                return OpenAIResponse()
+            raise translator.requests.exceptions.ConnectionError(
+                "synthetic local recovery outage"
+            )
+
+        translator._provider_post = malformed_primary_and_healthy_cloud
+        translator.BT_BATCH_SIZE = 2
+
+        denied_budget = self.budget(max_attempts=4)
+        denied = translator.translate_batch_detailed(
+            ["one", "two"],
+            max_concurrent=1,
+            budget=denied_budget,
+            allow_cloud_fallback=False,
+        )
+
+        self.assertEqual(
+            [item.text for item in denied],
+            [
+                "[TRANSLATION ERROR: provider_unavailable]",
+                "[TRANSLATION ERROR: provider_unavailable]",
+            ],
+        )
+        self.assertEqual(calls, {"primary": 4, "fallback": 0})
+        self.assertEqual(denied_budget.snapshot()["attempts"], 4)
+
+        calls.update(primary=0, fallback=0)
+        allowed_budget = self.budget(max_attempts=6)
+        allowed = translator.translate_batch_detailed(
+            ["one", "two"],
+            max_concurrent=1,
+            budget=allowed_budget,
+            allow_cloud_fallback=True,
+        )
+
+        self.assertEqual(
+            [(item.text, item.provider) for item in allowed],
+            [("cloud:one", "minimax"), ("cloud:two", "minimax")],
+        )
+        self.assertTrue(all(not item.server_cacheable for item in allowed))
+        self.assertEqual(calls, {"primary": 4, "fallback": 2})
+        self.assertEqual(allowed_budget.snapshot()["attempts"], 6)
+
+    def test_segment_recovery_stops_before_call_over_budget(self):
+        calls = 0
+
+        class MalformedResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": "not-json"}}],
+                }
+
+        def malformed_provider(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return MalformedResponse()
+
+        translator._provider_post = malformed_provider
+        translator._fallback_provider = None
+        translator.BT_BATCH_SIZE = 3
+        budget = self.budget(max_attempts=2)
+        recovery = translator.BatchRecoveryTracker()
+
+        with self.assertRaises(WorkBudgetExceeded) as raised:
+            translator.translate_batch_detailed(
+                ["one", "two", "three"],
+                max_concurrent=1,
+                budget=budget,
+                recovery_tracker=recovery,
+            )
+
+        self.assertEqual(raised.exception.reason, "attempts")
+        self.assertEqual(calls, 2)
+        self.assertEqual(budget.snapshot()["attempts"], 2)
+        self.assertEqual(recovery.snapshot(), {
+            "envelope_retry_groups": 1,
+            "envelope_retry_recovered_groups": 0,
+            "paragraph_fallback_groups": 1,
+            "paragraph_fallback_recovered_segments": 0,
+            "paragraph_fallback_failed_segments": 0,
+        })
+
+    def test_malformed_group_recovers_without_cancelling_healthy_sibling(self):
+        calls = []
+        calls_lock = threading.Lock()
+        first_wave = threading.Barrier(2)
+        bad_batch_calls = 0
+
+        class OpenAIResponse:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, output):
+                self._body = {
+                    "choices": [{"message": {"content": output}}],
+                }
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        def malformed_and_healthy_groups(_url, **kwargs):
+            nonlocal bad_batch_calls
+            payload = kwargs["json"]
+            system = payload["messages"][0]["content"]
+            user_content = payload["messages"][1]["content"]
+            if translator.SEGMENT_PROTOCOL not in system:
+                with calls_lock:
+                    calls.append(f"single:{user_content}")
+                return OpenAIResponse(f"translated:{user_content}")
+
+            request_body = translator.json.loads(user_content)
+            first_text = request_body["segments"][0]["text"]
+            with calls_lock:
+                calls.append(f"batch:{first_text}")
+                if first_text == "bad-0":
+                    bad_batch_calls += 1
+                    wait_for_first_wave = bad_batch_calls == 1
+                else:
+                    wait_for_first_wave = True
+            if wait_for_first_wave:
+                first_wave.wait(timeout=1)
+            if first_text == "bad-0":
+                return OpenAIResponse("not-json")
+            return OpenAIResponse(translator.json.dumps({
+                "protocol": translator.SEGMENT_PROTOCOL,
+                "translations": [
+                    {
+                        "id": segment["id"],
+                        "text": f"translated:{segment['text']}",
+                    }
+                    for segment in request_body["segments"]
+                ],
+            }))
+
+        translator._provider_post = malformed_and_healthy_groups
         translator.BT_BATCH_SIZE = 2
         translator._fallback_provider = None
         translator._UPSTREAM_SEM = threading.BoundedSemaphore(2)
+        budget = self.budget(max_attempts=5)
 
-        started = time.monotonic()
-        with self.assertRaises(translator.SegmentProtocolError):
-            translator.translate_batch(
-                ["bad-0", "bad-1", "slow-0", "slow-1",
-                 "queued-0", "queued-1", "queued-2", "queued-3"],
-                max_concurrent=2,
-                budget=self.budget(max_attempts=20),
-            )
-        elapsed = time.monotonic() - started
+        results = translator.translate_batch_detailed(
+            ["bad-0", "bad-1", "good-0", "good-1"],
+            max_concurrent=2,
+            budget=budget,
+        )
 
-        self.assertLess(elapsed, 0.15)
-        self.assertEqual(calls, 2)
-        self.assertTrue(slow_done.wait(timeout=1))
+        self.assertEqual(
+            [item.text for item in results],
+            [
+                "translated:bad-0",
+                "translated:bad-1",
+                "translated:good-0",
+                "translated:good-1",
+            ],
+        )
+        self.assertEqual(
+            [item.recovery_path for item in results],
+            ["paragraph_fallback", "paragraph_fallback", "direct", "direct"],
+        )
+        self.assertEqual(
+            [item.server_cacheable for item in results],
+            [False, False, True, True],
+        )
+        self.assertCountEqual(
+            calls,
+            [
+                "batch:bad-0",
+                "batch:bad-0",
+                "single:bad-0",
+                "single:bad-1",
+                "batch:good-0",
+            ],
+        )
+        self.assertEqual(budget.snapshot()["attempts"], 5)
 
 
 class DeploymentBudgetContractTests(unittest.TestCase):

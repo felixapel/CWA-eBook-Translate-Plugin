@@ -8,7 +8,7 @@ runs anywhere with just `flask` + `requests` installed:
     python test_translation.py
 
 Covers: provider fallback, errors not cached, batched-prompt translation
-(one LLM call per group), and strict fail-closed segment envelopes.
+(one LLM call per group), and bounded recovery from malformed envelopes.
 """
 import os, sys, json as jsonlib, re, tempfile
 
@@ -117,20 +117,24 @@ def run():
     check("batch: all 5 translated in order", d["translations"] == [f"[LOCAL] para {i}" for i in range(5)])
     check("batch: 2 grouped LLM calls (not 5)", STATE["batch_calls"] == 2 and STATE["single_calls"] == 0)
 
-    # Malformed segmented replies fail atomically. Retrying each paragraph
-    # would multiply upstream work and could cache text under the wrong slot.
+    # Two malformed segmented replies recover through bounded, sequential
+    # single-paragraph calls. Those results must not be written under the
+    # grouped-prompt cache contract; a later healthy grouped call may populate
+    # that cache, and only then may the following request be served from it.
     STATE["malform"] = True
     STATE["batch_calls"] = STATE["single_calls"] = 0
+    malformed_paragraphs = [f"malformed-recovery-a{i}" for i in range(3)]
     malformed_response = client.post(
-        "/translate/batch", json={"paragraphs": [f"a{i}" for i in range(3)]})
+        "/translate/batch", json={"paragraphs": malformed_paragraphs})
     d = malformed_response.get_json()
-    check("segment protocol: malformed group fails atomically",
-          malformed_response.status_code == 502
-          and d.get("error") == "invalid_provider_response")
-    check("segment protocol: malformed group triggers no per-paragraph fanout",
-          STATE["single_calls"] == 0)
+    check("segment recovery: malformed group returns complete HTTP 200",
+          malformed_response.status_code == 200
+          and d.get("translations") == [
+              f"[LOCAL] {paragraph}" for paragraph in malformed_paragraphs
+          ])
+    check("segment recovery: retries once then falls back within the group",
+          STATE["batch_calls"] == 2 and STATE["single_calls"] == 3)
     import cache as segment_cache
-    malformed_paragraphs = [f"a{i}" for i in range(3)]
     malformed_contract = translator.batch_cache_contract(
         malformed_paragraphs, [0, 1, 2], "English", "Spanish")
     malformed_scope = server._cache_scope(
@@ -140,9 +144,31 @@ def run():
         protocol_version=malformed_contract.protocol_version)
     check("segment protocol: malformed group writes nothing to cache",
           all(segment_cache.get_cached(
-              f"a{i}", "English", "Spanish", scope=malformed_scope) is None
-              for i in range(3)))
+              paragraph, "English", "Spanish", scope=malformed_scope) is None
+              for paragraph in malformed_paragraphs))
+
     STATE["malform"] = False
+    STATE["batch_calls"] = STATE["single_calls"] = 0
+    healthy_response = client.post(
+        "/translate/batch", json={"paragraphs": malformed_paragraphs})
+    healthy = healthy_response.get_json()
+    check("segment recovery: next healthy grouped request is fresh",
+          healthy_response.status_code == 200
+          and healthy.get("fresh_count") == 3
+          and healthy.get("cached_count") == 0
+          and STATE["batch_calls"] == 1
+          and STATE["single_calls"] == 0)
+
+    calls_after_healthy = (STATE["batch_calls"], STATE["single_calls"])
+    cached_response = client.post(
+        "/translate/batch", json={"paragraphs": malformed_paragraphs})
+    cached_result = cached_response.get_json()
+    check("segment recovery: healthy grouped result is cached normally",
+          cached_response.status_code == 200
+          and cached_result.get("cached_count") == 3
+          and cached_result.get("fresh_count") == 0
+          and (STATE["batch_calls"], STATE["single_calls"])
+              == calls_after_healthy)
 
     # Input text that contains the legacy marker must remain ordinary content;
     # it must never create, renumber, or truncate a segment.

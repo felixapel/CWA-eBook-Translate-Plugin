@@ -145,6 +145,45 @@ After changing the managed environment, do not recreate a role with an ad-hoc
 `docker run`; use the documented lifecycle so state and ownership remain
 verifiable.
 
+## Occasional malformed batch envelopes from a local model
+
+A local model can translate the text correctly but occasionally return JSON
+that does not match the strict segment envelope. The API log then records
+`segment envelope invalid attempt=1/2` without logging the prompt, generated
+IDs, or book text. This validation is intentional: do not loosen the parser,
+because it prevents one generated translation from being assigned to another
+paragraph.
+
+The current server retries that group once with new opaque IDs. If the second
+envelope is also malformed, it translates the group's paragraphs sequentially.
+Both stages use the original request's deadline, attempt, input-byte,
+output-token, global-inflight, cloud-consent, and singleflight boundaries.
+Successful paragraph recovery returns in the same `200` response while the
+shared work budget remains available, but is not stored under the grouped-prompt
+cache contract; a later healthy grouped request may populate that cache.
+Ordinary individual provider failures do not cancel healthy sibling groups.
+Work-budget exhaustion remains fatal and may terminate the shared request.
+
+Use `/metrics` to distinguish `envelope_retry_groups`,
+`envelope_retry_recovered_groups`, `paragraph_fallback_groups`, and recovered or
+failed fallback segments. These are fixed process-local counters and contain no
+book-derived labels. If the request budget is exhausted, the API returns the
+normal bounded `503` without starting another provider call. If only one
+individual recovery fails for another provider reason, that paragraph gets a
+sanitized translation-error marker and the reader exposes its explicit retry
+action instead of discarding healthy siblings.
+
+The reader never automatically retries these failures. Only a bounded `429`
+admission rejection, before provider work starts, is retried automatically; use
+the visible manual retry for every other failure.
+
+If recovery happens frequently, verify the configured model supports the
+OpenAI-compatible chat contract and has enough output capacity, then lower
+`BT_BATCH_SIZE` one step at a time. `BT_BATCH_SIZE=1` avoids multi-paragraph
+envelopes at the cost of one provider call per paragraph. Keep
+`BT_REQUEST_MAX_ATTEMPTS`, output limits, and the request deadline finite; do
+not hide a systematic provider problem by making them unlimited.
+
 ## 502 or 504 after CWA was recreated
 
 The injection proxy resolves `CWA_UPSTREAM` when its Nginx process starts. If
