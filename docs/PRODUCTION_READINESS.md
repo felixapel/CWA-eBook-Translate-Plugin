@@ -63,8 +63,9 @@ all of these outcomes without a skipped or unavailable gate:
 4. The image builds and the split API/proxy smoke test proves non-root identity,
    read-only filesystems, zero capabilities, routing, independent shutdown, and
    the forwarded Authentik edge contract on a protected API route.
-5. Gitea and GitHub CI definitions remain byte-identical and the workflow
-   contract suites pass.
+5. Gitea and GitHub CI definitions remain equivalent except for their enforced
+   provider-specific Docker runner bindings, and the workflow contract suites
+   pass.
 6. Release-policy contracts prove the fail-closed source workflow wiring;
    preflight rejects wrong versions, tags, commits, ancestry, or mirror parity,
    and the artifact smoke gate rejects a broken container build or runtime.

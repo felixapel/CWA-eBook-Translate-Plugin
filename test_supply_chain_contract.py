@@ -63,10 +63,27 @@ class SupplyChainContractTests(unittest.TestCase):
                     f"{workflow}: unexpected pin for {action}",
                 )
 
-    def test_gitea_and_github_ci_remain_byte_identical(self):
-        github_ci = (ROOT / ".github" / "workflows" / "ci.yml").read_bytes()
-        gitea_ci = (ROOT / ".gitea" / "workflows" / "ci.yml").read_bytes()
-        self.assertEqual(gitea_ci, github_ci)
+    def test_gitea_and_github_ci_only_diverge_on_docker_runner(self):
+        def normalize_provider_runner(source: str) -> str:
+            source = re.sub(
+                r"(?ms)^  # Provider-specific Docker runner:\n"
+                r"(?:  #[^\n]*\n)+(?=  docker-smoke:)",
+                "",
+                source,
+            )
+            return re.sub(
+                r"(?m)(^  docker-smoke:\n)    runs-on: "
+                r"(?:ubuntu-latest|weebdb-docker)$",
+                r"\1    runs-on: PROVIDER_DOCKER_RUNNER",
+                source,
+            )
+
+        github_ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        gitea_ci = (ROOT / ".gitea" / "workflows" / "ci.yml").read_text()
+        self.assertEqual(
+            normalize_provider_runner(gitea_ci),
+            normalize_provider_runner(github_ci),
+        )
 
     def test_supply_chain_contract_is_a_required_backend_gate(self):
         for workflow in WORKFLOWS:

@@ -331,10 +331,19 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertTrue(GITEA_CI.is_file())
         self.assertFalse(GITHUB_RELEASE.exists())
 
-    def test_gitea_workflow_directory_keeps_mirror_ci_in_lockstep(self):
+    def test_ci_uses_provider_appropriate_docker_runners(self):
         # Gitea uses the first existing workflow directory. Once .gitea exists,
         # a missing CI copy would silently remove every normal push/PR gate.
-        self.assertEqual(GITEA_CI.read_text(), GITHUB_CI.read_text())
+        gitea_ci = GITEA_CI.read_text()
+        github_ci = GITHUB_CI.read_text()
+        self.assertRegex(
+            gitea_ci,
+            r"(?m)^  docker-smoke:\n    runs-on: weebdb-docker$",
+        )
+        self.assertRegex(
+            github_ci,
+            r"(?m)^  docker-smoke:\n    runs-on: ubuntu-latest$",
+        )
 
     def test_source_release_is_gated_by_preflight_and_all_quality_checks(self):
         workflow = GITEA_RELEASE.read_text()
