@@ -26,11 +26,13 @@ from auth import (
     RequestAuthenticator,
 )
 from translator import (
-    translate_text, translate_batch, check_backend_health,
+    translate_text, translate_batch_detailed as translate_batch,
+    check_backend_health,
     BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
     ProviderUnavailableError, create_work_budget, model_for_provider,
     cache_lookup_backends, translation_groups, batch_cache_contract,
-    single_cache_contract, singleflight_stats,
+    single_cache_contract, singleflight_stats, BatchRecoveryTracker,
+    RECOVERY_METRIC_NAMES,
 )
 from work_budget import WorkBudget, WorkBudgetExceeded
 from cache import (
@@ -621,6 +623,7 @@ _WORK_BUDGET_REASONS = (
     "cancelled",
     "unknown",
 )
+_SEGMENT_RECOVERY_METRICS = RECOVERY_METRIC_NAMES
 
 
 def _empty_metrics() -> dict:
@@ -637,6 +640,9 @@ def _empty_metrics() -> dict:
         "http_responses": {name: 0 for name in _HTTP_RESPONSE_CLASSES},
         "outcomes": {name: 0 for name in _METRIC_OUTCOMES},
         "work_budget_reasons": {name: 0 for name in _WORK_BUDGET_REASONS},
+        "segment_recovery": {
+            name: 0 for name in _SEGMENT_RECOVERY_METRICS
+        },
         "batch_partial_failure_segments": 0,
     }
 
@@ -687,6 +693,46 @@ def _record_batch_partial_failure(segment_count: int) -> None:
     with _metrics_lock:
         _metrics["outcomes"]["batch_partial_failure_requests"] += 1
         _metrics["batch_partial_failure_segments"] += segment_count
+
+
+def _record_segment_recovery(increments: dict[str, int]) -> None:
+    """Add one fixed-cardinality tracker snapshot to process metrics."""
+    if set(increments) != set(_SEGMENT_RECOVERY_METRICS):
+        raise ValueError("invalid recovery metric dimensions")
+    if any(
+        isinstance(increments[name], bool)
+        or not isinstance(increments[name], int)
+        or increments[name] < 0
+        for name in _SEGMENT_RECOVERY_METRICS
+    ):
+        raise ValueError("recovery metric values must be non-negative integers")
+    if not any(increments[name] for name in _SEGMENT_RECOVERY_METRICS):
+        return
+    with _metrics_lock:
+        for name in _SEGMENT_RECOVERY_METRICS:
+            _metrics["segment_recovery"][name] += increments[name]
+
+
+def _record_segment_recovery_safely(increments: dict[str, int]) -> None:
+    """Best-effort metric sink that can never change an API outcome."""
+    try:
+        _record_segment_recovery(increments)
+    except Exception as exc:
+        log.error(
+            "segment recovery metrics unavailable error_type=%s",
+            type(exc).__name__,
+        )
+
+
+def _flush_segment_recovery(tracker: BatchRecoveryTracker) -> None:
+    """Flush now and retain a safe sink for records from late workers."""
+    try:
+        tracker.attach_sink_and_flush(_record_segment_recovery_safely)
+    except Exception as exc:
+        log.error(
+            "segment recovery metric flush failed error_type=%s",
+            type(exc).__name__,
+        )
 
 
 def _reset_metrics_for_tests() -> None:
@@ -810,26 +856,35 @@ def _translate_paragraphs(
             )
 
     if missing_groups:
-        results = translate_batch(
-            paragraphs,
-            source_lang,
-            target_lang,
-            budget=budget,
-            selected_groups=missing_groups,
-            operation_namespace=_operation_namespace(
-                tenant, book_id, chapter_id
-            ),
-            allow_cloud_fallback=allow_cloud_fallback,
-        )
+        recovery_tracker = BatchRecoveryTracker()
+        try:
+            results = translate_batch(
+                paragraphs,
+                source_lang,
+                target_lang,
+                budget=budget,
+                selected_groups=missing_groups,
+                operation_namespace=_operation_namespace(
+                    tenant, book_id, chapter_id
+                ),
+                allow_cloud_fallback=allow_cloud_fallback,
+                recovery_tracker=recovery_tracker,
+            )
+        finally:
+            _flush_segment_recovery(recovery_tracker)
         for group in missing_groups:
             contract = contracts[tuple(group)]
             for index in group:
-                translated, backend = results[index]
+                item = results[index]
+                translated = item.text
+                backend = item.provider
                 translations[index] = translated
                 backends[index] = backend or "unknown"
                 if translated.startswith("[TRANSLATION ERROR:"):
                     continue
                 fresh_count += 1
+                if not item.server_cacheable:
+                    continue
                 try:
                     scope = _cache_scope(
                         tenant=tenant,
@@ -1133,6 +1188,7 @@ def metrics():
         "http_responses": snapshot["http_responses"],
         "outcomes": snapshot["outcomes"],
         "work_budget_reasons": snapshot["work_budget_reasons"],
+        "segment_recovery": snapshot["segment_recovery"],
         "batch_partial_failure_segments": snapshot[
             "batch_partial_failure_segments"
         ],

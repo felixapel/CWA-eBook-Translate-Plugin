@@ -11,7 +11,7 @@ os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
 
 from auth import AuthUnavailable, RequestAuthenticator
 import server
-from translator import ProviderUnavailableError
+from translator import BatchRecoveryTracker, ProviderUnavailableError
 from work_budget import WorkBudgetExceeded
 
 
@@ -162,6 +162,80 @@ class ObservabilityContractTests(unittest.TestCase):
         self.assertEqual(snapshot["outcomes"]["batch_partial_failure_requests"], 1)
         self.assertEqual(snapshot["batch_partial_failure_segments"], 2)
 
+    def test_segment_recovery_metrics_distinguish_retry_and_fallback(self):
+        tracker = BatchRecoveryTracker()
+        tracker.record("envelope_retry_groups", 2)
+        tracker.record("envelope_retry_recovered_groups")
+        tracker.record("paragraph_fallback_groups")
+        tracker.record("paragraph_fallback_recovered_segments")
+        tracker.record("paragraph_fallback_failed_segments")
+
+        server._record_segment_recovery(tracker.snapshot())
+
+        recovery = self.metrics()["segment_recovery"]
+        self.assertEqual(recovery, {
+            "envelope_retry_groups": 2,
+            "envelope_retry_recovered_groups": 1,
+            "paragraph_fallback_groups": 1,
+            "paragraph_fallback_recovered_segments": 1,
+            "paragraph_fallback_failed_segments": 1,
+        })
+
+    def test_recovery_metrics_survive_work_budget_failure(self):
+        captured = {}
+
+        def exhaust_after_recovery(*_args, recovery_tracker=None, **_kwargs):
+            self.assertIsNotNone(recovery_tracker)
+            captured["tracker"] = recovery_tracker
+            recovery_tracker.record("envelope_retry_groups")
+            raise WorkBudgetExceeded("attempts")
+
+        with (
+            mock.patch.object(server, "get_cached", return_value=None),
+            mock.patch.object(
+                server, "translate_batch", side_effect=exhaust_after_recovery
+            ),
+        ):
+            failed = self.client.post(
+                "/translate/batch", json={"paragraphs": ["one", "two"]}
+            )
+
+        self.assertEqual(failed.status_code, 503)
+        # A worker already beyond provider I/O may finish its CPU-only
+        # bookkeeping after the coordinator has returned the bounded 503.
+        captured["tracker"].record("paragraph_fallback_groups")
+        recovery = self.metrics()["segment_recovery"]
+        self.assertEqual(recovery["envelope_retry_groups"], 1)
+        self.assertEqual(recovery["paragraph_fallback_groups"], 1)
+        self.assertEqual(recovery["envelope_retry_recovered_groups"], 0)
+        self.assertEqual(recovery["paragraph_fallback_recovered_segments"], 0)
+        self.assertEqual(recovery["paragraph_fallback_failed_segments"], 0)
+
+    def test_recovery_metric_failure_never_masks_work_budget_response(self):
+        def exhaust_after_recovery(*_args, recovery_tracker=None, **_kwargs):
+            self.assertIsNotNone(recovery_tracker)
+            recovery_tracker.record("envelope_retry_groups")
+            raise WorkBudgetExceeded("attempts")
+
+        with (
+            mock.patch.object(server, "get_cached", return_value=None),
+            mock.patch.object(
+                server, "translate_batch", side_effect=exhaust_after_recovery
+            ),
+            mock.patch.object(
+                server,
+                "_record_segment_recovery",
+                side_effect=RuntimeError("synthetic metric failure"),
+            ),
+        ):
+            failed = self.client.post(
+                "/translate/batch", json={"paragraphs": ["one", "two"]}
+            )
+
+        self.assertEqual(failed.status_code, 503)
+        self.assertEqual(failed.get_json()["error"], "work_budget_exhausted")
+        self.assertEqual(failed.get_json()["reason"], "attempts")
+
     def test_metric_dimensions_are_fixed_and_reject_dynamic_labels(self):
         snapshot = self.metrics()
 
@@ -185,6 +259,16 @@ class ObservabilityContractTests(unittest.TestCase):
                 "translation_failed",
                 "internal_error",
                 "batch_partial_failure_requests",
+            },
+        )
+        self.assertEqual(
+            set(snapshot["segment_recovery"]),
+            {
+                "envelope_retry_groups",
+                "envelope_retry_recovered_groups",
+                "paragraph_fallback_groups",
+                "paragraph_fallback_recovered_segments",
+                "paragraph_fallback_failed_segments",
             },
         )
         with self.assertRaises(ValueError):

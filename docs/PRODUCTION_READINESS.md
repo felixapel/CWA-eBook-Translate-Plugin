@@ -29,10 +29,10 @@ source release remains blocked until every item under
 | F-04 release independent of authoritative CI/parity | Implemented and gated, plus operator prerequisites | `.gitea/workflows/release.yml` validates the exact Gitea/GitHub tag and commit before all backend, browser, and container gates. Official artifacts are the validated source tag and archives. |
 | F-05 divergent historical `v2.0.0` tags | Historical exception | [The release runbook](RELEASE.md#historical-split-tag) records both immutable commit identities; all future releases fail on tag divergence. |
 | F-06 unprotected `main` and release tags | Operator prerequisite | Gitea branch and tag protection must be configured before promotion. |
-| F-07 ambiguous segment protocol | Implemented and gated | Translation batches use unpredictable IDs and validate a strict one-to-one structured envelope. |
+| F-07 ambiguous segment protocol | Implemented and gated | Translation batches use unpredictable IDs and validate a strict one-to-one structured envelope. One malformed envelope gets one fresh-ID retry; a second malformed envelope uses bounded sequential single-paragraph recovery, which cannot cross-map segments and is not cached as a grouped result. |
 | F-08 context-incomplete cache keys | Implemented and gated | Cache schema v2 includes tenant, book, chapter, provider/model, prompt/protocol, languages, and context fingerprints. |
 | F-09 plaintext unbounded retention | Implemented and gated | Source text is not persisted in `translations_v2`, identifiers are hashed, file modes are private, and server/browser retention is bounded and opt-in where applicable. The v1 table remains physically separate only for rollback. |
-| F-10 nested retries without coalescing | Implemented and gated | Absolute request budgets, bounded admission, and `singleflight.py` coalesce equivalent active work; the browser does not retry ambiguous provider work. |
+| F-10 nested retries without coalescing | Implemented and gated | Absolute request budgets, bounded admission, and `singleflight.py` coalesce equivalent active work. Envelope retry and paragraph recovery spend the same atomic budget; the browser does not retry ambiguous provider work. |
 | F-11 public provider-backed health probe | Implemented and gated | `/ping`, `/health`, and `/ready` are shallow; authenticated `/health/deep` uses the normal provider budget. |
 | F-12 browser token in `localStorage` | Implemented and gated | The recommended topology validates the existing HttpOnly CWA session and browser loaders no longer recover a shared secret from storage. |
 | F-13 unsigned, weakly reproducible supply chain | Scope reduced and gated | Official container publication was removed by ADR-008. Source identity is enforced by matching annotated tags and commits; Actions, dependencies, base inputs, and local container builds remain pinned and tested. |
@@ -41,7 +41,7 @@ source release remains blocked until every item under
 | F-16 privileged combined runtime | Implemented and gated | API and proxy are independent non-root roles with read-only roots, zero capabilities, and clean independent shutdown. |
 | F-17 malformed JSON returned HTML 500 | Implemented and gated | API schema contracts require stable JSON 4xx responses before business logic. |
 | F-18 implicit proxy authority | Implemented and gated | The proxy uses a configured public origin, fixed forwarding policy, validated upstreams, and finite body limits. |
-| F-19 missing failure observability | Implemented and gated | Fixed-cardinality metrics cover authentication, admission, deadlines, provider outcomes, partial batches, and singleflight pressure without book content labels. |
+| F-19 missing failure observability | Implemented and gated | Fixed-cardinality metrics cover authentication, admission, deadlines, provider outcomes, envelope/paragraph recovery, partial batches, and singleflight pressure without book content labels. |
 | F-20 frontend state/integration drift | Implemented and gated | Real Chromium tests cover route isolation, rendering, state, rate-limit handling, consent, accessibility, and console/network health; unit contracts cover transport retries. |
 | F-21 avoidable cache contention | Implemented and gated | Schema v2 uses indexed expiry/maintenance paths, WAL/busy-timeout handling, bounded maintenance, and concurrency contracts. |
 | F-22 brittle limits, scripts, and metadata | Implemented and gated | Extreme numeric inputs fail closed, deployment helpers use strict quoting, dependencies/metadata are locked, and shell/workflow contracts are enforced. |
@@ -77,11 +77,13 @@ all of these outcomes without a skipped or unavailable gate:
    socket-free exporter, proves `plan --json` reports that exact identity, and
    completes install, doctor, and conservative uninstall through the fallback.
 
-The final local candidate audit on 2026-07-14 passed Python compilation, the
-standalone translation and hardening suites, the complete backend contract suite,
-frontend unit tests, four real-Chromium scenarios, Python and npm vulnerability
-audits, local Markdown-link/parity checks, and the split-role container build
-and smoke gate on Docker 29.6.1. The earlier image-publication audit also
+The 2026-07-14 local candidate audit passed Python compilation, the standalone
+translation and hardening suites, the complete backend contract suite, frontend
+unit tests, four real-Chromium scenarios, Python and npm vulnerability audits,
+local Markdown-link/parity checks, and the split-role container build and smoke
+gate on Docker 29.6.1. It predates subsequent candidate fixes and is historical
+evidence, not acceptance for a newer commit; every maintained gate must run
+again on the exact merged candidate. The earlier image-publication audit also
 exercised multi-platform attestations before that publication path was retired
 by ADR-008. The stock-Unraid bootstrap gate additionally requires a full Git
 checkout but no host Python or NerdTools. Protected CI must repeat the currently
@@ -101,6 +103,10 @@ Before creating the first post-audit version tag, an authorized operator must:
   protected branch with zero assumed human approvals, wait for all checks on
   the exact `main` commit, and mirror it to GitHub before creating the annotated
   tag;
+- on physical stock Unraid 7.3.2 without host Python or NerdTools, run the
+  public `./btctl plan`, `install`, and `doctor` path from that exact clean
+  commit, then complete one real browser translation through the managed public
+  route and record the commit plus result before tagging;
 - publish only the annotated source tag through the Gitea-authoritative
   workflow, then build and deploy that exact checked-out tag locally.
 

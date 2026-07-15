@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.2.0] - 2026-07-14
+## [2.2.0] - 2026-07-15
 
 ### Security
 
@@ -103,7 +103,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bounded singleflight coalescing for identical active translation operations,
   with tenant/context isolation and pressure counters in `/metrics`.
 - Fixed-cardinality HTTP, authentication, rate-limit, work-budget, provider,
-  and partial-batch failure counters without content-derived metric labels.
+  envelope-recovery, and partial-batch failure counters without content-derived
+  metric labels.
 - `btctl` provides a single source-only lifecycle for Unraid and existing
   Compose deployments: mutation-free `plan`, verified split-role `install`,
   narrow `adopt`, read-only `doctor`, ownership-bound `uninstall`, offline
@@ -145,9 +146,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gettext/envsubst and their Alpine dependency surface were removed.
 - The split Compose proxy reaches the API through a managed, network-scoped DNS
   alias; no fixed Docker subnet is trusted or required.
-- The browser retries only bounded `429` admission rejections. Ambiguous
-  timeouts, network failures, and invalid responses require an explicit user
-  retry so they cannot duplicate provider work still running server-side.
+- The browser retries only bounded `429` admission rejections. Malformed
+  provider-envelope recovery happens server-side inside the original request
+  budget. Browser timeouts, network failures, and invalid HTTP responses still
+  require an explicit user retry so they cannot duplicate provider work still
+  running server-side.
 - Managed installs build an immutable local
   `local/cwa-translate:<version>-<sha12>` image from a clean checkout, create
   independent non-root API/proxy roles, leave CWA and data external, avoid a
@@ -164,6 +167,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An occasional malformed batch envelope from a local model no longer drops the
+  whole browser request with an unretried `502`. The server retries the affected
+  group once with fresh opaque IDs, then recovers it sequentially per paragraph
+  within the existing request-wide work budget. Ordinary individual failures
+  become sanitized markers for only those paragraphs and leave healthy sibling
+  groups intact. Recovery output is not written under the grouped cache
+  contract; work-budget exhaustion remains fatal and stops new provider I/O.
 - Native CWA sessions with `config_session=1` no longer fail every validation
   probe. The managed proxy preserves the browser `User-Agent` and overwrites
   both upstream paths with the same observed peer; the API replays that exact

@@ -196,7 +196,7 @@ legacy integrations.
 | `LLM_API_KEY` | | Your API key for the chosen provider (the only supported key mechanism since 2.0.0) |
 | `BT_LOCAL_URL` | `http://localhost:1234/v1/chat/completions` | Only used if `LLM_PROVIDER=local`. OpenAI-compatible endpoint — the **path is always `/v1/chat/completions`** (vLLM, LM Studio, Ollama, llama.cpp all speak it); only host:port changes (vLLM `:8000`, LM Studio `:1234`, Ollama `:11434`). **In Docker, `localhost` is the container itself** — use `http://host.docker.internal:<port>/...` or the host IP. |
 | `BT_MAX_CONCURRENT` | `2` | Simultaneous translation requests (batches). For a slow single-GPU local model, `1`–`2` is **more** stable than `3` (avoids timeout cascades). |
-| `BT_BATCH_SIZE` | `5` | Paragraphs translated per LLM call. `>1` is dramatically faster on slow models (one generation instead of one-per-paragraph). Batches use a strict, versioned JSON envelope; an invalid provider response fails the group atomically and is never cached. Set `1` for one-call-per-paragraph. |
+| `BT_BATCH_SIZE` | `5` | Paragraphs in the initial grouped LLM call. `>1` is dramatically faster on slow models. Batches use a strict, versioned JSON envelope. A malformed envelope gets one grouped retry with fresh IDs; a second malformed envelope triggers sequential per-paragraph recovery inside the same request work budget. Recovery output is not stored under the grouped cache contract. Ordinary individual failures become per-paragraph error markers; work-budget exhaustion remains fatal. Set `1` for one-call-per-paragraph. |
 | `BT_MAX_TOKENS` | `4096` | Hard ceiling on `max_tokens` for a **single**-paragraph request. The actual value sent is the smaller of this and the proportional cap (see `BT_OUTPUT_TOKEN_FACTOR`). |
 | `BT_BATCH_MAX_TOKENS` | `8192` | Same ceiling, but for a **batched** (multi-paragraph) request. |
 | `BT_OUTPUT_TOKEN_FACTOR` | `2.0` | Caps generated `max_tokens` at `input_tokens × FACTOR + FLOOR`, clamped to the ceiling above. Prevents a rambling/stuck local model from generating thousands of tokens for a short paragraph (the main cause of 8–20s and 120s stalls). `2.0` never truncates real translations; lower it (e.g. `1.6`) for a bit more speed at some risk on very expansive target languages. |
@@ -213,7 +213,7 @@ legacy integrations.
 | `BT_MAX_UPSTREAM_INFLIGHT` | `2` | Process-wide cap on simultaneous in-flight LLM calls across all readers. `BT_MAX_CONCURRENT` only bounds one batch request; this cap prevents multi-reader timeout cascades. Must be greater than zero. |
 | `BT_UPSTREAM_QUEUE_TIMEOUT` | `2` | Maximum seconds to wait for a global upstream slot. A full queue returns `503` with `Retry-After` without starting a provider call. |
 | `BT_SINGLEFLIGHT_MAX_ENTRIES` | `1024` | Process-wide bound on distinct active translation operations. Concurrent requests with the same tenant/book/chapter and exact prompt contract share one provider call; completed results are never retained here and must pass through the scoped SQLite cache. |
-| `BT_REQUEST_MAX_ATTEMPTS` | `20` | Maximum provider calls across groups, primary, and an allowed fallback for one API request. With explicit cloud consent, batch groups use one attempt per provider, so the default exactly covers 50 paragraphs at batch size 5 when the primary fails and a healthy fallback succeeds. The single-text endpoint retains two attempts per provider. Attempts are reserved atomically before network I/O. |
+| `BT_REQUEST_MAX_ATTEMPTS` | `20` | Maximum provider calls across groups, primary, and an allowed fallback for one API request. With explicit cloud consent, batch groups use one attempt per provider, so the default exactly covers 50 paragraphs at batch size 5 when the primary fails and a healthy fallback succeeds. A malformed-envelope retry and any sequential paragraph recovery consume this same finite budget; exhaustion stops before another provider call. The single-text endpoint retains two attempts per provider. Attempts are reserved atomically before network I/O. |
 | `BT_REQUEST_MAX_INPUT_BYTES` | `5000000` | Maximum cumulative UTF-8 prompt bytes reserved across every provider attempt in one API request. The default covers two passes over the largest valid default batch, including four-byte Unicode and protocol overhead. |
 | `BT_REQUEST_MAX_OUTPUT_TOKENS` | `163840` | Maximum cumulative `max_tokens` reserved across every provider attempt in one API request, sized for the same bounded 20-call batch path. |
 | `BT_REQUEST_DEADLINE_SECONDS` | `90` | Absolute request-wide deadline. Once expired, no new provider attempt can start; individual provider timeouts are clamped to the remaining time. |
@@ -310,12 +310,13 @@ compatibility uses `X-BT-Token`; the private cleanup token is not a browser
 credential.
 
 `/metrics` reports request/cache counters, fixed HTTP status classes, bounded
-authentication/rate-limit/provider/work-budget outcomes, partial-batch segment
-failures, and bounded singleflight activity (`active_entries`, shared results,
-follower timeouts, and capacity rejections). Metric dimensions are defined by
-the server: routes, identities, book metadata, provider URLs, exception strings,
-source text, and cache keys are never labels. Counters are process-local, which
-is another reason the shipped runtime intentionally uses one gunicorn worker.
+authentication/rate-limit/provider/work-budget outcomes, envelope-retry and
+paragraph-recovery outcomes, partial-batch segment failures, and bounded
+singleflight activity (`active_entries`, shared results, follower timeouts, and
+capacity rejections). Metric dimensions are defined by the server: routes,
+identities, book metadata, provider URLs, exception strings, source text, and
+cache keys are never labels. Counters are process-local, which is another reason
+the shipped runtime intentionally uses one gunicorn worker.
 
 Authentication-derived tenant behavior is intentional:
 

@@ -220,7 +220,14 @@ class TranslatorSingleFlightTests(unittest.TestCase):
             calls += 1
             entered.set()
             self.assertTrue(release.wait(1))
-            return [("uno", "local"), ("dos", "local")]
+            return [
+                translator.BatchTranslationItem(
+                    "uno", "local", True, "direct"
+                ),
+                translator.BatchTranslationItem(
+                    "dos", "local", True, "direct"
+                ),
+            ]
 
         def invoke():
             try:
@@ -257,6 +264,125 @@ class TranslatorSingleFlightTests(unittest.TestCase):
             [("uno", "local"), ("dos", "local")],
             [("uno", "local"), ("dos", "local")],
         ])
+
+    def test_identical_recovery_batches_share_the_bounded_provider_work(self) -> None:
+        # The outer batch flight must be sufficient to coalesce recovery. A
+        # nested single-paragraph flight would deadlock admission at capacity 1.
+        flights = SingleFlight(max_entries=1, result_ttl_seconds=0)
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+        results = []
+        errors = []
+        budgets = [budget(), budget()]
+        recovery_trackers = [
+            translator.BatchRecoveryTracker(),
+            translator.BatchRecoveryTracker(),
+        ]
+
+        class OpenAIResponse:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, output):
+                self._body = {
+                    "choices": [{"message": {"content": output}}],
+                }
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._body
+
+        def provider_post(_url, **kwargs):
+            payload = kwargs["json"]
+            system = payload["messages"][0]["content"]
+            user_content = payload["messages"][1]["content"]
+            with calls_lock:
+                calls.append(
+                    "batch"
+                    if translator.SEGMENT_PROTOCOL in system
+                    else f"single:{user_content}"
+                )
+                first_call = len(calls) == 1
+            if first_call:
+                entered.set()
+                self.assertTrue(release.wait(1))
+            if translator.SEGMENT_PROTOCOL in system:
+                return OpenAIResponse("not-json")
+            return OpenAIResponse(f"translated:{user_content}")
+
+        def invoke(index):
+            try:
+                detailed = translator.translate_batch_detailed(
+                    ["one", "two"],
+                    max_concurrent=1,
+                    budget=budgets[index],
+                    operation_namespace="tenant-book-chapter",
+                    recovery_tracker=recovery_trackers[index],
+                )
+                results.append([
+                    (item.text, item.provider) for item in detailed
+                ])
+            except Exception as exc:  # pragma: no cover - assertion evidence
+                errors.append(exc)
+
+        primary = translator._Provider("local", "fake-model", "")
+        with (
+            mock.patch.object(translator, "_TRANSLATION_SINGLEFLIGHT", flights),
+            mock.patch.object(translator, "_primary_provider", primary),
+            mock.patch.object(translator, "_fallback_provider", None),
+            mock.patch.object(translator, "_provider_post", side_effect=provider_post),
+            mock.patch.object(translator, "BT_BATCH_SIZE", 2),
+            mock.patch.object(translator, "BT_CONTEXT_WINDOW", 0),
+        ):
+            leader = threading.Thread(target=invoke, args=(0,))
+            follower = threading.Thread(target=invoke, args=(1,))
+            leader.start()
+            self.assertTrue(entered.wait(1))
+            follower.start()
+            deadline = time.monotonic() + 1
+            while (
+                flights.stats()["followers_waiting"] < 1
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            self.assertEqual(flights.stats()["followers_waiting"], 1)
+            release.set()
+            leader.join(1)
+            follower.join(1)
+
+        self.assertFalse(leader.is_alive())
+        self.assertFalse(follower.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(calls, [
+            "batch", "batch", "single:one", "single:two",
+        ])
+        self.assertEqual(results, [
+            [("translated:one", "local"), ("translated:two", "local")],
+            [("translated:one", "local"), ("translated:two", "local")],
+        ])
+        self.assertEqual(
+            sum(item.snapshot()["attempts"] for item in budgets), 4
+        )
+        self.assertEqual(flights.stats()["leaders"], 1)
+        self.assertEqual(flights.stats()["shared_results"], 1)
+        self.assertEqual(flights.stats()["capacity_rejections"], 0)
+        recovery_totals = {
+            name: sum(
+                tracker.snapshot()[name] for tracker in recovery_trackers
+            )
+            for name in translator.RECOVERY_METRIC_NAMES
+        }
+        self.assertEqual(recovery_totals, {
+            "envelope_retry_groups": 1,
+            "envelope_retry_recovered_groups": 0,
+            "paragraph_fallback_groups": 1,
+            "paragraph_fallback_recovered_segments": 2,
+            "paragraph_fallback_failed_segments": 0,
+        })
 
     def test_different_namespaces_never_share_work(self) -> None:
         flights = SingleFlight(max_entries=16, result_ttl_seconds=10)

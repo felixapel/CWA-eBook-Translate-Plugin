@@ -11,7 +11,7 @@ os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
 
 import server
 import translator
-from work_budget import WorkBudget
+from work_budget import WorkBudget, WorkBudgetExceeded
 
 
 def budget() -> WorkBudget:
@@ -79,7 +79,10 @@ class ServerGroupCacheTests(unittest.TestCase):
             self.assertFalse(record_hit)
             return "old-a" if text == "a" and scope.provider == "local" else None
 
-        fresh = [("new-a", "local"), ("new-b", "local")]
+        fresh = [
+            translator.BatchTranslationItem("new-a", "local", True, "direct"),
+            translator.BatchTranslationItem("new-b", "local", True, "direct"),
+        ]
         with (
             mock.patch.object(server, "get_cached", side_effect=partial_hit),
             mock.patch.object(server, "put_cache") as put_cache,
@@ -143,6 +146,127 @@ class ServerGroupCacheTests(unittest.TestCase):
         translate.assert_not_called()
         put_cache.assert_not_called()
         self.assertEqual(record_hit.call_count, 2)
+
+    def test_individual_recovery_is_not_cached_as_batch_but_siblings_are(self) -> None:
+        fresh = [
+            translator.BatchTranslationItem(
+                "new-a", "local", True, "direct"),
+            translator.BatchTranslationItem(
+                "new-b", "local", True, "direct"),
+            translator.BatchTranslationItem(
+                "new-c", "local", False, "paragraph_fallback"),
+            translator.BatchTranslationItem(
+                "new-d", "local", False, "paragraph_fallback"),
+        ]
+        with (
+            mock.patch.object(translator, "BT_BATCH_SIZE", 2),
+            mock.patch.object(server, "get_cached", return_value=None),
+            mock.patch.object(server, "put_cache") as put_cache,
+            mock.patch.object(
+                server, "translate_batch", return_value=fresh
+            ) as translate,
+            mock.patch.object(
+                server,
+                "cache_lookup_backends",
+                return_value=[("local", "gemma4-12b")],
+            ),
+        ):
+            result = server._translate_paragraphs(
+                ["a", "b", "c", "d"],
+                "English",
+                "Spanish",
+                budget(),
+                **self.namespace,
+            )
+
+        self.assertEqual(
+            result["translations"], ["new-a", "new-b", "new-c", "new-d"]
+        )
+        self.assertEqual(result["fresh_count"], 4)
+        self.assertEqual(
+            translate.call_args.kwargs["selected_groups"], [[0, 1], [2, 3]]
+        )
+        self.assertEqual(
+            [call.args[0] for call in put_cache.call_args_list], ["a", "b"]
+        )
+
+    def test_mid_recovery_budget_exhaustion_writes_no_partial_cache(self) -> None:
+        calls = []
+
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def __init__(self, output: str) -> None:
+                self._body = {
+                    "choices": [{"message": {"content": output}}],
+                }
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return self._body
+
+        def malformed_then_single(_url, **kwargs):
+            payload = kwargs["json"]
+            system = payload["messages"][0]["content"]
+            text = payload["messages"][1]["content"]
+            if translator.SEGMENT_PROTOCOL in system:
+                calls.append("batch")
+                return Response("not-json")
+            calls.append(f"single:{text}")
+            return Response(f"translated:{text}")
+
+        constrained_budget = WorkBudget(
+            max_attempts=3,
+            max_input_bytes=1_000_000,
+            max_output_tokens=100_000,
+            deadline_seconds=30,
+        )
+        primary = translator._Provider("local", "fake-model", "")
+        server._reset_metrics_for_tests()
+        try:
+            with (
+                mock.patch.object(translator, "_primary_provider", primary),
+                mock.patch.object(translator, "_fallback_provider", None),
+                mock.patch.object(
+                    translator, "_provider_post", side_effect=malformed_then_single
+                ),
+                mock.patch.object(translator, "BT_BATCH_SIZE", 3),
+                mock.patch.object(server, "get_cached", return_value=None),
+                mock.patch.object(server, "put_cache") as put_cache,
+                mock.patch.object(
+                    server,
+                    "cache_lookup_backends",
+                    return_value=[("local", "fake-model")],
+                ),
+            ):
+                with self.assertRaises(WorkBudgetExceeded) as raised:
+                    server._translate_paragraphs(
+                        ["one", "two", "three"],
+                        "English",
+                        "Spanish",
+                        constrained_budget,
+                        tenant="subject-mid-recovery",
+                        book_id="book-mid-recovery",
+                        chapter_id="chapter-mid-recovery",
+                    )
+
+            self.assertEqual(raised.exception.reason, "attempts")
+            self.assertEqual(calls, ["batch", "batch", "single:one"])
+            put_cache.assert_not_called()
+            with server._metrics_lock:
+                recovery = dict(server._metrics["segment_recovery"])
+            self.assertEqual(recovery, {
+                "envelope_retry_groups": 1,
+                "envelope_retry_recovered_groups": 0,
+                "paragraph_fallback_groups": 1,
+                "paragraph_fallback_recovered_segments": 1,
+                "paragraph_fallback_failed_segments": 0,
+            })
+        finally:
+            server._reset_metrics_for_tests()
 
 
 if __name__ == "__main__":

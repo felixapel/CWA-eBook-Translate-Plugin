@@ -4,10 +4,13 @@ Supports OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRoute
 A primary provider plus an OPTIONAL fallback provider for resilience. Remote
 fallback is used only with explicit consent on the current request.
 
-Batched translation: multiple paragraphs can be translated in a SINGLE LLM call
-(see BT_BATCH_SIZE) which is far faster on slow local models. Batched input and
-output use a versioned JSON envelope with server-generated IDs; a malformed
-response fails the whole group rather than risking cross-segment corruption.
+Batched translation sends multiple paragraphs in one strict, versioned JSON
+envelope with server-generated IDs. A malformed envelope gets one grouped retry
+with fresh IDs; a second malformed envelope falls back sequentially per
+paragraph inside the same request WorkBudget. Paragraph-recovery results retain
+provenance and are not stored under the grouped cache contract. Individual
+provider failures become per-paragraph markers; WorkBudget exhaustion remains
+fatal.
 """
 import json
 import hashlib
@@ -23,7 +26,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from requests.adapters import HTTPAdapter
-from typing import Optional
+from typing import Callable, Literal, Optional
 from urllib3 import PoolManager, ProxyManager
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
@@ -428,6 +431,105 @@ class TranslationCacheContract:
     prompt_hash: str
     protocol_version: str
     context_hash: str
+
+
+RecoveryPath = Literal[
+    "direct",
+    "envelope_retry",
+    "paragraph_fallback",
+    "paragraph_fallback_failed",
+    "failed",
+    "empty",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class BatchTranslationItem:
+    """One batch slot plus the provenance needed for safe server caching."""
+
+    text: str
+    provider: str
+    server_cacheable: bool
+    recovery_path: RecoveryPath
+
+
+RECOVERY_METRIC_NAMES = (
+    "envelope_retry_groups",
+    "envelope_retry_recovered_groups",
+    "paragraph_fallback_groups",
+    "paragraph_fallback_recovered_segments",
+    "paragraph_fallback_failed_segments",
+)
+
+
+class BatchRecoveryTracker:
+    """Thread-safe, fixed-cardinality recovery counters for one request.
+
+    The tracker deliberately contains no paragraph content, provider value,
+    segment ID, or other caller-controlled dimension. It is passed only to the
+    singleflight leader, so coalesced followers do not double-count provider
+    work.
+    """
+
+    __slots__ = ("_counts", "_lock", "_sink")
+
+    def __init__(self) -> None:
+        self._counts = {name: 0 for name in RECOVERY_METRIC_NAMES}
+        self._lock = _threading.Lock()
+        self._sink: Optional[Callable[[dict[str, int]], None]] = None
+
+    @staticmethod
+    def _publish(
+        sink: Callable[[dict[str, int]], None],
+        increments: dict[str, int],
+    ) -> None:
+        if not any(increments.values()):
+            return
+        try:
+            sink(increments)
+        except Exception as exc:
+            # Metrics are diagnostic and must never change translation or
+            # work-budget outcomes. No dynamic value is logged.
+            log.error(
+                "recovery metric sink failed error_type=%s",
+                type(exc).__name__,
+            )
+
+    def record(self, name: str, count: int = 1) -> None:
+        if name not in self._counts:
+            raise ValueError("unknown recovery metric")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("recovery metric count must be a positive integer")
+        with self._lock:
+            self._counts[name] += count
+            sink = self._sink
+        if sink is not None:
+            increments = {metric: 0 for metric in RECOVERY_METRIC_NAMES}
+            increments[name] = count
+            self._publish(sink, increments)
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._counts)
+
+    def attach_sink_and_flush(
+        self, sink: Callable[[dict[str, int]], None]
+    ) -> None:
+        """Publish current counts once, then publish every late increment.
+
+        A request may return after cancelling queued work while a provider
+        worker finishes CPU-only bookkeeping. Installing the sink under the
+        same lock as ``record`` closes that race without waiting for provider
+        I/O or permitting new work.
+        """
+        if not callable(sink):
+            raise ValueError("recovery metric sink must be callable")
+        with self._lock:
+            if self._sink is not None:
+                raise RuntimeError("recovery metric sink is already attached")
+            self._sink = sink
+            pending = dict(self._counts)
+        self._publish(sink, pending)
 
 
 def _contract_hash(value) -> str:
@@ -922,6 +1024,31 @@ def _single_operation_key(
     ])
 
 
+def _translate_text_operation(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    max_retries: int,
+    timeout: int,
+    budget: WorkBudget,
+    allow_cloud_fallback: bool,
+) -> tuple[str, str]:
+    """Run one single-text completion without entering singleflight."""
+    budget.ensure_active()
+    system = SYSTEM_PROMPT.format(
+        source_lang=source_lang, target_lang=target_lang
+    )
+    return _complete(
+        text,
+        system,
+        max_retries,
+        timeout,
+        _output_cap(text, BT_MAX_TOKENS),
+        budget,
+        allow_cloud_fallback=allow_cloud_fallback,
+    )
+
+
 def translate_text(
     text: str,
     source_lang: str = "English",
@@ -939,7 +1066,6 @@ def translate_text(
         budget = create_work_budget()
     budget.ensure_active()
     resolved_timeout = BT_TIMEOUT if timeout is None else timeout
-    system = SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
     key = _single_operation_key(
         text,
         source_lang,
@@ -952,14 +1078,14 @@ def translate_text(
     try:
         flight = _TRANSLATION_SINGLEFLIGHT.run(
             key,
-            lambda: _complete(
+            lambda: _translate_text_operation(
                 text,
-                system,
+                source_lang,
+                target_lang,
                 max_retries,
                 resolved_timeout,
-                _output_cap(text, BT_MAX_TOKENS),
                 budget,
-                allow_cloud_fallback=allow_cloud_fallback,
+                allow_cloud_fallback,
             ),
             timeout=budget.remaining_seconds(),
         )
@@ -1120,55 +1246,124 @@ def _translate_group_operation(
     source_lang: str,
     target_lang: str,
     budget: WorkBudget,
-    operation_namespace: str,
     allow_cloud_fallback: bool,
-) -> list[tuple[str, str]]:
+    recovery_tracker: Optional[BatchRecoveryTracker],
+) -> list[BatchTranslationItem]:
     """
-    Translate a group of paragraphs in ONE LLM call. A malformed protocol
-    response fails the group atomically; it never triggers unbounded
-    per-paragraph fanout or permits partial results to be cached.
+    Translate a group with a strict segment envelope and bounded recovery.
 
-    Returns one (translated_text, provider_name) per input segment.
+    One malformed envelope is retried with fresh opaque IDs. If the second
+    envelope is also malformed, each segment is translated sequentially using
+    the same request budget. The caller owns cache provenance and must not
+    store individual recovery results under the batch contract. Ordinary
+    individual provider failures become sanitized per-segment markers;
+    ``WorkBudgetExceeded`` propagates and remains request-fatal.
+
+    Returns one detailed result per input segment.
     """
     group_texts = [all_texts[i] for i in idxs]
     if len(group_texts) == 1 and BT_CONTEXT_WINDOW == 0:
-        return [translate_text(
+        translated, provider = _translate_text_operation(
             group_texts[0], source_lang, target_lang,
-            max_retries=1, budget=budget,
-            operation_namespace=operation_namespace,
-            allow_cloud_fallback=allow_cloud_fallback)]
+            1, BT_TIMEOUT, budget, allow_cloud_fallback)
+        return [BatchTranslationItem(
+            translated, provider, True, "direct")]
 
-    segment_ids = []
-    while len(segment_ids) < len(idxs):
-        candidate = secrets.token_hex(16)
-        if candidate not in segment_ids:
-            segment_ids.append(candidate)
-    envelope = {
-        "protocol": SEGMENT_PROTOCOL,
-        "segments": [
-            {"id": segment_id, "text": all_texts[i]}
-            for segment_id, i in zip(segment_ids, idxs)
-        ],
-    }
     context_block = _build_context_block(all_texts, idxs)
-    if context_block:
-        envelope["context"] = context_block
-
-    combined = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     system = BATCH_SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
+    used_segment_ids: set[str] = set()
 
-    output, provider = _complete(
-        combined,
-        system,
-        max_retries=1,
-        max_tokens=_output_cap(combined, BT_BATCH_MAX_TOKENS),
-        budget=budget,
-        allow_cloud_fallback=allow_cloud_fallback,
+    for envelope_attempt in range(2):
+        segment_ids = []
+        while len(segment_ids) < len(idxs):
+            candidate = secrets.token_hex(16)
+            if candidate not in used_segment_ids:
+                used_segment_ids.add(candidate)
+                segment_ids.append(candidate)
+        envelope = {
+            "protocol": SEGMENT_PROTOCOL,
+            "segments": [
+                {"id": segment_id, "text": all_texts[i]}
+                for segment_id, i in zip(segment_ids, idxs)
+            ],
+        }
+        if context_block:
+            envelope["context"] = context_block
+
+        combined = json.dumps(
+            envelope, ensure_ascii=False, separators=(",", ":"))
+        output, provider = _complete(
+            combined,
+            system,
+            max_retries=1,
+            max_tokens=_output_cap(combined, BT_BATCH_MAX_TOKENS),
+            budget=budget,
+            allow_cloud_fallback=allow_cloud_fallback,
+        )
+        parsed = _parse_segment_envelope(output, segment_ids)
+        if parsed is not None:
+            recovery_path: RecoveryPath = (
+                "direct" if envelope_attempt == 0 else "envelope_retry"
+            )
+            if envelope_attempt == 1 and recovery_tracker is not None:
+                recovery_tracker.record("envelope_retry_recovered_groups")
+            return [
+                BatchTranslationItem(seg, provider, True, recovery_path)
+                for seg in parsed
+            ]
+        if envelope_attempt == 0 and recovery_tracker is not None:
+            recovery_tracker.record("envelope_retry_groups")
+        log.warning(
+            "segment envelope invalid attempt=%d/2 group_size=%d",
+            envelope_attempt + 1,
+            len(idxs),
+        )
+
+    if recovery_tracker is not None:
+        recovery_tracker.record("paragraph_fallback_groups")
+    log.warning(
+        "segment envelope recovery using individual calls group_size=%d",
+        len(idxs),
     )
-    parsed = _parse_segment_envelope(output, segment_ids)
-    if parsed is None:
-        raise SegmentProtocolError("Invalid segment protocol response")
-    return [(seg, provider) for seg in parsed]
+    recovered: list[BatchTranslationItem] = []
+    for text in group_texts:
+        try:
+            translated, provider = _translate_text_operation(
+                text,
+                source_lang,
+                target_lang,
+                1,
+                BT_TIMEOUT,
+                budget,
+                allow_cloud_fallback,
+            )
+            recovered.append(BatchTranslationItem(
+                translated, provider, False, "paragraph_fallback"))
+            if recovery_tracker is not None:
+                recovery_tracker.record(
+                    "paragraph_fallback_recovered_segments"
+                )
+        except WorkBudgetExceeded:
+            raise
+        except Exception as exc:
+            error_code = (
+                "provider_unavailable"
+                if isinstance(exc, ProviderUnavailableError)
+                else "translation_failed"
+            )
+            log.warning(
+                "individual segment recovery failed error_type=%s",
+                type(exc).__name__,
+            )
+            recovered.append(BatchTranslationItem(
+                f"[TRANSLATION ERROR: {error_code}]",
+                "",
+                False,
+                "paragraph_fallback_failed",
+            ))
+            if recovery_tracker is not None:
+                recovery_tracker.record("paragraph_fallback_failed_segments")
+    return recovered
 
 
 def _batch_operation_key(
@@ -1207,9 +1402,10 @@ def _translate_group(
     budget: WorkBudget,
     operation_namespace: str,
     allow_cloud_fallback: bool,
-) -> list[tuple[str, str]]:
+    recovery_tracker: Optional[BatchRecoveryTracker],
+) -> list[BatchTranslationItem]:
     if len(idxs) == 1 and BT_CONTEXT_WINDOW == 0:
-        return [translate_text(
+        translated, provider = translate_text(
             all_texts[idxs[0]],
             source_lang,
             target_lang,
@@ -1217,7 +1413,9 @@ def _translate_group(
             budget=budget,
             operation_namespace=operation_namespace,
             allow_cloud_fallback=allow_cloud_fallback,
-        )]
+        )
+        return [BatchTranslationItem(
+            translated, provider, True, "direct")]
 
     budget.ensure_active()
     key = _batch_operation_key(
@@ -1233,8 +1431,8 @@ def _translate_group(
                 source_lang,
                 target_lang,
                 budget,
-                operation_namespace,
                 allow_cloud_fallback,
+                recovery_tracker,
             ),
             timeout=budget.remaining_seconds(),
         )
@@ -1246,7 +1444,7 @@ def _translate_group(
 
 
 
-def translate_batch(
+def translate_batch_detailed(
     texts: list[str],
     source_lang: str = "English",
     target_lang: str = "Spanish",
@@ -1256,18 +1454,25 @@ def translate_batch(
     selected_groups: Optional[list[list[int]]] = None,
     operation_namespace: str = "legacy",
     allow_cloud_fallback: bool = False,
-) -> list[tuple[str, str]]:
+    recovery_tracker: Optional[BatchRecoveryTracker] = None,
+) -> list[BatchTranslationItem]:
     """
-    Translate multiple texts. Non-empty texts are grouped into batches of
-    BT_BATCH_SIZE and each batch is translated in a single LLM call; batches run
-    concurrently (up to max_concurrent). Returns a (text, provider) per input.
+    Translate multiple texts and retain internal recovery/cache provenance.
+
+    Non-empty texts are grouped into batches of BT_BATCH_SIZE and batches run
+    concurrently up to max_concurrent. Public callers should normally use
+    ``translate_batch``; the server uses this detailed result to avoid caching
+    individual recovery output under a batch prompt contract.
     """
     if max_concurrent is None:
         max_concurrent = BT_MAX_CONCURRENT
     if budget is None:
         budget = create_work_budget()
     max_concurrent = max(1, max_concurrent)
-    results: list[tuple[str, str]] = [("", "")] * len(texts)
+    results = [
+        BatchTranslationItem("", "", False, "empty")
+        for _ in texts
+    ]
     if selected_groups is None:
         groups = translation_groups(texts)
     else:
@@ -1306,11 +1511,12 @@ def translate_batch(
                 budget,
                 operation_namespace,
                 allow_cloud_fallback,
+                recovery_tracker,
             )
         except SegmentProtocolError as exc:
-            # Publish the semantic failure before cancelling the shared budget.
-            # Other workers may observe "cancelled" first; the caller still
-            # needs the original 502-worthy protocol error, not a generic 503.
+            # Publish an unexpected typed protocol failure before cancelling
+            # the shared budget. Other workers may observe "cancelled" first;
+            # the caller still needs that original failure, not a generic 503.
             with fatal_lock:
                 if fatal_protocol_error[0] is None:
                     fatal_protocol_error[0] = exc
@@ -1328,8 +1534,14 @@ def translate_batch(
             log.error(
                 "Group translation failed error_type=%s", type(e).__name__)
             translations = [
-                (f"[TRANSLATION ERROR: {error_code}]", "")
-            ] * len(idxs)
+                BatchTranslationItem(
+                    f"[TRANSLATION ERROR: {error_code}]",
+                    "",
+                    False,
+                    "failed",
+                )
+                for _ in idxs
+            ]
         return idxs, translations
 
     executor = ThreadPoolExecutor(max_workers=max_concurrent)
@@ -1348,7 +1560,16 @@ def translate_batch(
             for j, idx in enumerate(idxs):
                 # Each entry carries the provider that ACTUALLY served it
                 # (the fallback provider when the primary failed).
-                results[idx] = translations[j] if j < len(translations) else ("[TRANSLATION ERROR: missing segment]", "")
+                results[idx] = (
+                    translations[j]
+                    if j < len(translations)
+                    else BatchTranslationItem(
+                        "[TRANSLATION ERROR: missing segment]",
+                        "",
+                        False,
+                        "failed",
+                    )
+                )
     except (SegmentProtocolError, WorkBudgetExceeded):
         for future in futures:
             future.cancel()
@@ -1361,6 +1582,31 @@ def translate_batch(
         executor.shutdown(wait=True)
 
     return results
+
+
+def translate_batch(
+    texts: list[str],
+    source_lang: str = "English",
+    target_lang: str = "Spanish",
+    max_concurrent: Optional[int] = None,
+    budget: Optional[WorkBudget] = None,
+    *,
+    selected_groups: Optional[list[list[int]]] = None,
+    operation_namespace: str = "legacy",
+    allow_cloud_fallback: bool = False,
+) -> list[tuple[str, str]]:
+    """Backward-compatible batch API returning one ``(text, provider)`` tuple."""
+    detailed = translate_batch_detailed(
+        texts,
+        source_lang,
+        target_lang,
+        max_concurrent=max_concurrent,
+        budget=budget,
+        selected_groups=selected_groups,
+        operation_namespace=operation_namespace,
+        allow_cloud_fallback=allow_cloud_fallback,
+    )
+    return [(item.text, item.provider) for item in detailed]
 
 
 # ── Health check (cached to avoid hammering the backend) ─────────────────────
