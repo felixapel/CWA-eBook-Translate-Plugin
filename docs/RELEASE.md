@@ -94,18 +94,23 @@ a publication credential. GHCR publication is a later, separate manual gate.
      "$CANDIDATE_IMAGE" "cwa-ca-$CANDIDATE_SHA"
    ```
 
-5. Record the maintainer self-review, merge through protected Gitea, and wait
-   for all required checks on the exact merged `main` commit.
-6. Fast-forward the GitHub mirror and verify both `main` refs resolve to that
-   exact commit.
-7. On physical stock Unraid 7.3.2 with no host Python or NerdTools, use the
-   exact clean merged commit to run the public `./btctl plan`, `install`, and
+5. Record the maintainer self-review, push the candidate through a protected
+   Gitea pull request, and wait for every required check on its exact head.
+6. Before merging, on physical stock Unraid 7.3.2 with no host Python or
+   NerdTools, use the exact clean candidate commit to run the public `./btctl
+   plan`, `install`, and
    `doctor` path. Then verify one real browser translation through the managed
    public route and record the commit plus result. Also validate the candidate
    `BT_ROLE=all` Community Applications configuration with port 8390 private,
    persistent cache recreation, and the final XML fields. This physical Unraid
    acceptance is mandatory before a v2.2.1 tag; simulated Docker gates are not
    substitutes.
+7. Only after that evidence passes, merge through protected Gitea and wait for
+   all required checks on the exact merged `main` commit. Fast-forward the
+   GitHub mirror and verify both `main` refs resolve to that exact commit. If the
+   merge changes the candidate commit ID, repeat physical acceptance on the
+   merged commit before tagging; acceptance of a different SHA is not evidence
+   for the release artifact.
 
 For the v1-to-v2 cache transition, `test_cache_v2` is a release blocker. It
 must prove that `translations` remains readable/writable by the v2.1.4 schema,
@@ -114,8 +119,9 @@ normalized without losing either table.
 
 ## Create the source release
 
-Stop here if physical Unraid and browser acceptance has not passed on the exact
-merged commit, or if any protected Gitea check is missing, skipped, or stale.
+Stop here if physical Unraid and browser acceptance has not passed before merge
+and on the exact merged commit, or if any protected Gitea check is missing,
+skipped, or stale.
 Do not create a tag to make a candidate appear complete.
 
 Create one annotated tag object and push it to GitHub first because Gitea's
@@ -138,10 +144,12 @@ archives are the official release.
 
 Then manually dispatch `.github/workflows/publish-image.yml` on GitHub with the
 exact `v2.2.1` tag and its peeled 40-character SHA. The workflow must reject an
-existing version tag, pass the pinned Trivy high/critical scan, publish SBOM and
-provenance attestations, and repeat both smoke profiles against the pulled
-digest. Record its `GHCR_DIGEST` output. Do not retry a partially successful
-publication or overwrite `2.2.1`; diagnose it and increment the version.
+existing version tag, pass the pinned Trivy high/critical scan before
+publication, publish SBOM and provenance attestations, validate the emitted
+OCI-index digest, pull it anonymously, scan that exact digest, and repeat both
+smoke profiles. Record its `GHCR_DIGEST` output. Do not retry a partially
+successful publication or overwrite `2.2.1`; diagnose it and increment the
+version.
 
 Claude Code must repeat physical Unraid acceptance using that exact digest and
 the final Community Applications XML. Only after that evidence passes may the

@@ -25,14 +25,16 @@ two coordinated containers.
 - A manual GitHub workflow accepts the exact existing tag and 40-character
   commit, re-runs release identity checks, rejects an existing immutable image
   tag, and uses only the repository `GITHUB_TOKEN`.
-- The first image is `linux/amd64` only. It is published as immutable `2.2.1`
-  plus a moving `latest` discovery alias. Documentation and the Community
-  Applications template never install `latest`; the final template pins the
-  exact manifest digest, with immutable `2.2.1` as a documented DockerMan
-  compatibility fallback only if digest syntax is rejected.
+- The first image is `linux/amd64` only and is published only as immutable
+  `2.2.1`; this release path does not create a moving `latest` alias. The final
+  Community Applications template pins the exact manifest digest, with
+  immutable `2.2.1` as a documented DockerMan compatibility fallback only if
+  digest syntax is rejected.
 - Publication requires pre-push split and combined smoke tests, a fail-closed
   high/critical Trivy scan, BuildKit SBOM and maximal provenance attestations,
-  then digest-pinned post-push smoke tests.
+  validation of the emitted OCI-index digest and attestation predicates, then
+  an anonymous pull, another high/critical scan, and digest-pinned post-push
+  smoke tests.
 - The certified Community Applications profile runs one `BT_ROLE=all`
   container as uid/gid `101:102`, with a read-only root filesystem, private
   writable `/app/data`, bounded `/tmp`, all capabilities dropped, and
@@ -40,7 +42,8 @@ two coordinated containers.
   port 8390 is never published.
 - Its first certified integration is Unraid 7.3.2 x86_64, CWA 4.0.6, native
   `cwa_session` authentication including strong session protection, and a local
-  OpenAI-compatible LLM.
+  OpenAI-compatible LLM. CWA reverse-proxy-header login must be disabled for
+  this native-session profile.
 - `btctl` split roles remain the recommended advanced path for upgrades,
   rollback, adoption, Compose, and Authentik-forwarded identity.
 
@@ -59,8 +62,10 @@ two coordinated containers.
 
 ## Verification
 
-`scripts/ca-container-smoke.sh` proves strong-session login, authenticated batch
-translation through the proxy, persistent cache after container recreation,
-absence of a published 8390 port, and the complete runtime sandbox. Normal CI,
-the Gitea tag workflow, and the manual GHCR workflow all execute it. Physical
-Unraid acceptance of the final digest and XML remains a mandatory release gate.
+`scripts/ca-container-smoke.sh` proves rejection of an unsafe appdata bind, the
+documented uid/gid and mode preparation, strong-session login, authenticated
+batch translation through the proxy, persistent cache after container
+recreation, absence of a published 8390 port, and the complete runtime sandbox.
+Normal CI, the Gitea tag workflow, and the manual GHCR workflow all execute it.
+Physical Unraid acceptance of the final digest and XML remains a mandatory
+release gate.

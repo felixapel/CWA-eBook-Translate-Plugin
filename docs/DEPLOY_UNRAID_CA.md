@@ -12,6 +12,9 @@ this exact profile.
 Know the CWA container name, a Docker network shared with it, the exact public
 reader origin, and an LLM URL reachable from Docker. CWA strong sessions assume
 the default `TRUSTED_PROXY_COUNT=1`; custom hop counts are not certified.
+Disable CWA's **Allow Reverse Proxy Authentication** setting for this profile.
+Native session validation is not compatible with trusting a browser-supplied
+login header through the directly published translator proxy.
 
 Create the only writable bind with the image's stable identity:
 
@@ -58,6 +61,7 @@ The template must retain all of these settings:
 - `--cap-drop=ALL` and `--security-opt=no-new-privileges:true`;
 - private `/app/data` bind;
 - native CWA-session validation, never disabled auth or a browser token.
+- CWA reverse-proxy-header login disabled.
 
 ## Acceptance
 
@@ -71,7 +75,8 @@ After install:
    from the persistent cache.
 5. Confirm Unraid shows no host mapping for container port 8390 and the image
    reference resolves to the exact release digest.
+6. Confirm CWA still has **Allow Reverse Proxy Authentication** disabled.
 
 Stop and use [TROUBLESHOOTING.md](TROUBLESHOOTING.md) if authentication is
-disabled, 8390 is published, ownership differs, the image is mutable, or a
-check above fails.
+disabled, reverse-proxy-header login is enabled, 8390 is published, ownership
+differs, the image is mutable, or a check above fails.

@@ -19,10 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Certified one narrow Community Applications combined profile with native CWA
   strong-session validation, a non-root read-only sandbox, all capabilities
   dropped, private appdata, and no host publication of internal API port 8390.
-- Live benchmark clients now support token or CWA-cookie authentication, ignore
-  inherited proxies, refuse redirects and URL credentials, close responses,
-  and fail on non-2xx or invalid JSON instead of silently measuring a login or
-  error page.
+- Live benchmark clients now support token or CWA-cookie authentication, require
+  the exact login-time User-Agent for strong CWA sessions, ignore inherited
+  proxies, refuse redirects and URL credentials, close responses, and fail on
+  non-2xx or invalid JSON instead of silently measuring a login or error page.
 
 ### Added
 

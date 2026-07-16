@@ -112,6 +112,7 @@ class RateLimitLiveScriptTests(unittest.TestCase):
                 "https://translator.example/bt-api",
                 token=None,
                 cookie="session=opaque-value",
+                user_agent="Exact Browser/1.0",
                 request_count=3,
                 timeout=1,
                 session=session,
@@ -129,6 +130,7 @@ class RateLimitLiveScriptTests(unittest.TestCase):
             "http://127.0.0.1:8080/bt-api",
             token=None,
             cookie="session=opaque-value",
+            user_agent="Exact Browser/1.0",
             request_count=2,
             timeout=1,
             session=session,
@@ -137,7 +139,10 @@ class RateLimitLiveScriptTests(unittest.TestCase):
         self.assertEqual(result, test_ratelimit.RateLimitResult(1, 1, 0))
         self.assertEqual(
             session.calls[0][1]["headers"],
-            {"Cookie": "session=opaque-value"},
+            {
+                "Cookie": "session=opaque-value",
+                "User-Agent": "Exact Browser/1.0",
+            },
         )
 
     def test_main_fails_when_no_request_is_admitted_or_limited(self):
@@ -172,6 +177,26 @@ class RateLimitLiveScriptTests(unittest.TestCase):
                     "--cookie", "session=cookie-value",
                 ])
         self.assertEqual(raised.exception.code, 2)
+
+        for args in (
+            ("--cookie", "session=cookie-value"),
+            ("--user-agent", "Exact Browser/1.0"),
+        ):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    test_ratelimit.main(list(args))
+            self.assertEqual(raised.exception.code, 2)
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            test_ratelimit.exercise_rate_limit(
+                "https://translator.example/bt-api",
+                token="token-value",
+                cookie="session=cookie-value",
+                user_agent="Exact Browser/1.0",
+                request_count=1,
+                timeout=1,
+                session=_FakeSession([200]),
+            )
 
     def test_main_rejects_non_http_or_ambiguous_urls(self):
         invalid_urls = (
@@ -217,6 +242,7 @@ class BenchmarkLiveScriptTests(unittest.TestCase):
             base_url="https://books.example.test/bt-api/",
             token=None,
             cookie="session=opaque-value",
+            user_agent="Exact Browser/1.0",
             timeout=13,
             session=session,
         )
@@ -224,7 +250,13 @@ class BenchmarkLiveScriptTests(unittest.TestCase):
         self.assertEqual(result, {"translations": ["hola"]})
         url, kwargs = session.calls[0]
         self.assertEqual(url, "https://books.example.test/bt-api/translate/batch")
-        self.assertEqual(kwargs["headers"], {"Cookie": "session=opaque-value"})
+        self.assertEqual(
+            kwargs["headers"],
+            {
+                "Cookie": "session=opaque-value",
+                "User-Agent": "Exact Browser/1.0",
+            },
+        )
         self.assertEqual(kwargs["timeout"], 13)
         self.assertFalse(kwargs["allow_redirects"])
         self.assertTrue(session.responses[0].closed)
@@ -250,6 +282,7 @@ class BenchmarkLiveScriptTests(unittest.TestCase):
                         base_url="https://books.example.test/bt-api",
                         token=None,
                         cookie="session=opaque-value",
+                        user_agent="Exact Browser/1.0",
                         timeout=5,
                         session=session,
                     )
@@ -270,6 +303,22 @@ class BenchmarkLiveScriptTests(unittest.TestCase):
                     with self.assertRaises(SystemExit) as raised:
                         module.main(["--token", "x", "--cookie", "session=y"])
                 self.assertEqual(raised.exception.code, 2)
+
+                for args in (
+                    ("--cookie", "session=y"),
+                    ("--user-agent", "Exact Browser/1.0"),
+                ):
+                    with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit) as raised:
+                            module.main(list(args))
+                    self.assertEqual(raised.exception.code, 2)
+
+        with self.assertRaisesRegex(RuntimeError, "mutually exclusive"):
+            benchmark._headers(
+                "token-value",
+                "session=cookie-value",
+                "Exact Browser/1.0",
+            )
 
     def test_owned_benchmark_sessions_ignore_environment_proxies(self):
         for module, runner in (

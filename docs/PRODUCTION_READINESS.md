@@ -35,7 +35,7 @@ source release remains blocked until every item under
 | F-10 nested retries without coalescing | Implemented and gated | Absolute request budgets, bounded admission, and `singleflight.py` coalesce equivalent active work. Envelope retry and paragraph recovery spend the same atomic budget; the browser does not retry ambiguous provider work. |
 | F-11 public provider-backed health probe | Implemented and gated | `/ping`, `/health`, and `/ready` are shallow; authenticated `/health/deep` uses the normal provider budget. |
 | F-12 browser token in `localStorage` | Implemented and gated | The recommended topology validates the existing HttpOnly CWA session and browser loaders no longer recover a shared secret from storage. |
-| F-13 unsigned, weakly reproducible supply chain | Implemented and gated | Source identity is enforced by matching annotated tags and commits. The manual GitHub workflow publishes only the matching amd64 GHCR image with pinned actions, vulnerability scanning, SBOM/provenance, and pre/post-push smoke gates. |
+| F-13 unsigned, weakly reproducible supply chain | Implemented; publication is an operator prerequisite | Source identity is enforced by matching annotated tags and commits. Static contracts cover the manual GitHub workflow's pinned actions, read-only candidate validation, exact digest capture, vulnerability scans, SBOM/provenance checks, anonymous pull, and pre/post-push smokes. The registry digest, public visibility, and emitted attestations are established only when that workflow succeeds and must be recorded before Community Applications promotion. |
 | F-14 CI could skip artifact and contract checks | Implemented and gated | Docker absence is fatal; backend, frontend, Chromium, dependency, proxy, and non-root artifact gates are mandatory. |
 | F-15 sensitive fallback and error leakage | Implemented and gated | Cloud fallback requires per-request consent; response sizes and error/log envelopes are bounded and sanitized. |
 | F-16 privileged combined runtime | Implemented and gated | `btctl` keeps independent non-root roles. The narrower Community Applications profile uses the existing combined role under the same non-root/read-only/capability-free sandbox, never publishes its internal API port, and has a dedicated smoke gate. |
@@ -100,14 +100,15 @@ Before creating the first post-audit version tag, an authorized operator must:
 - protect `v*` tags from updates/deletion and restrict creation to the release
   operator;
 - assign Docker smoke to the trusted host-capable runner;
-- complete and record the single maintainer's self-review, merge through the
-  protected branch with zero assumed human approvals, wait for all checks on
-  the exact `main` commit, and mirror it to GitHub before creating the annotated
-  tag;
+- complete and record the single maintainer's self-review, wait for all pull
+  request checks, and perform physical acceptance on the exact candidate before
+  merging through the protected branch with zero assumed human approvals;
+- after merge, wait for all checks on the exact `main` commit, mirror it to
+  GitHub, and repeat physical acceptance if the merge changed the commit ID;
 - on physical stock Unraid 7.3.2 without host Python or NerdTools, run the
-  public `./btctl plan`, `install`, and `doctor` path from that exact clean
-  commit, then complete one real browser translation through the managed public
-  route and record the commit plus result before tagging;
+  public `./btctl plan`, `install`, and `doctor` path from each required exact
+  clean commit, then complete one real browser translation through the managed
+  public route and record the commit plus result before tagging;
 - complete physical Unraid acceptance for both the recommended `btctl` split
   path and the v2.2.1 combined Community Applications candidate;
 - publish the annotated source tag through the Gitea-authoritative workflow,

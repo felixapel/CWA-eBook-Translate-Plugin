@@ -12,16 +12,31 @@ fi
 APP_CONTAINER="${SMOKE_PREFIX}-app"
 CWA_CONTAINER="${SMOKE_PREFIX}-cwa"
 PROVIDER_CONTAINER="${SMOKE_PREFIX}-provider"
+WRONG_DATA_CONTAINER="${SMOKE_PREFIX}-wrong-data"
 SMOKE_NETWORK="${SMOKE_PREFIX}-net"
-SMOKE_VOLUME="${SMOKE_PREFIX}-data"
+DATA_DIR=""
 COOKIE_JAR=""
 RESPONSE_FILE=""
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 cleanup() {
-    docker rm -f -v "$APP_CONTAINER" "$CWA_CONTAINER" "$PROVIDER_CONTAINER" \
+    docker rm -f -v \
+        "$APP_CONTAINER" "$CWA_CONTAINER" "$PROVIDER_CONTAINER" \
+        "$WRONG_DATA_CONTAINER" \
         >/dev/null 2>&1 || true
-    docker volume rm -f "$SMOKE_VOLUME" >/dev/null 2>&1 || true
     docker network rm "$SMOKE_NETWORK" >/dev/null 2>&1 || true
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        docker run --rm --user 0:0 --network none \
+            --read-only --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+            --security-opt no-new-privileges:true \
+            --mount "type=bind,src=${DATA_DIR},dst=/data" \
+            --entrypoint /bin/sh "$SMOKE_IMAGE" \
+            -ec 'chown -R "$1:$2" /data; chmod -R u+rwX /data' \
+            sh "$HOST_UID" "$HOST_GID" >/dev/null 2>&1 || true
+        rm -rf -- "$DATA_DIR"
+    fi
     [ -z "$COOKIE_JAR" ] || rm -f "$COOKIE_JAR"
     [ -z "$RESPONSE_FILE" ] || rm -f "$RESPONSE_FILE"
 }
@@ -30,13 +45,17 @@ cleanup
 
 test "$(docker image inspect "$SMOKE_IMAGE" --format '{{.Config.User}}')" = "appuser"
 docker network create "$SMOKE_NETWORK" >/dev/null
-docker volume create "$SMOKE_VOLUME" >/dev/null
+DATA_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cwa-ca-data.XXXXXX")"
 
 sandbox=(
     --read-only
     --tmpfs "/tmp:rw,noexec,nosuid,size=64m,uid=101,gid=102,mode=700"
     --cap-drop ALL
     --security-opt no-new-privileges:true
+)
+app_sandbox=(
+    --user 101:102
+    "${sandbox[@]}"
 )
 
 FIXTURE_SOURCE="$(pwd)/test_cwa_strong_fixture.py"
@@ -109,10 +128,53 @@ for endpoint in \
     fi
 done
 
+app_environment=(
+    -e BT_ROLE=all
+    -e "CWA_UPSTREAM=http://${CWA_CONTAINER}:8083"
+    -e BT_PUBLIC_ORIGIN=http://books.example.test:8385
+    -e BT_BROWSER_AUTH_MODE=cwa_session
+    -e BT_BROWSER_CREDENTIALS=same-origin
+    -e BT_AUTH_MODE=cwa_session
+    -e "BT_CWA_AUTH_URL=http://${CWA_CONTAINER}:8083/ajax/emailstat"
+    -e LLM_PROVIDER=local
+    -e LLM_MODEL=ca-smoke-model
+    -e "BT_LOCAL_URL=http://${PROVIDER_CONTAINER}:8000/v1/chat/completions"
+)
+
+# The CA bind must fail closed until the documented pre-step creates a private
+# directory owned by the runtime identity.
+docker run --rm --user 0:0 --network none \
+    --mount "type=bind,src=${DATA_DIR},dst=/data" \
+    --entrypoint /bin/sh "$SMOKE_IMAGE" \
+    -ec 'chown 0:0 /data; chmod 0755 /data'
+docker run -d --name "$WRONG_DATA_CONTAINER" --network "$SMOKE_NETWORK" \
+    "${app_sandbox[@]}" \
+    --mount "type=bind,src=${DATA_DIR},dst=/app/data" \
+    "${app_environment[@]}" "$SMOKE_IMAGE" >/dev/null
+for _ in $(seq 1 20); do
+    if [ "$(docker inspect "$WRONG_DATA_CONTAINER" --format '{{.State.Running}}')" = "false" ]; then
+        break
+    fi
+    sleep 0.1
+done
+if [ "$(docker inspect "$WRONG_DATA_CONTAINER" --format '{{.State.Running}}')" = "true" ]; then
+    echo "combined profile started with wrong ownership or mode" >&2
+    exit 1
+fi
+wrong_data_output="$(docker logs "$WRONG_DATA_CONTAINER" 2>&1)"
+grep -Eiq 'cache|data|writ' <<<"$wrong_data_output"
+docker rm "$WRONG_DATA_CONTAINER" >/dev/null
+
+docker run --rm --user 0:0 --network none \
+    --mount "type=bind,src=${DATA_DIR},dst=/data" \
+    --entrypoint /bin/sh "$SMOKE_IMAGE" \
+    -ec 'chown 101:102 /data; chmod 0700 /data'
+test "$(stat -c '%u:%g:%a' "$DATA_DIR")" = "101:102:700"
+
 # Invalid CA configuration must fail before serving anything.
 if invalid_output="$(docker run --rm --network "$SMOKE_NETWORK" \
-    "${sandbox[@]}" \
-    --mount "type=volume,source=${SMOKE_VOLUME},target=/app/data" \
+    "${app_sandbox[@]}" \
+    --mount "type=bind,src=${DATA_DIR},dst=/app/data" \
     -e BT_ROLE=all \
     -e "CWA_UPSTREAM=http://${CWA_CONTAINER}:8083" \
     -e BT_BROWSER_AUTH_MODE=cwa_session \
@@ -127,18 +189,9 @@ grep -q 'BT_PUBLIC_ORIGIN' <<<"$invalid_output"
 
 start_app() {
     docker run -d --name "$APP_CONTAINER" --network "$SMOKE_NETWORK" \
-        "${sandbox[@]}" \
-        --mount "type=volume,source=${SMOKE_VOLUME},target=/app/data" \
-        -e BT_ROLE=all \
-        -e "CWA_UPSTREAM=http://${CWA_CONTAINER}:8083" \
-        -e BT_PUBLIC_ORIGIN=http://books.example.test:8385 \
-        -e BT_BROWSER_AUTH_MODE=cwa_session \
-        -e BT_BROWSER_CREDENTIALS=same-origin \
-        -e BT_AUTH_MODE=cwa_session \
-        -e "BT_CWA_AUTH_URL=http://${CWA_CONTAINER}:8083/ajax/emailstat" \
-        -e LLM_PROVIDER=local \
-        -e LLM_MODEL=ca-smoke-model \
-        -e "BT_LOCAL_URL=http://${PROVIDER_CONTAINER}:8000/v1/chat/completions" \
+        "${app_sandbox[@]}" \
+        --mount "type=bind,src=${DATA_DIR},dst=/app/data" \
+        "${app_environment[@]}" \
         -p 127.0.0.1::8080 \
         "$SMOKE_IMAGE" >/dev/null
 }
@@ -157,6 +210,8 @@ curl -sf "http://127.0.0.1:${APP_PORT}/bt-api/ping" | grep -q '"status":"ok"'
 
 test "$(docker exec "$APP_CONTAINER" id -u)" = "101"
 test "$(docker exec "$APP_CONTAINER" id -g)" = "102"
+test "$(docker inspect "$APP_CONTAINER" --format '{{.Config.User}}')" = "101:102"
+test "$(docker inspect "$APP_CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Type}} {{.Source}}{{end}}{{end}}')" = "bind $DATA_DIR"
 test "$(docker inspect "$APP_CONTAINER" --format '{{.HostConfig.ReadonlyRootfs}}')" = "true"
 docker inspect "$APP_CONTAINER" --format '{{json .HostConfig.CapDrop}}' | grep -q 'ALL'
 docker inspect "$APP_CONTAINER" --format '{{json .HostConfig.SecurityOpt}}' | \
@@ -180,7 +235,7 @@ request_translation
 grep -q 'translated:first smoke paragraph' "$RESPONSE_FILE"
 grep -q 'translated:second smoke paragraph' "$RESPONSE_FILE"
 
-# Recreate the CA container with its original volume, stop the provider, and
+# Recreate the CA container with its original bind, stop the provider, and
 # prove the same request is served from the persistent cache.
 docker rm -f "$APP_CONTAINER" >/dev/null
 docker stop "$PROVIDER_CONTAINER" >/dev/null

@@ -90,6 +90,10 @@ class InstallDocumentationContractTests(unittest.TestCase):
         self.assertIn("ADR-011", architecture)
         self.assertIn("ADR-012", architecture)
         self.assertNotIn("BT_CLIENT_MIN_REQUEST_GAP_MS", troubleshooting)
+        self.assertIn(
+            "Implemented; publication is an operator prerequisite",
+            production,
+        )
 
     def test_launch_materials_are_versioned_and_separate_from_release_gates(self):
         forum = ROOT / "docs" / "launch" / "UNRAID_FORUM.md"
@@ -148,6 +152,7 @@ class InstallDocumentationContractTests(unittest.TestCase):
             "v2.2.1",
             "cwa_session",
             "/ajax/emailstat",
+            "Allow Reverse Proxy Authentication",
         ):
             self.assertIn(contract, source)
         self.assertNotIn(":latest", source)
@@ -195,6 +200,10 @@ class InstallDocumentationContractTests(unittest.TestCase):
     def test_troubleshooting_routes_managed_failures_through_doctor(self):
         source = TROUBLESHOOTING.read_text(encoding="utf-8")
         self.assertIn("./btctl doctor --env", source)
+        self.assertIn("Community Applications install has no `btctl` state", source)
+        self.assertIn("Do not diagnose it with\n`btctl doctor`", source)
+        self.assertIn("no mapping for 8390", source)
+        self.assertIn("first container startup or\nrequest error", source)
         self.assertIn("/bt-config.json", source)
         self.assertIn("authentik-forwarded", source)
         self.assertIn("BT_IDENTITY_PROXY_IP", source)

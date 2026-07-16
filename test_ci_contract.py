@@ -176,11 +176,48 @@ class CIContractTests(unittest.TestCase):
             "--provenance=mode=max",
             "ca-container-smoke.sh",
             "docker manifest inspect",
+            "path: trusted",
+            "path: candidate",
+            "trusted/scripts/release_preflight.py",
+            "--metadata-file",
+            "containerimage.digest",
+            "attestation-manifest",
+            "docker logout ghcr.io",
             "GHCR_DIGEST=",
         ):
             self.assertIn(token, workflow)
         self.assertIn('"$IMAGE:$VERSION"', workflow)
-        self.assertIn('"$IMAGE:latest"', workflow)
+        self.assertNotIn('"$IMAGE:latest"', workflow)
+        self.assertNotIn("RepoDigests", workflow)
+        self.assertGreaterEqual(workflow.count("--severity HIGH,CRITICAL"), 2)
+        self.assertIn('manifest_output="$(docker manifest inspect', workflow)
+        self.assertRegex(workflow, r"(?m)^  validate:\n    runs-on: ubuntu-latest$")
+        self.assertRegex(
+            workflow,
+            r"(?m)^  publish:\n    needs: validate\n    runs-on: ubuntu-latest$",
+        )
+        self.assertEqual(workflow.count("packages: write"), 1)
+        self.assertGreaterEqual(workflow.count("persist-credentials: false"), 3)
+        self.assertIn("ref: ${{ needs.validate.outputs.release_sha }}", workflow)
+        self.assertLess(
+            workflow.index("trusted/scripts/release_preflight.py"),
+            workflow.index("packages: write"),
+        )
+        self.assertLess(
+            workflow.index("Smoke the local candidate"),
+            workflow.index("Log in only for the immutable push"),
+        )
+        self.assertLess(
+            workflow.index("Remove registry credentials before verification"),
+            workflow.index("Validate the published index and attestations anonymously"),
+        )
+        for explicit_absence in (
+            "manifest unknown",
+            "name unknown",
+            "no such manifest",
+        ):
+            self.assertIn(explicit_absence, workflow)
+        self.assertIn("could not prove the immutable version tag is absent", workflow)
         for forbidden in ("CR_PAT", "GHCR_PAT", "DOCKERHUB", "continue-on-error"):
             self.assertNotIn(forbidden, workflow)
 

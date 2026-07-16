@@ -196,9 +196,14 @@ class ContainerContractTests(unittest.TestCase):
             "BT_AUTH_MODE=cwa_session",
             "test_cwa_strong_fixture.py",
             "BT_LOCAL_URL=",
+            "--user 101:102",
             "--read-only",
             "--cap-drop ALL",
             "no-new-privileges:true",
+            "type=bind,src=${DATA_DIR},dst=/app/data",
+            "chown 101:102 /data",
+            "chmod 0700 /data",
+            "wrong ownership or mode",
             "docker rm -f",
             "recreate",
             "cached",
@@ -206,6 +211,8 @@ class ContainerContractTests(unittest.TestCase):
             self.assertIn(token, smoke)
         self.assertRegex(smoke, r"-p\s+127\.0\.0\.1::8080")
         self.assertNotRegex(smoke, r"-p[^\n]*8390")
+        self.assertNotIn("type=volume", smoke)
+        self.assertNotIn("docker volume", smoke)
         self.assertIn("./scripts/ca-container-smoke.sh", (
             ROOT / ".github" / "workflows" / "ci.yml"
         ).read_text())

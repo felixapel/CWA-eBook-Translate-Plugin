@@ -1,7 +1,8 @@
 """Exercise warm and cold live translation batches with explicit authentication.
 
-Set ``BT_API_TOKEN`` for token auth or ``BT_BENCHMARK_COOKIE`` for a CWA
-session and point ``--url`` to the corresponding API or ``/bt-api`` base path.
+Set ``BT_API_TOKEN`` for token auth or both ``BT_BENCHMARK_COOKIE`` and
+``BT_BENCHMARK_USER_AGENT`` for a CWA session, then point ``--url`` to the
+corresponding API or ``/bt-api`` base path.
 Redirects and inherited HTTP proxy settings are disabled so credentials cannot
 silently leave the operator-selected endpoint.
 """
@@ -17,7 +18,7 @@ from typing import Sequence
 
 import requests
 
-from benchmark import _headers, _http_url, _positive_float
+from benchmark import _headers, _http_url, _positive_float, _user_agent
 
 
 DEFAULT_URL = "http://127.0.0.1:8390"
@@ -31,11 +32,12 @@ def translate_batch(
     cookie: str | None,
     timeout: float,
     session,
+    user_agent: str | None = None,
 ) -> tuple[dict, float]:
     started = time.monotonic()
     response = session.post(
         f"{base_url.rstrip('/')}/translate/batch",
-        headers=_headers(token, cookie),
+        headers=_headers(token, cookie, user_agent),
         json={
             "paragraphs": paragraphs,
             "source_lang": "English",
@@ -70,6 +72,7 @@ def run_benchmark_scenario(
     cookie: str | None,
     timeout: float,
     session=None,
+    user_agent: str | None = None,
 ) -> None:
     print(f"\n--- Scenario: {name} ---")
     prefix = "WARM_CACHE_STATIC_TEST_STR_" if warm else f"COLD_CACHE_{time.time()}_"
@@ -96,6 +99,7 @@ def run_benchmark_scenario(
                     base_url=base_url,
                     token=token,
                     cookie=cookie,
+                    user_agent=user_agent,
                     timeout=timeout,
                     session=client,
                 )
@@ -129,6 +133,12 @@ def _parser() -> argparse.ArgumentParser:
         "--cookie", default=os.environ.get("BT_BENCHMARK_COOKIE"),
         help="CWA Cookie header; defaults to BT_BENCHMARK_COOKIE",
     )
+    parser.add_argument(
+        "--user-agent",
+        type=_user_agent,
+        default=os.environ.get("BT_BENCHMARK_USER_AGENT"),
+        help="exact login-time browser User-Agent; defaults to BT_BENCHMARK_USER_AGENT",
+    )
     parser.add_argument("--timeout", type=_positive_float, default=120.0)
     return parser
 
@@ -138,6 +148,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.token and args.cookie:
         parser.error("--token and --cookie are mutually exclusive")
+    if bool(args.cookie) != bool(args.user_agent):
+        parser.error("--cookie and --user-agent must be provided together")
+    if args.token and args.user_agent:
+        parser.error("--user-agent is valid only with --cookie")
     scenarios = (
         ("Warming", 10, 5, 2, True),
         ("Warm Cache (Batch 5, Conc 2)", 50, 5, 2, True),
@@ -155,6 +169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 base_url=args.url,
                 token=args.token,
                 cookie=args.cookie,
+                user_agent=args.user_agent,
                 timeout=args.timeout,
             )
     except (requests.RequestException, RuntimeError) as exc:

@@ -4,8 +4,9 @@ Start the API with a fresh rate-limit window, then run for example:
 
     BT_API_TOKEN=... python test_ratelimit.py --url http://127.0.0.1:8390
 
-For the recommended CWA-session proxy, set ``BT_RATE_LIMIT_TEST_COOKIE`` to
-the browser cookie header and point ``--url`` at the proxy's ``/bt-api`` path.
+For the recommended CWA-session proxy, set ``BT_RATE_LIMIT_TEST_COOKIE`` and
+``BT_RATE_LIMIT_TEST_USER_AGENT`` to the exact browser values and point
+``--url`` at the proxy's ``/bt-api`` path.
 
 The probe deliberately sends English-to-English translations. The request
 still traverses authentication and rate limiting, but the endpoint echoes the
@@ -73,6 +74,19 @@ def _http_url(raw: str) -> str:
     return raw
 
 
+def _user_agent(raw: str) -> str:
+    if (
+        not raw
+        or raw != raw.strip()
+        or len(raw.encode("utf-8")) > 1024
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        raise argparse.ArgumentTypeError(
+            "must be the exact non-empty browser User-Agent without control characters"
+        )
+    return raw
+
+
 def exercise_rate_limit(
     base_url: str,
     *,
@@ -80,6 +94,7 @@ def exercise_rate_limit(
     request_count: int,
     timeout: float,
     cookie: str | None = None,
+    user_agent: str | None = None,
     session=None,
 ) -> RateLimitResult:
     """Return live-probe counts, stopping on the first 429 or error."""
@@ -90,10 +105,17 @@ def exercise_rate_limit(
         # HTTP(S)_PROXY values inherited from the shell.
         client.trust_env = False
     headers = {}
+    if token and (cookie or user_agent):
+        raise ValueError("token and CWA cookie authentication are mutually exclusive")
     if token:
         headers["X-BT-Token"] = token
     if cookie:
         headers["Cookie"] = cookie
+        if not user_agent:
+            raise ValueError("CWA cookie authentication requires the exact browser User-Agent")
+        headers["User-Agent"] = _user_agent(user_agent)
+    elif user_agent:
+        raise ValueError("a browser User-Agent is valid only with CWA cookie authentication")
     admitted = 0
     rate_limited = 0
     unexpected = 0
@@ -167,6 +189,12 @@ def _parser() -> argparse.ArgumentParser:
         help="CWA Cookie header; defaults to BT_RATE_LIMIT_TEST_COOKIE",
     )
     parser.add_argument(
+        "--user-agent",
+        type=_user_agent,
+        default=os.environ.get("BT_RATE_LIMIT_TEST_USER_AGENT"),
+        help="exact login-time browser User-Agent; defaults to BT_RATE_LIMIT_TEST_USER_AGENT",
+    )
+    parser.add_argument(
         "--requests",
         type=_positive_int,
         default=os.environ.get("BT_RATE_LIMIT_TEST_REQUESTS", "130"),
@@ -186,12 +214,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.token and args.cookie:
         parser.error("--token and --cookie are mutually exclusive")
+    if bool(args.cookie) != bool(args.user_agent):
+        parser.error("--cookie and --user-agent must be provided together")
+    if args.token and args.user_agent:
+        parser.error("--user-agent is valid only with --cookie")
     result = exercise_rate_limit(
         args.url,
         token=args.token,
         request_count=args.requests,
         timeout=args.timeout,
         cookie=args.cookie,
+        user_agent=args.user_agent,
     )
     print(
         f"admitted={result.admitted} "

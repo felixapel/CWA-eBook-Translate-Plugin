@@ -46,7 +46,7 @@ contracts.
 
 | Topology | Status | Boundary |
 |---|---|---|
-| Native CWA session, same-origin proxy | Recommended and CI-certified | `BT_AUTH_PROFILE=cwa-session`; CWA v4.0.6 with `config_session=1` and its default `TRUSTED_PROXY_COUNT=1` is covered by unit and container regression fixtures. The API validates selected cookies with the exact proxy-observed address/User-Agent context and has no host port. Custom trusted-proxy hop counts are not yet certified. |
+| Native CWA session, same-origin proxy | Recommended and CI-certified | `BT_AUTH_PROFILE=cwa-session`; CWA v4.0.6 with `config_session=1`, reverse-proxy-header login disabled, and its default `TRUSTED_PROXY_COUNT=1` is covered by unit and container regression fixtures. The API validates selected cookies with the exact proxy-observed address/User-Agent context and has no host port. Custom trusted-proxy hop counts are not yet certified. |
 | Authentik forwarded identity | Managed advanced profile | Requires `docker-edge`, exact `/32` or `/128` edge peer, a patched Authentik version, and the generated direct API route. See [AUTHENTIK.md](AUTHENTIK.md). |
 | Nginx edge | Generated and contract-tested | Merge the fragment into the existing HTTPS/Authentik server configuration. SWAG and Nginx Proxy Manager still require product-specific config validation. |
 | Traefik edge | Generated and contract-tested | Existing entrypoint, TLS, certificate, and Authentik settings remain operator-owned. |

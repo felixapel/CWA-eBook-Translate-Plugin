@@ -91,12 +91,14 @@ BT_API_TOKEN='<token>' python3 test_ratelimit.py \
   --url http://127.0.0.1:8390 --requests 130 --timeout 5
 ```
 
-For the recommended CWA-session proxy, pass the browser cookie through an
-environment variable rather than the command line:
+For the recommended CWA-session proxy, pass the browser cookie and exact
+login-time User-Agent through environment variables rather than the command
+line, and run the probe from the same client IP that created the session:
 
 ```bash
 BT_RATE_LIMIT_TEST_COOKIE='session=<opaque-value>' \
-  python3 test_ratelimit.py --url http://127.0.0.1:8080/bt-api
+BT_RATE_LIMIT_TEST_USER_AGENT='Mozilla/5.0 ... exact browser value' \
+  python3 test_ratelimit.py --url https://books.example.test/bt-api
 ```
 
 It exits nonzero on connection/authentication errors, unexpected statuses, or
@@ -111,12 +113,16 @@ non-2xx responses, or invalid JSON. Use one authentication mechanism only:
 ```bash
 BT_API_TOKEN='<token>' python3 benchmark.py \
   --url http://127.0.0.1:8390
-BT_BENCHMARK_COOKIE='session=<opaque-value>' python3 benchmark_realistic.py \
+BT_BENCHMARK_COOKIE='session=<opaque-value>' \
+BT_BENCHMARK_USER_AGENT='Mozilla/5.0 ... exact browser value' \
+  python3 benchmark_realistic.py \
   --url https://books.example.test/bt-api
 ```
 
 Do not paste credentials into a URL or publish benchmark output containing
-private endpoint names.
+private endpoint names. CWA strong sessions bind the cookie to the browser
+User-Agent and observed source address; a mismatched live probe can invalidate
+the session, so sign in again if either value was wrong.
 
 ## Frontend Development
 

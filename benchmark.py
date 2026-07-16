@@ -2,7 +2,8 @@
 
 Use the same-origin proxy path for ``cwa_session`` deployments, for example::
 
-    BT_BENCHMARK_COOKIE='session=...' python benchmark.py \
+    BT_BENCHMARK_COOKIE='session=...' \
+    BT_BENCHMARK_USER_AGENT='the exact browser User-Agent' python benchmark.py \
       --url https://books.example.test/bt-api
 
 Use ``BT_API_TOKEN`` instead for token-authenticated API endpoints. Credentials
@@ -63,11 +64,34 @@ def _http_url(raw: str) -> str:
     return raw
 
 
-def _headers(token: str | None, cookie: str | None) -> dict[str, str]:
+def _user_agent(raw: str) -> str:
+    if (
+        not raw
+        or raw != raw.strip()
+        or len(raw.encode("utf-8")) > 1024
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        raise argparse.ArgumentTypeError(
+            "must be the exact non-empty browser User-Agent without control characters"
+        )
+    return raw
+
+
+def _headers(
+    token: str | None,
+    cookie: str | None,
+    user_agent: str | None = None,
+) -> dict[str, str]:
+    if token and (cookie or user_agent):
+        raise RuntimeError("token and CWA cookie authentication are mutually exclusive")
     if token:
         return {"X-BT-Token": token}
     if cookie:
-        return {"Cookie": cookie}
+        if not user_agent:
+            raise RuntimeError("CWA cookie authentication requires the exact browser User-Agent")
+        return {"Cookie": cookie, "User-Agent": _user_agent(user_agent)}
+    if user_agent:
+        raise RuntimeError("a browser User-Agent is valid only with CWA cookie authentication")
     return {}
 
 
@@ -79,10 +103,11 @@ def make_request(
     cookie: str | None,
     timeout: float,
     session,
+    user_agent: str | None = None,
 ) -> dict:
     response = session.post(
         f"{base_url.rstrip('/')}/translate",
-        headers=_headers(token, cookie),
+        headers=_headers(token, cookie, user_agent),
         json={
             "text": f"This is test paragraph number {index}.",
             "source_lang": "English",
@@ -111,6 +136,7 @@ def run_benchmark(
     cookie: str | None,
     timeout: float,
     session=None,
+    user_agent: str | None = None,
 ) -> None:
     client = session if session is not None else requests.Session()
     owns_session = session is None
@@ -127,6 +153,7 @@ def run_benchmark(
                     base_url=base_url,
                     token=token,
                     cookie=cookie,
+                    user_agent=user_agent,
                     timeout=timeout,
                     session=client,
                 )
@@ -160,6 +187,12 @@ def _parser() -> argparse.ArgumentParser:
         "--cookie", default=os.environ.get("BT_BENCHMARK_COOKIE"),
         help="CWA Cookie header; defaults to BT_BENCHMARK_COOKIE",
     )
+    parser.add_argument(
+        "--user-agent",
+        type=_user_agent,
+        default=os.environ.get("BT_BENCHMARK_USER_AGENT"),
+        help="exact login-time browser User-Agent; defaults to BT_BENCHMARK_USER_AGENT",
+    )
     parser.add_argument("--requests", type=_positive_int, default=80)
     parser.add_argument("--workers", type=_positive_int, default=10)
     parser.add_argument("--timeout", type=_positive_float, default=120.0)
@@ -171,6 +204,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.token and args.cookie:
         parser.error("--token and --cookie are mutually exclusive")
+    if bool(args.cookie) != bool(args.user_agent):
+        parser.error("--cookie and --user-agent must be provided together")
+    if args.token and args.user_agent:
+        parser.error("--user-agent is valid only with --cookie")
     try:
         run_benchmark(
             args.requests,
@@ -178,6 +215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             base_url=args.url,
             token=args.token,
             cookie=args.cookie,
+            user_agent=args.user_agent,
             timeout=args.timeout,
         )
     except (requests.RequestException, RuntimeError) as exc:

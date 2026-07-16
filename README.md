@@ -157,14 +157,21 @@ included so you can measure *your* deployment:
   background prefetch) against a live backend.
 
 Run either against the authenticated API or the proxy's `/bt-api` base path.
-Use `BT_API_TOKEN` for token mode or `BT_BENCHMARK_COOKIE` for a temporary CWA
-browser Cookie header; never paste credentials into the URL. Both scripts
-disable redirects and inherited HTTP proxies and fail on any non-2xx response:
+Use `BT_API_TOKEN` for token mode. For a temporary CWA browser session, both
+`BT_BENCHMARK_COOKIE` and the exact login-time `BT_BENCHMARK_USER_AGENT` are
+required; run from the same client IP that created the session, because CWA
+strong protection binds both values. Never paste credentials into the URL.
+Both scripts disable redirects and inherited HTTP proxies and fail on any
+non-2xx response:
 
 ```bash
 BT_BENCHMARK_COOKIE='session=REDACTED' \
+BT_BENCHMARK_USER_AGENT='Mozilla/5.0 ... exact browser value' \
   python benchmark_realistic.py --url https://books.example.test/bt-api
 ```
+
+Using a different User-Agent or source IP can invalidate a strong CWA session;
+sign in again if a probe was attempted with mismatched identity context.
 
 If cold translations feel slow, see `BT_BATCH_SIZE`, `BT_OUTPUT_TOKEN_FACTOR`, and
 `BT_MAX_CONCURRENT` below, and `docs/TROUBLESHOOTING.md`.
