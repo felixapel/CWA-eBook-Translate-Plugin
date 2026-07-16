@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 README = ROOT / "README.md"
 UNRAID = ROOT / "docs" / "DEPLOY_UNRAID.md"
+UNRAID_CA = ROOT / "docs" / "DEPLOY_UNRAID_CA.md"
 COMPOSE = ROOT / "docs" / "DEPLOY_COMPOSE.md"
 AUTHENTIK = ROOT / "docs" / "AUTHENTIK.md"
 COMPATIBILITY = ROOT / "docs" / "COMPATIBILITY.md"
@@ -129,6 +130,28 @@ class InstallDocumentationContractTests(unittest.TestCase):
         self.assertIn("host Python or NerdTools", readme)
         self.assertIn("Unraid 7.3.2", compatibility)
         self.assertNotIn("`plan` does not mutate files or Docker", readme)
+
+    def test_ca_guide_is_simple_exact_and_keeps_the_api_private(self):
+        source = UNRAID_CA.read_text(encoding="utf-8")
+        for contract in (
+            "Unraid 7.3.2",
+            "CWA 4.0.6",
+            "linux/amd64",
+            "BT_ROLE=all",
+            "101:102",
+            "0700",
+            "8080",
+            "8385",
+            "8390",
+            "not be published",
+            "exact digest",
+            "v2.2.1",
+            "cwa_session",
+            "/ajax/emailstat",
+        ):
+            self.assertIn(contract, source)
+        self.assertNotIn(":latest", source)
+        self.assertIn("DEPLOY_UNRAID_CA.md", README.read_text(encoding="utf-8"))
 
     def test_authentik_guide_is_fail_closed_and_edge_owned(self):
         source = AUTHENTIK.read_text(encoding="utf-8")

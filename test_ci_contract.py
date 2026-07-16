@@ -10,6 +10,7 @@ ROOT = Path(__file__).parent
 GITHUB_CI = ROOT / ".github" / "workflows" / "ci.yml"
 GITEA_CI = ROOT / ".gitea" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".gitea" / "workflows" / "release.yml"
+PUBLISH_IMAGE = ROOT / ".github" / "workflows" / "publish-image.yml"
 DOCKER_NAMES = ROOT / "scripts" / "ci-docker-names.sh"
 FRONTEND_WORKFLOWS = (
     GITHUB_CI,
@@ -92,6 +93,10 @@ class CIContractTests(unittest.TestCase):
             './scripts/btctl-bootstrap-smoke.sh "$SMOKE_PREFIX"',
             self.workflow,
         )
+        self.assertIn(
+            './scripts/ca-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-ca"',
+            self.workflow,
+        )
         self.assertNotIn("docker build -t bt-audit:ci", self.workflow)
 
     def test_docker_names_are_isolated_across_repositories(self):
@@ -153,6 +158,31 @@ class CIContractTests(unittest.TestCase):
 
     def test_required_steps_have_no_continue_on_error(self):
         self.assertNotIn("continue-on-error", self.workflow)
+
+    def test_ghcr_publication_is_manual_exact_and_fail_closed(self):
+        workflow = PUBLISH_IMAGE.read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotRegex(workflow, r"(?m)^\s+(?:push|pull_request):")
+        for token in (
+            "release_tag:",
+            "release_sha:",
+            "packages: write",
+            "GITHUB_TOKEN",
+            "scripts/release_preflight.py",
+            "linux/amd64",
+            "aquasec/trivy:0.69.3@sha256:7228e304ae0f610a1fad937baa463598cadac0c2ac4027cc68f3a8b997115689",
+            "--severity HIGH,CRITICAL",
+            "--sbom=true",
+            "--provenance=mode=max",
+            "ca-container-smoke.sh",
+            "docker manifest inspect",
+            "GHCR_DIGEST=",
+        ):
+            self.assertIn(token, workflow)
+        self.assertIn('"$IMAGE:$VERSION"', workflow)
+        self.assertIn('"$IMAGE:latest"', workflow)
+        for forbidden in ("CR_PAT", "GHCR_PAT", "DOCKERHUB", "continue-on-error"):
+            self.assertNotIn(forbidden, workflow)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,119 @@
+name: Publish GHCR image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing annotated release tag, for example v2.2.1
+        required: true
+        type: string
+      release_sha:
+        description: Exact 40-character commit SHA peeled from that tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/cwa-ebook-translate-plugin
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Validate exact release identity
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "release_tag must be vMAJOR.MINOR.PATCH" >&2; exit 64 ;;
+          esac
+          case "$RELEASE_SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "release_sha must be 40 lowercase hexadecimal characters" >&2; exit 64 ;;
+          esac
+          VERSION="${RELEASE_TAG#v}"
+          test "$VERSION" = "$(tr -d '\n' < VERSION)"
+          test "$RELEASE_SHA" = "$(git rev-parse HEAD^{commit})"
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          python3 scripts/release_preflight.py \
+            --repository . \
+            --tag "$RELEASE_TAG" \
+            --sha "$RELEASE_SHA" \
+            --main-ref refs/remotes/origin/main \
+            --mirror-url "https://github.com/${GITHUB_REPOSITORY}.git"
+          printf 'VERSION=%s\nRELEASE_SHA=%s\n' "$VERSION" "$RELEASE_SHA" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR with the workflow token
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Refuse an existing immutable version tag
+        run: |
+          set -euo pipefail
+          if docker manifest inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "$IMAGE:$VERSION already exists; increment VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build the exact amd64 candidate
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg "BUILD_VERSION=$VERSION" \
+            --build-arg "BUILD_REVISION=$RELEASE_SHA" \
+            -t "$IMAGE:scan-$RELEASE_SHA" .
+
+      - name: Smoke the local candidate
+        run: |
+          ./scripts/container-smoke.sh "$IMAGE:scan-$RELEASE_SHA" "ghcr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ./scripts/ca-container-smoke.sh "$IMAGE:scan-$RELEASE_SHA" "ghcr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ca"
+
+      - name: Reject high and critical image vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.69.3@sha256:7228e304ae0f610a1fad937baa463598cadac0c2ac4027cc68f3a8b997115689 \
+            image --exit-code 1 --severity HIGH,CRITICAL --no-progress \
+            "$IMAGE:scan-$RELEASE_SHA"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Publish version and moving latest alias with attestations
+        run: |
+          docker buildx build --platform linux/amd64 \
+            --build-arg "BUILD_VERSION=$VERSION" \
+            --build-arg "BUILD_REVISION=$RELEASE_SHA" \
+            --sbom=true \
+            --provenance=mode=max \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            --push .
+
+      - name: Pull the immutable digest and repeat smoke
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE:$VERSION"
+          GHCR_DIGEST="$(docker image inspect "$IMAGE:$VERSION" --format '{{index .RepoDigests 0}}')"
+          case "$GHCR_DIGEST" in
+            "$IMAGE"@sha256:*) ;;
+            *) echo "could not resolve the published digest" >&2; exit 1 ;;
+          esac
+          printf 'GHCR_DIGEST=%s\n' "$GHCR_DIGEST" >> "$GITHUB_ENV"
+          printf 'Published `%s`\n' "$GHCR_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          ./scripts/container-smoke.sh "$GHCR_DIGEST" "ghcr-pull-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ./scripts/ca-container-smoke.sh "$GHCR_DIGEST" "ghcr-pull-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ca"

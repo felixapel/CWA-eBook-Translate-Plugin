@@ -1,9 +1,13 @@
 # Managed Unraid deployment
 
-The supported v2.2.0 Unraid path is local and source-only. It does not SSH into
+The advanced v2.2 Unraid path is local and source-built. It does not SSH into
 the server, download a project image, publish the API, copy a CWA template, or
 mount an overlay into CWA. One clean checkout builds one immutable local image;
 that image runs as two separate non-root containers.
+
+For the simpler single-container Community Applications profile introduced in
+v2.2.1, use [DEPLOY_UNRAID_CA.md](DEPLOY_UNRAID_CA.md). This guide remains the
+recommended path for upgrades, rollback, Authentik, and independent roles.
 
 ```text
 browser/reverse proxy -> cwa-translate-proxy -> stock CWA

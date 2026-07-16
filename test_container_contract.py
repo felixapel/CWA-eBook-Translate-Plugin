@@ -187,6 +187,41 @@ class ContainerContractTests(unittest.TestCase):
             self.assertIn(token, smoke)
         self.assertNotIn("gosu", smoke)
 
+    def test_ca_profile_certifies_the_combined_role_without_publishing_api(self):
+        smoke_path = ROOT / "scripts" / "ca-container-smoke.sh"
+        smoke = smoke_path.read_text(encoding="utf-8")
+        self.assertTrue(smoke_path.stat().st_mode & 0o111)
+        for token in (
+            "BT_ROLE=all",
+            "BT_AUTH_MODE=cwa_session",
+            "test_cwa_strong_fixture.py",
+            "BT_LOCAL_URL=",
+            "--read-only",
+            "--cap-drop ALL",
+            "no-new-privileges:true",
+            "docker rm -f",
+            "recreate",
+            "cached",
+        ):
+            self.assertIn(token, smoke)
+        self.assertRegex(smoke, r"-p\s+127\.0\.0\.1::8080")
+        self.assertNotRegex(smoke, r"-p[^\n]*8390")
+        self.assertIn("./scripts/ca-container-smoke.sh", (
+            ROOT / ".github" / "workflows" / "ci.yml"
+        ).read_text())
+
+    def test_runtime_image_declares_public_oci_identity(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        for token in (
+            "ARG BUILD_VERSION=dev",
+            "ARG BUILD_REVISION=unknown",
+            'org.opencontainers.image.source="https://github.com/felixapel/CWA-eBook-Translate-Plugin"',
+            'org.opencontainers.image.licenses="GPL-3.0-only"',
+            'org.opencontainers.image.version="$BUILD_VERSION"',
+            'org.opencontainers.image.revision="$BUILD_REVISION"',
+        ):
+            self.assertIn(token, dockerfile)
+
     def test_lifecycle_smoke_can_remove_non_root_managed_data(self):
         smoke = (ROOT / "scripts" / "btctl-lifecycle-smoke.sh").read_text()
         cleanup = smoke.split("cleanup() {", 1)[1].split("}\ntrap cleanup EXIT", 1)[0]

@@ -48,8 +48,9 @@ existing one-container deployments while Compose users migrate.
   unmanaged defaults remain `0600` and `0700`. This avoids requiring root for
   rollback or reinstall while granting no access to host users outside the
   selected operator group.
-- The combined role remains supported for compatibility but is not the
-  production recommendation.
+- The combined role remains supported for compatibility. ADR-012 additionally
+  certifies one narrow Community Applications production profile; it does not
+  replace the split recommendation for managed lifecycle or advanced installs.
 - nginx and the standard-library-only validated config renderer remain present
   in the shared image even for the API role; this is the accepted cost of
   keeping one auditable release artifact. gettext/envsubst was removed.

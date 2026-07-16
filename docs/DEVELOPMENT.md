@@ -105,6 +105,19 @@ ignores inherited `HTTP_PROXY`/`HTTPS_PROXY` settings, refuses redirects and URL
 credentials, streams no response body, and closes each response immediately so
 the token or CWA cookie stays bound to the explicitly selected origin.
 
+The two benchmark scripts enforce the same boundary and also fail on redirects,
+non-2xx responses, or invalid JSON. Use one authentication mechanism only:
+
+```bash
+BT_API_TOKEN='<token>' python3 benchmark.py \
+  --url http://127.0.0.1:8390
+BT_BENCHMARK_COOKIE='session=<opaque-value>' python3 benchmark_realistic.py \
+  --url https://books.example.test/bt-api
+```
+
+Do not paste credentials into a URL or publish benchmark output containing
+private endpoint names.
+
 ## Frontend Development
 
 The frontend consists of `static/translator.js`, `static/translator.css`, and

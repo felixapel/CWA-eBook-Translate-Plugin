@@ -94,3 +94,5 @@ jobs:
         run: ./scripts/btctl-lifecycle-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"
       - name: Exercise the stock-Unraid bootstrap without host Python
         run: ./scripts/btctl-bootstrap-smoke.sh "$SMOKE_PREFIX"
+      - name: Exercise the Community Applications combined profile
+        run: ./scripts/ca-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-ca"

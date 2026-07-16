@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-07-16
+
+### Security
+
+- Added a fail-closed, manual GHCR publication workflow for the exact annotated
+  release tag and commit. It uses only GitHub's built-in workflow token,
+  refuses an existing immutable version tag, scans the candidate for high and
+  critical vulnerabilities, publishes BuildKit SBOM/provenance attestations,
+  and repeats runtime smoke tests against the pulled digest.
+- Certified one narrow Community Applications combined profile with native CWA
+  strong-session validation, a non-root read-only sandbox, all capabilities
+  dropped, private appdata, and no host publication of internal API port 8390.
+- Live benchmark clients now support token or CWA-cookie authentication, ignore
+  inherited proxies, refuse redirects and URL credentials, close responses,
+  and fail on non-2xx or invalid JSON instead of silently measuring a login or
+  error page.
+
+### Added
+
+- Added the `linux/amd64` Community Applications install guide, deterministic
+  combined-container smoke test, ADR-012, compatibility boundary, physical
+  acceptance checklist, and versioned Unraid forum/Reddit/CA launch packet.
+- Added OCI source, documentation, license, version, and revision labels to the
+  runtime image.
+
+### Changed
+
+- Replaced placeholder checkout commands and absolute performance/install
+  claims with the exact v2.2.1 coordinates, explicit prerequisites, and bounded
+  compatibility language.
+- Completed the security/contact, contribution, conduct, issue, release, and
+  production-readiness documentation for a sole-maintainer public launch.
+- Retired the personal `deploy_unraid.sh` and `verify_unraid.sh` paths. The
+  supported source-built lifecycle is `btctl`; the simpler path is the
+  separately certified Community Applications profile.
+
 ## [2.2.0] - 2026-07-15
 
 ### Security

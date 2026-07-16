@@ -395,6 +395,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             './scripts/container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
             './scripts/btctl-lifecycle-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
             './scripts/btctl-bootstrap-smoke.sh "$SMOKE_PREFIX"',
+            './scripts/ca-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-ca"',
         ):
             self.assertIn(command, workflow)
 

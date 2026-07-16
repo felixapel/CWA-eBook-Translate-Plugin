@@ -108,6 +108,8 @@ change the address CWA binds into the session and require separate validation.
 
 Use the guide for your host:
 
+- [Community Applications on Unraid](docs/DEPLOY_UNRAID_CA.md) — simplest
+  certified v2.2.1 profile for CWA 4.0.6, native sessions, and a local LLM.
 - [Unraid deployment](docs/DEPLOY_UNRAID.md) — root-owned appdata, DockerMan
   templates, v2.1.4 upgrade, rollback, and acceptance checks.
 - [Existing Compose deployment](docs/DEPLOY_COMPOSE.md) — the same managed
