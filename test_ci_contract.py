@@ -29,7 +29,7 @@ class CIContractTests(unittest.TestCase):
             "python3 test_hardening.py",
             "python3 -m unittest -v test_btctl test_btctl_container test_btctl_compose test_btctl_unraid test_btctl_auth test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_install_docs test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts",
             "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
-            "bash -n btctl install_unraid.sh deploy_unraid.sh verify_unraid.sh scripts/btctl-bootstrap-smoke.sh",
+            "bash -n btctl install_unraid.sh scripts/btctl-bootstrap-smoke.sh",
         ):
             self.assertIn(command, self.workflow)
 

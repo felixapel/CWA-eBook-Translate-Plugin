@@ -1,20 +1,24 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Propose a user problem or workflow improvement
 title: "[FEATURE] "
 labels: enhancement
 assignees: ''
-
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+## Problem or workflow
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+Who needs this, what are they trying to do, and what currently gets in the way?
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+## Desired outcome
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+Describe the result rather than prescribing an architecture.
+
+## Alternatives and scope
+
+What workaround do you use today? What should explicitly remain out of scope?
+
+## Environment or compatibility constraints
+
+List relevant CWA, Unraid/host, browser, authentication, and LLM details. Do not
+include credentials, cookies, provider keys, private book text, or full logs.

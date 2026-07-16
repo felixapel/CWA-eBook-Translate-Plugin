@@ -15,7 +15,7 @@ Bilingual LLM-powered translation overlay for [Calibre-Web-Automated](https://gi
 - 📚 **Deep DOM Parsing** — accurately captures headings, custom title classes, and clickable TOC links
 - 💾 **Private Bounded Cache** — durable server-side SQLite uses scoped SHA-256 keys, mandatory TTL/cap, and private file modes; browser persistence is opt-in on trusted single-user devices
 - 🔒 **Rate limited & Stable** — request-size caps, per-client authentication admission, and per-subject API quotas protect your API keys and GPU from runaway requests, with `AbortController` cancellation for responsive UI buttons
-- 🔌 **Zero-touch install** — proxy-injection mode overlays a **stock** CWA container: no template mounts, nothing to re-apply when CWA updates
+- 🔌 **Stock CWA integration** — proxy-injection mode leaves the CWA image unchanged; installation still requires explicit network, storage, origin, and LLM configuration
 
 ### A note on language quality
 
@@ -37,15 +37,15 @@ checkout into one immutable local image and creates two isolated roles: a
 browser-facing injection proxy and an unpublished translation API. CWA itself
 is never modified or owned by the installer.
 
-Start from either an annotated release tag or a full reviewed commit. If a
-version tag has not been published yet, use the exact candidate commit supplied
-by the maintainer; do not invent the tag or substitute a mutable `latest` image.
+Start from the annotated release tag. Candidate testing may instead use an
+exact full commit supplied by the maintainer; never substitute a mutable
+`latest` image.
 
 ```bash
-git clone <repository-url> cwa-translate
+git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git cwa-translate
 cd cwa-translate
 git fetch --tags
-git switch --detach <release-tag-or-full-reviewed-commit>
+git switch --detach v2.2.1
 ```
 
 On stock Unraid, the same public `./btctl` command starts a temporary local
@@ -154,8 +154,15 @@ included so you can measure *your* deployment:
 - `benchmark_realistic.py` — simulates a realistic reading session (visible-page +
   background prefetch) against a live backend.
 
-Run either with the API up (`python benchmark.py` / `python benchmark_realistic.py`)
-and read the printed p50/p95/throughput for your own hardware.
+Run either against the authenticated API or the proxy's `/bt-api` base path.
+Use `BT_API_TOKEN` for token mode or `BT_BENCHMARK_COOKIE` for a temporary CWA
+browser Cookie header; never paste credentials into the URL. Both scripts
+disable redirects and inherited HTTP proxies and fail on any non-2xx response:
+
+```bash
+BT_BENCHMARK_COOKIE='session=REDACTED' \
+  python benchmark_realistic.py --url https://books.example.test/bt-api
+```
 
 If cold translations feel slow, see `BT_BATCH_SIZE`, `BT_OUTPUT_TOKEN_FACTOR`, and
 `BT_MAX_CONCURRENT` below, and `docs/TROUBLESHOOTING.md`.
@@ -199,7 +206,7 @@ legacy integrations.
 | `BT_BATCH_SIZE` | `5` | Paragraphs in the initial grouped LLM call. `>1` is dramatically faster on slow models. Batches use a strict, versioned JSON envelope. A malformed envelope gets one grouped retry with fresh IDs; a second malformed envelope triggers sequential per-paragraph recovery inside the same request work budget. Recovery output is not stored under the grouped cache contract. Ordinary individual failures become per-paragraph error markers; work-budget exhaustion remains fatal. Set `1` for one-call-per-paragraph. |
 | `BT_MAX_TOKENS` | `4096` | Hard ceiling on `max_tokens` for a **single**-paragraph request. The actual value sent is the smaller of this and the proportional cap (see `BT_OUTPUT_TOKEN_FACTOR`). |
 | `BT_BATCH_MAX_TOKENS` | `8192` | Same ceiling, but for a **batched** (multi-paragraph) request. |
-| `BT_OUTPUT_TOKEN_FACTOR` | `2.0` | Caps generated `max_tokens` at `input_tokens × FACTOR + FLOOR`, clamped to the ceiling above. Prevents a rambling/stuck local model from generating thousands of tokens for a short paragraph (the main cause of 8–20s and 120s stalls). `2.0` never truncates real translations; lower it (e.g. `1.6`) for a bit more speed at some risk on very expansive target languages. |
+| `BT_OUTPUT_TOKEN_FACTOR` | `2.0` | Caps generated `max_tokens` at `input_tokens × FACTOR + FLOOR`, clamped to the ceiling above. This bounds rambling or stuck local models. Very expansive target languages or unusual models may need a higher value; lowering it can improve latency but raises truncation risk. |
 | `BT_OUTPUT_TOKEN_FLOOR` | `256` | Minimum `max_tokens` per request. |
 | `BT_CONTEXT_WINDOW` | `0` | Number of surrounding paragraphs included as a do-not-translate `[CONTEXT]` block in batch prompts. Set to `1` or `2` for context-aware translations. Improves literary quality but consumes more tokens per request. |
 | `BT_TIMEOUT` | `60` | Seconds before a single translation request is abandoned. Raise it if a slow local model times out on long paragraphs; lower it (with a smaller `BT_BATCH_SIZE`) if you'd rather fail fast under contention. |
@@ -330,9 +337,9 @@ Authentication-derived tenant behavior is intentional:
 - `token` is one shared tenant. `disabled` is one anonymous tenant and must not
   be used for production.
 
-Release operators should follow the [Gitea-authoritative source release
-runbook](docs/RELEASE.md); GitHub is a public source mirror and neither service
-publishes container images.
+Release operators should follow the [Gitea-authoritative release
+runbook](docs/RELEASE.md). Gitea remains the source/tag authority; GitHub is the
+public mirror and publishes the matching GHCR image for Community Applications.
 See the [architecture overview](docs/ARCHITECTURE.md) for component details and
 accepted architecture decision records. The
 [production-readiness record](docs/PRODUCTION_READINESS.md) maps the latest

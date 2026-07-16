@@ -14,6 +14,8 @@ This document details the architecture of the `book-translator` plugin.
 - [ADR-008: Publish verified source releases without registry credentials](decisions/ADR-008-source-only-releases.md)
 - [ADR-009: Keep cache schemas side by side for rollback](decisions/ADR-009-side-by-side-cache-schemas.md)
 - [ADR-010: Make `btctl` the fail-closed deployment authority](decisions/ADR-010-btctl-state-and-ownership.md)
+- [ADR-011: Bootstrap the Unraid operator through Docker](decisions/ADR-011-containerized-unraid-bootstrap.md)
+- [ADR-012: Publish a certified combined image for Community Applications](decisions/ADR-012-community-applications-image.md)
 
 ## Overview
 

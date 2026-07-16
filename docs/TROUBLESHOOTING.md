@@ -1,6 +1,7 @@
 # Troubleshooting
 
-These checks apply to the managed v2.2.0 split deployment. Do not expose the
+These checks apply to the managed v2.2 split deployment and the certified
+v2.2.1 Community Applications profile. Do not expose the
 API, add a browser token, broaden a trusted proxy range, or disable
 authentication to make an error disappear.
 
@@ -201,7 +202,7 @@ actual local/provider latency with a short text first, then adjust only one
 bounded setting at a time.
 
 Useful controls include `BT_RATE_LIMIT_PER_MINUTE`,
-`BT_CLIENT_MIN_REQUEST_GAP_MS`, `BT_MAX_UPSTREAM_INFLIGHT`, request deadline,
+client request pacing, `BT_MAX_UPSTREAM_INFLIGHT`, request deadline,
 and output-token limits. Never set an unlimited production value. Local model,
 context size, target language, and GPU memory normally dominate latency.
 
