@@ -3,21 +3,28 @@ import io
 import unittest
 from unittest import mock
 
+import benchmark
+import benchmark_realistic
 import test_ratelimit
 
 
 class _FakeResponse:
-    def __init__(self, status_code):
+    def __init__(self, status_code, payload=None):
         self.status_code = status_code
+        self._payload = payload or {"translation": "ok", "elapsed_ms": 10}
         self.closed = False
+
+    def json(self):
+        return self._payload
 
     def close(self):
         self.closed = True
 
 
 class _FakeSession:
-    def __init__(self, statuses):
+    def __init__(self, statuses, payloads=None):
         self._statuses = iter(statuses)
+        self._payloads = iter(payloads or [])
         self.calls = []
         self.responses = []
         self.closed = False
@@ -25,7 +32,11 @@ class _FakeSession:
 
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
-        response = _FakeResponse(next(self._statuses))
+        try:
+            payload = next(self._payloads)
+        except StopIteration:
+            payload = None
+        response = _FakeResponse(next(self._statuses), payload)
         self.responses.append(response)
         return response
 
@@ -101,6 +112,7 @@ class RateLimitLiveScriptTests(unittest.TestCase):
                 "https://translator.example/bt-api",
                 token=None,
                 cookie="session=opaque-value",
+                user_agent="Exact Browser/1.0",
                 request_count=3,
                 timeout=1,
                 session=session,
@@ -118,6 +130,7 @@ class RateLimitLiveScriptTests(unittest.TestCase):
             "http://127.0.0.1:8080/bt-api",
             token=None,
             cookie="session=opaque-value",
+            user_agent="Exact Browser/1.0",
             request_count=2,
             timeout=1,
             session=session,
@@ -126,7 +139,10 @@ class RateLimitLiveScriptTests(unittest.TestCase):
         self.assertEqual(result, test_ratelimit.RateLimitResult(1, 1, 0))
         self.assertEqual(
             session.calls[0][1]["headers"],
-            {"Cookie": "session=opaque-value"},
+            {
+                "Cookie": "session=opaque-value",
+                "User-Agent": "Exact Browser/1.0",
+            },
         )
 
     def test_main_fails_when_no_request_is_admitted_or_limited(self):
@@ -162,6 +178,26 @@ class RateLimitLiveScriptTests(unittest.TestCase):
                 ])
         self.assertEqual(raised.exception.code, 2)
 
+        for args in (
+            ("--cookie", "session=cookie-value"),
+            ("--user-agent", "Exact Browser/1.0"),
+        ):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    test_ratelimit.main(list(args))
+            self.assertEqual(raised.exception.code, 2)
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            test_ratelimit.exercise_rate_limit(
+                "https://translator.example/bt-api",
+                token="token-value",
+                cookie="session=cookie-value",
+                user_agent="Exact Browser/1.0",
+                request_count=1,
+                timeout=1,
+                session=_FakeSession([200]),
+            )
+
     def test_main_rejects_non_http_or_ambiguous_urls(self):
         invalid_urls = (
             "ftp://translator.example/bt-api",
@@ -175,6 +211,145 @@ class RateLimitLiveScriptTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as raised:
                     test_ratelimit.main(["--url", url])
                 self.assertEqual(raised.exception.code, 2)
+
+
+class BenchmarkLiveScriptTests(unittest.TestCase):
+    def test_quick_benchmark_uses_token_and_refuses_redirects(self):
+        session = _FakeSession([200])
+
+        result = benchmark.make_request(
+            7,
+            base_url="https://books.example.test/bt-api",
+            token="opaque-token",
+            cookie=None,
+            timeout=9,
+            session=session,
+        )
+
+        self.assertEqual(result["translation"], "ok")
+        url, kwargs = session.calls[0]
+        self.assertEqual(url, "https://books.example.test/bt-api/translate")
+        self.assertEqual(kwargs["headers"], {"X-BT-Token": "opaque-token"})
+        self.assertEqual(kwargs["timeout"], 9)
+        self.assertFalse(kwargs["allow_redirects"])
+        self.assertTrue(session.responses[0].closed)
+
+    def test_realistic_benchmark_supports_cwa_cookie(self):
+        session = _FakeSession([200], [{"translations": ["hola"]}])
+
+        result, _elapsed = benchmark_realistic.translate_batch(
+            ["hello"],
+            base_url="https://books.example.test/bt-api/",
+            token=None,
+            cookie="session=opaque-value",
+            user_agent="Exact Browser/1.0",
+            timeout=13,
+            session=session,
+        )
+
+        self.assertEqual(result, {"translations": ["hola"]})
+        url, kwargs = session.calls[0]
+        self.assertEqual(url, "https://books.example.test/bt-api/translate/batch")
+        self.assertEqual(
+            kwargs["headers"],
+            {
+                "Cookie": "session=opaque-value",
+                "User-Agent": "Exact Browser/1.0",
+            },
+        )
+        self.assertEqual(kwargs["timeout"], 13)
+        self.assertFalse(kwargs["allow_redirects"])
+        self.assertTrue(session.responses[0].closed)
+
+    def test_benchmarks_fail_closed_on_non_2xx(self):
+        for module, callable_, arguments in (
+            (
+                benchmark,
+                benchmark.make_request,
+                (1,),
+            ),
+            (
+                benchmark_realistic,
+                benchmark_realistic.translate_batch,
+                (["hello"],),
+            ),
+        ):
+            with self.subTest(module=module.__name__):
+                session = _FakeSession([302])
+                with self.assertRaisesRegex(RuntimeError, "unexpected HTTP 302"):
+                    callable_(
+                        *arguments,
+                        base_url="https://books.example.test/bt-api",
+                        token=None,
+                        cookie="session=opaque-value",
+                        user_agent="Exact Browser/1.0",
+                        timeout=5,
+                        session=session,
+                    )
+                self.assertFalse(session.calls[0][1]["allow_redirects"])
+                self.assertTrue(session.responses[0].closed)
+
+    def test_benchmark_cli_rejects_ambiguous_auth_and_url_credentials(self):
+        for module in (benchmark, benchmark_realistic):
+            with self.subTest(module=module.__name__):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        module.main([
+                            "--url", "https://user:password@books.example.test/bt-api",
+                        ])
+                self.assertEqual(raised.exception.code, 2)
+
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        module.main(["--token", "x", "--cookie", "session=y"])
+                self.assertEqual(raised.exception.code, 2)
+
+                for args in (
+                    ("--cookie", "session=y"),
+                    ("--user-agent", "Exact Browser/1.0"),
+                ):
+                    with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit) as raised:
+                            module.main(list(args))
+                    self.assertEqual(raised.exception.code, 2)
+
+        with self.assertRaisesRegex(RuntimeError, "mutually exclusive"):
+            benchmark._headers(
+                "token-value",
+                "session=cookie-value",
+                "Exact Browser/1.0",
+            )
+
+    def test_owned_benchmark_sessions_ignore_environment_proxies(self):
+        for module, runner in (
+            (benchmark, benchmark.run_benchmark),
+            (benchmark_realistic, benchmark_realistic.run_benchmark_scenario),
+        ):
+            with self.subTest(module=module.__name__):
+                session = _FakeSession([200] * 4, [{"translations": ["ok"]}] * 4)
+                with mock.patch.object(module.requests, "Session", return_value=session):
+                    if module is benchmark:
+                        runner(
+                            1,
+                            1,
+                            base_url="http://127.0.0.1:8390",
+                            token="secret",
+                            cookie=None,
+                            timeout=3,
+                        )
+                    else:
+                        runner(
+                            "test",
+                            1,
+                            1,
+                            1,
+                            base_url="http://127.0.0.1:8390",
+                            token="secret",
+                            cookie=None,
+                            timeout=3,
+                        )
+                self.assertFalse(session.trust_env)
+                self.assertTrue(session.closed)
 
 
 if __name__ == "__main__":

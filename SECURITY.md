@@ -8,7 +8,11 @@ Only the latest release (and `main`) receives security fixes.
 
 Please report vulnerabilities privately via **GitHub Security Advisories**
 ("Report a vulnerability" on the repository's Security tab) rather than a
-public issue. You should get a first response within 7 days.
+public issue. If that form is unavailable, email
+`felixguillermoapel@gmail.com` with the subject `CWA Translate security report`.
+Do not include credentials, session cookies, book text, or provider keys unless
+we explicitly arrange a safe transfer. You should get a first response within
+7 days.
 
 ## Scope notes for self-hosters
 

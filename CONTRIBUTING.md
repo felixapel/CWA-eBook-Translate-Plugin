@@ -1,37 +1,62 @@
-# Contributing to Book Translator
+# Contributing to CWA eBook Translate
 
-Thank you for your interest in contributing to the Book Translator plugin for Calibre-Web-Automated! We welcome contributions from everyone.
+Thanks for helping improve the project. Keep changes narrow, explain the user
+problem, and include a regression test for behavior changes.
 
-## Development Setup
+## Development setup
 
-1. Fork and clone the repository.
-2. Ensure you have Python 3.11+ installed.
-3. Set up a virtual environment:
+1. Fork and clone the repository, then create a short-lived branch.
+2. Install Python 3.11 and Node from `.node-version`.
+3. Create a virtual environment and install the reviewed lock:
+
    ```bash
    python3 -m venv .venv
-   source .venv/bin/activate
+   . .venv/bin/activate
    python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
+   npm ci
    ```
-4. Install a local LLM or obtain an API key for your preferred cloud provider.
-5. Create a `.env` file to store your API keys.
 
-## Pull Request Process
+Tests use fakes and do not need an LLM key. Keep real credentials in a private
+environment file outside the checkout; never commit `.env`, cookies, book text,
+provider keys, or generated deployment state.
 
-1. Create a descriptive branch name (e.g. `feat/add-new-provider` or `bugfix/fix-cache-lock`).
-2. Write clean, self-documenting code.
-3. Test your changes locally to ensure translation latency and DOM injection are stable.
-4. If modifying the frontend (`translator.js`), test on various ebook formats and themes (Light, Dark, Sepia, Black).
-5. Submit a pull request detailing the changes and the rationale.
+## Required checks
+
+Run the smallest relevant test while developing, then the maintained gates
+before opening a pull request:
+
+```bash
+python3 -m unittest -v test_live_scripts test_install_docs
+python3 test_translation.py
+python3 test_hardening.py
+python3 -m unittest discover -v
+node -c static/translator.js
+node -c static/loader.js
+npm ci
+npm audit --audit-level=high
+npm test
+npx playwright install --with-deps --only-shell chromium
+npm run test:e2e
+```
+
+Container or installer changes must also run the applicable smoke commands in
+`docs/RELEASE.md`. Live benchmark scripts require explicit authentication; see
+`docs/DEVELOPMENT.md`.
 
 Dependency updates must change the relevant `requirements*.in` file, regenerate
 the committed hash lock with `scripts/compile-requirements.sh`, and include the
-reviewed lock diff. See `docs/DEVELOPMENT.md` for the pinned compiler workflow.
+reviewed diff. Do not hand-edit generated requirement locks.
 
-## Code Style Guide
+## Pull requests
 
-- **Python**: Follow PEP 8 guidelines. Use type hints (`typing`) wherever possible. Keep the logic contained to avoid importing unnecessary heavy dependencies.
-- **JavaScript**: Use modern ES6+ features. Avoid external dependencies in the frontend script to keep the overlay lightweight. No jQuery. Keep DOM mutations isolated to prevent breaking EPUB.js.
+- Explain the problem, approach, risk, and verification evidence.
+- State the exact tag or commit used for runtime reproductions.
+- Add or update tests before changing behavior.
+- Keep frontend changes compatible with light, dark, sepia, and black reader
+  themes and exercise the real Chromium suite.
+- Do not include raw `/metrics`, logs, cookies, paths, book text, or provider
+  responses without redacting private data.
 
-## Reporting Bugs
-
-Please use the provided issue templates when reporting a bug. Provide clear reproduction steps, logs from `/metrics`, and mention whether the issue occurs on the frontend (UI glitch) or backend (API failure).
+For bugs, use the issue template and begin with `./btctl doctor --json` on
+managed installs. Security reports belong in the private channel described in
+`SECURITY.md`, never a public issue.

@@ -2,48 +2,47 @@
 
 ## Our Pledge
 
-We as members, contributors, and leaders pledge to make participation in our
-community a harassment-free experience for everyone, regardless of age, body
-size, visible or invisible disability, ethnicity, sex characteristics, gender
-identity and expression, level of experience, education, socio-economic status,
-nationality, personal appearance, race, caste, color, religion, or sexual
-identity and orientation.
+We pledge to make participation in this project a harassment-free experience
+for everyone, regardless of age, body size, disability, ethnicity, sex
+characteristics, gender identity and expression, experience, education,
+socio-economic status, nationality, appearance, race, caste, color, religion,
+or sexual identity and orientation.
 
-We pledge to act and interact in ways that contribute to an open, welcoming,
-diverse, inclusive, and healthy community.
+We will act in ways that contribute to an open, welcoming, diverse, inclusive,
+and healthy community.
 
 ## Our Standards
 
-Examples of behavior that contributes to a positive environment for our
-community include:
-
-* Demonstrating empathy and kindness toward other people
-* Being respectful of differing opinions, viewpoints, and experiences
-* Giving and gracefully accepting constructive feedback
-* Accepting responsibility and apologizing to those affected by our mistakes,
-  and learning from the experience
-* Focusing on what is best not just for us as individuals, but for the overall
-  community
-
-Examples of unacceptable behavior include:
-
-* The use of sexualized language or imagery, and sexual attention or advances of
-  any kind
-* Trolling, insulting or derogatory comments, and personal or political attacks
-* Public or private harassment
-* Publishing others' private information, such as a physical or email address,
-  without their explicit permission
-* Other conduct which could reasonably be considered inappropriate in a
-  professional setting
+Positive behavior includes empathy, respect for different viewpoints,
+constructive feedback, accepting responsibility, and focusing on the health of
+the community. Unacceptable behavior includes sexualized conduct, trolling,
+insults, personal or political attacks, public or private harassment,
+publishing another person's private information without permission, and other
+conduct reasonably considered inappropriate in a professional setting.
 
 ## Enforcement Responsibilities
 
-Community leaders are responsible for clarifying and enforcing our standards of
-acceptable behavior and will take appropriate and fair corrective action in
-response to any behavior that they deem inappropriate, threatening, offensive,
-or harmful.
+The maintainer is responsible for clarifying and enforcing these standards and
+may remove, edit, or reject comments, commits, code, issues, or other
+contributions that do not align with them. Moderation decisions will be
+explained when appropriate.
 
-Community leaders have the right and responsibility to remove, edit, or reject
-comments, commits, code, wiki edits, issues, and other contributions that are
-not aligned to this Code of Conduct, and will communicate reasons for moderation
-decisions when appropriate.
+## Scope
+
+This Code applies in every project space, including issues, pull requests,
+discussions, release channels, and community support threads, and when someone
+officially represents the project in public.
+
+## Enforcement
+
+Report abusive, harassing, or otherwise unacceptable behavior privately to
+`felixguillermoapel@gmail.com` with the subject `CWA Translate conduct report`.
+Reports will be reviewed promptly and kept confidential as far as reasonably
+possible. The maintainer will use a proportionate response, from correction or
+warning through temporary or permanent exclusion. Do not use this address for
+ordinary support; use GitHub Issues or Discussions instead.
+
+## Attribution
+
+This Code is adapted from the [Contributor Covenant, version
+2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct.html).

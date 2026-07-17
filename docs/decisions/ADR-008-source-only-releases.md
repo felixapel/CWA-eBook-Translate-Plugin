@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Partially superseded by
+[ADR-012](ADR-012-community-applications-image.md)
 
 ## Date
 
@@ -25,8 +26,9 @@ publish official containers.
 - The tag workflow retains trusted-main preflight, version/parity checks,
   backend and dependency gates, real-browser tests, and the hardened container
   build/runtime smoke test.
-- The project does not publish container images. Compose and Unraid users build
-  the exact checked-out source locally.
+- Source releases and `btctl` continue to build the exact checked-out source
+  locally. ADR-012 permits one official GHCR image for the certified Community
+  Applications profile under a separate manual, fail-closed publication gate.
 - Release-specific registry credentials and Cosign keys are not configured or
   referenced by repository workflows.
 
@@ -57,6 +59,7 @@ images justifies the key custody, registry access, and maintenance burden.
 - Installation performs a local Docker build and therefore takes longer than
   pulling a prebuilt image.
 - Historical registry images remain historical artifacts and are not evidence
-  of current releases.
-- Reintroducing official images requires a new reviewed ADR and an explicit
-  artifact authenticity and maintenance policy.
+  of current releases. Only images published under ADR-012's exact tag/digest
+  policy are current artifacts.
+- Any additional registry, architecture, image name, or publication mechanism
+  requires another reviewed decision.

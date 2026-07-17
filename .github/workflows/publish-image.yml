@@ -1,0 +1,235 @@
+name: Publish GHCR image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing annotated release tag, for example v2.2.1
+        required: true
+        type: string
+      release_sha:
+        description: Exact 40-character commit SHA peeled from that tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ghcr-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/cwa-ebook-translate-plugin
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      release_sha: ${{ steps.identity.outputs.release_sha }}
+    steps:
+      - name: Check out trusted release policy
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out the candidate tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.release_tag }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate exact release identity
+        id: identity
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          python3 - "$RELEASE_TAG" "$RELEASE_SHA" <<'PY'
+          import re
+          import sys
+
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", sys.argv[1]):
+              raise SystemExit("release_tag must be vMAJOR.MINOR.PATCH")
+          if not re.fullmatch(r"[0-9a-f]{40}", sys.argv[2]):
+              raise SystemExit(
+                  "release_sha must be 40 lowercase hexadecimal characters"
+              )
+          PY
+          VERSION="${RELEASE_TAG#v}"
+          test "$VERSION" = "$(tr -d '\n' < candidate/VERSION)"
+          test "$RELEASE_SHA" = "$(git -C candidate rev-parse HEAD^{commit})"
+          git -C candidate fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          python3 trusted/scripts/release_preflight.py \
+            --repository candidate \
+            --tag "$RELEASE_TAG" \
+            --sha "$RELEASE_SHA" \
+            --main-ref refs/remotes/origin/main \
+            --mirror-url "https://github.com/${GITHUB_REPOSITORY}.git"
+          printf 'VERSION=%s\nRELEASE_SHA=%s\n' "$VERSION" "$RELEASE_SHA" >> "$GITHUB_ENV"
+          printf 'version=%s\nrelease_sha=%s\n' "$VERSION" "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build the exact amd64 candidate
+        working-directory: candidate
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg "BUILD_VERSION=$VERSION" \
+            --build-arg "BUILD_REVISION=$RELEASE_SHA" \
+            -t "$IMAGE:scan-$RELEASE_SHA" .
+
+      - name: Smoke the local candidate
+        working-directory: candidate
+        run: |
+          ./scripts/container-smoke.sh "$IMAGE:scan-$RELEASE_SHA" "ghcr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ./scripts/ca-container-smoke.sh "$IMAGE:scan-$RELEASE_SHA" "ghcr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ca"
+
+      - name: Reject high and critical image vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.69.3@sha256:7228e304ae0f610a1fad937baa463598cadac0c2ac4027cc68f3a8b997115689 \
+            image --exit-code 1 --severity HIGH,CRITICAL --no-progress \
+            "$IMAGE:scan-$RELEASE_SHA"
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the exact validated candidate without persisted credentials
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind publication to the validated identity
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_SHA" = "${{ inputs.release_sha }}"
+          test "$VERSION" = "${RELEASE_TAG#v}"
+          test "$VERSION" = "$(tr -d '\n' < candidate/VERSION)"
+          test "$RELEASE_SHA" = "$(git -C candidate rev-parse HEAD^{commit})"
+          printf 'VERSION=%s\nRELEASE_SHA=%s\n' "$VERSION" "$RELEASE_SHA" >> "$GITHUB_ENV"
+
+      - name: Refuse an existing immutable version tag anonymously
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          if manifest_output="$(docker manifest inspect "$IMAGE:$VERSION" 2>&1)"; then
+            echo "$IMAGE:$VERSION already exists; increment VERSION" >&2
+            exit 1
+          fi
+          case "$manifest_output" in
+            *"manifest unknown"*|*"name unknown"*|*"no such manifest"*) ;;
+            *)
+              printf '%s\n' "$manifest_output" >&2
+              echo "could not prove the immutable version tag is absent" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in only for the immutable push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish the immutable version with attestations
+        run: |
+          docker buildx build --platform linux/amd64 \
+            --build-arg "BUILD_VERSION=$VERSION" \
+            --build-arg "BUILD_REVISION=$RELEASE_SHA" \
+            --sbom=true \
+            --provenance=mode=max \
+            -t "$IMAGE:$VERSION" \
+            --metadata-file "$RUNNER_TEMP/buildx-metadata.json" \
+            --push candidate
+
+      - name: Capture the exact emitted digest
+        run: |
+          set -euo pipefail
+          DIGEST="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["containerimage.digest"])' "$RUNNER_TEMP/buildx-metadata.json")"
+          python3 -c 'import re,sys; raise SystemExit(0 if re.fullmatch(r"sha256:[0-9a-f]{64}", sys.argv[1]) else 1)' "$DIGEST"
+          GHCR_DIGEST="$IMAGE@$DIGEST"
+          printf 'GHCR_DIGEST=%s\n' "$GHCR_DIGEST" >> "$GITHUB_ENV"
+          printf 'Published `%s`\n' "$GHCR_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove registry credentials before verification
+        run: docker logout ghcr.io
+
+      - name: Validate the published index and attestations anonymously
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$GHCR_DIGEST" --raw \
+            > "$RUNNER_TEMP/published-index.json"
+          python3 - "$RUNNER_TEMP/published-index.json" \
+            "$RUNNER_TEMP/attestation-digest" <<'PY'
+          import json
+          import re
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          manifests = payload.get("manifests")
+          assert payload.get("mediaType") == "application/vnd.oci.image.index.v1+json"
+          assert isinstance(manifests, list)
+          platforms = [
+              item for item in manifests
+              if item.get("platform") == {"architecture": "amd64", "os": "linux"}
+          ]
+          attestations = [
+              item for item in manifests
+              if item.get("annotations", {}).get("vnd.docker.reference.type")
+              == "attestation-manifest"
+          ]
+          assert len(platforms) == 1
+          assert len(attestations) == 1
+          digest = attestations[0].get("digest", "")
+          assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+          open(sys.argv[2], "w", encoding="utf-8").write(digest + "\n")
+          PY
+          ATTESTATION_DIGEST="$(cat "$RUNNER_TEMP/attestation-digest")"
+          docker buildx imagetools inspect "$IMAGE@$ATTESTATION_DIGEST" --raw \
+            > "$RUNNER_TEMP/attestation-manifest.json"
+          python3 - "$RUNNER_TEMP/attestation-manifest.json" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          predicates = {
+              layer.get("annotations", {}).get("in-toto.io/predicate-type", "")
+              for layer in payload.get("layers", [])
+          }
+          assert any("spdx" in predicate.lower() for predicate in predicates), predicates
+          assert any("slsa.dev/provenance" in predicate for predicate in predicates), predicates
+          PY
+
+      - name: Prove anonymous pull, scan the digest, and repeat smoke
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          docker image rm "$IMAGE:$VERSION" >/dev/null 2>&1 || true
+          docker pull "$GHCR_DIGEST"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.69.3@sha256:7228e304ae0f610a1fad937baa463598cadac0c2ac4027cc68f3a8b997115689 \
+            image --exit-code 1 --severity HIGH,CRITICAL --no-progress \
+            "$GHCR_DIGEST"
+          ./scripts/container-smoke.sh "$GHCR_DIGEST" "ghcr-pull-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ./scripts/ca-container-smoke.sh "$GHCR_DIGEST" "ghcr-pull-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ca"

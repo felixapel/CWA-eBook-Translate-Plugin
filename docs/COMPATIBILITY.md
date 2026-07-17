@@ -22,6 +22,7 @@ The project tracks the stable CWA reader contract using the
 | Environment | Status | Notes |
 |---|---|---|
 | Stock Unraid 7.3.2 on x86_64 | Managed and acceptance-targeted | The automated gate runs public `./btctl` plan/install/doctor/uninstall without host Python or Git. Use `BT_INSTALL_PROFILE=unraid` as root with Docker, Bash, and a full Git checkout; NerdTools is not required. Physical-host and browser acceptance is still required before tagging. |
+| Community Applications on Unraid 7.3.2 x86_64 | Release candidate: CI-certified; physical acceptance and publication required | v2.2.1 adds a single combined non-root container for CWA 4.0.6, native CWA sessions, and a local OpenAI-compatible LLM. Only proxy port 8080 is mapped; API port 8390 remains private. It is not a public install path until the tag, anonymous digest-pinned image, and searchable CA listing exist. See [DEPLOY_UNRAID_CA.md](DEPLOY_UNRAID_CA.md). |
 | Linux with existing Compose-managed CWA | Managed and CI contract-tested | Use `BT_INSTALL_PROFILE=compose-existing`; CWA stays external to the generated private Compose document. A Docker-capable non-root account is supported when the same account and private primary group are used for every lifecycle command. |
 | Docker Engine with `docker compose` plugin | Required for Compose profile | The current development audit used Docker `29.6.1` and Compose `5.3.1`. CI also builds and exercises the image on a real Docker runner. No lower minimum is claimed without a matching gate. |
 | ARM64 Linux/Unraid | Not yet CI-certified | The source build may work where pinned base/package inputs resolve, but promotion requires an ARM build and runtime smoke gate. |
@@ -45,7 +46,7 @@ contracts.
 
 | Topology | Status | Boundary |
 |---|---|---|
-| Native CWA session, same-origin proxy | Recommended and CI-certified | `BT_AUTH_PROFILE=cwa-session`; CWA v4.0.6 with `config_session=1` and its default `TRUSTED_PROXY_COUNT=1` is covered by unit and container regression fixtures. The API validates selected cookies with the exact proxy-observed address/User-Agent context and has no host port. Custom trusted-proxy hop counts are not yet certified. |
+| Native CWA session, same-origin proxy | Recommended and CI-certified | `BT_AUTH_PROFILE=cwa-session`; CWA v4.0.6 with `config_session=1`, reverse-proxy-header login disabled, and its default `TRUSTED_PROXY_COUNT=1` is covered by unit and container regression fixtures. The API validates selected cookies with the exact proxy-observed address/User-Agent context and has no host port. Custom trusted-proxy hop counts are not yet certified. |
 | Authentik forwarded identity | Managed advanced profile | Requires `docker-edge`, exact `/32` or `/128` edge peer, a patched Authentik version, and the generated direct API route. See [AUTHENTIK.md](AUTHENTIK.md). |
 | Nginx edge | Generated and contract-tested | Merge the fragment into the existing HTTPS/Authentik server configuration. SWAG and Nginx Proxy Manager still require product-specific config validation. |
 | Traefik edge | Generated and contract-tested | Existing entrypoint, TLS, certificate, and Authentik settings remain operator-owned. |

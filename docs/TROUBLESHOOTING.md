@@ -1,13 +1,14 @@
 # Troubleshooting
 
-These checks apply to the managed v2.2.0 split deployment. Do not expose the
+These checks apply to the managed v2.2 split deployment and the certified
+v2.2.1 Community Applications profile. Do not expose the
 API, add a browser token, broaden a trusted proxy range, or disable
 authentication to make an error disappear.
 
 ## Start with the deployment evidence
 
-Run the read-only doctor from the same clean checkout and private environment
-file used to install:
+For a managed `btctl` split deployment, run the read-only doctor from the same
+clean checkout and private environment file used to install:
 
 ```bash
 ./btctl doctor --env /absolute/private/path/cwa-translate.env
@@ -23,6 +24,26 @@ Every check must be `ok`. Doctor validates the saved plan, version+commit image,
 owned containers/network, exact CWA evidence, health, runtime environment,
 authentication profile, published ports, and generated artifacts. Fix its first
 failed check before debugging the browser.
+
+A Community Applications install has no `btctl` state. Do not diagnose it with
+`btctl doctor`. In the Unraid Docker tab, open the translator container's
+**Logs** and **Edit** screens. Record its exact image digest, configured user,
+published ports, appdata bind, network, and environment after removing provider
+secrets. First confirm user `101:102`, a bind to `/app/data`, only container port
+8080 published, and no mapping for 8390. Then work from the first startup or
+request error in the container log. The remaining checks in this guide apply to
+both profiles unless a paragraph explicitly refers to `btctl` or managed split
+roles.
+
+## Application is missing from Community Applications
+
+The v2.2.1 Community Applications path exists only after its annotated tag,
+public digest-pinned GHCR image, and approved searchable CA listing all exist.
+If **CWA eBook Translate** is not returned by Community Applications search,
+stop: the listing is not yet public or has been withdrawn. Do not install an
+XML from Git history, a cached template URL, or a mutable image tag. Use the
+source-built `btctl` path from the latest published tag, or wait for the listing
+to return.
 
 ## `env: python3: No such file or directory` on Unraid
 
@@ -96,8 +117,10 @@ anonymous mode and do not put a shared secret in browser storage.
 A `503` instead of `401` means the API could not safely evaluate CWA as the
 authority. Check that the CWA container is running, `CWA_UPSTREAM` and
 `BT_CWA_NETWORK` are exact, and the selected auth endpoint is reachable from
-the API container. `doctor` catches topology and runtime drift; API logs contain
-the bounded authority failure without session-cookie contents.
+the API container. On a managed split install, `doctor` catches topology and
+runtime drift. On Community Applications, verify the CWA network and auth URL in
+the Unraid Edit screen. In both profiles, API logs contain the bounded authority
+failure without session-cookie contents.
 
 ## Translation requests return 401 with `authentik-forwarded`
 
@@ -187,8 +210,10 @@ not hide a systematic provider problem by making them unlimited.
 ## 502 or 504 after CWA was recreated
 
 The injection proxy resolves `CWA_UPSTREAM` when its Nginx process starts. If
-CWA was recreated with a new address, restart only the managed translator proxy
-and rerun `doctor`. Do not recreate CWA or the translator API for this symptom.
+CWA was recreated with a new address, restart only the translator proxy role,
+or the single translator container for Community Applications. On a managed
+split install, rerun `doctor`. Do not recreate CWA or the translator API role
+for this symptom.
 
 Also confirm CWA still joins the exact `BT_CWA_NETWORK` and that its running
 image supplies the exact `BT_CWA_VERSION` tag/label expected by the plan.
@@ -201,7 +226,7 @@ actual local/provider latency with a short text first, then adjust only one
 bounded setting at a time.
 
 Useful controls include `BT_RATE_LIMIT_PER_MINUTE`,
-`BT_CLIENT_MIN_REQUEST_GAP_MS`, `BT_MAX_UPSTREAM_INFLIGHT`, request deadline,
+client request pacing, `BT_MAX_UPSTREAM_INFLIGHT`, request deadline,
 and output-token limits. Never set an unlimited production value. Local model,
 context size, target language, and GPU memory normally dominate latency.
 
@@ -266,7 +291,9 @@ DRM-free EPUB.
 
 ## Collecting a useful issue report
 
-Include the exact source commit, `VERSION`, host/profile, CWA image tag,
-reverse-proxy type, browser, the redacted first failed doctor check, and the
-smallest relevant log window. Remove cookies, Authentik headers, public IPs,
-private filesystem paths, book text, and all LLM credentials before sharing.
+Include the exact source commit or image digest, `VERSION`, host/profile, CWA
+image tag, reverse-proxy type, browser, and the smallest relevant log window.
+For managed split installs, also include the redacted first failed doctor
+check; for Community Applications, include the first container startup or
+request error instead. Remove cookies, Authentik headers, public IPs, private
+filesystem paths, book text, and all LLM credentials before sharing.

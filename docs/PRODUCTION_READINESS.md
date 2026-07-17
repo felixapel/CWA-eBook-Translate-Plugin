@@ -1,9 +1,9 @@
 # Production readiness record
 
-This document records the disposition of the 2026-07-12 security and
-production-readiness audit that started from the `v2.1.4` codebase and produced
-the `v2.2.0` candidate. It is a promotion record, not a claim that the new
-source version has already been released or deployed.
+This document records the disposition of the security and production-readiness
+audit that started from v2.1.4, shipped as v2.2.0, and now gates the v2.2.1
+Community Applications release. Repository automation is evidence, but it is
+not a substitute for physical Unraid acceptance on the exact candidate.
 
 The source remediation is complete when the repository gates below pass. A
 source release remains blocked until every item under
@@ -35,10 +35,10 @@ source release remains blocked until every item under
 | F-10 nested retries without coalescing | Implemented and gated | Absolute request budgets, bounded admission, and `singleflight.py` coalesce equivalent active work. Envelope retry and paragraph recovery spend the same atomic budget; the browser does not retry ambiguous provider work. |
 | F-11 public provider-backed health probe | Implemented and gated | `/ping`, `/health`, and `/ready` are shallow; authenticated `/health/deep` uses the normal provider budget. |
 | F-12 browser token in `localStorage` | Implemented and gated | The recommended topology validates the existing HttpOnly CWA session and browser loaders no longer recover a shared secret from storage. |
-| F-13 unsigned, weakly reproducible supply chain | Scope reduced and gated | Official container publication was removed by ADR-008. Source identity is enforced by matching annotated tags and commits; Actions, dependencies, base inputs, and local container builds remain pinned and tested. |
+| F-13 unsigned, weakly reproducible supply chain | Implemented; publication is an operator prerequisite | Source identity is enforced by matching annotated tags and commits. Static contracts cover the manual GitHub workflow's pinned actions, read-only candidate validation, exact digest capture, vulnerability scans, SBOM/provenance checks, anonymous pull, and pre/post-push smokes. The registry digest, public visibility, and emitted attestations are established only when that workflow succeeds and must be recorded before Community Applications promotion. |
 | F-14 CI could skip artifact and contract checks | Implemented and gated | Docker absence is fatal; backend, frontend, Chromium, dependency, proxy, and non-root artifact gates are mandatory. |
 | F-15 sensitive fallback and error leakage | Implemented and gated | Cloud fallback requires per-request consent; response sizes and error/log envelopes are bounded and sanitized. |
-| F-16 privileged combined runtime | Implemented and gated | API and proxy are independent non-root roles with read-only roots, zero capabilities, and clean independent shutdown. |
+| F-16 privileged combined runtime | Implemented and gated | `btctl` keeps independent non-root roles. The narrower Community Applications profile uses the existing combined role under the same non-root/read-only/capability-free sandbox, never publishes its internal API port, and has a dedicated smoke gate. |
 | F-17 malformed JSON returned HTML 500 | Implemented and gated | API schema contracts require stable JSON 4xx responses before business logic. |
 | F-18 implicit proxy authority | Implemented and gated | The proxy uses a configured public origin, fixed forwarding policy, validated upstreams, and finite body limits. |
 | F-19 missing failure observability | Implemented and gated | Fixed-cardinality metrics cover authentication, admission, deadlines, provider outcomes, envelope/paragraph recovery, partial batches, and singleflight pressure without book content labels. |
@@ -100,16 +100,28 @@ Before creating the first post-audit version tag, an authorized operator must:
 - protect `v*` tags from updates/deletion and restrict creation to the release
   operator;
 - assign Docker smoke to the trusted host-capable runner;
-- complete and record the single maintainer's self-review, merge through the
-  protected branch with zero assumed human approvals, wait for all checks on
-  the exact `main` commit, and mirror it to GitHub before creating the annotated
-  tag;
+- keep the GHCR package public before dispatch so an unauthenticated client can
+  distinguish an unused version tag from an authorization failure; public GHCR
+  packages support anonymous pulls, while a newly created package is private
+  until its visibility is changed;
+- keep the public Community Applications template quarantined until the final
+  digest and XML pass post-publication physical acceptance;
+- complete and record the single maintainer's self-review, wait for all pull
+  request checks, and perform physical acceptance on the exact candidate before
+  merging through the protected branch with zero assumed human approvals;
+- after merge, wait for all checks on the exact `main` commit, mirror it to
+  GitHub, and repeat physical acceptance if the merge changed the commit ID;
 - on physical stock Unraid 7.3.2 without host Python or NerdTools, run the
-  public `./btctl plan`, `install`, and `doctor` path from that exact clean
-  commit, then complete one real browser translation through the managed public
-  route and record the commit plus result before tagging;
-- publish only the annotated source tag through the Gitea-authoritative
-  workflow, then build and deploy that exact checked-out tag locally.
+  public `./btctl plan`, `install`, and `doctor` path from each required exact
+  clean commit, then complete one real browser translation through the managed
+  public route and record the commit plus result before tagging;
+- complete physical Unraid acceptance for both the recommended `btctl` split
+  path and the v2.2.1 combined Community Applications candidate;
+- publish the annotated source tag through the Gitea-authoritative workflow,
+  then publish only the matching GHCR image through the manual GitHub workflow;
+- record the emitted `GHCR_DIGEST`, prove anonymously that immutable tag
+  `2.2.1` resolves to that same digest, and only then put that digest in the
+  public template repository.
 
 Runner requirements, tag order, verification commands, and rollback policy are
 defined in the [release runbook](RELEASE.md). No release-specific Actions

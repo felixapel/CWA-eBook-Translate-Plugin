@@ -11,6 +11,9 @@ WORKFLOWS = (
     ROOT / ".gitea" / "workflows" / "ci.yml",
     ROOT / ".gitea" / "workflows" / "release.yml",
 )
+ACTION_WORKFLOWS = WORKFLOWS + (
+    ROOT / ".github" / "workflows" / "publish-image.yml",
+)
 
 PINNED_ACTIONS = {
     "actions/checkout": (
@@ -20,6 +23,10 @@ PINNED_ACTIONS = {
     "actions/setup-node": (
         "49933ea5288caeca8642d1e84afbd3f7d6820020",
         "v4.4.0",
+    ),
+    "docker/setup-buildx-action": (
+        "8d2750c68a42422c14e847fe6c8ac0403b4cbd6f",
+        "v3.12.0",
     ),
 }
 
@@ -45,7 +52,7 @@ USES_LINE = re.compile(
 
 class SupplyChainContractTests(unittest.TestCase):
     def test_every_external_action_is_pinned_to_the_reviewed_commit(self):
-        for workflow in WORKFLOWS:
+        for workflow in ACTION_WORKFLOWS:
             source = workflow.read_text()
             uses_lines = [line for line in source.splitlines() if "uses:" in line]
             matches = list(USES_LINE.finditer(source))

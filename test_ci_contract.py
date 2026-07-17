@@ -10,6 +10,7 @@ ROOT = Path(__file__).parent
 GITHUB_CI = ROOT / ".github" / "workflows" / "ci.yml"
 GITEA_CI = ROOT / ".gitea" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".gitea" / "workflows" / "release.yml"
+PUBLISH_IMAGE = ROOT / ".github" / "workflows" / "publish-image.yml"
 DOCKER_NAMES = ROOT / "scripts" / "ci-docker-names.sh"
 FRONTEND_WORKFLOWS = (
     GITHUB_CI,
@@ -29,7 +30,7 @@ class CIContractTests(unittest.TestCase):
             "python3 test_hardening.py",
             "python3 -m unittest -v test_btctl test_btctl_container test_btctl_compose test_btctl_unraid test_btctl_auth test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_install_docs test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts",
             "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
-            "bash -n btctl install_unraid.sh deploy_unraid.sh verify_unraid.sh scripts/btctl-bootstrap-smoke.sh",
+            "bash -n btctl install_unraid.sh scripts/btctl-bootstrap-smoke.sh",
         ):
             self.assertIn(command, self.workflow)
 
@@ -90,6 +91,10 @@ class CIContractTests(unittest.TestCase):
         )
         self.assertIn(
             './scripts/btctl-bootstrap-smoke.sh "$SMOKE_PREFIX"',
+            self.workflow,
+        )
+        self.assertIn(
+            './scripts/ca-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-ca"',
             self.workflow,
         )
         self.assertNotIn("docker build -t bt-audit:ci", self.workflow)
@@ -153,6 +158,68 @@ class CIContractTests(unittest.TestCase):
 
     def test_required_steps_have_no_continue_on_error(self):
         self.assertNotIn("continue-on-error", self.workflow)
+
+    def test_ghcr_publication_is_manual_exact_and_fail_closed(self):
+        workflow = PUBLISH_IMAGE.read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertNotRegex(workflow, r"(?m)^\s+(?:push|pull_request):")
+        for token in (
+            "release_tag:",
+            "release_sha:",
+            "packages: write",
+            "GITHUB_TOKEN",
+            "scripts/release_preflight.py",
+            "linux/amd64",
+            "aquasec/trivy:0.69.3@sha256:7228e304ae0f610a1fad937baa463598cadac0c2ac4027cc68f3a8b997115689",
+            "--severity HIGH,CRITICAL",
+            "--sbom=true",
+            "--provenance=mode=max",
+            "ca-container-smoke.sh",
+            "docker manifest inspect",
+            "path: trusted",
+            "path: candidate",
+            "trusted/scripts/release_preflight.py",
+            "--metadata-file",
+            "containerimage.digest",
+            "attestation-manifest",
+            "docker logout ghcr.io",
+            "GHCR_DIGEST=",
+        ):
+            self.assertIn(token, workflow)
+        self.assertIn('"$IMAGE:$VERSION"', workflow)
+        self.assertNotIn('"$IMAGE:latest"', workflow)
+        self.assertNotIn("RepoDigests", workflow)
+        self.assertGreaterEqual(workflow.count("--severity HIGH,CRITICAL"), 2)
+        self.assertIn('manifest_output="$(docker manifest inspect', workflow)
+        self.assertRegex(workflow, r"(?m)^  validate:\n    runs-on: ubuntu-latest$")
+        self.assertRegex(
+            workflow,
+            r"(?m)^  publish:\n    needs: validate\n    runs-on: ubuntu-latest$",
+        )
+        self.assertEqual(workflow.count("packages: write"), 1)
+        self.assertGreaterEqual(workflow.count("persist-credentials: false"), 3)
+        self.assertIn("ref: ${{ needs.validate.outputs.release_sha }}", workflow)
+        self.assertLess(
+            workflow.index("trusted/scripts/release_preflight.py"),
+            workflow.index("packages: write"),
+        )
+        self.assertLess(
+            workflow.index("Smoke the local candidate"),
+            workflow.index("Log in only for the immutable push"),
+        )
+        self.assertLess(
+            workflow.index("Remove registry credentials before verification"),
+            workflow.index("Validate the published index and attestations anonymously"),
+        )
+        for explicit_absence in (
+            "manifest unknown",
+            "name unknown",
+            "no such manifest",
+        ):
+            self.assertIn(explicit_absence, workflow)
+        self.assertIn("could not prove the immutable version tag is absent", workflow)
+        for forbidden in ("CR_PAT", "GHCR_PAT", "DOCKERHUB", "continue-on-error"):
+            self.assertNotIn(forbidden, workflow)
 
 
 if __name__ == "__main__":
