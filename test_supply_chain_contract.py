@@ -216,6 +216,8 @@ class SupplyChainContractTests(unittest.TestCase):
             "--only-binary=:all: -r requirements.txt",
             dockerfile,
         )
+        # Runtime image must not retain packaging tooling after install (Trivy).
+        self.assertIn("pip uninstall -y setuptools wheel pip", dockerfile)
 
     def test_python_lock_files_pin_and_hash_every_dependency(self):
         for name in (

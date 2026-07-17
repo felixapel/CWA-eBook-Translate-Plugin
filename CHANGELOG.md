@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.2] - 2026-07-17
+
+### Security
+
+- Runtime image uninstalls `setuptools`, `wheel`, and `pip` after the hashed
+  requirement install so Trivy HIGH findings in setuptools-vendored
+  `jaraco.context` / `wheel` (CVE-2026-23949, CVE-2026-24049) cannot block GHCR
+  publication of an otherwise clean artifact.
+
 ## [2.2.1] - 2026-07-17
 
 ### Security
