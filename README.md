@@ -37,9 +37,11 @@ checkout into one immutable local image and creates two isolated roles: a
 browser-facing injection proxy and an unpublished translation API. CWA itself
 is never modified or owned by the installer.
 
-Start from the annotated release tag. Candidate testing may instead use an
-exact full commit supplied by the maintainer; never substitute a mutable
-`latest` image.
+Start from the annotated release tag. The `v2.2.1` command below is valid only
+after that tag exists in the public repository; before publication, v2.2.0
+remains the latest source release and v2.2.1 testing must use an exact full
+commit supplied by the maintainer. Never substitute a mutable branch, archive,
+or `latest` image.
 
 ```bash
 git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git cwa-translate
@@ -110,6 +112,8 @@ Use the guide for your host:
 
 - [Community Applications on Unraid](docs/DEPLOY_UNRAID_CA.md) — simplest
   certified v2.2.1 profile for CWA 4.0.6, native sessions, and a local LLM.
+  It is installable only after the v2.2.1 tag, public digest-pinned image, and
+  searchable Community Applications listing all exist.
 - [Unraid deployment](docs/DEPLOY_UNRAID.md) — root-owned appdata, DockerMan
   templates, v2.1.4 upgrade, rollback, and acceptance checks.
 - [Existing Compose deployment](docs/DEPLOY_COMPOSE.md) — the same managed

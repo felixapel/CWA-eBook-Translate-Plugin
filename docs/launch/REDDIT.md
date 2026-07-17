@@ -1,8 +1,9 @@
 # Reddit launch draft — v2.2.1
 
-Do not publish until the CA listing is approved and searchable. Start with
-r/unRAID. A separate r/selfhosted post must follow that community's current
-new-project rules rather than duplicating this announcement.
+Do not publish until the CA listing is approved and searchable and a clean
+Community Applications install has repeated the final physical acceptance.
+Start with r/unRAID. A separate r/selfhosted post must follow that community's
+current new-project rules rather than duplicating this announcement.
 
 ## Suggested title
 
@@ -19,6 +20,11 @@ The first Community Applications profile targets Unraid 7.3.2 x86_64, CWA
 4.0.6, native CWA sessions, and a local LLM. The container runs non-root and
 does not publish its internal API. More advanced installs can use the source
 `btctl` workflow for split roles, rollback, and Authentik.
+
+There is no project API key, account, telemetry, ad service, or subscription.
+Local models keep provider prompts on your network; configuring a cloud
+provider sends the selected text to that provider only after the documented
+consent boundary.
 
 Source, installation, demo, limitations, and support:
 https://github.com/felixapel/CWA-eBook-Translate-Plugin

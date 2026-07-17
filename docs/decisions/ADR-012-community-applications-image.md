@@ -35,6 +35,11 @@ two coordinated containers.
   validation of the emitted OCI-index digest and attestation predicates, then
   an anonymous pull, another high/critical scan, and digest-pinned post-push
   smoke tests.
+- The GHCR package must already be public before a release dispatch. This lets
+  the workflow prove anonymously that the immutable version is unused before
+  push and that the emitted digest is readable afterward. The operator records
+  the emitted digest and separately verifies that the immutable version tag
+  resolves to it.
 - The certified Community Applications profile runs one `BT_ROLE=all`
   container as uid/gid `101:102`, with a read-only root filesystem, private
   writable `/app/data`, bounded `/tmp`, all capabilities dropped, and
@@ -56,6 +61,9 @@ two coordinated containers.
   CA scope and is stated in the install guide.
 - GHCR availability becomes an operational dependency for the CA path; source
   releases and local builds remain available if the registry is unavailable.
+- The public template repository stays quarantined until post-publication
+  physical acceptance passes. Restoration is a deliberate replacement with
+  the reviewed digest-pinned XML, never a checkout of the withdrawn draft.
 - ARM64, arbitrary CWA versions, forwarded identity, custom reverse-proxy hop
   counts, and multi-container CA templates remain unsupported until separately
   tested.

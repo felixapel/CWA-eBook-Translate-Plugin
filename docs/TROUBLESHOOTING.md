@@ -35,6 +35,16 @@ request error in the container log. The remaining checks in this guide apply to
 both profiles unless a paragraph explicitly refers to `btctl` or managed split
 roles.
 
+## Application is missing from Community Applications
+
+The v2.2.1 Community Applications path exists only after its annotated tag,
+public digest-pinned GHCR image, and approved searchable CA listing all exist.
+If **CWA eBook Translate** is not returned by Community Applications search,
+stop: the listing is not yet public or has been withdrawn. Do not install an
+XML from Git history, a cached template URL, or a mutable image tag. Use the
+source-built `btctl` path from the latest published tag, or wait for the listing
+to return.
+
 ## `env: python3: No such file or directory` on Unraid
 
 Current `./btctl` automatically uses Docker when host Python 3.11+ is absent;

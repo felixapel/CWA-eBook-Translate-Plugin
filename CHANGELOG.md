@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.2.1] - 2026-07-16
+## [2.2.1] - 2026-07-17
 
 ### Security
 
@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced placeholder checkout commands and absolute performance/install
   claims with the exact v2.2.1 coordinates, explicit prerequisites, and bounded
   compatibility language.
+- Made release-candidate availability explicit across the README, compatibility
+  matrix, Community Applications guide, troubleshooting, and launch drafts so
+  no unpublished tag, image, cached XML, or quarantined listing is presented as
+  installable.
+- Documented the public/anonymous GHCR prerequisite, independent immutable
+  tag-to-digest check, and quarantine-to-reviewed-template promotion sequence.
 - Completed the security/contact, contribution, conduct, issue, release, and
   production-readiness documentation for a sole-maintainer public launch.
 - Retired the personal `deploy_unraid.sh` and `verify_unraid.sh` paths. The

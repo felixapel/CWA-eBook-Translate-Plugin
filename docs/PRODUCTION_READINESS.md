@@ -100,6 +100,12 @@ Before creating the first post-audit version tag, an authorized operator must:
 - protect `v*` tags from updates/deletion and restrict creation to the release
   operator;
 - assign Docker smoke to the trusted host-capable runner;
+- keep the GHCR package public before dispatch so an unauthenticated client can
+  distinguish an unused version tag from an authorization failure; public GHCR
+  packages support anonymous pulls, while a newly created package is private
+  until its visibility is changed;
+- keep the public Community Applications template quarantined until the final
+  digest and XML pass post-publication physical acceptance;
 - complete and record the single maintainer's self-review, wait for all pull
   request checks, and perform physical acceptance on the exact candidate before
   merging through the protected branch with zero assumed human approvals;
@@ -112,7 +118,10 @@ Before creating the first post-audit version tag, an authorized operator must:
 - complete physical Unraid acceptance for both the recommended `btctl` split
   path and the v2.2.1 combined Community Applications candidate;
 - publish the annotated source tag through the Gitea-authoritative workflow,
-  then publish only the matching GHCR image through the manual GitHub workflow.
+  then publish only the matching GHCR image through the manual GitHub workflow;
+- record the emitted `GHCR_DIGEST`, prove anonymously that immutable tag
+  `2.2.1` resolves to that same digest, and only then put that digest in the
+  public template repository.
 
 Runner requirements, tag order, verification commands, and rollback policy are
 defined in the [release runbook](RELEASE.md). No release-specific Actions

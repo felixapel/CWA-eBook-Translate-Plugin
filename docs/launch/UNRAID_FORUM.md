@@ -1,7 +1,8 @@
 # Unraid forum launch draft — v2.2.1
 
-Publish this only after the v2.2.1 tag, Gitea release workflow, GHCR digest,
-physical Unraid acceptance, and support links are final.
+Publish this only after the v2.2.1 tag, Gitea release workflow, public GHCR
+digest, physical Unraid acceptance, searchable Community Applications listing,
+and support links are final.
 
 ## Title
 
@@ -22,6 +23,10 @@ upgrades, rollback, and Authentik deployments.
 Before installing, read the compatibility matrix and create the documented
 private appdata directory. Support and source:
 https://github.com/felixapel/CWA-eBook-Translate-Plugin
+
+There is no project API key or telemetry. Local models keep provider prompts on
+your network; optional cloud providers receive selected text only under the
+documented consent boundary.
 
 This is an early-adopter release. Please report the exact v2.2.1 image digest,
 CWA/Unraid versions, auth profile, and redacted doctor/log evidence with bugs.

@@ -20,6 +20,17 @@ image publication decision in
 - Keep Gitea Docker smoke on the trusted `weebdb-docker` label. The public
   GitHub mirror uses GitHub-hosted `ubuntu-latest` for Docker smoke; do not
   attach its public pull-request workflow to a homelab runner.
+- Before the first image publication, create the GHCR package without consuming
+  a release version and set its visibility to **Public**. GHCR packages are
+  private by default; [public GHCR packages can be pulled
+  anonymously](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
+  Before every dispatch, log Docker out and confirm an unused version returns a
+  registry "manifest unknown"/"name unknown" result rather than an authorization
+  error.
+- Keep the public
+  [`felixapel/unraid-templates`](https://github.com/felixapel/unraid-templates)
+  repository quarantined until the final published digest and XML pass the
+  post-publication physical acceptance gate.
 
 No Docker Hub, Cosign key, PAT, or release-specific Actions secret is required.
 The manual GitHub workflow uses its built-in `GITHUB_TOKEN` for GHCR.
@@ -151,10 +162,24 @@ smoke profiles. Record its `GHCR_DIGEST` output. Do not retry a partially
 successful publication or overwrite `2.2.1`; diagnose it and increment the
 version.
 
+Independently verify the immutable tag-to-digest binding without registry
+credentials. In the first command, the top-level `Digest:` value must exactly
+equal the digest portion of `GHCR_DIGEST`; the second command must inspect that
+same OCI index:
+
+```bash
+IMAGE=ghcr.io/felixapel/cwa-ebook-translate-plugin
+VERSION=2.2.1
+docker logout ghcr.io >/dev/null 2>&1 || true
+docker buildx imagetools inspect "$IMAGE:$VERSION"
+docker buildx imagetools inspect "$GHCR_DIGEST"
+```
+
 Claude Code must repeat physical Unraid acceptance using that exact digest and
 the final Community Applications XML. Only after that evidence passes may the
-template repository be updated, CA Validate/Scan/submission run, and public
-launch posts published.
+quarantined template be replaced with the reviewed digest-pinned XML, CA
+Validate/Scan/submission run, and public launch posts published. Never restore
+the pre-release template from history.
 
 Do not force-push, recreate, or delete a rejected tag. Correct the issue,
 increment the version, and create a new tag.

@@ -7,6 +7,14 @@ authentication, and a local OpenAI-compatible LLM. Use
 roles, upgrade/rollback, Authentik-forwarded identity, or a topology outside
 this exact profile.
 
+> **Availability gate:** follow this guide only when the public `v2.2.1` tag
+> exists, the GHCR package can be pulled anonymously, and **CWA eBook
+> Translate** is searchable in Community Applications. Until all three are
+> true, this profile is a release candidate rather than a public install path.
+> Do not restore an archived template, copy a cached XML, or substitute a
+> mutable image tag; use the source-built `btctl` guide from the latest
+> published tag instead.
+
 ## Before opening Community Applications
 
 Know the CWA container name, a Docker network shared with it, the exact public
@@ -34,6 +42,10 @@ a mutable image reference. If the installed DockerMan version rejects digest
 syntax, use only the documented immutable `2.2.1` fallback and verify the image
 ID against the release record. Never use a moving image tag for an exact
 install.
+
+If the application is not searchable, stop. That means the listing has not yet
+been published or has been withdrawn; it is not an instruction to install a
+template directly from repository history.
 
 Configure:
 
