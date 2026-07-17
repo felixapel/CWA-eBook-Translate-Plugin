@@ -21,9 +21,13 @@ RUN apk add --no-cache \
     nginx=1.30.3-r0 \
     pcre2=10.47-r1
 
-# Copy requirements and install
+# Copy requirements and install. Then strip packaging tooling that is only needed
+# to install wheels: setuptools/wheel/pip (and their vendored trees) are not used
+# by the runtime and have historically carried HIGH Trivy findings.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt \
+ && pip uninstall -y setuptools wheel pip \
+ && rm -rf /root/.cache /tmp/pip-*
 
 # Copy only runtime modules; tests, benchmarks, and operator helpers do not
 # belong in the published execution artifact.
