@@ -257,6 +257,7 @@ class SupplyChainContractTests(unittest.TestCase):
         self.assertIn('EXPECTED_PIP_COMPILE="7.5.3"', compiler)
         self.assertIn("PIP_CONFIG_FILE=/dev/null", compiler)
         self.assertIn("PIP_INDEX_URL=https://pypi.org/simple", compiler)
+        self.assertIn('cd "$(dirname "$0")/../requirements"', compiler)
         for option in (
             "--generate-hashes",
             "--resolver=backtracking",
@@ -264,9 +265,9 @@ class SupplyChainContractTests(unittest.TestCase):
             "--no-emit-trusted-host",
         ):
             self.assertIn(option, compiler)
-        self.assertIn("requirements/requirements.in", compiler)
-        self.assertIn("requirements/requirements-audit.in", compiler)
-        self.assertIn("requirements/requirements-compile.in", compiler)
+        self.assertIn("requirements.in", compiler)
+        self.assertIn("requirements-audit.in", compiler)
+        self.assertIn("requirements-compile.in", compiler)
 
     def test_local_dependency_audit_uses_the_same_complete_locks(self):
         audit_path = ROOT / "scripts" / "audit-deps.sh"

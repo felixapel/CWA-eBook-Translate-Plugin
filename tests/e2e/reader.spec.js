@@ -43,7 +43,9 @@ test('the real overlay translates, reports state, and keeps cloud consent explic
             status: 200,
             contentType: 'application/json',
             body: JSON.stringify({
-                translations: payload.paragraphs.map(text => `ES: ${text}`),
+                translations: payload.paragraphs.map(
+                    text => `${payload.source_lang}->${payload.target_lang}: ${text}`
+                ),
                 backends: payload.paragraphs.map(() => 'e2e'),
                 cached: payload.paragraphs.map(() => false),
             }),
@@ -69,7 +71,10 @@ test('the real overlay translates, reports state, and keeps cloud consent explic
 
     const chapter = page.frameLocator('iframe[title="Book chapter"]');
     await expect(chapter.locator('#paragraph-one .bt-translation')).toHaveText(
-        'ES: A quiet production test paragraph.'
+        'English->Spanish: A quiet production test paragraph.'
+    );
+    await expect(chapter.locator('#paragraph-two .bt-translation')).toHaveText(
+        'English->Spanish: A second paragraph checks queue order.'
     );
 
     const settings = page.getByRole('button', { name: /settings|ajustes/i });
@@ -83,13 +88,24 @@ test('the real overlay translates, reports state, and keeps cloud consent explic
     await expect(cloudConsent).toHaveAttribute('aria-checked', 'true');
 
     await page.locator('#bt-lang').selectOption('French');
-    await expect.poll(() => payloads.length).toBeGreaterThan(1);
-    expect(payloads.at(-1).allow_cloud_fallback).toBe(true);
-    expect(payloads.at(-1).target_lang).toBe('French');
+    await expect.poll(() => payloads.some(payload => (
+        payload.source_lang === 'English'
+        && payload.target_lang === 'French'
+        && payload.allow_cloud_fallback === true
+    ))).toBe(true);
+    await expect(chapter.locator('#paragraph-two .bt-translation')).toHaveText(
+        'English->French: A second paragraph checks queue order.'
+    );
 
     await page.locator('#bt-source-lang').selectOption('Spanish');
-    await expect.poll(() => payloads.at(-1).source_lang).toBe('Spanish');
-    expect(payloads.at(-1).target_lang).toBe('French');
+    await expect.poll(() => payloads.some(payload => (
+        payload.source_lang === 'Spanish'
+        && payload.target_lang === 'French'
+        && payload.allow_cloud_fallback === true
+    ))).toBe(true);
+    await expect(chapter.locator('#paragraph-two .bt-translation')).toHaveText(
+        'Spanish->French: A second paragraph checks queue order.'
+    );
 
     const snapshot = await toolbar.ariaSnapshot();
     expect(snapshot).toContain('button');

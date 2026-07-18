@@ -2,7 +2,7 @@
 # Regenerate reviewed Python locks from public PyPI with a fixed compiler.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../requirements"
 
 EXPECTED_PYTHON="3.11"
 EXPECTED_PIP_COMPILE="7.5.3"
@@ -31,10 +31,10 @@ common=(
 
 PIP_CONFIG_FILE=/dev/null PIP_INDEX_URL=https://pypi.org/simple \
     "$LOCK_PYTHON" -m piptools compile "${common[@]}" \
-    --output-file=requirements/requirements.txt requirements/requirements.in
+    --output-file=requirements.txt requirements.in
 PIP_CONFIG_FILE=/dev/null PIP_INDEX_URL=https://pypi.org/simple \
     "$LOCK_PYTHON" -m piptools compile "${common[@]}" --allow-unsafe \
-    --output-file=requirements/requirements-audit.txt requirements/requirements-audit.in
+    --output-file=requirements-audit.txt requirements-audit.in
 PIP_CONFIG_FILE=/dev/null PIP_INDEX_URL=https://pypi.org/simple \
     "$LOCK_PYTHON" -m piptools compile "${common[@]}" --allow-unsafe \
-    --output-file=requirements/requirements-compile.txt requirements/requirements-compile.in
+    --output-file=requirements-compile.txt requirements-compile.in
