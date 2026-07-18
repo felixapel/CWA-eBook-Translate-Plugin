@@ -258,6 +258,12 @@ class SupplyChainContractTests(unittest.TestCase):
 
     def test_lock_regeneration_is_pinned_and_uses_public_pypi(self):
         compiler = (ROOT / "scripts" / "compile-requirements.sh").read_text()
+        compiler_intent = (
+            ROOT / "requirements" / "requirements-compile.in"
+        ).read_text()
+        compiler_lock = (
+            ROOT / "requirements" / "requirements-compile.txt"
+        ).read_text()
         self.assertIn('EXPECTED_PYTHON="3.11"', compiler)
         self.assertIn('EXPECTED_PIP_COMPILE="7.5.3"', compiler)
         self.assertIn("PIP_CONFIG_FILE=/dev/null", compiler)
@@ -273,6 +279,12 @@ class SupplyChainContractTests(unittest.TestCase):
         self.assertIn("requirements.in", compiler)
         self.assertIn("requirements-audit.in", compiler)
         self.assertIn("requirements-compile.in", compiler)
+        reviewed_build = re.findall(
+            r"(?m)^build==([^\s]+)$",
+            compiler_intent,
+        )
+        self.assertEqual(len(reviewed_build), 1)
+        self.assertIn(f"build=={reviewed_build[0]} \\", compiler_lock)
 
     def test_local_dependency_audit_uses_the_same_complete_locks(self):
         audit_path = ROOT / "scripts" / "audit-deps.sh"
