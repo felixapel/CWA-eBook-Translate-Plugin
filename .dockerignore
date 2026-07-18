@@ -28,6 +28,9 @@ data.db-*
 *.sqlite
 *.sqlite3
 *.log
+backups/
+data/
+config/translator/
 
 # Development-only source. Dockerfiles copy runtime files explicitly.
 tests/

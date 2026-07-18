@@ -81,15 +81,10 @@ It runs the public dispatcher in a clean checkout, removes Python and Git from
 the simulated host image, verifies that `plan --json` reports the exact commit,
 and exercises Unraid install, doctor, and uninstall through the same fallback.
 
-The modules under `tools/probes/` and `tools/benchmarks/` are different — they
-hit a **live** API
-(`BENCHMARK_URL`, default `http://127.0.0.1:8390`), so start the server first:
-```bash
-python3 server.py &
-BENCHMARK_URL=http://127.0.0.1:8390 python3 -m tools.probes.endpoints
-```
-
-The rate-limit probe requires a fresh limiter window and valid authentication.
+The rate-limit probe and benchmark modules hit a **live** API
+(`BENCHMARK_URL`, default `http://127.0.0.1:8390`). Start the server with the
+token-mode command above before running them. The rate-limit probe requires a
+fresh limiter window and valid authentication.
 It sends same-language requests, so it exercises authentication and admission
 without calling the configured translation provider. Its default 130 probes
 cover the default limit of 120; raise `--requests` if your deployment uses a

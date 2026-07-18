@@ -10,11 +10,10 @@ decisions.
 
 ## Overview
 
-The plugin operates as a decoupled overlay integrated into Calibre-Web-Automated (CWA).
+The plugin operates as a decoupled overlay integrated into
+Calibre-Web-Automated (CWA). There are two production deployment profiles:
 
-There are two integration methods:
-
-1. **Proxy-injection mode (recommended, 2.0.0+).** Two isolated non-root
+1. **Managed split profile (`btctl`, recommended).** Two isolated non-root
    containers run the same release image with `BT_ROLE=proxy` and
    `BT_ROLE=api`. nginx sits in front of a **stock** CWA instance
    (`CWA_UPSTREAM`). HTML responses get a
@@ -30,13 +29,20 @@ There are two integration methods:
    inbound forwarding headers are discarded, the observed peer becomes the
    only forwarded client hop, and CWA uploads have an operator-configurable
    finite body cap.
-2. **Bind-mount mode (advanced/development).** `overlay/read.html` plus the
-   JS/CSS are mounted into the CWA container; the overlay calls the API on
-   `:8390` cross-origin. The template copy is tracked against the CWA version
-   pinned in `docker-compose.yml`.
+2. **Community Applications combined profile (listing-gated).** One non-root
+   container runs `BT_ROLE=all`, exposes only its proxy port and keeps API port
+   `8390` private. This is production-supported only when the searchable
+   listing pins a certified immutable image digest and the host matches the
+   [documented boundary](../install/community-applications.md). Otherwise use
+   `btctl`.
 
-The diagram below shows the recommended proxy data flow. The proxy is the only
-browser-facing translator role; the API owns the writable SQLite volume.
+`overlay/read.html` remains a legacy development fixture for investigating CWA
+template compatibility. Mounting it into CWA and publishing the API
+cross-origin is not a supported production installation method.
+
+The diagram below shows the recommended split data flow. The proxy is the only
+browser-facing translator role; the API owns the writable SQLite volume. The
+combined CA profile preserves the same logical boundary inside one container.
 
 ```
 Browser ──► proxy role (:8080) ──► CWA (:8083, stock)

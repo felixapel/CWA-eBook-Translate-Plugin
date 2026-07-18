@@ -37,18 +37,24 @@ role settings and redacts secrets from its output. Never commit the edited file.
 
 ## Translation runtime settings
 
-These variables are the low-level image interface. Managed installs derive
-authentication, role, network and browser settings; override tuning values only
-with measured evidence.
+These variables are the supported operator-facing part of the low-level image
+interface. Managed installs derive authentication, role, network and browser
+settings; override tuning values only with measured evidence. Variables not
+listed here are internal implementation details, not additional supported
+configuration.
 
 | Variable | Default | Boundary |
 |---|---:|---|
-| `BT_ROLE` | `auto` | `api`, `proxy` or compatibility-only `all`. Managed installs set roles explicitly. |
+| `BT_ROLE` | `auto` | `api` or `proxy` for managed split installs; `all` only for the certified, digest-pinned Community Applications profile. |
 | `PORT` | `8390` | API listen port inside the container. |
 | `BT_PROXY_PORT` | `8080` | Proxy listen port inside the container. |
 | `BT_CWA_MAX_BODY_SIZE` | `2g` | Finite nginx upload limit for CWA traffic. |
 | `BT_MAX_CONCURRENT` | `2` | Group workers inside one batch request. |
 | `BT_BATCH_SIZE` | `5` | Paragraphs per grouped provider call. |
+| `BT_MAX_BATCH_PARAGRAPHS` | `50` | Maximum paragraphs accepted in one batch request. |
+| `BT_MAX_PARAGRAPH_CHARS` | `8000` | Maximum characters accepted in one paragraph; input is rejected, never truncated. |
+| `BT_CACHE_SCOPE_MAX_CHARS` | `512` | Maximum length of each book/chapter scope input before hashing. |
+| `BT_MAX_CONTENT_LENGTH` | `2097152` | WSGI request-body ceiling in bytes. |
 | `BT_MAX_TOKENS` | `4096` | Single-paragraph output ceiling. |
 | `BT_BATCH_MAX_TOKENS` | `8192` | Grouped output ceiling. |
 | `BT_OUTPUT_TOKEN_FACTOR` | `2.0` | Proportional output cap. |
@@ -86,6 +92,7 @@ work budgets fail the request before starting more provider work.
 | `BT_CWA_AUTH_MAX_RESPONSE_BYTES` | `262144` | Maximum decompressed CWA probe response. |
 | `BT_IDENTITY_TRUSTED_PROXIES` | empty | Exact trusted peers for forwarded identity. |
 | `BT_AUTH_RATE_LIMIT_PER_MINUTE` | `300` | Pre-authentication attempts per observed client. |
+| `BT_AUTH_MAX_INFLIGHT_PER_CLIENT` | `2` | Concurrent pre-authentication requests per observed client. |
 | `BT_RATE_LIMIT_PER_MINUTE` | `120` | Successful API requests per authenticated subject. |
 | `BT_RATE_LIMIT_RETRY_AFTER` | `10` | `Retry-After` value returned on `429`. |
 | `BT_RATE_LIMIT_MAX_CLIENTS` | `10000` | Active limiter-bucket cap. |
@@ -121,3 +128,7 @@ as primary is a separate operator decision and sends ordinary requests there.
 Cache schema v2 stores translations plus scoped one-way hashes, not source
 paragraphs, CWA cookies or raw user/book identifiers. The legacy v1 table stays
 side by side for rollback but is never read by v2.
+
+`BT_CACHE_DIR` and `BT_CACHE_OPERATOR_GROUP_ACCESS` are lifecycle-internal
+filesystem controls. Managed operators set `BT_DATA_DIR`; `btctl` and the image
+derive those internal values and their ownership policy.

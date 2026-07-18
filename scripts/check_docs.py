@@ -54,8 +54,12 @@ def _relative_markdown_files(repository: Path) -> list[Path]:
         repository / "CONTRIBUTING.md",
         repository / "SECURITY.md",
         repository / "CODE_OF_CONDUCT.md",
+        repository / "AGENTS.md",
+        repository / "CLAUDE.md",
     ]
     roots.extend(sorted((repository / "docs").rglob("*.md")))
+    roots.extend(sorted((repository / ".github").rglob("*.md")))
+    roots.extend(sorted((repository / ".gitea").rglob("*.md")))
     return [path for path in roots if path.is_file()]
 
 
@@ -193,16 +197,22 @@ def collect_errors(repository: Path = REPOSITORY) -> list[str]:
     if len(readme.splitlines()) > 220:
         errors.append("README exceeds the 220-line public-entrypoint budget")
 
-    current_version_files = [repository / "README.md"] + [
+    version_parts = version.split(".")
+    current_series = ".".join(version_parts[:2]) + "."
+    current_version_files = [
         path
-        for path in docs.rglob("*.md")
-        if not ADR_RE.match(path.name)
+        for path in _relative_markdown_files(repository)
+        if not (path.parent == docs / "decisions" and ADR_RE.match(path.name))
     ]
     for path in current_version_files:
         if not path.is_file():
             continue
         versions = set(VERSION_RE.findall(path.read_text(encoding="utf-8")))
-        stale = sorted(item for item in versions if item.startswith("2.2.") and item != version)
+        stale = sorted(
+            item
+            for item in versions
+            if item.startswith(current_series) and item != version
+        )
         if stale:
             errors.append(
                 f"{path.relative_to(repository)} contains stale current-series releases: "

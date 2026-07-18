@@ -188,6 +188,11 @@ class SupplyChainContractTests(unittest.TestCase):
             dockerfile,
         )
 
+    def test_docker_context_excludes_local_state_and_backups(self):
+        dockerignore = (ROOT / ".dockerignore").read_text().splitlines()
+        for path in ("backups/", "data/", "config/translator/"):
+            self.assertIn(path, dockerignore)
+
     def test_python_installs_require_the_reviewed_hashes_and_wheels(self):
         expected_install = (
             "python3 -m pip install --break-system-packages "
