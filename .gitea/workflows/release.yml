@@ -68,12 +68,12 @@ jobs:
           python3 --version && python3 -m pip --version
       - name: Install dependencies
         run: >-
-          python3 -m pip install --break-system-packages --require-hashes --only-binary=:all: -r requirements.txt
+          python3 -m pip install --break-system-packages --require-hashes --only-binary=:all: -r requirements/requirements.txt
       - name: Audit Python dependencies
         run: |
           set -e
-          python3 -m pip install --break-system-packages --require-hashes --only-binary=:all: -r requirements-audit.txt
-          python3 -m pip_audit -r requirements.txt --strict --disable-pip --no-deps
+          python3 -m pip install --break-system-packages --require-hashes --only-binary=:all: -r requirements/requirements-audit.txt
+          python3 -m pip_audit -r requirements/requirements.txt --strict --disable-pip --no-deps
       - run: python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py scripts/release_preflight.py
       - run: bash -n btctl install_unraid.sh scripts/btctl-bootstrap-smoke.sh
       - run: python3 -m tests.python.test_translation

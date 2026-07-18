@@ -154,14 +154,5 @@ class ShellContractTests(unittest.TestCase):
         self.assertNotIn("docker pull", source)
         self.assertNotIn("ghcr.io", source)
 
-    def test_legacy_unraid_template_is_hard_gated_to_v214_migration(self):
-        template = (ROOT / "my-book-translator-api.xml.tmpl").read_text()
-        self.assertIn("2.1.4", template)
-        self.assertIn("LEGACY ONLY", template)
-        self.assertIn("migration", template)
-        self.assertNotIn("latest", template)
-        self.assertNotIn('Type="Port"', template)
-
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)

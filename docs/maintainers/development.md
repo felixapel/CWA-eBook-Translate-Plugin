@@ -15,7 +15,8 @@ The backend is a Flask application running in python.
    ```
 2. Install dependencies:
    ```bash
-   python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
+   python -m pip install --require-hashes --only-binary=:all: \
+     -r requirements/requirements.txt
    ```
 3. Run the development server:
    ```bash
@@ -157,26 +158,28 @@ Chromium instead of Playwright's managed headless shell, set
 
 ## Updating Dependency Locks
 
-`requirements.in` records runtime intent. `requirements.txt` is the reviewed
-production lock; every direct and transitive dependency is version-pinned and
-hashed. The auditor and lock compiler have independent locks so CI does not
-resolve mutable tooling at runtime.
+`requirements/requirements.in` records runtime intent.
+`requirements/requirements.txt` is the reviewed production lock; every direct
+and transitive dependency is version-pinned and hashed. The auditor and lock
+compiler have independent locks in the same directory so CI does not resolve
+mutable tooling at runtime.
 
 Regenerate all three locks with the currently approved compiler:
 
 ```bash
 python3.11 -m venv /tmp/cwa-lock-tools
 /tmp/cwa-lock-tools/bin/python -m pip install \
-  --require-hashes --only-binary=:all: -r requirements-compile.txt
+  --require-hashes --only-binary=:all: \
+  -r requirements/requirements-compile.txt
 LOCK_PYTHON=/tmp/cwa-lock-tools/bin/python \
   ./scripts/compile-requirements.sh
-git diff -- requirements.txt requirements-audit.txt requirements-compile.txt
+git diff -- requirements/
 ```
 
 Review every version and hash change, run the complete test/container gate, and
 commit the `.in` file and its generated lock together. To run dependency audits
-locally, install `requirements-audit.txt` with the same two pip safety flags and
-then run `./scripts/audit-deps.sh`.
+locally, install `requirements/requirements-audit.txt` with the same two pip
+safety flags and then run `./scripts/audit-deps.sh`.
 
 ### Manual Testing
 

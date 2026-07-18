@@ -12,7 +12,8 @@ problem, and include a regression test for behavior changes.
    ```bash
    python3 -m venv .venv
    . .venv/bin/activate
-   python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
+   python -m pip install --require-hashes --only-binary=:all: \
+     -r requirements/requirements.txt
    npm ci
    ```
 
@@ -55,7 +56,8 @@ the [release runbook](docs/maintainers/release.md). Live benchmark scripts
 require explicit authentication; see the
 [development guide](docs/maintainers/development.md).
 
-Dependency updates must change the relevant `requirements*.in` file, regenerate
+Dependency updates must change the relevant `requirements/requirements*.in`
+file, regenerate
 the committed hash lock with `scripts/compile-requirements.sh`, and include the
 reviewed diff. Do not hand-edit generated requirement locks.
 

@@ -292,7 +292,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         changelog = (ROOT / "CHANGELOG.md").read_text()
         self.assertEqual(changelog.count("\n## [Unreleased]\n"), 1)
         unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-        self.assertFalse(unreleased.strip())
+        self.assertRegex(unreleased, r"(?m)^### (?:Added|Changed|Deprecated|Removed|Fixed|Security)$")
 
     def test_v214_compose_upgrade_is_offline_external_and_reversible(self):
         lifecycle = (ROOT / "docs" / "operations" / "lifecycle.md").read_text()

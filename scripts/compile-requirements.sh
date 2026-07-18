@@ -31,10 +31,10 @@ common=(
 
 PIP_CONFIG_FILE=/dev/null PIP_INDEX_URL=https://pypi.org/simple \
     "$LOCK_PYTHON" -m piptools compile "${common[@]}" \
-    --output-file=requirements.txt requirements.in
+    --output-file=requirements/requirements.txt requirements/requirements.in
 PIP_CONFIG_FILE=/dev/null PIP_INDEX_URL=https://pypi.org/simple \
     "$LOCK_PYTHON" -m piptools compile "${common[@]}" --allow-unsafe \
-    --output-file=requirements-audit.txt requirements-audit.in
+    --output-file=requirements/requirements-audit.txt requirements/requirements-audit.in
 PIP_CONFIG_FILE=/dev/null PIP_INDEX_URL=https://pypi.org/simple \
     "$LOCK_PYTHON" -m piptools compile "${common[@]}" --allow-unsafe \
-    --output-file=requirements-compile.txt requirements-compile.in
+    --output-file=requirements/requirements-compile.txt requirements/requirements-compile.in

@@ -191,18 +191,20 @@ class SupplyChainContractTests(unittest.TestCase):
     def test_python_installs_require_the_reviewed_hashes_and_wheels(self):
         expected_install = (
             "python3 -m pip install --break-system-packages "
-            "--require-hashes --only-binary=:all: -r requirements.txt"
+            "--require-hashes --only-binary=:all: "
+            "-r requirements/requirements.txt"
         )
         expected_tools = (
             "python3 -m pip install --break-system-packages "
-            "--require-hashes --only-binary=:all: -r requirements-audit.txt"
+            "--require-hashes --only-binary=:all: "
+            "-r requirements/requirements-audit.txt"
         )
         for workflow in WORKFLOWS:
             source = workflow.read_text()
             self.assertIn(expected_install, source)
             self.assertIn(expected_tools, source)
             self.assertIn(
-                "python3 -m pip_audit -r requirements.txt "
+                "python3 -m pip_audit -r requirements/requirements.txt "
                 "--strict --disable-pip --no-deps",
                 source,
             )
@@ -210,7 +212,10 @@ class SupplyChainContractTests(unittest.TestCase):
             self.assertNotIn("requirements-pinned.txt", source)
 
         dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertIn("COPY requirements.txt .", dockerfile)
+        self.assertIn(
+            "COPY requirements/requirements.txt ./requirements.txt",
+            dockerfile,
+        )
         self.assertIn(
             "pip install --no-cache-dir --require-hashes "
             "--only-binary=:all: -r requirements.txt",
@@ -225,7 +230,7 @@ class SupplyChainContractTests(unittest.TestCase):
             "requirements-audit.txt",
             "requirements-compile.txt",
         ):
-            lock = (ROOT / name).read_text()
+            lock = (ROOT / "requirements" / name).read_text()
             logical_lock = lock.replace("\\\n", " ")
             requirements = re.findall(
                 r"(?m)^([a-z0-9][a-z0-9_.-]*)==([^\s]+)([^\n]*)",
@@ -242,7 +247,7 @@ class SupplyChainContractTests(unittest.TestCase):
             self.assertNotRegex(lock, r"(?m)^[a-z0-9_.-]+\s*@\s*")
 
     def test_direct_runtime_imports_are_declared_as_direct_dependencies(self):
-        intent = (ROOT / "requirements.in").read_text()
+        intent = (ROOT / "requirements" / "requirements.in").read_text()
         self.assertIn("requests>=2.31.0,<3.0", intent)
         self.assertIn("urllib3>=2.0,<3.0", intent)
 
@@ -259,15 +264,16 @@ class SupplyChainContractTests(unittest.TestCase):
             "--no-emit-trusted-host",
         ):
             self.assertIn(option, compiler)
-        self.assertIn("requirements.in", compiler)
-        self.assertIn("requirements-audit.in", compiler)
-        self.assertIn("requirements-compile.in", compiler)
+        self.assertIn("requirements/requirements.in", compiler)
+        self.assertIn("requirements/requirements-audit.in", compiler)
+        self.assertIn("requirements/requirements-compile.in", compiler)
 
     def test_local_dependency_audit_uses_the_same_complete_locks(self):
         audit_path = ROOT / "scripts" / "audit-deps.sh"
         audit = audit_path.read_text()
         self.assertIn(
-            "pip-audit -r requirements.txt --strict --disable-pip --no-deps",
+            "pip-audit -r requirements/requirements.txt "
+            "--strict --disable-pip --no-deps",
             audit,
         )
         self.assertIn("npm audit --audit-level=high", audit)
