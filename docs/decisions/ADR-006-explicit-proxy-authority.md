@@ -73,8 +73,8 @@ from the image because unvalidated textual substitution is no longer used.
 
 ## Verification
 
-`test_proxy_config.py` exercises valid rendering plus origin, upstream URL,
-port, version, and size rejection without exposing rejected values.
-`test_container_contract.py` pins the static trust boundary, while
-`scripts/container-smoke.sh` inspects the actual rendered configuration inside
-the read-only non-root proxy container.
+`tests/python/test_proxy_config.py` exercises valid rendering plus origin,
+upstream URL, port, version, and size rejection without exposing rejected
+values. `tests/python/test_container_contract.py` pins the static trust
+boundary, while `scripts/container-smoke.sh` inspects the actual rendered
+configuration inside the read-only non-root proxy container.

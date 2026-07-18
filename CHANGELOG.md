@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the accumulated, overlapping documentation set with one indexed
+  guide hierarchy for installation, operations, reference material,
+  maintainers, and durable architecture decisions.
+- Moved automated tests under `tests/`, live probes and benchmarks under
+  `tools/`, and Python dependency inputs and hash locks under `requirements/`.
+- Narrowed the Docker build context to runtime inputs and removed obsolete
+  systemd and legacy Unraid template artifacts from the supported tree.
+- Added repository guidance and documentation contracts so CI, contributor
+  commands, release checks, and public docs stay aligned with the canonical
+  layout.
+- Pinned the lock compiler's build frontend to a reviewed non-yanked release
+  instead of retaining a withdrawn transitive candidate.
+
 ## [2.2.2] - 2026-07-17
 
 ### Security

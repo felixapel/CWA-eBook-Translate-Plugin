@@ -1,37 +1,45 @@
-# Reduce image size: drop build artefacts and the dev-only bits that should
-# never end up in a production image.
-.venv
-.git
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache
-.mypy_cache
+# Version-control and local environments.
+.git/
+.venv/
+venv/
+env/
+node_modules/
+
+# Generated language and test artifacts.
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
 .coverage
 htmlcov/
+playwright-report/
+test-results/
+blob-report/
 
-# Live database files (the running container writes to /app/data, which is
-# a named volume; you do NOT want a stale local one baked into the image).
+# Local credentials and runtime state.
+.env
+.env.*
+auth.json
+*.b64
 translations.db
 translations.db-*
 data.db
 data.db-*
 *.sqlite
 *.sqlite3
-
-# Legacy / exploratory bits the image doesn't need.
-overlay
-userscript
-benchmark.py
-benchmark_realistic.py
-my-book-translator-api.xml
-
-# Test files: the image bakes the app, not its tests. The CI smoke test
-# brings its own copy of test_translation.py when needed.
-test_*.py
-
-# Local docs and build artefacts.
-docs/assets/demo.gif
 *.log
+backups/
+data/
+config/translator/
+
+# Development-only source. Dockerfiles copy runtime files explicitly.
+tests/
+tools/
+docs/
+.github/
+.gitea/
+scripts/
+overlay/
+
+# Platform noise.
 .DS_Store

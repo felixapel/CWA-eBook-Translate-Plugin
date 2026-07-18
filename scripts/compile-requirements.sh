@@ -2,7 +2,7 @@
 # Regenerate reviewed Python locks from public PyPI with a fixed compiler.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../requirements"
 
 EXPECTED_PYTHON="3.11"
 EXPECTED_PIP_COMPILE="7.5.3"

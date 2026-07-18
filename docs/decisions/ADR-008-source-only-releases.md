@@ -1,13 +1,8 @@
 # ADR-008: Publish verified source releases without registry credentials
 
-## Status
-
-Partially superseded by
-[ADR-012](ADR-012-community-applications-image.md)
-
-## Date
-
-2026-07-13
+- Status: Accepted
+- Date: 2026-07-13
+- Partially superseded by: [ADR-012](ADR-012-community-applications-image.md)
 
 ## Context
 

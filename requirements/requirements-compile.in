@@ -1,0 +1,5 @@
+# Compiler used to regenerate every Python lock.
+# pip-tools accepts build>=1; keep this transitive tool on a reviewed,
+# non-yanked release instead of inheriting a stale lock candidate.
+build==1.5.0
+pip-tools==7.5.3

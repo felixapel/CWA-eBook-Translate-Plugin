@@ -24,7 +24,7 @@ RUN apk add --no-cache \
 # Copy requirements and install. Then strip packaging tooling that is only needed
 # to install wheels: setuptools/wheel/pip (and their vendored trees) are not used
 # by the runtime and have historically carried HIGH Trivy findings.
-COPY requirements.txt .
+COPY requirements/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements.txt \
  && pip uninstall -y setuptools wheel pip \
  && rm -rf /root/.cache /tmp/pip-*

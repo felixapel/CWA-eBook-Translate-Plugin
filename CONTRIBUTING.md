@@ -12,7 +12,8 @@ problem, and include a regression test for behavior changes.
    ```bash
    python3 -m venv .venv
    . .venv/bin/activate
-   python -m pip install --require-hashes --only-binary=:all: -r requirements.txt
+   python -m pip install --require-hashes --only-binary=:all: \
+     -r requirements/requirements.txt
    npm ci
    ```
 
@@ -26,10 +27,21 @@ Run the smallest relevant test while developing, then the maintained gates
 before opening a pull request:
 
 ```bash
-python3 -m unittest -v test_live_scripts test_install_docs
-python3 test_translation.py
-python3 test_hardening.py
-python3 -m unittest discover -v
+python3 -m tests.python.test_translation
+python3 -m tests.python.test_hardening
+python3 -m unittest -v \
+  tests.python.test_btctl tests.python.test_btctl_container \
+  tests.python.test_btctl_compose tests.python.test_btctl_unraid \
+  tests.python.test_btctl_auth tests.python.test_btctl_lifecycle \
+  tests.python.test_work_budget tests.python.test_provider_budget \
+  tests.python.test_cache_v2 tests.python.test_context_cache \
+  tests.python.test_singleflight tests.python.test_auth \
+  tests.python.test_ci_contract tests.python.test_docs_contract \
+  tests.python.test_release_contract tests.python.test_supply_chain_contract \
+  tests.python.test_shell_contract tests.python.test_container_contract \
+  tests.python.test_cleanup_token tests.python.test_api_schema \
+  tests.python.test_error_privacy tests.python.test_observability \
+  tests.python.test_proxy_config tests.python.test_live_scripts
 node -c static/translator.js
 node -c static/loader.js
 npm ci
@@ -40,10 +52,12 @@ npm run test:e2e
 ```
 
 Container or installer changes must also run the applicable smoke commands in
-`docs/RELEASE.md`. Live benchmark scripts require explicit authentication; see
-`docs/DEVELOPMENT.md`.
+the [release runbook](docs/maintainers/release.md). Live benchmark scripts
+require explicit authentication; see the
+[development guide](docs/maintainers/development.md).
 
-Dependency updates must change the relevant `requirements*.in` file, regenerate
+Dependency updates must change the relevant `requirements/requirements*.in`
+file, regenerate
 the committed hash lock with `scripts/compile-requirements.sh`, and include the
 reviewed diff. Do not hand-edit generated requirement locks.
 
