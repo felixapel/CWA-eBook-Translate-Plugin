@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[2]
 GITHUB_CI = ROOT / ".github" / "workflows" / "ci.yml"
 GITEA_CI = ROOT / ".gitea" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".gitea" / "workflows" / "release.yml"
@@ -17,6 +17,32 @@ FRONTEND_WORKFLOWS = (
     GITEA_CI,
     ROOT / ".gitea" / "workflows" / "release.yml",
 )
+BACKEND_UNIT_COMMAND = "python3 -m unittest -v " + " ".join((
+    "tests.python.test_btctl",
+    "tests.python.test_btctl_container",
+    "tests.python.test_btctl_compose",
+    "tests.python.test_btctl_unraid",
+    "tests.python.test_btctl_auth",
+    "tests.python.test_btctl_lifecycle",
+    "tests.python.test_work_budget",
+    "tests.python.test_provider_budget",
+    "tests.python.test_cache_v2",
+    "tests.python.test_context_cache",
+    "tests.python.test_singleflight",
+    "tests.python.test_auth",
+    "tests.python.test_ci_contract",
+    "tests.python.test_docs_contract",
+    "tests.python.test_release_contract",
+    "tests.python.test_supply_chain_contract",
+    "tests.python.test_shell_contract",
+    "tests.python.test_container_contract",
+    "tests.python.test_cleanup_token",
+    "tests.python.test_api_schema",
+    "tests.python.test_error_privacy",
+    "tests.python.test_observability",
+    "tests.python.test_proxy_config",
+    "tests.python.test_live_scripts",
+))
 
 
 class CIContractTests(unittest.TestCase):
@@ -26,9 +52,9 @@ class CIContractTests(unittest.TestCase):
 
     def test_all_backend_contract_suites_are_required(self):
         for command in (
-            "python3 test_translation.py",
-            "python3 test_hardening.py",
-            "python3 -m unittest -v test_btctl test_btctl_container test_btctl_compose test_btctl_unraid test_btctl_auth test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_docs_contract test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts",
+            "python3 -m tests.python.test_translation",
+            "python3 -m tests.python.test_hardening",
+            BACKEND_UNIT_COMMAND,
             "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
             "bash -n btctl install_unraid.sh scripts/btctl-bootstrap-smoke.sh",
         ):
@@ -38,7 +64,11 @@ class CIContractTests(unittest.TestCase):
         workflow = RELEASE.read_text()
         for module in ("btctl_auth.py", "btctl_lifecycle.py"):
             self.assertIn(module, workflow)
-        for suite in ("test_btctl_auth", "test_btctl_lifecycle", "test_docs_contract"):
+        for suite in (
+            "tests.python.test_btctl_auth",
+            "tests.python.test_btctl_lifecycle",
+            "tests.python.test_docs_contract",
+        ):
             self.assertIn(suite, workflow)
 
     def test_node_install_and_audit_include_locked_dev_tree(self):
@@ -155,6 +185,12 @@ class CIContractTests(unittest.TestCase):
         for key in ("name", "version", "license"):
             self.assertEqual(lock.get(key, root.get(key)), package[key])
             self.assertEqual(root[key], package[key])
+        self.assertIs(package["private"], True)
+        self.assertNotIn("main", package)
+        self.assertEqual(
+            package["scripts"]["test"],
+            "node tests/frontend/test_frontend.js",
+        )
 
     def test_required_steps_have_no_continue_on_error(self):
         self.assertNotIn("continue-on-error", self.workflow)

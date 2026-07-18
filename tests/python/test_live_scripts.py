@@ -3,9 +3,8 @@ import io
 import unittest
 from unittest import mock
 
-import benchmark
-import benchmark_realistic
-import test_ratelimit
+from tools.benchmarks import benchmark, benchmark_realistic
+from tools.probes import rate_limit as test_ratelimit
 
 
 class _FakeResponse:

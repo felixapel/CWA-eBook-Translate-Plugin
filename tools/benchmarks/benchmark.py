@@ -3,7 +3,8 @@
 Use the same-origin proxy path for ``cwa_session`` deployments, for example::
 
     BT_BENCHMARK_COOKIE='session=...' \
-    BT_BENCHMARK_USER_AGENT='the exact browser User-Agent' python benchmark.py \
+    BT_BENCHMARK_USER_AGENT='the exact browser User-Agent' \
+      python -m tools.benchmarks.benchmark \
       --url https://books.example.test/bt-api
 
 Use ``BT_API_TOKEN`` instead for token-authenticated API endpoints. Credentials

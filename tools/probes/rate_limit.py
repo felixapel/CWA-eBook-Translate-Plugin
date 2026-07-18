@@ -2,7 +2,7 @@
 
 Start the API with a fresh rate-limit window, then run for example:
 
-    BT_API_TOKEN=... python test_ratelimit.py --url http://127.0.0.1:8390
+    BT_API_TOKEN=... python3 -m tools.probes.rate_limit --url http://127.0.0.1:8390
 
 For the recommended CWA-session proxy, set ``BT_RATE_LIMIT_TEST_COOKIE`` and
 ``BT_RATE_LIMIT_TEST_USER_AGENT`` to the exact browser values and point

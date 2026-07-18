@@ -18,7 +18,7 @@ from typing import Sequence
 
 import requests
 
-from benchmark import _headers, _http_url, _positive_float, _user_agent
+from tools.benchmarks.benchmark import _headers, _http_url, _positive_float, _user_agent
 
 
 DEFAULT_URL = "http://127.0.0.1:8390"

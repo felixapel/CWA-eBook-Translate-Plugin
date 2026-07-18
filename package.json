@@ -1,13 +1,13 @@
 {
   "name": "cwa-ebook-translate-plugin",
   "version": "2.2.2",
-  "description": "Bilingual LLM-powered translation overlay for Calibre-Web-Automated. Translate ebooks paragraph-by-paragraph while reading, in 100+ languages, using local LLMs (Gemma 4 via vLLM/LM Studio/Ollama) or any major cloud API.",
-  "main": "test_frontend.js",
+  "private": true,
+  "description": "Bilingual paragraph-level LLM translation for the Calibre-Web-Automated reader.",
   "directories": {
     "doc": "docs"
   },
   "scripts": {
-    "test": "node test_frontend.js",
+    "test": "node tests/frontend/test_frontend.js",
     "test:e2e": "playwright test"
   },
   "repository": {

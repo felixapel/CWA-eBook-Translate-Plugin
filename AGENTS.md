@@ -35,7 +35,8 @@ Start with:
 ```bash
 git diff --check
 python3 scripts/check_docs.py
-python3 -m unittest discover -v
+python3 -m tests.python.test_translation
+python3 -m tests.python.test_hardening
 npm test
 ```
 

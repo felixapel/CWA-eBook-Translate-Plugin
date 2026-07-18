@@ -1,9 +1,10 @@
 """
 Smoke test against a LIVE backend (not mocked — start the API first).
-For a self-contained test with no live server, use test_translation.py instead.
+For a self-contained test with no live server, use
+``python -m tests.python.test_translation`` instead.
 
     pip install requests
-    BENCHMARK_URL=http://127.0.0.1:8390 python test_endpoints.py
+    BENCHMARK_URL=http://127.0.0.1:8390 python -m tools.probes.endpoints
 """
 import os
 import requests

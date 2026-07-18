@@ -58,7 +58,7 @@ app_sandbox=(
     "${sandbox[@]}"
 )
 
-FIXTURE_SOURCE="$(pwd)/test_cwa_strong_fixture.py"
+FIXTURE_SOURCE="$(pwd)/tests/python/test_cwa_strong_fixture.py"
 test -r "$FIXTURE_SOURCE"
 docker run -d --name "$CWA_CONTAINER" --network "$SMOKE_NETWORK" \
     "${sandbox[@]}" \

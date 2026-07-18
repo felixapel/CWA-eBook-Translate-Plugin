@@ -1,10 +1,12 @@
 const fs = require('fs');
 const assert = require('assert');
+const path = require('path');
 const jsdom = require("jsdom");
 const { JSDOM } = jsdom;
 
-const code = fs.readFileSync('static/translator.js', 'utf-8');
-const loaderCode = fs.readFileSync('static/loader.js', 'utf-8');
+const root = path.resolve(__dirname, '../..');
+const code = fs.readFileSync(path.join(root, 'static/translator.js'), 'utf-8');
+const loaderCode = fs.readFileSync(path.join(root, 'static/loader.js'), 'utf-8');
 
 assert(!/getItem\(['"]bt_token['"]\)/.test(loaderCode),
     'The proxy loader must never recover a JavaScript-readable API token from localStorage');

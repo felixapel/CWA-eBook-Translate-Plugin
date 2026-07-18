@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[2]
 RENDERER = ROOT / "proxy" / "render_config.py"
 TEMPLATE = ROOT / "proxy" / "nginx.conf.template"
 

@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "release_preflight.py"
 GITEA_RELEASE = ROOT / ".gitea" / "workflows" / "release.yml"
 GITEA_CI = ROOT / ".gitea" / "workflows" / "ci.yml"
@@ -367,11 +367,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         workflow = GITEA_RELEASE.read_text()
         for command in (
             "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py",
-            "python3 test_translation.py",
-            "python3 test_hardening.py",
-            "test_btctl_auth test_btctl_lifecycle",
-            "test_singleflight test_auth test_ci_contract test_docs_contract",
-            "test_release_contract",
+            "python3 -m tests.python.test_translation",
+            "python3 -m tests.python.test_hardening",
+            "tests.python.test_btctl_auth tests.python.test_btctl_lifecycle",
+            "tests.python.test_singleflight tests.python.test_auth tests.python.test_ci_contract tests.python.test_docs_contract",
+            "tests.python.test_release_contract",
             "npm ci",
             "npm audit --audit-level=high",
             "npm test",

@@ -26,7 +26,7 @@ from btctl_core import (
 )
 
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[2]
 BTCTL = ROOT / "btctl.py"
 
 

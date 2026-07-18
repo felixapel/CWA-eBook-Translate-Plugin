@@ -27,16 +27,21 @@ The backend is a Flask application running in python.
 The backend test suite is self-contained — it mocks the LLM and the database
 file, so it needs no running server, no API key, and no network access:
 ```bash
-.venv/bin/python3 test_translation.py
-.venv/bin/python3 test_hardening.py
+.venv/bin/python3 -m tests.python.test_translation
+.venv/bin/python3 -m tests.python.test_hardening
 .venv/bin/python3 -m unittest -v \
-  test_btctl test_btctl_container test_btctl_compose test_btctl_unraid test_btctl_auth \
-  test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 \
-  test_context_cache test_singleflight test_auth test_ci_contract \
-  test_docs_contract test_release_contract test_supply_chain_contract \
-  test_shell_contract test_container_contract test_cleanup_token \
-  test_api_schema test_error_privacy test_observability test_proxy_config \
-  test_live_scripts
+  tests.python.test_btctl tests.python.test_btctl_container \
+  tests.python.test_btctl_compose tests.python.test_btctl_unraid \
+  tests.python.test_btctl_auth tests.python.test_btctl_lifecycle \
+  tests.python.test_work_budget tests.python.test_provider_budget \
+  tests.python.test_cache_v2 tests.python.test_context_cache \
+  tests.python.test_singleflight tests.python.test_auth \
+  tests.python.test_ci_contract tests.python.test_docs_contract \
+  tests.python.test_release_contract tests.python.test_supply_chain_contract \
+  tests.python.test_shell_contract tests.python.test_container_contract \
+  tests.python.test_cleanup_token tests.python.test_api_schema \
+  tests.python.test_error_privacy tests.python.test_observability \
+  tests.python.test_proxy_config tests.python.test_live_scripts
 ```
 
 Always also check syntax/compile before committing:
@@ -52,8 +57,11 @@ The installer contract is self-contained and uses disposable Git repositories;
 it never contacts Docker or a live CWA instance:
 
 ```bash
-python3 -m unittest -v test_btctl test_btctl_container test_btctl_compose test_btctl_unraid \
-  test_btctl_auth test_btctl_lifecycle test_docs_contract
+python3 -m unittest -v \
+  tests.python.test_btctl tests.python.test_btctl_container \
+  tests.python.test_btctl_compose tests.python.test_btctl_unraid \
+  tests.python.test_btctl_auth tests.python.test_btctl_lifecycle \
+  tests.python.test_docs_contract
 ```
 
 Use `./btctl plan --env /absolute/path/install.env --json` to inspect a clean
@@ -72,12 +80,12 @@ It runs the public dispatcher in a clean checkout, removes Python and Git from
 the simulated host image, verifies that `plan --json` reports the exact commit,
 and exercises Unraid install, doctor, and uninstall through the same fallback.
 
-`test_endpoints.py`, `test_ratelimit.py`, `benchmark.py`, and
-`benchmark_realistic.py` are different — they hit a **live** API
+The modules under `tools/probes/` and `tools/benchmarks/` are different — they
+hit a **live** API
 (`BENCHMARK_URL`, default `http://127.0.0.1:8390`), so start the server first:
 ```bash
 python3 server.py &
-BENCHMARK_URL=http://127.0.0.1:8390 python3 test_endpoints.py
+BENCHMARK_URL=http://127.0.0.1:8390 python3 -m tools.probes.endpoints
 ```
 
 The rate-limit probe requires a fresh limiter window and valid authentication.
@@ -87,7 +95,7 @@ cover the default limit of 120; raise `--requests` if your deployment uses a
 higher `BT_RATE_LIMIT_PER_MINUTE`:
 
 ```bash
-BT_API_TOKEN='<token>' python3 test_ratelimit.py \
+BT_API_TOKEN='<token>' python3 -m tools.probes.rate_limit \
   --url http://127.0.0.1:8390 --requests 130 --timeout 5
 ```
 
@@ -98,7 +106,8 @@ line, and run the probe from the same client IP that created the session:
 ```bash
 BT_RATE_LIMIT_TEST_COOKIE='session=<opaque-value>' \
 BT_RATE_LIMIT_TEST_USER_AGENT='Mozilla/5.0 ... exact browser value' \
-  python3 test_ratelimit.py --url https://books.example.test/bt-api
+  python3 -m tools.probes.rate_limit \
+  --url https://books.example.test/bt-api
 ```
 
 It exits nonzero on connection/authentication errors, unexpected statuses, or
@@ -111,11 +120,11 @@ The two benchmark scripts enforce the same boundary and also fail on redirects,
 non-2xx responses, or invalid JSON. Use one authentication mechanism only:
 
 ```bash
-BT_API_TOKEN='<token>' python3 benchmark.py \
+BT_API_TOKEN='<token>' python3 -m tools.benchmarks.benchmark \
   --url http://127.0.0.1:8390
 BT_BENCHMARK_COOKIE='session=<opaque-value>' \
 BT_BENCHMARK_USER_AGENT='Mozilla/5.0 ... exact browser value' \
-  python3 benchmark_realistic.py \
+  python3 -m tools.benchmarks.benchmark_realistic \
   --url https://books.example.test/bt-api
 ```
 
@@ -135,7 +144,7 @@ The frontend consists of `static/translator.js`, `static/translator.css`, and
 ```bash
 node -c static/translator.js   # syntax check
 npm ci                         # exact package-lock.json dependency tree
-npm test                       # runs test_frontend.js against a mocked reader/iframe
+npm test                       # runs tests/frontend/test_frontend.js
 npx playwright install --with-deps --only-shell chromium
 npm run test:e2e               # real Chromium: loader, DOM, network, a11y, consent
 ```

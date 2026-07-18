@@ -5,12 +5,15 @@ Uses Flask's test client and a mocked provider transport, so it
 runs anywhere with just `flask` + `requests` installed:
 
     pip install flask requests
-    python test_translation.py
+    python -m tests.python.test_translation
 
 Covers: provider fallback, errors not cached, batched-prompt translation
 (one LLM call per group), and bounded recovery from malformed envelopes.
 """
 import os, sys, json as jsonlib, re, tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
 
 os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_test_translations.db")
 os.environ["BT_CACHE_DIR"] = tempfile.gettempdir()  # for /cache/cleanup auth token
@@ -335,13 +338,13 @@ def run():
           and d.get("translations") == ["same lang a", "same lang b"])
 
     # Loader inherits its version from its own ?v= param (no hardcoded version).
-    loader_src = open("static/loader.js", encoding="utf-8").read()
+    loader_src = (ROOT / "static/loader.js").read_text(encoding="utf-8")
     check("loader: no hardcoded semver", not re.search(r"VERSION\s*=\s*'\d", loader_src))
     check("loader: derives version from currentScript", "document.currentScript" in loader_src)
 
     # The cleanup token value must never be written to logs.
     check("token hygiene: token value not logged",
-          "cleanup token: %s" not in open("server.py", encoding="utf-8").read())
+          "cleanup token: %s" not in (ROOT / "server.py").read_text(encoding="utf-8"))
 
     # Fallback cache scoping: a translation produced by the FALLBACK provider
     # must be cached under the fallback's model key (caching it under the
@@ -424,7 +427,7 @@ def run():
 
     # Language catalog: frontend picker and backend validation must offer the
     # exact same set, or the UI could offer a language the API rejects.
-    js = open("static/translator.js", encoding="utf-8").read()
+    js = (ROOT / "static/translator.js").read_text(encoding="utf-8")
     block = re.search(r"const TOP_LANGUAGES = \[(.*?)\];.*?const MORE_LANGUAGES = \[(.*?)\];", js, re.S)
     js_codes = [c.replace("\\'", "'") for c in
                 re.findall(r"code:\s*'((?:[^'\\]|\\.)*)'", block.group(1) + block.group(2))]

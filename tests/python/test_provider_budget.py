@@ -18,7 +18,7 @@ os.environ.pop("BT_MAX_UPSTREAM_INFLIGHT", None)
 from work_budget import WorkBudget, WorkBudgetExceeded  # noqa: E402
 import translator  # noqa: E402
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class ProviderBudgetTests(unittest.TestCase):
@@ -457,7 +457,7 @@ class ProviderBudgetTests(unittest.TestCase):
         env["BT_MAX_UPSTREAM_INFLIGHT"] = "0"
         result = subprocess.run(
             [sys.executable, "-c", "import translator"],
-            cwd=os.path.dirname(__file__),
+            cwd=ROOT,
             env=env,
             capture_output=True,
             text=True,
@@ -483,7 +483,7 @@ class ProviderBudgetTests(unittest.TestCase):
                 env[name] = value
                 result = subprocess.run(
                     [sys.executable, "-c", "import translator"],
-                    cwd=os.path.dirname(__file__),
+                    cwd=ROOT,
                     env=env,
                     capture_output=True,
                     text=True,
@@ -1062,14 +1062,20 @@ class DeploymentBudgetContractTests(unittest.TestCase):
         for name, value in expected.items():
             self.assertIn(f"- {name}={value}", compose)
 
-    def test_readme_and_unraid_templates_do_not_document_unlimited_default(self):
-        readme = (ROOT / "README.md").read_text()
+    def test_configuration_and_unraid_templates_do_not_document_unlimited_default(self):
+        configuration = (ROOT / "docs" / "reference" / "configuration.md").read_text()
         templates = "\n".join(
             path.read_text()
             for path in (ROOT / "deploy" / "unraid").glob("*.xml.tmpl")
         )
-        self.assertIn("| `BT_MAX_UPSTREAM_INFLIGHT` | `2` |", readme)
-        self.assertNotIn("| `BT_MAX_UPSTREAM_INFLIGHT` | `0` |", readme)
+        self.assertIn(
+            "| `BT_MAX_UPSTREAM_INFLIGHT` | `2` |",
+            configuration,
+        )
+        self.assertNotIn(
+            "| `BT_MAX_UPSTREAM_INFLIGHT` | `0` |",
+            configuration,
+        )
         self.assertNotIn("(0 = unlimited)", templates)
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from cache import CACHE_SCHEMA_VERSION, CacheScope, CacheStore
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class MutableClock:
@@ -647,12 +647,14 @@ class CacheDeploymentContractTests(unittest.TestCase):
 
     def test_deployment_defaults_are_bounded(self) -> None:
         compose = (ROOT / "docker-compose.yml").read_text()
-        readme = (ROOT / "README.md").read_text()
+        configuration = (
+            ROOT / "docs" / "reference" / "configuration.md"
+        ).read_text()
         self.assertIn("BT_CACHE_TTL_DAYS=90", compose)
         self.assertIn("BT_CACHE_MAX_ENTRIES=100000", compose)
-        self.assertIn("| `BT_CACHE_TTL_DAYS` | `90` |", readme)
-        self.assertIn("| `BT_CACHE_MAX_ENTRIES` | `100000` |", readme)
-        self.assertNotIn("`0` = unlimited", readme)
+        self.assertIn("| `BT_CACHE_TTL_DAYS` | `90` |", configuration)
+        self.assertIn("| `BT_CACHE_MAX_ENTRIES` | `100000` |", configuration)
+        self.assertNotIn("`0` = unlimited", configuration)
 
 
 if __name__ == "__main__":

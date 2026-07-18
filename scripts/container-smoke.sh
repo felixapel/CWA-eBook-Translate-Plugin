@@ -52,7 +52,7 @@ sandbox=(
 # checkout inside the candidate image. It exercises ProxyFix(x_for=1), the
 # address/User-Agent session fingerprint, and /ajax/emailstat's HTML-vs-JSON
 # contract without pulling another mutable application image into this gate.
-FIXTURE_SOURCE="$(pwd)/test_cwa_strong_fixture.py"
+FIXTURE_SOURCE="$(pwd)/tests/python/test_cwa_strong_fixture.py"
 test -r "$FIXTURE_SOURCE"
 docker run -d --name "$CWA_CONTAINER" --network "$SMOKE_NETWORK" \
     "${sandbox[@]}" \
@@ -361,7 +361,8 @@ for container in "$API_CONTAINER" "$PROXY_CONTAINER"; do
     fi
     docker exec "$container" sh -c ': > /tmp/write-probe && rm /tmp/write-probe'
 done
-if docker exec "$API_CONTAINER" sh -c 'test -e /app/test_auth.py -o -e /app/benchmark.py'; then
+if docker exec "$API_CONTAINER" sh -c \
+    'test -e /app/test_auth.py -o -e /app/benchmark.py -o -e /app/tests -o -e /app/tools'; then
     echo "published runtime unexpectedly contains tests or benchmarks" >&2
     exit 1
 fi

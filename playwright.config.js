@@ -4,7 +4,7 @@ const port = Number(process.env.BT_E2E_PORT || 4173);
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
 
 module.exports = defineConfig({
-    testDir: './e2e',
+    testDir: './tests/e2e',
     fullyParallel: false,
     forbidOnly: Boolean(process.env.CI),
     retries: 0,
@@ -22,7 +22,7 @@ module.exports = defineConfig({
         launchOptions: executablePath ? { executablePath } : {},
     },
     webServer: {
-        command: 'node e2e/fixture-server.js',
+        command: 'node tests/e2e/fixture-server.js',
         url: `http://127.0.0.1:${port}/library`,
         reuseExistingServer: false,
         timeout: 10_000,

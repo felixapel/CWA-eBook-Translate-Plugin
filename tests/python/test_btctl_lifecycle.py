@@ -25,7 +25,7 @@ from btctl_lifecycle import (
     _sqlite_integrity,
     _tree_manifest,
 )
-from test_btctl_compose import FakeDocker, values
+from tests.python.test_btctl_compose import FakeDocker, values
 
 
 class LifecycleDocker(FakeDocker):

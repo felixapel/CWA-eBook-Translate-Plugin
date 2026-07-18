@@ -15,6 +15,8 @@ os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
 
 import server
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 class CleanupTokenTests(unittest.TestCase):
     def setUp(self):
@@ -112,7 +114,7 @@ class CleanupTokenTests(unittest.TestCase):
             env["DB_PATH"] = str(Path(self.tempdir.name) / f"child-{index}.db")
             processes.append(subprocess.Popen(
                 [sys.executable, "-c", child_code, str(start_file)],
-                cwd=Path(__file__).parent,
+                cwd=ROOT,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -189,7 +191,7 @@ class CleanupTokenTests(unittest.TestCase):
         )
         process = subprocess.Popen(
             [sys.executable, "-c", child_code],
-            cwd=Path(__file__).parent,
+            cwd=ROOT,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

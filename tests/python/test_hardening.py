@@ -1,7 +1,7 @@
 """
 Self-contained tests for the production-hardening batch (2026-07-02).
 
-These tests share state with test_translation.py (DB_PATH, env vars,
+These tests share state with ``tests.python.test_translation`` (DB_PATH, env vars,
 request.post monkeypatch) by importing the same modules — do NOT add
 a second init_db or recreate the app.
 
@@ -12,12 +12,14 @@ Covers:
   - /metrics returns Prometheus-friendly counters
   - pre-auth admission per observed client and API limits per auth subject
 
-Run with: python3 test_hardening.py
+Run with: python3 -m tests.python.test_hardening
 """
 import os, sys, json, subprocess, tempfile
 from pathlib import Path
 
-# Same env-var contract as test_translation.py.
+ROOT = Path(__file__).resolve().parents[2]
+
+# Same env-var contract as tests.python.test_translation.
 os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_test_translations.db")
 os.environ["BT_CACHE_DIR"] = tempfile.gettempdir()  # for /cache/cleanup auth token
 os.environ["LLM_PROVIDER"] = "local"
@@ -37,8 +39,8 @@ for f in (os.environ["DB_PATH"], os.environ["DB_PATH"] + "-wal", os.environ["DB_
 
 import ipaddress
 
-# Re-use the same fake_post from test_translation.py.
-import test_translation  # noqa: E402
+# Re-use the same fake_post from tests.python.test_translation.
+from tests.python import test_translation  # noqa: E402
 STATE = test_translation.STATE
 fake_post = test_translation.fake_post
 import translator  # noqa: E402
@@ -304,7 +306,7 @@ def run():
 
     # The entrypoint must export the proxy trust boundary before Gunicorn
     # imports server.py. Import-time configuration set later is ineffective.
-    entrypoint = (Path(__file__).parent / "docker-entrypoint.sh").read_text()
+    entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
     trust_export = entrypoint.find('export BT_TRUSTED_PROXIES=')
     gunicorn_start = entrypoint.find('exec gunicorn --bind')
     check("entrypoint: trusted proxy config is exported before Gunicorn",
@@ -317,7 +319,7 @@ def run():
     invalid_env["DB_PATH"] = os.path.join(tempfile.gettempdir(), "bt_invalid_proxy.db")
     invalid_proxy = subprocess.run(
         [sys.executable, "-c", "import server"],
-        cwd=Path(__file__).parent,
+        cwd=ROOT,
         env=invalid_env,
         capture_output=True,
         text=True,

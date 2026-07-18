@@ -18,7 +18,7 @@ from auth import (
     CwaSessionBinding,
     RequestAuthenticator,
 )
-from test_cwa_strong_fixture import create_cwa_strong_app, session_cookie_from
+from tests.python.test_cwa_strong_fixture import create_cwa_strong_app, session_cookie_from
 
 os.environ.setdefault("BT_AUTH_MODE", "disabled")
 os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
