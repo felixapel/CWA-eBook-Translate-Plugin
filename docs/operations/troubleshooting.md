@@ -1,7 +1,7 @@
 # Troubleshooting
 
-These checks apply to the managed v2.2 split deployment and the certified
-v2.2.1 Community Applications profile. Do not expose the
+These checks apply to the managed split deployment and the certified
+Community Applications profile. Do not expose the
 API, add a browser token, broaden a trusted proxy range, or disable
 authentication to make an error disappear.
 
@@ -37,8 +37,8 @@ roles.
 
 ## Application is missing from Community Applications
 
-The v2.2.1 Community Applications path exists only after its annotated tag,
-public digest-pinned GHCR image, and approved searchable CA listing all exist.
+The Community Applications path exists only through a public digest-pinned
+GHCR image and an approved searchable CA listing.
 If **CWA eBook Translate** is not returned by Community Applications search,
 stop: the listing is not yet public or has been withdrawn. Do not install an
 XML from Git history, a cached template URL, or a mutable image tag. Use the
@@ -111,7 +111,7 @@ boundary instead of repairing it.
 
 If Authentik authenticates the browser but CWA never creates a session that its
 `/ajax/emailstat` endpoint accepts, use the separate
-`authentik-forwarded` topology in [AUTHENTIK.md](AUTHENTIK.md). Do not switch to
+`authentik-forwarded` topology in the [Authentik guide](../install/authentik.md). Do not switch to
 anonymous mode and do not put a shared secret in browser storage.
 
 A `503` instead of `401` means the API could not safely evaluate CWA as the

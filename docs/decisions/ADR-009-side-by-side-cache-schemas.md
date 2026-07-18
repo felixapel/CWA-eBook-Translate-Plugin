@@ -1,12 +1,7 @@
 # ADR-009: Keep cache schemas side by side for rollback
 
-## Status
-
-Accepted
-
-## Date
-
-2026-07-13
+- Status: Accepted
+- Date: 2026-07-13
 
 ## Context
 

@@ -1,12 +1,8 @@
 # ADR-007: Sign and verify release digests with a self-managed key
 
-## Status
-
-Superseded by [ADR-008](ADR-008-source-only-releases.md)
-
-## Date
-
-2026-07-12
+- Status: Superseded
+- Date: 2026-07-12
+- Superseded by: [ADR-008](ADR-008-source-only-releases.md)
 
 ## Context
 

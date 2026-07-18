@@ -33,7 +33,7 @@ file, so it needs no running server, no API key, and no network access:
   test_btctl test_btctl_container test_btctl_compose test_btctl_unraid test_btctl_auth \
   test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 \
   test_context_cache test_singleflight test_auth test_ci_contract \
-  test_install_docs test_release_contract test_supply_chain_contract \
+  test_docs_contract test_release_contract test_supply_chain_contract \
   test_shell_contract test_container_contract test_cleanup_token \
   test_api_schema test_error_privacy test_observability test_proxy_config \
   test_live_scripts
@@ -53,7 +53,7 @@ it never contacts Docker or a live CWA instance:
 
 ```bash
 python3 -m unittest -v test_btctl test_btctl_container test_btctl_compose test_btctl_unraid \
-  test_btctl_auth test_btctl_lifecycle test_install_docs
+  test_btctl_auth test_btctl_lifecycle test_docs_contract
 ```
 
 Use `./btctl plan --env /absolute/path/install.env --json` to inspect a clean

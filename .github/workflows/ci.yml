@@ -49,7 +49,7 @@ jobs:
       - run: bash -n btctl install_unraid.sh scripts/btctl-bootstrap-smoke.sh
       - run: python3 test_translation.py
       - run: python3 test_hardening.py
-      - run: python3 -m unittest -v test_btctl test_btctl_container test_btctl_compose test_btctl_unraid test_btctl_auth test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_install_docs test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts
+      - run: python3 -m unittest -v test_btctl test_btctl_container test_btctl_compose test_btctl_unraid test_btctl_auth test_btctl_lifecycle test_work_budget test_provider_budget test_cache_v2 test_context_cache test_singleflight test_auth test_ci_contract test_docs_contract test_release_contract test_supply_chain_contract test_shell_contract test_container_contract test_cleanup_token test_api_schema test_error_privacy test_observability test_proxy_config test_live_scripts
 
   frontend:
     runs-on: ubuntu-latest

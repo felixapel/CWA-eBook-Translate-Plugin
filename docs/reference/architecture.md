@@ -4,18 +4,9 @@ This document details the architecture of the `book-translator` plugin.
 
 ## Architecture decisions
 
-- [ADR-001: Use Gitea as the sole release authority](decisions/ADR-001-gitea-release-authority.md)
-- [ADR-002: Split API and proxy into non-root runtime roles](decisions/ADR-002-split-non-root-runtime-roles.md)
-- [ADR-003: Use an atomically scoped private cache](decisions/ADR-003-scoped-private-cache.md)
-- [ADR-004: Authenticate before deriving cache tenants](decisions/ADR-004-authentication-boundaries.md)
-- [ADR-005: Require request consent for cloud fallback](decisions/ADR-005-cloud-fallback-consent.md)
-- [ADR-006: Make proxy authority and forwarding explicit](decisions/ADR-006-explicit-proxy-authority.md)
-- [ADR-007: Sign and verify release digests with a self-managed key (superseded)](decisions/ADR-007-sign-release-digests.md)
-- [ADR-008: Publish verified source releases without registry credentials](decisions/ADR-008-source-only-releases.md)
-- [ADR-009: Keep cache schemas side by side for rollback](decisions/ADR-009-side-by-side-cache-schemas.md)
-- [ADR-010: Make `btctl` the fail-closed deployment authority](decisions/ADR-010-btctl-state-and-ownership.md)
-- [ADR-011: Bootstrap the Unraid operator through Docker](decisions/ADR-011-containerized-unraid-bootstrap.md)
-- [ADR-012: Publish a certified combined image for Community Applications](decisions/ADR-012-community-applications-image.md)
+The indexed [architecture decision records](../decisions/README.md) preserve
+the security, release, cache and deployment rationale, including superseded
+decisions.
 
 ## Overview
 

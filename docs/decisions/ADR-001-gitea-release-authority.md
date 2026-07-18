@@ -1,13 +1,8 @@
 # ADR-001: Use Gitea as the sole release authority
 
-## Status
-
-Accepted; container publication details superseded by
-[ADR-008](ADR-008-source-only-releases.md)
-
-## Date
-
-2026-07-12
+- Status: Accepted
+- Date: 2026-07-12
+- Container publication details superseded by: [ADR-008](ADR-008-source-only-releases.md)
 
 ## Context
 
@@ -58,7 +53,7 @@ artifacts without a matching public source tag.
 ## Consequences
 
 - Operators must push the one local annotated tag object to GitHub first and to
-  Gitea second, following `docs/RELEASE.md`.
+  Gitea second, following `docs/maintainers/release.md`.
 - GitHub unavailability blocks a release rather than weakening the identity
   check.
 - Gitea `main`, `v*` tags, and the trusted runner require one-time remote

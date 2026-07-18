@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-12
+- Amended by: [ADR-012](ADR-012-community-applications-image.md)
 
 ## Context
 

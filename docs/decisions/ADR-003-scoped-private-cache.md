@@ -1,8 +1,8 @@
 # ADR-003: Use an atomically scoped private cache
 
-- Status: Accepted; migration layout amended by
-  [ADR-009](ADR-009-side-by-side-cache-schemas.md)
+- Status: Accepted
 - Date: 2026-07-12
+- Amended by: [ADR-009](ADR-009-side-by-side-cache-schemas.md)
 
 ## Context
 

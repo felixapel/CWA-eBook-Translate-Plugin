@@ -40,8 +40,9 @@ npm run test:e2e
 ```
 
 Container or installer changes must also run the applicable smoke commands in
-`docs/RELEASE.md`. Live benchmark scripts require explicit authentication; see
-`docs/DEVELOPMENT.md`.
+the [release runbook](docs/maintainers/release.md). Live benchmark scripts
+require explicit authentication; see the
+[development guide](docs/maintainers/development.md).
 
 Dependency updates must change the relevant `requirements*.in` file, regenerate
 the committed hash lock with `scripts/compile-requirements.sh`, and include the

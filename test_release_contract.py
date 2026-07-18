@@ -295,33 +295,18 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertFalse(unreleased.strip())
 
     def test_v214_compose_upgrade_is_offline_external_and_reversible(self):
-        release = (ROOT / "docs" / "RELEASE.md").read_text()
-        unraid = (ROOT / "docs" / "DEPLOY_UNRAID.md").read_text()
+        lifecycle = (ROOT / "docs" / "operations" / "lifecycle.md").read_text()
         gitignore = (ROOT / ".gitignore").read_text()
 
-        self.assertLess(
-            release.index("docker stop book-translator"),
-            release.index("docker compose up -d --build"),
-        )
         for contract in (
-            'BT_BACKUP_DIR="$HOME/cwa-backups/pre-v2.2.0-app-data"',
-            'OLD_IMAGE_ID="$(docker inspect book-translator',
-            'type=bind,src=$OLD_DATA_DIR,dst=/source,readonly',
-            'cp -a /source/. /target/',
-            "docker compose create --no-deps book-translator-api",
-            'DATA_VOLUME="$(docker inspect "$API_CONTAINER"',
-            'type=volume,src=$DATA_VOLUME,dst=/target',
-            "Leave the stopped `book-translator` container in place",
-            "docker start book-translator",
+            "stops the only writer",
+            "checkpoints the SQLite WAL",
+            "external snapshot",
+            "./btctl rollback --env",
+            "Never point a fresh install at the live legacy directory",
         ):
-            self.assertIn(contract, release)
-        self.assertNotIn("install -d -m 0700 ./backups", release)
-        self.assertNotIn(
-            "/mnt/user/appdata/book-translator-api/backups", unraid
-        )
-        self.assertIn("/mnt/user/backups/cwa-translate/", unraid)
-        self.assertIn("PRAGMA wal_checkpoint(TRUNCATE)", unraid)
-        self.assertNotIn("mode=ro&immutable=1", unraid)
+            self.assertIn(contract, lifecycle)
+        self.assertRegex(lifecycle, r"validates\s+the copy")
         self.assertIn("backups/", gitignore.splitlines())
         self.assertIn("/config/translator/", gitignore.splitlines())
         self.assertIn("/data/", gitignore.splitlines())
@@ -385,7 +370,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "python3 test_translation.py",
             "python3 test_hardening.py",
             "test_btctl_auth test_btctl_lifecycle",
-            "test_singleflight test_auth test_ci_contract test_install_docs",
+            "test_singleflight test_auth test_ci_contract test_docs_contract",
             "test_release_contract",
             "npm ci",
             "npm audit --audit-level=high",
