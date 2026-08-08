@@ -16,7 +16,7 @@ map $http_upgrade $connection_upgrade {
 # Raw reader cookies are confined to the exact exchange endpoint below.
 map $http_cookie $bt_session_cookie {
     default "";
-    ~*(?:^|;[[:space:]]*)(${BT_SESSION_COOKIE_NAME}=[^;]{1,128})(?:;|$) $1;
+    "~*(?:^|;[[:space:]]*)(${BT_SESSION_COOKIE_NAME}=[^;]{1,128})(?:;|$)" $1;
 }
 
 server {
@@ -67,7 +67,7 @@ server {
         proxy_pass ${BT_API_UPSTREAM}/;
         proxy_ssl_server_name on;
         proxy_set_header Host ${BT_PUBLIC_HOST};
-        proxy_set_header Cookie $bt_session_cookie;
+        proxy_set_header Cookie ${BT_API_COOKIE_SOURCE};
         proxy_set_header Authorization "";
         # This injection proxy is not an identity authority. Always discard
         # client-supplied forwarded identity; forwarded auth deployments must

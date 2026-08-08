@@ -196,6 +196,7 @@ def _atomic_write(output_path: Path, content: str) -> None:
 
 
 def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> None:
+    browser_config = _validated_browser_config(env)
     reader_upstream = _validated_reader_upstream(env)
     api_upstream, _, _ = _validated_base_url(env, "BT_API_UPSTREAM")
     _, public_scheme, public_host = _validated_base_url(env, "BT_PUBLIC_ORIGIN")
@@ -215,6 +216,11 @@ def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> No
         "${BT_PUBLIC_SCHEME}": public_scheme,
         "${BT_PUBLIC_HOST}": public_host,
         "${BT_SESSION_COOKIE_NAME}": session_cookie_name,
+        "${BT_API_COOKIE_SOURCE}": {
+            "cwa_session": "$http_cookie",
+            "reader_session": "$bt_session_cookie",
+            "forwarded": '""',
+        }[browser_config["authMode"]],
         "${BT_CWA_MAX_BODY_SIZE}": _validated_size(
             env, "BT_CWA_MAX_BODY_SIZE"
         ),

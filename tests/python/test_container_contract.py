@@ -183,9 +183,21 @@ class ContainerContractTests(unittest.TestCase):
             "--cap-drop ALL",
             "--security-opt no-new-privileges:true",
             "docker image inspect \"$SMOKE_IMAGE\" --format '{{.Config.User}}'",
+            "BT_AUTH_MODE=reader_session",
+            "BT_READER_TYPE=kavita",
+            "BT_READER_VERSION=0.9.0.2",
+            "test_kavita_auth_fixture.py",
+            "/bt-api/session",
         ):
             self.assertIn(token, smoke)
         self.assertNotIn("gosu", smoke)
+
+    def test_kavita_container_fixture_is_literal_compilable_python(self):
+        fixture = ROOT / "tests" / "python" / "test_kavita_auth_fixture.py"
+        source = fixture.read_text(encoding="utf-8")
+        compile(source, str(fixture), "exec")
+        self.assertIn('"kavitaVersion": "0.9.0.2"', source)
+        self.assertIn('class="book-content"', source.replace('\\"', '"'))
 
     def test_ca_profile_certifies_the_combined_role_without_publishing_api(self):
         smoke_path = ROOT / "scripts" / "ca-container-smoke.sh"

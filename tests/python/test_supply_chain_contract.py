@@ -39,7 +39,7 @@ NODE_VERSION = "24.18.0"
 APK_PACKAGES = {
     "libgomp": "15.2.0-r5",
     "libxml2": "2.13.9-r2",
-    "nginx": "1.30.3-r0",
+    "nginx": "1.30.4-r1",
     "pcre2": "10.47-r1",
 }
 

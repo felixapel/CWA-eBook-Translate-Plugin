@@ -70,6 +70,8 @@ class ProxyConfigRendererTests(unittest.TestCase):
         self.assertIn("listen 8080;", rendered)
         self.assertIn("proxy_pass http://calibre-web:8083;", rendered)
         self.assertIn("proxy_pass http://book-translator-api:8390/;", rendered)
+        self.assertEqual(rendered.count("proxy_set_header Cookie $http_cookie;"), 2)
+        self.assertNotIn("proxy_set_header Cookie $bt_session_cookie;", rendered)
         self.assertIn('proxy_set_header Remote-User "";', rendered)
         self.assertNotIn("$http_x_forwarded_proto", rendered)
         self.assertNotRegex(rendered, r"\$\{(?:BT_|CWA_)")
@@ -94,12 +96,15 @@ class ProxyConfigRendererTests(unittest.TestCase):
             self.assertIn(f'proxy_set_header {header} "";', rendered)
 
     def test_forwarded_browser_contract_sends_cookie_only_to_identity_edge(self):
-        result, _, browser_output = self.render({
+        result, output, browser_output = self.render({
             "BT_BROWSER_AUTH_MODE": "forwarded",
             "BT_BROWSER_CREDENTIALS": "include",
         })
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rendered = output.read_text(encoding="utf-8")
+        self.assertEqual(rendered.count("proxy_set_header Cookie $http_cookie;"), 1)
+        self.assertIn('proxy_set_header Cookie "";', rendered)
         self.assertEqual(
             json.loads(browser_output.read_text()),
             {
