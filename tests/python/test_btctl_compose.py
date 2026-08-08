@@ -10,6 +10,7 @@ from btctl_core import (
     ConfigError,
     DeploymentPlan,
     InstallConfig,
+    InstallAttemptStore,
     OperationLock,
     ReleaseIdentity,
     StateStore,
@@ -417,6 +418,65 @@ class ComposeInstallTests(unittest.TestCase):
             self.assertNotIn("build_image", [call[0] for call in docker.calls])
             self.assertNotIn("compose_up", [call[0] for call in docker.calls])
             self.assertFalse((root / "state").exists())
+
+    def test_fresh_install_rejects_an_unknown_nonempty_state_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir(mode=0o700)
+            marker = state_dir / "belongs-to-another-tool"
+            marker.write_text("preserve", encoding="utf-8")
+            marker.chmod(0o600)
+            config = InstallConfig.from_mapping(values(root), self.identity)
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker()
+
+            with self.assertRaisesRegex(InstallError, "state directory.*not empty"):
+                ComposeInstaller(docker).install(config, plan, root)
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+            self.assertNotIn("build_image", [call[0] for call in docker.calls])
+
+    def test_install_journal_is_durable_before_the_first_docker_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(values(root), self.identity)
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker()
+            original_build = docker.build_image
+
+            def build_image(repository, image, labels):
+                journal = InstallAttemptStore(Path(config.state_dir)).load()
+                self.assertEqual(journal["status"], "prepared")
+                self.assertEqual(journal["config_fingerprint"], plan.config_fingerprint)
+                self.assertNotIn("LLM_API_KEY", json.dumps(journal))
+                original_build(repository, image, labels)
+
+            docker.build_image = build_image
+            ComposeInstaller(docker).install(config, plan, root)
+
+            self.assertFalse(InstallAttemptStore(Path(config.state_dir)).path.exists())
+
+    def test_cleanup_failure_is_reported_and_preserves_recovery_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(values(root), self.identity)
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_health=True)
+
+            def fail_cleanup(document, project):
+                docker.calls.append(("compose_down", str(document), project))
+                raise InstallError("compose cleanup failed")
+
+            docker.compose_down = fail_cleanup
+            with self.assertRaisesRegex(
+                InstallError, "health check failed.*cleanup.*compose cleanup failed"
+            ):
+                ComposeInstaller(docker).install(config, plan, root)
+
+            journal = InstallAttemptStore(Path(config.state_dir)).load()
+            self.assertEqual(journal["status"], "cleanup-failed")
+            self.assertEqual(journal["cleanup_errors"], ["compose: compose cleanup failed"])
 
     def test_preflight_rejects_cwa_version_without_exact_runtime_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

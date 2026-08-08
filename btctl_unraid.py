@@ -21,7 +21,9 @@ from btctl_compose import (
     _container_networks,
     _completed_uninstall_for_reinstall,
     _has_exact_cwa_version,
+    _install_attempt_payload,
     _labels,
+    _bounded_error,
     _probe_runtime_dependencies,
     _validate_data_destination,
     _verify_identity_edge_artifact,
@@ -32,6 +34,7 @@ from btctl_core import (
     ConfigError,
     DeploymentPlan,
     DeploymentState,
+    InstallAttemptStore,
     InstallConfig,
     OperationLock,
     StateStore,
@@ -278,6 +281,16 @@ class UnraidInstaller:
             Path(config.data_dir),
             allow_nonempty=allow_existing_data or previous_state is not None,
         )
+        try:
+            StateStore(Path(config.state_dir))._validate_destination()
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            if attempt_store.path.exists():
+                attempt_store.load()
+                raise InstallError(
+                    "unfinished install attempt exists; inspect recovery evidence"
+                )
+        except ConfigError as exc:
+            raise InstallError(f"state directory is unsafe: {exc}") from exc
         return previous_state
 
     def install(
@@ -306,46 +319,75 @@ class UnraidInstaller:
             allow_existing_data=_allow_existing_data,
             allow_rolled_back_state=_allow_rolled_back_state,
         )
-        image_labels = {
-            "io.cwa-translate.version": config.identity.version,
-            "io.cwa-translate.revision": config.identity.sha,
-            "io.cwa-translate.source": "local-checkout",
-        }
-        self.docker.build_image(Path(repository), config.image, image_labels)
-        verifier = ComposeInstaller(self.docker)
-        image_id = verifier._verify_image(config, self.docker.inspect_image(config.image))
-        self.prepare_data(Path(config.data_dir))
-
+        install_id = str(uuid.uuid4())
         state_dir = Path(config.state_dir)
+        attempt_store = InstallAttemptStore(state_dir)
+        attempt = _install_attempt_payload(plan, install_id)
+        try:
+            attempt_store.save(attempt)
+        except ConfigError as exc:
+            raise InstallError("install attempt could not be committed") from exc
         api_env = state_dir / "api.env"
         proxy_env = state_dir / "proxy.env"
-        _write_private(api_env, _environment_text({**config.api_environment(), "BT_ROLE": "api"}))
-        _write_private(
-            proxy_env,
-            _environment_text(
-                {
-                    **config.proxy_environment(),
-                    "BT_ROLE": "proxy",
-                    "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
-                }
-            ),
-        )
-        templates = render_templates(config, plan)
-        for role, source in templates.items():
-            _write_private(state_dir / f"{role}.template.xml", source)
-        if config.auth_profile == "authentik-forwarded":
-            artifact = render_authentik_edge(config, plan)
-            artifact_path = Path(str(plan.resources["identity_edge_config"]["path"]))
-            if artifact_path.name != artifact.filename:
-                raise InstallError("identity-edge artifact name does not match the plan")
-            _write_private(artifact_path, artifact.content)
+        try:
+            image_labels = {
+                "io.cwa-translate.version": config.identity.version,
+                "io.cwa-translate.revision": config.identity.sha,
+                "io.cwa-translate.source": "local-checkout",
+            }
+            self.docker.build_image(Path(repository), config.image, image_labels)
+            verifier = ComposeInstaller(self.docker)
+            image_id = verifier._verify_image(
+                config, self.docker.inspect_image(config.image)
+            )
+            self.prepare_data(Path(config.data_dir))
 
-        install_id = str(uuid.uuid4())
+            _write_private(
+                api_env,
+                _environment_text(
+                    {**config.api_environment(), "BT_ROLE": "api"}
+                ),
+            )
+            _write_private(
+                proxy_env,
+                _environment_text(
+                    {
+                        **config.proxy_environment(),
+                        "BT_ROLE": "proxy",
+                        "BT_API_UPSTREAM": (
+                            f"http://{plan.resources['api']['name']}:8390"
+                        ),
+                    }
+                ),
+            )
+            templates = render_templates(config, plan)
+            for role, source in templates.items():
+                _write_private(state_dir / f"{role}.template.xml", source)
+            if config.auth_profile == "authentik-forwarded":
+                artifact = render_authentik_edge(config, plan)
+                artifact_path = Path(
+                    str(plan.resources["identity_edge_config"]["path"])
+                )
+                if artifact_path.name != artifact.filename:
+                    raise InstallError(
+                        "identity-edge artifact name does not match the plan"
+                    )
+                _write_private(artifact_path, artifact.content)
+        except BaseException:
+            try:
+                attempt_store.remove()
+            except BaseException:
+                pass
+            raise
+
         private_name = str(plan.resources["private_network"]["name"])
         network_attempted = False
         attempted_roles: list[tuple[str, str]] = []
         copied_templates: list[Path] = []
+        state_committed = False
         try:
+            attempt["status"] = "starting"
+            attempt_store.save(attempt)
             network_attempted = True
             self.docker.create_network(
                 private_name,
@@ -425,13 +467,23 @@ class UnraidInstaller:
             if previous_state is not None:
                 state_store.archive(previous_state)
             state_store.save(state)
+            state_committed = True
+            attempt_store.remove()
             return state
-        except BaseException:
+        except BaseException as exc:
+            if state_committed:
+                raise InstallError(
+                    "runtime state committed but install-attempt cleanup failed; "
+                    "run doctor before further lifecycle operations"
+                ) from exc
+            cleanup_errors: list[str] = []
             for target in reversed(copied_templates):
                 try:
                     target.unlink()
-                except OSError:
-                    pass
+                except OSError as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error(f"template {target.name}", cleanup_exc)
+                    )
             for role, name in reversed(attempted_roles):
                 try:
                     container = self.docker.inspect_container(name)
@@ -447,16 +499,43 @@ class UnraidInstaller:
                         and all(labels.get(key) == value for key, value in expected.items())
                     ):
                         self.docker.remove_container(name)
-                except BaseException:
-                    pass
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error(f"{role} container", cleanup_exc)
+                    )
             if network_attempted:
                 try:
                     network = self.docker.inspect_network(private_name)
                     if network is not None:
                         _verify_private_network(config, install_id, network)
                         self.docker.remove_network(private_name)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error("private network", cleanup_exc)
+                    )
+            if cleanup_errors:
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
+                except BaseException as journal_exc:
+                    cleanup_errors.append(_bounded_error("journal", journal_exc))
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
+            try:
+                attempt_store.remove()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(_bounded_error("journal", cleanup_exc))
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
                 except BaseException:
                     pass
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
             raise
 
 

@@ -658,6 +658,27 @@ class PlanAndStateTests(unittest.TestCase):
                     )
                 )
 
+    def test_state_save_refuses_to_take_over_an_existing_mutable_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "state"
+            root.mkdir(mode=0o755)
+            marker = root / "belongs-to-another-tool"
+            marker.write_text("preserve", encoding="utf-8")
+            store = StateStore(root)
+            state = DeploymentState.new(
+                install_id="01234567-89ab-4cde-8123-0123456789ab",
+                plan=DeploymentPlan.from_config(
+                    InstallConfig.from_mapping(self.values, self.identity)
+                ),
+            )
+
+            with self.assertRaisesRegex(ConfigError, "owned.*mode 0700"):
+                store.save(state)
+
+            self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+            self.assertFalse(store.path.exists())
+
     def test_state_load_rejects_mutable_or_linked_ownership_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -17,6 +17,7 @@ from btctl_core import (
     ConfigError,
     DeploymentPlan,
     DeploymentState,
+    InstallAttemptStore,
     InstallConfig,
     OperationLock,
     StateStore,
@@ -97,6 +98,31 @@ def _validate_data_destination(path: Path, *, allow_nonempty: bool) -> None:
             "BT_DATA_DIR must be empty for a fresh install; existing data requires "
             "exact managed uninstall or migration evidence"
         )
+
+
+def _install_attempt_payload(
+    plan: DeploymentPlan,
+    install_id: str,
+    *,
+    status: str = "prepared",
+    cleanup_errors: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "install_id": install_id,
+        "status": status,
+        "version": plan.version,
+        "revision": plan.revision,
+        "image": plan.image,
+        "config_fingerprint": plan.config_fingerprint,
+        "install_profile": plan.install_profile,
+        "resources": copy.deepcopy(plan.resources),
+        "cleanup_errors": list(cleanup_errors or []),
+    }
+
+
+def _bounded_error(label: str, error: BaseException) -> str:
+    detail = " ".join(str(error).split()) or error.__class__.__name__
+    return f"{label}: {detail}"[:512]
 
 
 def _probe_runtime_dependencies(
@@ -522,6 +548,17 @@ class ComposeInstaller:
             Path(config.data_dir),
             allow_nonempty=allow_existing_data or previous_state is not None,
         )
+        state_store = StateStore(Path(config.state_dir))
+        try:
+            state_store._validate_destination()
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            if attempt_store.path.exists():
+                attempt_store.load()
+                raise InstallError(
+                    "unfinished install attempt exists; inspect recovery evidence"
+                )
+        except ConfigError as exc:
+            raise InstallError(f"state directory is unsafe: {exc}") from exc
         return previous_state
 
     def _verify_image(self, config: InstallConfig, image: dict | None) -> str:
@@ -622,40 +659,59 @@ class ComposeInstaller:
             allow_existing_data=_allow_existing_data,
             allow_rolled_back_state=_allow_rolled_back_state,
         )
-        image_labels = {
-            "io.cwa-translate.version": config.identity.version,
-            "io.cwa-translate.revision": config.identity.sha,
-            "io.cwa-translate.source": "local-checkout",
-        }
-        self.docker.build_image(Path(repository), config.image, image_labels)
-        image_id = self._verify_image(config, self.docker.inspect_image(config.image))
-
-        data_dir = Path(config.data_dir)
-        try:
-            ensure_directory_durable(data_dir, enforce_existing_mode=False)
-        except ConfigError as exc:
-            raise InstallError("BT_DATA_DIR could not be created durably") from exc
-        self.docker.prepare_data_directory(config.image, data_dir)
-        try:
-            _fsync_directory(data_dir)
-            _fsync_directory(data_dir.parent)
-        except ConfigError as exc:
-            raise InstallError("BT_DATA_DIR metadata could not be made durable") from exc
-
         install_id = str(uuid.uuid4())
-        document_path = Path(config.state_dir) / "deployment.compose.json"
-        _write_private_json(document_path, render_compose(config, plan, install_id))
-        if config.auth_profile == "authentik-forwarded":
-            artifact = render_authentik_edge(config, plan)
-            artifact_path = Path(str(plan.resources["identity_edge_config"]["path"]))
-            if artifact_path.name != artifact.filename:
-                raise InstallError("identity-edge artifact name does not match the plan")
-            _write_private_text(artifact_path, artifact.content)
-        start_attempted = False
+        attempt_store = InstallAttemptStore(Path(config.state_dir))
+        attempt = _install_attempt_payload(plan, install_id)
         try:
+            attempt_store.save(attempt)
+        except ConfigError as exc:
+            raise InstallError("install attempt could not be committed") from exc
+        document_path = Path(config.state_dir) / "deployment.compose.json"
+        start_attempted = False
+        state_committed = False
+        try:
+            image_labels = {
+                "io.cwa-translate.version": config.identity.version,
+                "io.cwa-translate.revision": config.identity.sha,
+                "io.cwa-translate.source": "local-checkout",
+            }
+            self.docker.build_image(Path(repository), config.image, image_labels)
+            image_id = self._verify_image(
+                config, self.docker.inspect_image(config.image)
+            )
+
+            data_dir = Path(config.data_dir)
+            try:
+                ensure_directory_durable(data_dir, enforce_existing_mode=False)
+            except ConfigError as exc:
+                raise InstallError("BT_DATA_DIR could not be created durably") from exc
+            self.docker.prepare_data_directory(config.image, data_dir)
+            try:
+                _fsync_directory(data_dir)
+                _fsync_directory(data_dir.parent)
+            except ConfigError as exc:
+                raise InstallError(
+                    "BT_DATA_DIR metadata could not be made durable"
+                ) from exc
+
+            _write_private_json(
+                document_path, render_compose(config, plan, install_id)
+            )
+            if config.auth_profile == "authentik-forwarded":
+                artifact = render_authentik_edge(config, plan)
+                artifact_path = Path(
+                    str(plan.resources["identity_edge_config"]["path"])
+                )
+                if artifact_path.name != artifact.filename:
+                    raise InstallError(
+                        "identity-edge artifact name does not match the plan"
+                    )
+                _write_private_text(artifact_path, artifact.content)
             self.docker.compose_validate(document_path, config.install_name)
             # `compose up` may create only a subset of the declared resources
             # before returning non-zero. Arm scoped cleanup before invoking it.
+            attempt["status"] = "starting"
+            attempt_store.save(attempt)
             start_attempted = True
             self.docker.compose_up(document_path, config.install_name)
             names = [str(plan.resources[role]["name"]) for role in ("api", "proxy")]
@@ -682,10 +738,44 @@ class ComposeInstaller:
             if previous_state is not None:
                 state_store.archive(previous_state)
             state_store.save(state)
+            state_committed = True
+            attempt_store.remove()
             return state
-        except BaseException:
+        except BaseException as exc:
+            if state_committed:
+                raise InstallError(
+                    "runtime state committed but install-attempt cleanup failed; "
+                    "run doctor before further lifecycle operations"
+                ) from exc
+            cleanup_errors: list[str] = []
             if start_attempted:
-                self.docker.compose_down(document_path, config.install_name)
+                try:
+                    self.docker.compose_down(document_path, config.install_name)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(_bounded_error("compose", cleanup_exc))
+            if cleanup_errors:
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
+                except BaseException as journal_exc:
+                    cleanup_errors.append(_bounded_error("journal", journal_exc))
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
+            try:
+                attempt_store.remove()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(_bounded_error("journal", cleanup_exc))
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
+                except BaseException:
+                    pass
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
             raise
 
 

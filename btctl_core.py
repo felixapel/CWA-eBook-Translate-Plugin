@@ -55,6 +55,7 @@ _LLM_PROVIDERS = frozenset(
     }
 )
 STATE_SCHEMA_VERSION = 1
+INSTALL_ATTEMPT_SCHEMA_VERSION = 1
 
 _MANAGED_PROXY_HEADERS = frozenset(
     {
@@ -1034,6 +1035,75 @@ class StateStore:
             raise ConfigError("state destination must not be a symbolic link")
         if self.state_dir.exists() and not self.state_dir.is_dir():
             raise ConfigError("state destination must be a directory")
+        if not self.state_dir.exists():
+            return
+        try:
+            directory_metadata = self.state_dir.lstat()
+        except OSError as exc:
+            raise ConfigError("state destination could not be inspected") from exc
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            raise ConfigError(
+                "state destination must be owned by the current user with mode 0700"
+            )
+        if self.path.exists():
+            try:
+                state_metadata = self.path.lstat()
+            except OSError as exc:
+                raise ConfigError("state destination could not be inspected") from exc
+            if (
+                not stat.S_ISREG(state_metadata.st_mode)
+                or state_metadata.st_nlink != 1
+                or state_metadata.st_uid != directory_metadata.st_uid
+                or stat.S_IMODE(state_metadata.st_mode) != 0o600
+            ):
+                raise ConfigError(
+                    "deployment state must be one private regular file owned by "
+                    "the current user with mode 0600"
+                )
+            return
+
+        allowed_files = {
+            "api.env",
+            "api.template.xml",
+            "authentik-edge.caddy",
+            "authentik-edge.nginx.conf",
+            "authentik-edge.traefik.yml",
+            "deployment.compose.json",
+            "install-attempt.json",
+            "migration-v214.json",
+            "proxy.env",
+            "proxy.template.xml",
+        }
+        try:
+            entries = list(self.state_dir.iterdir())
+        except OSError as exc:
+            raise ConfigError("state destination could not be inspected") from exc
+        for entry in entries:
+            if entry.name == "history":
+                metadata = entry.lstat()
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != directory_metadata.st_uid
+                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                ):
+                    raise ConfigError("state history must be a private owned directory")
+                continue
+            if entry.name not in allowed_files:
+                raise ConfigError(
+                    "state directory is not empty and contains unknown entries"
+                )
+            metadata = entry.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != directory_metadata.st_uid
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ConfigError("managed state artifact must be a private owned file")
 
     def save(self, state: DeploymentState) -> None:
         self._validate_destination()
@@ -1056,6 +1126,8 @@ class StateStore:
             except FileNotFoundError:
                 pass
             raise
+        if self.load() != state:
+            raise ConfigError("deployment state readback did not match the committed state")
 
     def load(self) -> DeploymentState:
         try:
@@ -1131,6 +1203,126 @@ class StateStore:
             except FileNotFoundError:
                 pass
         return target
+
+
+class InstallAttemptStore:
+    """Durable, non-secret evidence for one not-yet-committed install."""
+
+    _STATUSES = frozenset({"prepared", "starting", "cleanup-failed"})
+    _EXPECTED_FIELDS = frozenset(
+        {
+            "schema_version",
+            "install_id",
+            "status",
+            "version",
+            "revision",
+            "image",
+            "config_fingerprint",
+            "install_profile",
+            "resources",
+            "cleanup_errors",
+        }
+    )
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        self.path = self.state_dir / "install-attempt.json"
+
+    @classmethod
+    def _validate(cls, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict) or set(payload) != cls._EXPECTED_FIELDS:
+            raise ConfigError("install attempt fields do not match the supported schema")
+        if payload.get("schema_version") != INSTALL_ATTEMPT_SCHEMA_VERSION:
+            raise ConfigError("unsupported install attempt schema version")
+        try:
+            install_id = str(uuid.UUID(str(payload.get("install_id", ""))))
+        except (ValueError, AttributeError) as exc:
+            raise ConfigError("install attempt contains an invalid install_id") from exc
+        if install_id != payload.get("install_id") or not _INSTALL_ID_RE.fullmatch(
+            install_id
+        ):
+            raise ConfigError("install attempt contains an invalid install_id")
+        if payload.get("status") not in cls._STATUSES:
+            raise ConfigError("install attempt contains an invalid status")
+        if payload.get("install_profile") not in _INSTALL_PROFILES:
+            raise ConfigError("install attempt contains an invalid install profile")
+        if not isinstance(payload.get("version"), str) or not _SEMVER_RE.fullmatch(
+            str(payload["version"])
+        ):
+            raise ConfigError("install attempt contains an invalid version")
+        if not isinstance(payload.get("revision"), str) or not _SHA_RE.fullmatch(
+            str(payload["revision"])
+        ):
+            raise ConfigError("install attempt contains an invalid revision")
+        if not isinstance(payload.get("image"), str) or not payload["image"]:
+            raise ConfigError("install attempt contains an invalid image")
+        fingerprint = payload.get("config_fingerprint")
+        if not isinstance(fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", fingerprint
+        ):
+            raise ConfigError("install attempt contains an invalid fingerprint")
+        if not isinstance(payload.get("resources"), dict):
+            raise ConfigError("install attempt resources must be an object")
+        cleanup_errors = payload.get("cleanup_errors")
+        if (
+            not isinstance(cleanup_errors, list)
+            or len(cleanup_errors) > 32
+            or any(
+                not isinstance(error, str)
+                or not error
+                or len(error) > 512
+                or any(character in error for character in "\r\n\0")
+                for error in cleanup_errors
+            )
+        ):
+            raise ConfigError("install attempt cleanup errors are invalid")
+        return dict(payload)
+
+    def save(self, payload: Mapping[str, object]) -> None:
+        document = dict(payload)
+        document["schema_version"] = INSTALL_ATTEMPT_SCHEMA_VERSION
+        validated = self._validate(document)
+        StateStore(self.state_dir)._validate_destination()
+        ensure_directory_durable(self.state_dir)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".install-attempt.json.", dir=self.state_dir
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(validated, handle, sort_keys=True, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary_name, 0o600)
+            os.replace(temporary_name, self.path)
+            _fsync_directory(self.state_dir)
+        except BaseException:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+        if self.load() != validated:
+            raise ConfigError("install attempt readback did not match committed evidence")
+
+    def load(self) -> dict[str, object]:
+        try:
+            payload = json.loads(
+                read_private_text(
+                    self.state_dir, self.path.name, label="install attempt"
+                )
+            )
+        except json.JSONDecodeError as exc:
+            raise ConfigError("install attempt is not valid JSON") from exc
+        return self._validate(payload)
+
+    def remove(self) -> None:
+        self.load()
+        try:
+            self.path.unlink()
+            _fsync_directory(self.state_dir)
+        except OSError as exc:
+            raise ConfigError("install attempt could not be removed durably") from exc
 
 
 def redact_mapping(values: Mapping[str, str]) -> dict[str, str]:

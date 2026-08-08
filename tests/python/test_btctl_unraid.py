@@ -6,7 +6,13 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
 
-from btctl_core import DeploymentPlan, InstallConfig, ReleaseIdentity, StateStore
+from btctl_core import (
+    DeploymentPlan,
+    InstallAttemptStore,
+    InstallConfig,
+    ReleaseIdentity,
+    StateStore,
+)
 from btctl_lifecycle import RuntimeUninstaller
 from btctl_docker import DockerCLI, DockerCommandError
 from btctl_unraid import (
@@ -622,6 +628,33 @@ class UnraidInstallTests(unittest.TestCase):
 
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
             self.assertNotIn("build_image", [call[0] for call in docker.calls])
+
+    def test_cleanup_errors_are_aggregated_and_leave_recovery_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(values(root), self.identity)
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_proxy_health=True)
+            original_remove = docker.remove_container
+
+            def remove_container(name):
+                if name.endswith("-proxy"):
+                    raise InstallError("proxy removal failed")
+                original_remove(name)
+
+            docker.remove_container = remove_container
+            with self.assertRaisesRegex(
+                InstallError, "proxy health failed.*cleanup.*proxy removal failed"
+            ):
+                UnraidInstaller(
+                    docker, prepare_data=lambda path: path.mkdir()
+                ).install(config, plan, root)
+
+            journal = InstallAttemptStore(Path(config.state_dir)).load()
+            self.assertEqual(journal["status"], "cleanup-failed")
+            self.assertTrue(
+                any("proxy" in error for error in journal["cleanup_errors"])
+            )
 
 
 class UnraidAdoptTests(unittest.TestCase):
