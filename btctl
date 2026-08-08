@@ -217,7 +217,7 @@ if [ -n "$env_file" ]; then
     [ "$(stat -c '%u:%a:%h' -- "$environment_snapshot")" = "0:600:1" ] \
         || fail 1 "environment snapshot is not root-owned mode 0600"
     read -r environment_sha256 _ < <(
-        sha256sum --binary -- "$environment_snapshot"
+        sha256sum -- "$environment_snapshot"
     ) || fail 1 "environment snapshot could not be hashed"
     [[ "$environment_sha256" =~ ^[0-9a-f]{64}$ ]] \
         || fail 1 "environment snapshot digest is invalid"
@@ -508,7 +508,7 @@ esac
 [ "$(stat -c '%u:%a:%h' -- "$environment_snapshot")" = "0:600:1" ] \
     || fail 1 "environment snapshot metadata changed after planning"
 read -r final_environment_sha256 _ < <(
-    sha256sum --binary -- "$environment_snapshot"
+    sha256sum -- "$environment_snapshot"
 ) || fail 1 "environment snapshot could not be revalidated"
 [ "$final_environment_sha256" = "$environment_sha256" ] \
     || fail 1 "environment snapshot changed after planning"

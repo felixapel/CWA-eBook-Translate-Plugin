@@ -62,7 +62,6 @@ class ShellContractTests(unittest.TestCase):
             "/run/cwa-translate-btctl-locks",
             '[ "$second" = "$HOST_LOCK_DIRECTORY" ]',
             'environment_snapshot="$temporary/install.env.snapshot"',
-            'sha256sum --binary -- "$environment_snapshot"',
             'cmp --silent -- "$temporary/mount-plan" "$temporary/final-mount-plan"',
             'final_operator_arguments+=(--env "$environment_snapshot")',
         ):
@@ -75,6 +74,11 @@ class ShellContractTests(unittest.TestCase):
         )
         self.assertIn('cp -P -- \\\n            "$env_file" "$environment_snapshot"', source)
         self.assertNotIn("--no-preserve=all", source)
+        self.assertEqual(
+            source.count('sha256sum -- "$environment_snapshot"'),
+            2,
+        )
+        self.assertNotIn("sha256sum --binary", source)
         self.assertIn('chown 0:0 -- "$environment_snapshot"', source)
         self.assertIn('chmod 0600 -- "$environment_snapshot"', source)
 
