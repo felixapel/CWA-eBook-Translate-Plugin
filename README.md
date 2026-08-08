@@ -11,7 +11,7 @@ reader without modifying the CWA image.
 - Shows original and translated text together, or either one by itself.
 - Offers 100+ source and target language choices. Translation quality depends
   on the selected model and language pair.
-- Prioritizes visible paragraphs, then prefetches the rest of the chapter.
+- Prioritizes visible paragraphs; whole-chapter prefetch is an explicit opt-in.
 - Supports local OpenAI-compatible servers and optional cloud providers.
 - Keeps provider credentials server-side and requires explicit consent before
   a configured local provider falls back to a cloud provider.

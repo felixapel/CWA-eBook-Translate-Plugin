@@ -337,13 +337,20 @@ async function runTest() {
     // Regression guard: "Translated" mode used to store only PLAIN TEXT of the
     // original and restore via textContent, permanently stripping the
     // paragraph's markup (italics/bold/links) when toggling back. The fix
-    // keeps the original innerHTML in a WeakMap and restores from it.
+    // keeps cloned DOM nodes in a WeakMap and restores them without reparsing
+    // serialized EPUB markup through innerHTML.
     assert(
-        /const originalHtml = new WeakMap\(\)/.test(code)
+        /const originalContent = new WeakMap\(\)/.test(code)
             && /function restoreOriginal\(el\)/.test(code)
-            && /originalHtml\.set\(el,\s*clone\.innerHTML\)/.test(code)
-            && /el\.innerHTML = html/.test(code),
-        'Inline mode must preserve and restore the original markup (regression: italics/links lost)'
+            && /originalContent\.set\(el,\s*fragment\)/.test(code)
+            && /el\.replaceChildren\(/.test(code)
+            && !/el\.innerHTML\s*=/.test(code),
+        'Inline mode must restore cloned markup without an innerHTML parser sink'
+    );
+
+    assert(
+        /let prefetchEnabled = localStorage\.getItem\(['"]bt_prefetch['"]\) === ['"]1['"]/.test(code),
+        'Whole-chapter prefetch must be explicit opt-in, not the default'
     );
 
     // Regression guard: ambiguous timeouts/network failures must never spawn a

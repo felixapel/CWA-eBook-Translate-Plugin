@@ -125,7 +125,10 @@ class CacheV2Tests(unittest.TestCase):
         self.assertIsNone(
             self.store.get("hello", "English", "Spanish", scope())
         )
-        self.assertEqual(self.store.stats()["total_entries"], 0)
+        remaining = self.store.connection().execute(
+            "SELECT COUNT(*) FROM translations_v2"
+        ).fetchone()[0]
+        self.assertEqual(remaining, 0)
 
     def test_hard_cap_is_never_exceeded(self) -> None:
         for index in range(6):

@@ -332,6 +332,9 @@ def _deadline_provider_post(
     """Start one HTTP operation with inactivity and absolute time bounds."""
     budget.ensure_active()
     session = requests.Session()
+    # Provider credentials and book text must never be redirected to another
+    # authority or routed through ambient host proxy configuration.
+    session.trust_env = False
     adapter = _DeadlineHTTPAdapter()
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -344,6 +347,7 @@ def _deadline_provider_post(
             json=json,
             timeout=timeout,
             stream=stream,
+            allow_redirects=False,
         )
         response._bt_deadline_session = session
         return response

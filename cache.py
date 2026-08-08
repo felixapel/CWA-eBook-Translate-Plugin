@@ -411,12 +411,26 @@ class CacheStore:
         record_hit: bool = True,
     ) -> str | None:
         cache_key = self.compute_key(text, source_lang, target_lang, cache_scope)
-        row = self.connection().execute(
-            """SELECT translated_text FROM translations_v2
-               WHERE cache_key = ? AND created_at >= ?""",
-            (cache_key, self._cutoff()),
+        conn = self.connection()
+        cutoff = self._cutoff()
+        row = conn.execute(
+            """SELECT translated_text, created_at FROM translations_v2
+               WHERE cache_key = ?""",
+            (cache_key,),
         ).fetchone()
         if row is None:
+            return None
+        if row[1] < cutoff:
+            try:
+                conn.execute(
+                    """DELETE FROM translations_v2
+                       WHERE cache_key = ? AND created_at = ?""",
+                    (cache_key, row[1]),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
             return None
         if record_hit:
             self._queue_hit(cache_key)

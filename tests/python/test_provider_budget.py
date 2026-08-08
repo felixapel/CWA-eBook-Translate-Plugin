@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ["LLM_PROVIDER"] = "local"
 os.environ["LLM_MODEL"] = "fake-model"
@@ -81,6 +82,40 @@ class ProviderBudgetTests(unittest.TestCase):
     def test_default_global_upstream_limit_is_not_unbounded(self):
         self.assertGreater(translator.BT_MAX_UPSTREAM_INFLIGHT, 0)
         self.assertIsNotNone(translator._UPSTREAM_SEM)
+
+    def test_provider_transport_ignores_proxy_environment_and_redirects(self):
+        class Response:
+            pass
+
+        class Session:
+            def __init__(self):
+                self.trust_env = True
+                self.calls = []
+
+            def mount(self, *_args):
+                return None
+
+            def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return Response()
+
+            def close(self):
+                return None
+
+        session = Session()
+        with mock.patch.object(translator.requests, "Session", return_value=session):
+            response = translator._deadline_provider_post(
+                "https://provider.example.test/v1/chat/completions",
+                headers={"Authorization": "Bearer test"},
+                json={"messages": []},
+                timeout=1,
+                stream=True,
+                budget=self.budget(max_attempts=1),
+            )
+
+        self.assertIs(response._bt_deadline_session, session)
+        self.assertFalse(session.trust_env)
+        self.assertFalse(session.calls[0][1]["allow_redirects"])
 
     def test_remote_fallback_requires_explicit_consent(self):
         calls = {"primary": 0, "fallback": 0}

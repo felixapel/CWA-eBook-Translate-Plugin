@@ -60,7 +60,7 @@
     let pendingFirstVisibleHash = null; // 2-poll debounce for the page-turn detector
 
     // UI / status state
-    let prefetchEnabled = localStorage.getItem('bt_prefetch') !== '0'; // translate whole chapter ahead
+    let prefetchEnabled = localStorage.getItem('bt_prefetch') === '1'; // explicit whole-chapter opt-in
     // Privacy decision scoped to this reader tab/book. Never restore it from
     // browser storage: every new book session starts with remote fallback off.
     let allowCloudFallback = false;
@@ -1187,18 +1187,18 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     // ── Rendering ──────────────────────────────────────────────────────
-    // Original inner HTML of inline-replaced elements. dataset.originalText
+    // Cloned original children of inline-replaced elements. dataset.originalText
     // (plain text) remains the marker + hash source, but restoring from it
-    // would permanently strip the paragraph's markup (italics, bold, links…) —
-    // so the real markup is kept here and used for restoration.
-    const originalHtml = new WeakMap();
+    // would permanently strip markup. Keeping nodes avoids reparsing EPUB
+    // markup through an innerHTML sink during restoration.
+    const originalContent = new WeakMap();
 
     function restoreOriginal(el) {
         if (el.dataset.originalText === undefined) return;
-        const html = originalHtml.get(el);
-        if (html !== undefined) el.innerHTML = html;
+        const fragment = originalContent.get(el);
+        if (fragment !== undefined) el.replaceChildren(fragment);
         else el.textContent = el.dataset.originalText; // fallback (pre-fix entries)
-        originalHtml.delete(el);
+        originalContent.delete(el);
         delete el.dataset.originalText;
     }
 
@@ -1238,12 +1238,14 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
 
             // Store the CLEAN original so toggling back restores correctly even
             // after bilingual rendering: plain text in dataset (marker + hash
-            // source) and the real markup in the WeakMap (see restoreOriginal).
+            // source) and cloned markup nodes in the WeakMap (see restoreOriginal).
             if (!el.dataset.originalText) {
                 el.dataset.originalText = text;
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll('.bt-translation, .bt-loading').forEach(n => n.remove());
-                originalHtml.set(el, clone.innerHTML);
+                const fragment = el.ownerDocument.createDocumentFragment();
+                while (clone.firstChild) fragment.appendChild(clone.firstChild);
+                originalContent.set(el, fragment);
             }
             // Remove any bilingual/loading spans before replacing the text.
             el.querySelectorAll('.bt-translation, .bt-loading').forEach(n => n.remove());

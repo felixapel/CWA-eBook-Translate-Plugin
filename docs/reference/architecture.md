@@ -74,7 +74,9 @@ cannot detach an active API container from its bind source.
 
 ### Frontend (`translator.js`)
 - **Lifecycle Observers**: Hooks into CWA reader using iframe document checking and `epub.js` rendition hooks (`relocated`, `rendered`).
-- **Translation Management**: Coordinates visible-first translation chunking and background sequential prefetching.
+- **Translation Management**: Coordinates visible-first translation chunking;
+  background sequential whole-chapter prefetch is disabled until the reader
+  explicitly enables it.
 - **Client Cache**: Keeps context-scoped translations in memory. Durable
   `localStorage` is an explicit opt-in for trusted single-user browsers; keys
   include release, languages, book, chapter, and stable DOM position so
