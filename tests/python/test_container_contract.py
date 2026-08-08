@@ -38,6 +38,14 @@ class ContainerContractTests(unittest.TestCase):
         self.assertNotIn("USER appuser", dockerfile)
         self.assertNotIn("docker-entrypoint.sh", dockerfile)
 
+    def test_bootstrap_smoke_shares_only_its_private_tmpdir_with_sibling_docker(self):
+        smoke = (ROOT / "scripts" / "btctl-bootstrap-smoke.sh").read_text()
+        self.assertIn(
+            '--mount "type=bind,src=$TEMPORARY,dst=$TEMPORARY"',
+            smoke,
+        )
+        self.assertIn('--env "TMPDIR=$TEMPORARY"', smoke)
+
     def test_entrypoint_never_changes_ownership_or_escalates(self):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
         for forbidden in ("gosu", "chown", "appuser gunicorn"):
