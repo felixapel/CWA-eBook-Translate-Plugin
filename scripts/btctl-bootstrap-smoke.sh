@@ -275,6 +275,7 @@ run_without_host_tooling() {
     docker run --rm --user 0:0 --network none \
         --read-only --pids-limit 128 --cap-drop ALL \
         --cap-add DAC_READ_SEARCH \
+        --cap-add DAC_OVERRIDE \
         --security-opt no-new-privileges:true \
         --env HOME=/tmp/home \
         --env DOCKER_CONFIG=/tmp/docker \

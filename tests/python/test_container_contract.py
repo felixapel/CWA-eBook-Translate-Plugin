@@ -45,6 +45,11 @@ class ContainerContractTests(unittest.TestCase):
             smoke,
         )
         self.assertIn('--env "TMPDIR=$TEMPORARY"', smoke)
+        dispatcher = smoke.split("run_without_host_tooling() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertIn("--cap-add DAC_READ_SEARCH", dispatcher)
+        self.assertIn("--cap-add DAC_OVERRIDE", dispatcher)
 
     def test_entrypoint_never_changes_ownership_or_escalates(self):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
