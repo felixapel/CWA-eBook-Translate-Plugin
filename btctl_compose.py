@@ -125,6 +125,35 @@ def _bounded_error(label: str, error: BaseException) -> str:
     return f"{label}: {detail}"[:512]
 
 
+def _managed_credential_present(path: Path) -> bool:
+    """Check one exact credential path without following a final symlink."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise InstallError("reader session credential could not be inspected") from exc
+    return True
+
+
+def _remove_new_session_key(
+    docker: "ComposeDocker",
+    config: InstallConfig,
+    *,
+    preexisting: bool,
+) -> None:
+    """Remove only a key created by this uncommitted install attempt."""
+    if not config.uses_reader_session or preexisting:
+        return
+    data_dir = Path(config.data_dir)
+    key_path = data_dir / "reader_session_key"
+    if not _managed_credential_present(key_path):
+        return
+    docker.remove_data_credential(config.image, data_dir, key_path.name)
+    if _managed_credential_present(key_path):
+        raise InstallError("reader session credential cleanup did not complete")
+
+
 def _probe_runtime_dependencies(
     docker: "ComposeDocker",
     config: InstallConfig,
@@ -816,6 +845,7 @@ class ComposeInstaller:
         document_path = Path(config.state_dir) / "deployment.compose.json"
         start_attempted = False
         state_committed = False
+        session_key_preexisting = False
         try:
             image_labels = {
                 "io.book-translator.version": config.identity.version,
@@ -842,6 +872,10 @@ class ComposeInstaller:
             except ConfigError as exc:
                 raise InstallError("BT_DATA_DIR could not be created durably") from exc
             self.docker.prepare_data_directory(config.image, data_dir)
+            if config.uses_reader_session:
+                session_key_preexisting = _managed_credential_present(
+                    data_dir / "reader_session_key"
+                )
             try:
                 _fsync_directory(data_dir)
                 _fsync_directory(data_dir.parent)
@@ -909,6 +943,17 @@ class ComposeInstaller:
                     self.docker.compose_down(document_path, config.install_name)
                 except BaseException as cleanup_exc:
                     cleanup_errors.append(_bounded_error("compose", cleanup_exc))
+            if start_attempted and not cleanup_errors:
+                try:
+                    _remove_new_session_key(
+                        self.docker,
+                        config,
+                        preexisting=session_key_preexisting,
+                    )
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error("reader session credential", cleanup_exc)
+                    )
             if cleanup_errors:
                 attempt["status"] = "cleanup-failed"
                 attempt["cleanup_errors"] = cleanup_errors

@@ -25,7 +25,7 @@ from btctl_unraid import (
 )
 
 
-def values(root: Path, *, forwarded=False):
+def values(root: Path, *, forwarded=False, reader="cwa"):
     result = {
         "BT_INSTALL_PROFILE": "unraid",
         "BT_INSTALL_NAME": "cwa-translate-test",
@@ -57,6 +57,26 @@ def values(root: Path, *, forwarded=False):
             "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
             "BT_REVERSE_PROXY": "caddy",
         })
+    if reader == "kavita":
+        for name in (
+            "CWA_UPSTREAM",
+            "BT_CWA_CONTAINER",
+            "BT_CWA_NETWORK",
+            "BT_CWA_VERSION",
+        ):
+            result.pop(name)
+        result.update(
+            {
+                "BT_INSTALL_NAME": "kavita-translate-test",
+                "BT_AUTH_PROFILE": "reader-session",
+                "BT_READER_TYPE": "kavita",
+                "BT_READER_UPSTREAM": "http://kavita:5000",
+                "BT_READER_CONTAINER": "kavita",
+                "BT_READER_NETWORK": "kavita_default",
+                "BT_READER_VERSION": "0.9.0.2",
+                "BT_CWA_IDENTITY_HEADER": "",
+            }
+        )
     return result
 
 
@@ -75,6 +95,7 @@ class FakeDocker:
         self.images = {}
         self.networks = {
             "cwa_default": {"Id": "cwa-network"},
+            "kavita_default": {"Id": "kavita-network"},
             "authentik_backend": {"Id": "edge-network"},
         }
         self.containers = {
@@ -83,7 +104,13 @@ class FakeDocker:
                 "State": {"Status": "running"},
                 "Config": {"Image": "crocodilestick/calibre-web-automated:v4.0.6"},
                 "NetworkSettings": {"Networks": {"cwa_default": {}}},
-            }
+            },
+            "kavita": {
+                "Id": "kavita-id",
+                "State": {"Status": "running"},
+                "Config": {"Image": "jvmilazz0/kavita:0.9.0.2"},
+                "NetworkSettings": {"Networks": {"kavita_default": {}}},
+            },
         }
 
     def require_available(self):
@@ -170,7 +197,12 @@ class FakeDocker:
                 }
             },
         }
-        if spec.role == "api" and spec.data_dir is not None:
+        if (
+            spec.role == "api"
+            and spec.data_dir is not None
+            and "BT_AUTH_MODE=reader_session"
+            in spec.env_file.read_text(encoding="utf-8").splitlines()
+        ):
             session_key = Path(spec.data_dir) / "reader_session_key"
             session_key.write_bytes(b"s" * 32)
             session_key.chmod(0o600)
@@ -570,13 +602,85 @@ class UnraidInstallTests(unittest.TestCase):
                     config, plan, root
                 )
 
-            removed = [call[1] for call in docker.calls if call[0].startswith("remove_")]
+            removed = [
+                call[1]
+                for call in docker.calls
+                if call[0] in {"remove_container", "remove_network"}
+            ]
             self.assertEqual(
                 removed,
-                ["cwa-translate-test-proxy", "cwa-translate-test-api", "cwa-translate-test-private"],
+                [
+                    "cwa-translate-test-proxy",
+                    "cwa-translate-test-api",
+                    "cwa-translate-test-private",
+                ],
+            )
+            self.assertIn(
+                "remove_data_credential", [call[0] for call in docker.calls]
             )
             self.assertIn("calibre-web-automated", docker.containers)
             self.assertFalse((root / "state" / "state.json").exists())
+
+    def test_failed_reader_session_start_removes_new_key_and_can_retry(self):
+        for reader in ("cwa", "kavita"):
+            with (
+                self.subTest(reader=reader),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                config_values = values(root, reader=reader)
+                config_values["BT_AUTH_PROFILE"] = "reader-session"
+                config = InstallConfig.from_mapping(config_values, self.identity)
+                plan = DeploymentPlan.from_config(config)
+                docker = FakeDocker(fail_proxy_health=True)
+                installer = UnraidInstaller(
+                    docker, prepare_data=lambda path: path.mkdir(exist_ok=True)
+                )
+
+                with self.assertRaisesRegex(InstallError, "health"):
+                    installer.install(config, plan, root)
+
+                session_key = Path(config.data_dir) / "reader_session_key"
+                self.assertFalse(session_key.exists())
+                self.assertFalse(
+                    InstallAttemptStore(Path(config.state_dir)).path.exists()
+                )
+                docker.fail_proxy_health = False
+                state = installer.install(config, plan, root)
+                self.assertEqual(state.status, "installed")
+
+    def test_failed_session_key_cleanup_retains_recovery_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_proxy_health=True)
+
+            def fail_credential_cleanup(image, path, filename):
+                docker.calls.append(
+                    ("remove_data_credential", image, str(path), filename)
+                )
+                raise InstallError("credential removal failed")
+
+            docker.remove_data_credential = fail_credential_cleanup
+            with self.assertRaisesRegex(
+                InstallError, "health.*reader session credential.*removal failed"
+            ):
+                UnraidInstaller(
+                    docker, prepare_data=lambda path: path.mkdir(exist_ok=True)
+                ).install(config, plan, root)
+
+            self.assertTrue((Path(config.data_dir) / "reader_session_key").exists())
+            journal = InstallAttemptStore(Path(config.state_dir)).load()
+            self.assertEqual(journal["status"], "cleanup-failed")
+            self.assertTrue(
+                any(
+                    "reader session credential" in error
+                    for error in journal["cleanup_errors"]
+                )
+            )
 
     def test_ambiguous_network_create_cleans_only_exact_labeled_network(self):
         with tempfile.TemporaryDirectory() as directory:

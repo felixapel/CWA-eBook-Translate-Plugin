@@ -24,7 +24,9 @@ from btctl_compose import (
     _install_attempt_payload,
     _labels,
     _bounded_error,
+    _managed_credential_present,
     _probe_runtime_dependencies,
+    _remove_new_session_key,
     _validate_data_destination,
     _verify_identity_edge_artifact,
     _verify_private_network,
@@ -330,6 +332,7 @@ class UnraidInstaller:
             raise InstallError("install attempt could not be committed") from exc
         api_env = state_dir / "api.env"
         proxy_env = state_dir / "proxy.env"
+        session_key_preexisting = False
         try:
             image_labels = {
                 "io.book-translator.version": config.identity.version,
@@ -351,6 +354,10 @@ class UnraidInstaller:
                 config, self.docker.inspect_image(config.image)
             )
             self.prepare_data(Path(config.data_dir))
+            if config.uses_reader_session:
+                session_key_preexisting = _managed_credential_present(
+                    Path(config.data_dir) / "reader_session_key"
+                )
 
             _write_private(
                 api_env,
@@ -528,6 +535,17 @@ class UnraidInstaller:
                 except BaseException as cleanup_exc:
                     cleanup_errors.append(
                         _bounded_error("private network", cleanup_exc)
+                    )
+            if not cleanup_errors:
+                try:
+                    _remove_new_session_key(
+                        self.docker,
+                        config,
+                        preexisting=session_key_preexisting,
+                    )
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error("reader session credential", cleanup_exc)
                     )
             if cleanup_errors:
                 attempt["status"] = "cleanup-failed"

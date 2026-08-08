@@ -475,6 +475,62 @@ class ComposeInstallTests(unittest.TestCase):
             self.assertIn("compose_down", calls)
             self.assertFalse((root / "state" / "state.json").exists())
 
+    def test_failed_reader_session_start_removes_new_key_and_can_retry(self):
+        for reader in ("cwa", "kavita"):
+            with (
+                self.subTest(reader=reader),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                config_values = values(root, reader=reader)
+                config_values["BT_AUTH_PROFILE"] = "reader-session"
+                config = InstallConfig.from_mapping(config_values, self.identity)
+                plan = DeploymentPlan.from_config(config)
+                docker = FakeDocker(fail_health=True)
+                installer = ComposeInstaller(docker)
+
+                with self.assertRaisesRegex(InstallError, "health"):
+                    installer.install(config, plan, root)
+
+                session_key = Path(config.data_dir) / "reader_session_key"
+                self.assertFalse(session_key.exists())
+                self.assertFalse(
+                    InstallAttemptStore(Path(config.state_dir)).path.exists()
+                )
+                docker.fail_health = False
+                state = installer.install(config, plan, root)
+                self.assertEqual(state.status, "installed")
+
+    def test_failed_session_key_cleanup_retains_recovery_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_values = values(root, reader="kavita")
+            config = InstallConfig.from_mapping(config_values, self.identity)
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_health=True)
+
+            def fail_credential_cleanup(image, path, filename):
+                docker.calls.append(
+                    ("remove_data_credential", image, str(path), filename)
+                )
+                raise InstallError("credential removal failed")
+
+            docker.remove_data_credential = fail_credential_cleanup
+            with self.assertRaisesRegex(
+                InstallError, "health.*reader session credential.*removal failed"
+            ):
+                ComposeInstaller(docker).install(config, plan, root)
+
+            self.assertTrue((Path(config.data_dir) / "reader_session_key").exists())
+            journal = InstallAttemptStore(Path(config.state_dir)).load()
+            self.assertEqual(journal["status"], "cleanup-failed")
+            self.assertTrue(
+                any(
+                    "reader session credential" in error
+                    for error in journal["cleanup_errors"]
+                )
+            )
+
     def test_preflight_failure_has_no_build_or_runtime_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
