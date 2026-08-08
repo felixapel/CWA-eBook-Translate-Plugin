@@ -152,6 +152,94 @@ class LifecycleTests(unittest.TestCase):
         MigrationJournalStore(Path(config.state_dir)).save(payload)
         return payload
 
+    def test_historical_ca_latest_reference_requires_exact_image_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _config, _plan, docker, migration_values, _repository = (
+                self.migration_fixture(root)
+            )
+            legacy_name = migration_values["BT_LEGACY_CONTAINER"]
+            legacy = docker.containers[legacy_name]
+            legacy["Config"]["Image"] = (
+                "ghcr.io/felixapel/cwa-ebook-translate-plugin:latest"
+            )
+
+            verified = LegacyUpgrade(docker)._verify_legacy(
+                legacy_name,
+                Path(migration_values["BT_LEGACY_DATA_DIR"]),
+            )
+
+            self.assertIs(verified, legacy)
+            self.assertIn(
+                ("probe_image_version", legacy["Image"], "2.1.4"),
+                docker.calls,
+            )
+
+    def test_legacy_migration_rejects_unrelated_latest_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _config, _plan, docker, migration_values, _repository = (
+                self.migration_fixture(root)
+            )
+            legacy_name = migration_values["BT_LEGACY_CONTAINER"]
+            legacy = docker.containers[legacy_name]
+            legacy["Config"]["Image"] = "example.invalid/translator:latest"
+
+            with self.assertRaisesRegex(InstallError, "approved v2.1.4 source"):
+                LegacyUpgrade(docker)._verify_legacy(
+                    legacy_name,
+                    Path(migration_values["BT_LEGACY_DATA_DIR"]),
+                )
+
+            self.assertNotIn(
+                ("probe_image_version", legacy["Image"], "2.1.4"),
+                docker.calls,
+            )
+
+    def test_legacy_migration_rejects_tagless_version_like_repository(self):
+        for image_ref in ("example.invalid/2.1.4", "example.invalid/v2.1.4"):
+            with self.subTest(image_ref=image_ref), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _config, _plan, docker, migration_values, _repository = (
+                    self.migration_fixture(root)
+                )
+                legacy_name = migration_values["BT_LEGACY_CONTAINER"]
+                legacy = docker.containers[legacy_name]
+                legacy["Config"]["Image"] = image_ref
+
+                with self.assertRaisesRegex(InstallError, "approved v2.1.4 source"):
+                    LegacyUpgrade(docker)._verify_legacy(
+                        legacy_name,
+                        Path(migration_values["BT_LEGACY_DATA_DIR"]),
+                    )
+
+                self.assertNotIn(
+                    ("probe_image_version", legacy["Image"], "2.1.4"),
+                    docker.calls,
+                )
+
+    def test_historical_ca_latest_reference_rejects_wrong_image_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _config, _plan, docker, migration_values, _repository = (
+                self.migration_fixture(root)
+            )
+            legacy_name = migration_values["BT_LEGACY_CONTAINER"]
+            docker.containers[legacy_name]["Config"]["Image"] = (
+                "ghcr.io/felixapel/cwa-ebook-translate-plugin:latest"
+            )
+
+            with mock.patch.object(
+                docker,
+                "probe_image_version",
+                side_effect=InstallError("legacy image version mismatch"),
+            ):
+                with self.assertRaisesRegex(InstallError, "version mismatch"):
+                    LegacyUpgrade(docker)._verify_legacy(
+                        legacy_name,
+                        Path(migration_values["BT_LEGACY_DATA_DIR"]),
+                    )
+
     def test_migration_journal_load_rejects_mutable_local_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory) / "state"

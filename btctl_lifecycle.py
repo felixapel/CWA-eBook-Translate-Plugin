@@ -49,6 +49,9 @@ from btctl_unraid import (
 
 _CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _JOURNAL_SCHEMA = 1
+_HISTORICAL_CA_LATEST_IMAGE = (
+    "ghcr.io/felixapel/cwa-ebook-translate-plugin:latest"
+)
 
 
 class LifecycleDocker(Protocol):
@@ -652,9 +655,12 @@ class LegacyUpgrade:
         if container is None:
             raise InstallError("exact legacy container is missing")
         image_ref = container.get("Config", {}).get("Image", "")
-        tag = image_ref.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-        if tag not in {"2.1.4", "v2.1.4"}:
-            raise InstallError("legacy container is not pinned to exact v2.1.4")
+        _image_name, tag_separator, tag = image_ref.rsplit("/", 1)[-1].rpartition(":")
+        is_version_tag = bool(tag_separator) and tag in {"2.1.4", "v2.1.4"}
+        if not is_version_tag and image_ref != (
+            _HISTORICAL_CA_LATEST_IMAGE
+        ):
+            raise InstallError("legacy container is not an approved v2.1.4 source")
         mounts = [
             mount
             for mount in container.get("Mounts", [])

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The managed v2.1.4 migration path now recognizes the exact historical
+  Community Applications `ghcr.io/felixapel/cwa-ebook-translate-plugin:latest`
+  reference only after the container's immutable image ID is probed in a
+  network-disabled sandbox and reports version 2.1.4. Other mutable `latest`
+  references remain rejected.
+
 ### Changed
 
 - Replaced the accumulated, overlapping documentation set with one indexed

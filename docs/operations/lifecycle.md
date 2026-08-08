@@ -40,6 +40,15 @@ BT_LEGACY_CONTAINER=book-translator-v214-rollback
 BT_LEGACY_DATA_DIR=/absolute/path/to/legacy-data
 ```
 
+A source-built legacy container must use the `2.1.4` or `v2.1.4` image tag.
+For compatibility with the historical Community Applications template, the
+exact image reference
+`ghcr.io/felixapel/cwa-ebook-translate-plugin:latest` is also recognized, but
+only when a network-disabled, read-only probe of the container's immutable
+image ID reports `/app/VERSION` as `2.1.4`. The verified image ID is recorded in
+the migration journal. `btctl` does not pull or resolve the mutable tag during
+this check, and every other `latest` reference fails closed.
+
 Then run:
 
 ```bash
