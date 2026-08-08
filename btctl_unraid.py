@@ -19,6 +19,7 @@ from btctl_compose import (
     ComposeInstaller,
     InstallError,
     _container_networks,
+    _cleaned_attempt_matches,
     _completed_uninstall_for_reinstall,
     _has_exact_reader_version,
     _install_attempt_payload,
@@ -280,20 +281,25 @@ class UnraidInstaller:
             target = Path(plan.resources[f"{role}_template"]["path"])
             if target.exists() or target.is_symlink():
                 raise InstallError(f"Unraid {role} template already exists")
-        _validate_data_destination(
-            Path(config.data_dir),
-            allow_nonempty=allow_existing_data or previous_state is not None,
-        )
+        cleaned_retry = False
         try:
             StateStore(Path(config.state_dir))._validate_destination()
             attempt_store = InstallAttemptStore(Path(config.state_dir))
             if attempt_store.path.exists():
-                attempt_store.load()
-                raise InstallError(
-                    "unfinished install attempt exists; inspect recovery evidence"
-                )
+                attempt = attempt_store.load()
+                if not _cleaned_attempt_matches(attempt, plan):
+                    raise InstallError(
+                        "unfinished install attempt exists; inspect recovery evidence"
+                    )
+                cleaned_retry = True
         except ConfigError as exc:
             raise InstallError(f"state directory is unsafe: {exc}") from exc
+        _validate_data_destination(
+            Path(config.data_dir),
+            allow_nonempty=(
+                allow_existing_data or previous_state is not None or cleaned_retry
+            ),
+        )
         return previous_state
 
     def install(
@@ -325,6 +331,14 @@ class UnraidInstaller:
         install_id = str(uuid.uuid4())
         state_dir = Path(config.state_dir)
         attempt_store = InstallAttemptStore(state_dir)
+        retry_evidence: dict[str, object] | None = None
+        if attempt_store.path.exists():
+            try:
+                retry_evidence = attempt_store.load()
+            except ConfigError as exc:
+                raise InstallError(
+                    "cleaned retry evidence could not be reloaded"
+                ) from exc
         attempt = _install_attempt_payload(plan, install_id)
         try:
             attempt_store.save(attempt)
@@ -396,11 +410,25 @@ class UnraidInstaller:
                         "identity-edge artifact name does not match the plan"
                     )
                 _write_private(artifact_path, artifact.content)
-        except BaseException:
+        except BaseException as exc:
+            cleanup_errors: list[str] = []
             try:
-                attempt_store.remove()
-            except BaseException:
-                pass
+                if retry_evidence is None:
+                    attempt_store.remove()
+                else:
+                    attempt_store.save(retry_evidence)
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(_bounded_error("journal", cleanup_exc))
+            if cleanup_errors:
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
+                except BaseException:
+                    pass
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
             raise
 
         private_name = str(plan.resources["private_network"]["name"])
@@ -557,8 +585,10 @@ class UnraidInstaller:
                 raise InstallError(
                     f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
                 ) from exc
+            attempt["status"] = "cleaned"
+            attempt["cleanup_errors"] = []
             try:
-                attempt_store.remove()
+                attempt_store.save(attempt)
             except BaseException as cleanup_exc:
                 cleanup_errors.append(_bounded_error("journal", cleanup_exc))
                 attempt["status"] = "cleanup-failed"

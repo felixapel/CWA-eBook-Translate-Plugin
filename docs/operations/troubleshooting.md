@@ -291,8 +291,13 @@ DRM-free EPUB.
   without Python, the temporary bootstrap may still warm Docker build cache.
   Correct the named field and rerun it.
 - A failed fresh install removes only newly created translator runtime
-  resources and writes no successful `state.json`; CWA and user data stay
-  external.
+  resources and the newly created session key, and writes no successful
+  `state.json`; the stock reader and translation database stay external. If
+  cleanup completes, `install-attempt.json` records `status=cleaned` and the
+  unchanged install command may retry against that exact retained data. Do not
+  edit the journal: a different checkout, configuration, profile or resource
+  plan is rejected. `status=cleanup-failed` requires inspection and repair of
+  every recorded cleanup error before another install.
 - If `state.json` alone was lost while the complete labeled split runtime is
   healthy, use `./btctl adopt --env ...`. It rejects partial or unlabeled
   resources and never converts a v2.1.4 combined container.

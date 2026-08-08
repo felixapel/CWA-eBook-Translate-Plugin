@@ -40,9 +40,13 @@ durable record of what the installer may later change.
 - Before the first Docker mutation, install writes and reads back a private,
   non-secret `install-attempt.json` bound to the install UUID, checkout
   identity, configuration fingerprint, and declared resources. Successful
-  state commit removes it durably. Failed cleanup aggregates every scoped
-  cleanup error and preserves the journal as recovery evidence instead of
-  silently discarding failures.
+  state commit removes it durably. When startup creates durable translation
+  data but scoped runtime cleanup succeeds, the journal advances to `cleaned`;
+  only the exact same plan may use that evidence to retry against the retained
+  data. A failure before runtime restores prior `cleaned` evidence instead of
+  minting new retry authority. Failed cleanup aggregates every scoped cleanup
+  error and preserves a `cleanup-failed` journal instead of silently discarding
+  failures.
 - Resources are classified as `owned`, `adopted`, or `external`. A later
   lifecycle operation may mutate only an exact allowlist of `owned` resources
   whose live IDs and installation labels still match state.

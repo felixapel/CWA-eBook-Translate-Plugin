@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -114,6 +115,14 @@ class FakeDocker:
                 session_key = data_source / "reader_session_key"
                 session_key.write_bytes(b"s" * 32)
                 session_key.chmod(0o600)
+            if role == "api":
+                data_source = Path(
+                    _compose_interpolate(service["volumes"][0]["source"])
+                )
+                database = data_source / "translations.db"
+                if not database.exists():
+                    with sqlite3.connect(database) as connection:
+                        connection.execute("PRAGMA user_version = 2")
             self.containers[name] = {
                 "Id": f"{name}-id",
                 "Image": "sha256:image-id",
@@ -494,12 +503,15 @@ class ComposeInstallTests(unittest.TestCase):
 
                 session_key = Path(config.data_dir) / "reader_session_key"
                 self.assertFalse(session_key.exists())
-                self.assertFalse(
-                    InstallAttemptStore(Path(config.state_dir)).path.exists()
-                )
+                database = Path(config.data_dir) / "translations.db"
+                self.assertTrue(database.exists())
+                attempt_store = InstallAttemptStore(Path(config.state_dir))
+                self.assertEqual(attempt_store.load()["status"], "cleaned")
                 docker.fail_health = False
                 state = installer.install(config, plan, root)
                 self.assertEqual(state.status, "installed")
+                self.assertFalse(attempt_store.path.exists())
+                self.assertTrue(database.exists())
 
     def test_failed_session_key_cleanup_retains_recovery_journal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -529,6 +541,60 @@ class ComposeInstallTests(unittest.TestCase):
                     "reader session credential" in error
                     for error in journal["cleanup_errors"]
                 )
+            )
+
+    def test_cleaned_retry_evidence_survives_a_pre_runtime_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_health=True)
+            installer = ComposeInstaller(docker)
+            with self.assertRaisesRegex(InstallError, "health"):
+                installer.install(config, plan, root)
+
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            cleaned = attempt_store.load()
+            original_build = docker.build_image
+
+            def fail_build(repository, image, labels):
+                raise InstallError("build failed before runtime")
+
+            docker.fail_health = False
+            docker.build_image = fail_build
+            with self.assertRaisesRegex(InstallError, "build failed"):
+                installer.install(config, plan, root)
+
+            self.assertEqual(attempt_store.load(), cleaned)
+            docker.build_image = original_build
+            self.assertEqual(installer.install(config, plan, root).status, "installed")
+
+    def test_cleaned_retry_requires_the_exact_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_health=True)
+            installer = ComposeInstaller(docker)
+            with self.assertRaisesRegex(InstallError, "health"):
+                installer.install(config, plan, root)
+
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            mismatched = attempt_store.load()
+            mismatched["config_fingerprint"] = "0" * 64
+            attempt_store.save(mismatched)
+            build_count = sum(call[0] == "build_image" for call in docker.calls)
+
+            docker.fail_health = False
+            with self.assertRaisesRegex(InstallError, "unfinished install attempt"):
+                installer.install(config, plan, root)
+
+            self.assertEqual(
+                sum(call[0] == "build_image" for call in docker.calls), build_count
             )
 
     def test_preflight_failure_has_no_build_or_runtime_mutation(self):

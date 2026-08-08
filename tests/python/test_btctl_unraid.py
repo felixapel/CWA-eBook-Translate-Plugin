@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -219,6 +220,13 @@ class FakeDocker:
             "Status": "running",
             "Health": {"Status": "healthy"},
         }
+        if name.endswith("-api"):
+            mounts = self.containers[name].get("Mounts", [])
+            if mounts:
+                database = Path(mounts[0]["Source"]) / "translations.db"
+                if not database.exists():
+                    with sqlite3.connect(database) as connection:
+                        connection.execute("PRAGMA user_version = 2")
 
     def stop_container(self, name):
         self.calls.append(("stop_container", name))
@@ -642,12 +650,15 @@ class UnraidInstallTests(unittest.TestCase):
 
                 session_key = Path(config.data_dir) / "reader_session_key"
                 self.assertFalse(session_key.exists())
-                self.assertFalse(
-                    InstallAttemptStore(Path(config.state_dir)).path.exists()
-                )
+                database = Path(config.data_dir) / "translations.db"
+                self.assertTrue(database.exists())
+                attempt_store = InstallAttemptStore(Path(config.state_dir))
+                self.assertEqual(attempt_store.load()["status"], "cleaned")
                 docker.fail_proxy_health = False
                 state = installer.install(config, plan, root)
                 self.assertEqual(state.status, "installed")
+                self.assertFalse(attempt_store.path.exists())
+                self.assertTrue(database.exists())
 
     def test_failed_session_key_cleanup_retains_recovery_journal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -680,6 +691,64 @@ class UnraidInstallTests(unittest.TestCase):
                     "reader session credential" in error
                     for error in journal["cleanup_errors"]
                 )
+            )
+
+    def test_cleaned_retry_evidence_survives_a_pre_runtime_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_proxy_health=True)
+            installer = UnraidInstaller(
+                docker, prepare_data=lambda path: path.mkdir(exist_ok=True)
+            )
+            with self.assertRaisesRegex(InstallError, "health"):
+                installer.install(config, plan, root)
+
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            cleaned = attempt_store.load()
+            original_build = docker.build_image
+
+            def fail_build(repository, image, labels):
+                raise InstallError("build failed before runtime")
+
+            docker.fail_proxy_health = False
+            docker.build_image = fail_build
+            with self.assertRaisesRegex(InstallError, "build failed"):
+                installer.install(config, plan, root)
+
+            self.assertEqual(attempt_store.load(), cleaned)
+            docker.build_image = original_build
+            self.assertEqual(installer.install(config, plan, root).status, "installed")
+
+    def test_cleaned_retry_requires_the_exact_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_proxy_health=True)
+            installer = UnraidInstaller(
+                docker, prepare_data=lambda path: path.mkdir(exist_ok=True)
+            )
+            with self.assertRaisesRegex(InstallError, "health"):
+                installer.install(config, plan, root)
+
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            mismatched = attempt_store.load()
+            mismatched["config_fingerprint"] = "0" * 64
+            attempt_store.save(mismatched)
+            build_count = sum(call[0] == "build_image" for call in docker.calls)
+
+            docker.fail_proxy_health = False
+            with self.assertRaisesRegex(InstallError, "unfinished install attempt"):
+                installer.install(config, plan, root)
+
+            self.assertEqual(
+                sum(call[0] == "build_image" for call in docker.calls), build_count
             )
 
     def test_ambiguous_network_create_cleans_only_exact_labeled_network(self):

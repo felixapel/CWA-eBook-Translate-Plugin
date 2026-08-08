@@ -17,6 +17,7 @@ from btctl_core import (
     DeploymentPlan,
     DeploymentState,
     InstallConfig,
+    InstallAttemptStore,
     OperationLock,
     ReleaseIdentity,
     StateStore,
@@ -743,6 +744,25 @@ class PlanAndStateTests(unittest.TestCase):
             self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
             self.assertNotIn("never-print-this", payload)
             self.assertEqual(store.load(), state)
+
+    def test_cleaned_install_attempt_cannot_report_cleanup_errors(self):
+        plan = DeploymentPlan.from_config(
+            InstallConfig.from_mapping(self.values, self.identity)
+        )
+        payload = {
+            "install_id": "01234567-89ab-4cde-8123-0123456789ab",
+            "status": "cleaned",
+            "version": plan.version,
+            "revision": plan.revision,
+            "image": plan.image,
+            "config_fingerprint": plan.config_fingerprint,
+            "install_profile": plan.install_profile,
+            "resources": plan.resources,
+            "cleanup_errors": ["compose: cleanup failed"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ConfigError, "cannot contain cleanup errors"):
+                InstallAttemptStore(Path(directory)).save(payload)
 
     def test_fresh_state_directory_entry_is_durable_before_state_publish(self):
         with tempfile.TemporaryDirectory() as directory:

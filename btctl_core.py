@@ -1395,7 +1395,7 @@ class StateStore:
 class InstallAttemptStore:
     """Durable, non-secret evidence for one not-yet-committed install."""
 
-    _STATUSES = frozenset({"prepared", "starting", "cleanup-failed"})
+    _STATUSES = frozenset({"prepared", "starting", "cleaned", "cleanup-failed"})
     _EXPECTED_FIELDS = frozenset(
         {
             "schema_version",
@@ -1463,6 +1463,8 @@ class InstallAttemptStore:
             )
         ):
             raise ConfigError("install attempt cleanup errors are invalid")
+        if payload.get("status") == "cleaned" and cleanup_errors:
+            raise ConfigError("cleaned install attempt cannot contain cleanup errors")
         return dict(payload)
 
     def save(self, payload: Mapping[str, object]) -> None:

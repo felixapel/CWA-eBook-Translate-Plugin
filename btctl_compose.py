@@ -120,6 +120,22 @@ def _install_attempt_payload(
     }
 
 
+def _cleaned_attempt_matches(
+    attempt: dict[str, object], plan: DeploymentPlan
+) -> bool:
+    """Authorize retained-data retry only from exact completed cleanup evidence."""
+    return (
+        attempt.get("status") == "cleaned"
+        and attempt.get("version") == plan.version
+        and attempt.get("revision") == plan.revision
+        and attempt.get("image") == plan.image
+        and attempt.get("config_fingerprint") == plan.config_fingerprint
+        and attempt.get("install_profile") == plan.install_profile
+        and attempt.get("resources") == plan.resources
+        and attempt.get("cleanup_errors") == []
+    )
+
+
 def _bounded_error(label: str, error: BaseException) -> str:
     detail = " ".join(str(error).split()) or error.__class__.__name__
     return f"{label}: {detail}"[:512]
@@ -673,21 +689,26 @@ class ComposeInstaller:
         private_name = str(plan.resources["private_network"]["name"])
         if self.docker.inspect_network(private_name) is not None:
             raise InstallError(f"network {private_name} already exists")
-        _validate_data_destination(
-            Path(config.data_dir),
-            allow_nonempty=allow_existing_data or previous_state is not None,
-        )
+        cleaned_retry = False
         state_store = StateStore(Path(config.state_dir))
         try:
             state_store._validate_destination()
             attempt_store = InstallAttemptStore(Path(config.state_dir))
             if attempt_store.path.exists():
-                attempt_store.load()
-                raise InstallError(
-                    "unfinished install attempt exists; inspect recovery evidence"
-                )
+                attempt = attempt_store.load()
+                if not _cleaned_attempt_matches(attempt, plan):
+                    raise InstallError(
+                        "unfinished install attempt exists; inspect recovery evidence"
+                    )
+                cleaned_retry = True
         except ConfigError as exc:
             raise InstallError(f"state directory is unsafe: {exc}") from exc
+        _validate_data_destination(
+            Path(config.data_dir),
+            allow_nonempty=(
+                allow_existing_data or previous_state is not None or cleaned_retry
+            ),
+        )
         return previous_state
 
     def _verify_image(
@@ -837,6 +858,14 @@ class ComposeInstaller:
         )
         install_id = str(uuid.uuid4())
         attempt_store = InstallAttemptStore(Path(config.state_dir))
+        retry_evidence: dict[str, object] | None = None
+        if attempt_store.path.exists():
+            try:
+                retry_evidence = attempt_store.load()
+            except ConfigError as exc:
+                raise InstallError(
+                    "cleaned retry evidence could not be reloaded"
+                ) from exc
         attempt = _install_attempt_payload(plan, install_id)
         try:
             attempt_store.save(attempt)
@@ -938,6 +967,25 @@ class ComposeInstaller:
                     "run doctor before further lifecycle operations"
                 ) from exc
             cleanup_errors: list[str] = []
+            if not start_attempted:
+                try:
+                    if retry_evidence is None:
+                        attempt_store.remove()
+                    else:
+                        attempt_store.save(retry_evidence)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(_bounded_error("journal", cleanup_exc))
+                if cleanup_errors:
+                    attempt["status"] = "cleanup-failed"
+                    attempt["cleanup_errors"] = cleanup_errors
+                    try:
+                        attempt_store.save(attempt)
+                    except BaseException:
+                        pass
+                    raise InstallError(
+                        f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                    ) from exc
+                raise
             if start_attempted:
                 try:
                     self.docker.compose_down(document_path, config.install_name)
@@ -964,8 +1012,10 @@ class ComposeInstaller:
                 raise InstallError(
                     f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
                 ) from exc
+            attempt["status"] = "cleaned"
+            attempt["cleanup_errors"] = []
             try:
-                attempt_store.remove()
+                attempt_store.save(attempt)
             except BaseException as cleanup_exc:
                 cleanup_errors.append(_bounded_error("journal", cleanup_exc))
                 attempt["status"] = "cleanup-failed"

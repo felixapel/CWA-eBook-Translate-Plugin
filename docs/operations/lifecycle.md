@@ -104,7 +104,11 @@ an in-place upgrade.
 - Invalid configuration, reader evidence, names, paths or network preconditions
   stops before runtime creation.
 - A failed startup removes only newly created translator containers and their
-  private network; the reader, external networks, data, configuration and backups stay.
+  private network and newly created session key; the reader, external networks,
+  translation database, configuration and backups stay. A successful cleanup
+  leaves exact `cleaned` retry evidence, so rerunning the unchanged install is
+  supported even though the data directory is now nonempty. Any plan mismatch
+  or cleanup error remains fail-closed.
 - State is committed only after live postconditions pass.
 - Do not recover by exposing the API, setting disabled auth, editing generated
   state or applying generated Unraid templates manually.
