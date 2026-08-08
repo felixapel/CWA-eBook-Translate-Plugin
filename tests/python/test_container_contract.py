@@ -267,6 +267,19 @@ class ContainerContractTests(unittest.TestCase):
             smoke,
         )
 
+    def test_lifecycle_smoke_proves_kavita_isolated_from_cwa(self):
+        smoke = (ROOT / "scripts" / "btctl-lifecycle-smoke.sh").read_text()
+        for token in (
+            "BT_READER_TYPE=kavita",
+            "BT_READER_VERSION=0.9.0.2",
+            "test_kavita_auth_fixture.py",
+            'assert_doctor "$KAVITA_ENV"',
+            'assert_doctor "$FRESH_ENV"',
+            'test ! -e "$KAVITA_DATA/reader_session_key"',
+            'docker inspect "$CWA_CONTAINER"',
+        ):
+            self.assertIn(token, smoke)
+
     def test_image_auth_defaults_fail_closed_and_proxy_forwards_cwa_cookie(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
