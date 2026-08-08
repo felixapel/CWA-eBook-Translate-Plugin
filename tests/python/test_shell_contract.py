@@ -73,6 +73,8 @@ class ShellContractTests(unittest.TestCase):
             'cp -- "$SCRIPT_DIR/Dockerfile.btctl"',
             source,
         )
+        self.assertIn('cp -P -- \\\n            "$env_file" "$environment_snapshot"', source)
+        self.assertNotIn("--no-preserve=all", source)
         self.assertIn('chown 0:0 -- "$environment_snapshot"', source)
         self.assertIn('chmod 0600 -- "$environment_snapshot"', source)
 

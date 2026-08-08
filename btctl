@@ -203,7 +203,7 @@ if [ -n "$env_file" ]; then
         || fail "$EX_USAGE" "environment file must use private mode 0600 or stricter"
     (
         umask 077
-        cp --no-dereference --no-preserve=all -- \
+        cp -P -- \
             "$env_file" "$environment_snapshot"
     ) || fail 1 "environment snapshot could not be created"
     [ -f "$environment_snapshot" ] && [ ! -L "$environment_snapshot" ] \
