@@ -39,7 +39,10 @@ _INSTALL_ID_RE = re.compile(
 
 _INSTALL_PROFILES = frozenset({"unraid", "compose-existing"})
 _INGRESS_MODES = frozenset({"published", "docker-edge"})
-_AUTH_PROFILES = frozenset({"cwa-session", "authentik-forwarded"})
+_AUTH_PROFILES = frozenset(
+    {"cwa-session", "reader-session", "authentik-forwarded"}
+)
+_READER_TYPES = frozenset({"cwa", "kavita"})
 _REVERSE_PROXIES = frozenset({"nginx", "traefik", "caddy"})
 _LLM_PROVIDERS = frozenset(
     {
@@ -54,8 +57,11 @@ _LLM_PROVIDERS = frozenset(
         "openrouter",
     }
 )
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 INSTALL_ATTEMPT_SCHEMA_VERSION = 1
+
+KAVITA_CERTIFIED_VERSION = "0.9.0.2"
+KAVITA_CERTIFIED_COMMIT = "6bcd5689385d0e96824982d843c54f15ce784ddc"
 
 _MANAGED_PROXY_HEADERS = frozenset(
     {
@@ -524,10 +530,12 @@ class InstallConfig:
     ingress_mode: str
     auth_profile: str
     public_origin: str
-    cwa_upstream: str
-    cwa_container: str
-    cwa_network: str
-    cwa_version: str
+    reader_type: str
+    reader_upstream: str
+    reader_container: str
+    reader_network: str
+    reader_version: str
+    reader_contract_version: str
     compatibility_tier: str
     cwa_identity_header: str
     edge_network: str
@@ -564,40 +572,104 @@ class InstallConfig:
         ingress_mode = _choice(values, "BT_INGRESS_MODE", _INGRESS_MODES)
         auth_profile = _choice(values, "BT_AUTH_PROFILE", _AUTH_PROFILES)
         public_origin = _exact_origin(values.get("BT_PUBLIC_ORIGIN", ""), "BT_PUBLIC_ORIGIN")
-        cwa_upstream = _exact_origin(values.get("CWA_UPSTREAM", ""), "CWA_UPSTREAM")
+        reader_type = _clean_value(
+            values.get("BT_READER_TYPE", "cwa"), "BT_READER_TYPE"
+        )
+        if reader_type not in _READER_TYPES:
+            raise ConfigError(f"BT_READER_TYPE must be one of {sorted(_READER_TYPES)}")
 
-        cwa_container = _clean_value(
-            values.get("BT_CWA_CONTAINER", ""), "BT_CWA_CONTAINER"
+        def reader_value(generic_name: str, legacy_name: str) -> str:
+            generic = _clean_value(
+                values.get(generic_name, ""), generic_name, allow_empty=True
+            )
+            legacy = _clean_value(
+                values.get(legacy_name, ""), legacy_name, allow_empty=True
+            )
+            if reader_type == "kavita" and legacy:
+                raise ConfigError(f"{legacy_name} is CWA-only and forbidden for Kavita")
+            if generic and legacy and generic != legacy:
+                raise ConfigError(
+                    f"{generic_name} conflicts with the legacy {legacy_name} value"
+                )
+            return _clean_value(generic or legacy, generic_name)
+
+        reader_upstream = _exact_origin(
+            reader_value("BT_READER_UPSTREAM", "CWA_UPSTREAM"),
+            "BT_READER_UPSTREAM" if reader_type == "kavita" else "CWA_UPSTREAM",
         )
-        if not _CONTAINER_RE.fullmatch(cwa_container):
-            raise ConfigError("BT_CWA_CONTAINER must be one exact Docker container name")
-        parsed_cwa_upstream = urlsplit(cwa_upstream)
+        reader_container = reader_value("BT_READER_CONTAINER", "BT_CWA_CONTAINER")
+        if not _CONTAINER_RE.fullmatch(reader_container):
+            raise ConfigError(
+                "BT_READER_CONTAINER must be one exact Docker container name"
+            )
+        reader_network = reader_value("BT_READER_NETWORK", "BT_CWA_NETWORK")
+        if not _NETWORK_RE.fullmatch(reader_network):
+            raise ConfigError("BT_READER_NETWORK must be one exact Docker network name")
+        reader_version = reader_value("BT_READER_VERSION", "BT_CWA_VERSION")
+
+        parsed_reader_upstream = urlsplit(reader_upstream)
+        expected_port = 8083 if reader_type == "cwa" else 5000
         if (
-            parsed_cwa_upstream.scheme != "http"
-            or parsed_cwa_upstream.hostname is None
-            or parsed_cwa_upstream.hostname.casefold() != cwa_container.casefold()
-            or parsed_cwa_upstream.port != 8083
+            parsed_reader_upstream.scheme != "http"
+            or parsed_reader_upstream.hostname is None
+            or parsed_reader_upstream.hostname.casefold()
+            != reader_container.casefold()
+            or parsed_reader_upstream.port != expected_port
         ):
+            if reader_type == "cwa":
+                raise ConfigError(
+                    "CWA_UPSTREAM must be exactly http://<BT_CWA_CONTAINER>:8083"
+                )
             raise ConfigError(
-                "CWA_UPSTREAM must be exactly http://<BT_CWA_CONTAINER>:8083"
+                "BT_READER_UPSTREAM must be exactly "
+                "http://<BT_READER_CONTAINER>:5000 for Kavita"
             )
-        cwa_upstream = f"http://{cwa_container}:8083"
-        cwa_network = _clean_value(
-            values.get("BT_CWA_NETWORK", ""), "BT_CWA_NETWORK"
-        )
-        if not _NETWORK_RE.fullmatch(cwa_network):
-            raise ConfigError("BT_CWA_NETWORK must be one exact Docker network name")
-        cwa_version = _clean_value(
-            values.get("BT_CWA_VERSION", ""), "BT_CWA_VERSION"
-        )
-        cwa_tier = compatibility_tier(cwa_version)
-        if cwa_tier == "legacy" and not allow_legacy_cwa:
-            raise ConfigError(
-                "CWA 3.1.4 is migration-only; use the explicit btctl upgrade workflow"
+        reader_upstream = f"http://{reader_container}:{expected_port}"
+
+        if reader_type == "cwa":
+            compatibility = compatibility_tier(reader_version)
+            if compatibility == "legacy" and not allow_legacy_cwa:
+                raise ConfigError(
+                    "CWA 3.1.4 is migration-only; use the explicit btctl upgrade workflow"
+                )
+            reader_contract_version = "cwa-epub-v1"
+            cwa_identity_header = _cwa_identity_header(
+                values.get("BT_CWA_IDENTITY_HEADER", "Remote-User")
             )
-        cwa_identity_header = _cwa_identity_header(
-            values.get("BT_CWA_IDENTITY_HEADER", "Remote-User")
-        )
+            if auth_profile not in {
+                "cwa-session",
+                "reader-session",
+                "authentik-forwarded",
+            }:
+                raise ConfigError("CWA requires a supported reader authentication profile")
+        else:
+            if reader_version != KAVITA_CERTIFIED_VERSION:
+                raise ConfigError(
+                    "the only certified Kavita version is exactly 0.9.0.2"
+                )
+            compatibility = "certified"
+            reader_contract_version = "kavita-0.9.0.2-epub-v1"
+            if _clean_value(
+                values.get("BT_CWA_IDENTITY_HEADER", ""),
+                "BT_CWA_IDENTITY_HEADER",
+                allow_empty=True,
+            ):
+                raise ConfigError("BT_CWA_IDENTITY_HEADER is CWA-only and forbidden for Kavita")
+            cwa_identity_header = ""
+            if auth_profile != "reader-session":
+                raise ConfigError("Kavita requires BT_AUTH_PROFILE=reader-session")
+        if auth_profile in {"cwa-session", "reader-session"}:
+            parsed_public_origin = urlsplit(public_origin)
+            hostname = parsed_public_origin.hostname or ""
+            loopback = hostname.casefold() == "localhost"
+            try:
+                loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                pass
+            if parsed_public_origin.scheme != "https" and not loopback:
+                raise ConfigError(
+                    "reader-session BT_PUBLIC_ORIGIN requires HTTPS outside loopback development"
+                )
         state_dir = _absolute_dir(values.get("BT_STATE_DIR", ""), "BT_STATE_DIR")
         data_dir = _absolute_dir(values.get("BT_DATA_DIR", ""), "BT_DATA_DIR")
         backup_dir = _absolute_dir(values.get("BT_BACKUP_DIR", ""), "BT_BACKUP_DIR")
@@ -653,8 +725,8 @@ class InstallConfig:
                 raise ConfigError(
                     "BT_EDGE_NETWORK must be one exact Docker network name for docker-edge ingress"
                 )
-        if edge_network and edge_network == cwa_network:
-            raise ConfigError("BT_EDGE_NETWORK and BT_CWA_NETWORK must be separate")
+        if edge_network and edge_network == reader_network:
+            raise ConfigError("BT_EDGE_NETWORK and BT_READER_NETWORK must be separate")
 
         llm_provider = _choice(values, "LLM_PROVIDER", _LLM_PROVIDERS)
         llm_model = _clean_value(values.get("LLM_MODEL", ""), "LLM_MODEL")
@@ -686,6 +758,8 @@ class InstallConfig:
         authentik_outpost_url = ""
         reverse_proxy = ""
         if auth_profile == "authentik-forwarded":
+            if reader_type != "cwa":
+                raise ConfigError("authentik-forwarded is supported only for CWA")
             if ingress_mode != "docker-edge":
                 raise ConfigError(
                     "authentik-forwarded requires BT_INGRESS_MODE=docker-edge"
@@ -717,11 +791,13 @@ class InstallConfig:
             ingress_mode=ingress_mode,
             auth_profile=auth_profile,
             public_origin=public_origin,
-            cwa_upstream=cwa_upstream,
-            cwa_container=cwa_container,
-            cwa_network=cwa_network,
-            cwa_version=cwa_version,
-            compatibility_tier=cwa_tier,
+            reader_type=reader_type,
+            reader_upstream=reader_upstream,
+            reader_container=reader_container,
+            reader_network=reader_network,
+            reader_version=reader_version,
+            reader_contract_version=reader_contract_version,
+            compatibility_tier=compatibility,
             cwa_identity_header=cwa_identity_header,
             edge_network=edge_network,
             state_dir=state_dir,
@@ -743,12 +819,31 @@ class InstallConfig:
     def image(self) -> str:
         return self.identity.image
 
+    @property
+    def cwa_upstream(self) -> str:
+        """Compatibility accessor for lifecycle code while schema 1 remains readable."""
+        return self.reader_upstream
+
+    @property
+    def cwa_container(self) -> str:
+        return self.reader_container
+
+    @property
+    def cwa_network(self) -> str:
+        return self.reader_network
+
+    @property
+    def cwa_version(self) -> str:
+        return self.reader_version
+
+    @property
+    def uses_reader_session(self) -> bool:
+        return self.auth_profile in {"cwa-session", "reader-session"}
+
     def api_environment(self) -> dict[str, str]:
         values = {
             "BT_AUTH_MODE": (
-                "cwa_session"
-                if self.auth_profile == "cwa-session"
-                else "forwarded"
+                "reader_session" if self.uses_reader_session else "forwarded"
             ),
             "LLM_PROVIDER": self.llm_provider,
             "LLM_MODEL": self.llm_model,
@@ -757,9 +852,22 @@ class InstallConfig:
         }
         if self.install_profile == "compose-existing":
             values["BT_CACHE_OPERATOR_GROUP_ACCESS"] = "true"
-        if self.auth_profile == "cwa-session":
-            values["BT_CWA_AUTH_URL"] = f"{self.cwa_upstream}/ajax/emailstat"
-            values["BT_TRUSTED_PROXY_HOST"] = "translator-proxy"
+        if self.uses_reader_session:
+            values.update(
+                {
+                    "BT_READER_TYPE": self.reader_type,
+                    "BT_READER_AUTH_URL": (
+                        f"{self.reader_upstream}/api/Account"
+                        if self.reader_type == "kavita"
+                        else f"{self.reader_upstream}/ajax/emailstat"
+                    ),
+                    "BT_READER_VERSION": self.reader_version,
+                    "BT_READER_CONTRACT_VERSION": self.reader_contract_version,
+                    "BT_PUBLIC_ORIGIN": self.public_origin,
+                    "BT_TRUSTED_PROXY_HOST": "translator-proxy",
+                    "BT_SESSION_KEY_PATH": "/app/data/reader_session_key",
+                }
+            )
         else:
             values.update(
                 {
@@ -772,32 +880,34 @@ class InstallConfig:
         return values
 
     def proxy_environment(self) -> dict[str, str]:
-        return {
+        values = {
             "BT_PUBLIC_ORIGIN": self.public_origin,
-            "CWA_UPSTREAM": self.cwa_upstream,
-            "BT_CWA_IDENTITY_HEADER": self.cwa_identity_header,
+            "BT_READER_TYPE": self.reader_type,
+            "BT_READER_UPSTREAM": self.reader_upstream,
+            "BT_CWA_IDENTITY_HEADER": self.cwa_identity_header or "Remote-User",
             "BT_BROWSER_AUTH_MODE": (
-                "cwa_session"
-                if self.auth_profile == "cwa-session"
+                "reader_session"
+                if self.uses_reader_session
                 else "forwarded"
             ),
+            "BT_READER_VERSION": self.reader_version,
+            "BT_READER_CONTRACT_VERSION": self.reader_contract_version,
             "BT_BROWSER_CREDENTIALS": (
-                "same-origin" if self.auth_profile == "cwa-session" else "include"
+                "same-origin" if self.uses_reader_session else "include"
             ),
         }
+        if self.reader_type == "cwa":
+            values["CWA_UPSTREAM"] = self.reader_upstream
+        return values
 
     def public_contract(self) -> dict[str, object]:
         """Return stable non-secret settings suitable for plans and audit logs."""
-        return {
+        common = {
             "install_profile": self.install_profile,
             "install_name": self.install_name,
             "ingress_mode": self.ingress_mode,
             "auth_profile": self.auth_profile,
             "public_origin": self.public_origin,
-            "cwa_upstream": self.cwa_upstream,
-            "cwa_container": self.cwa_container,
-            "cwa_network": self.cwa_network,
-            "cwa_version": self.cwa_version,
             "compatibility_tier": self.compatibility_tier,
             "cwa_identity_header": self.cwa_identity_header,
             "edge_network": self.edge_network,
@@ -815,6 +925,30 @@ class InstallConfig:
             "local_url": self.local_url,
             "has_api_key": bool(self.llm_api_key),
         }
+        if self.reader_type == "cwa":
+            # This projection deliberately remains byte-for-byte compatible
+            # with schema-1 CWA fingerprints.
+            common.update(
+                {
+                    "cwa_upstream": self.reader_upstream,
+                    "cwa_container": self.reader_container,
+                    "cwa_network": self.reader_network,
+                    "cwa_version": self.reader_version,
+                    "cwa_identity_header": self.cwa_identity_header,
+                }
+            )
+        else:
+            common.update(
+                {
+                    "reader_type": self.reader_type,
+                    "reader_upstream": self.reader_upstream,
+                    "reader_container": self.reader_container,
+                    "reader_network": self.reader_network,
+                    "reader_version": self.reader_version,
+                    "reader_contract_version": self.reader_contract_version,
+                }
+            )
+        return common
 
 
 @dataclass(frozen=True, slots=True)
@@ -826,7 +960,9 @@ class DeploymentPlan:
     install_profile: str
     ingress_mode: str
     auth_profile: str
-    cwa_version: str
+    reader_type: str
+    reader_version: str
+    reader_contract_version: str
     compatibility_tier: str
     state_dir: str
     data_dir: str
@@ -842,12 +978,14 @@ class DeploymentPlan:
         fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         proxy_ports = [config.proxy_port] if config.proxy_port is not None else []
         resources: dict[str, dict[str, object]] = {
-            "cwa": {
-                "name": config.cwa_container,
+            "reader": {
+                "name": config.reader_container,
+                "type": config.reader_type,
+                "version": config.reader_version,
                 "ownership": "external",
             },
-            "cwa_network": {
-                "name": config.cwa_network,
+            "reader_network": {
+                "name": config.reader_network,
                 "ownership": "external",
             },
             "private_network": {
@@ -872,6 +1010,12 @@ class DeploymentPlan:
                 "published_ports": proxy_ports,
             },
         }
+        if config.uses_reader_session:
+            resources["session_key"] = {
+                "path": str(Path(config.data_dir) / "reader_session_key"),
+                "ownership": "owned-credential",
+                "retention": "remove-on-uninstall",
+            }
         if config.edge_network:
             resources["edge_network"] = {
                 "name": config.edge_network,
@@ -888,15 +1032,20 @@ class DeploymentPlan:
                 "ownership": "owned",
             }
         if config.install_profile == "unraid":
+            template_prefix = (
+                "my-cwa-translate"
+                if config.reader_type == "cwa"
+                else "my-kavita-translate"
+            )
             resources["api_template"] = {
                 "path": str(
-                    Path(config.unraid_template_dir) / "my-cwa-translate-api.xml"
+                    Path(config.unraid_template_dir) / f"{template_prefix}-api.xml"
                 ),
                 "ownership": "owned",
             }
             resources["proxy_template"] = {
                 "path": str(
-                    Path(config.unraid_template_dir) / "my-cwa-translate-proxy.xml"
+                    Path(config.unraid_template_dir) / f"{template_prefix}-proxy.xml"
                 ),
                 "ownership": "owned",
             }
@@ -908,7 +1057,9 @@ class DeploymentPlan:
             install_profile=config.install_profile,
             ingress_mode=config.ingress_mode,
             auth_profile=config.auth_profile,
-            cwa_version=config.cwa_version,
+            reader_type=config.reader_type,
+            reader_version=config.reader_version,
+            reader_contract_version=config.reader_contract_version,
             compatibility_tier=config.compatibility_tier,
             state_dir=config.state_dir,
             data_dir=config.data_dir,
@@ -928,7 +1079,9 @@ class DeploymentPlan:
             "install_profile": self.install_profile,
             "ingress_mode": self.ingress_mode,
             "auth_profile": self.auth_profile,
-            "cwa_version": self.cwa_version,
+            "reader_type": self.reader_type,
+            "reader_version": self.reader_version,
+            "reader_contract_version": self.reader_contract_version,
             "compatibility_tier": self.compatibility_tier,
             "state_dir": self.state_dir,
             "data_dir": self.data_dir,
@@ -950,6 +1103,8 @@ class DeploymentState:
     config_fingerprint: str
     install_profile: str
     auth_profile: str
+    reader_type: str
+    reader_contract_version: str
     resources: dict[str, dict[str, object]]
 
     @classmethod
@@ -970,11 +1125,13 @@ class DeploymentState:
             config_fingerprint=plan.config_fingerprint,
             install_profile=plan.install_profile,
             auth_profile=plan.auth_profile,
+            reader_type=plan.reader_type,
+            reader_contract_version=plan.reader_contract_version,
             resources=plan.resources,
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        document = {
             "schema_version": self.schema_version,
             "install_id": self.install_id,
             "status": self.status,
@@ -984,14 +1141,23 @@ class DeploymentState:
             "config_fingerprint": self.config_fingerprint,
             "install_profile": self.install_profile,
             "auth_profile": self.auth_profile,
-            "resources": self.resources,
         }
+        if self.schema_version == 2:
+            document.update(
+                {
+                    "reader_type": self.reader_type,
+                    "reader_contract_version": self.reader_contract_version,
+                }
+            )
+        document["resources"] = self.resources
+        return document
 
     @classmethod
     def from_dict(cls, payload: object) -> "DeploymentState":
         if not isinstance(payload, dict):
             raise ConfigError("state must be one JSON object")
-        if payload.get("schema_version") != STATE_SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if schema_version not in {1, STATE_SCHEMA_VERSION}:
             raise ConfigError("unsupported state schema version")
         expected = {
             "schema_version",
@@ -1005,9 +1171,19 @@ class DeploymentState:
             "auth_profile",
             "resources",
         }
+        if schema_version == 2:
+            expected.update({"reader_type", "reader_contract_version"})
         if set(payload) != expected:
             raise ConfigError("state fields do not match the supported schema")
-        state = cls(**payload)
+        normalized = dict(payload)
+        if schema_version == 1:
+            normalized.update(
+                {
+                    "reader_type": "cwa",
+                    "reader_contract_version": "cwa-epub-v1",
+                }
+            )
+        state = cls(**normalized)
         if not _INSTALL_ID_RE.fullmatch(str(state.install_id)):
             raise ConfigError("state contains an invalid install_id")
         if state.status not in {
@@ -1020,6 +1196,14 @@ class DeploymentState:
             raise ConfigError("state contains an invalid status")
         if not isinstance(state.resources, dict):
             raise ConfigError("state resources must be an object")
+        if state.reader_type not in _READER_TYPES:
+            raise ConfigError("state contains an invalid reader_type")
+        expected_contracts = {
+            "cwa": "cwa-epub-v1",
+            "kavita": "kavita-0.9.0.2-epub-v1",
+        }
+        if state.reader_contract_version != expected_contracts[state.reader_type]:
+            raise ConfigError("state contains an invalid reader contract version")
         return state
 
 

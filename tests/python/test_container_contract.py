@@ -106,17 +106,17 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn("absolute_redirect off;", template)
         self.assertNotIn("$http_x_forwarded_proto", template)
         self.assertEqual(
-            template.count("proxy_set_header Host ${BT_PUBLIC_HOST};"), 2
+            template.count("proxy_set_header Host ${BT_PUBLIC_HOST};"), 3
         )
         self.assertEqual(
             template.count("proxy_set_header X-Forwarded-Proto ${BT_PUBLIC_SCHEME};"),
-            2,
+            3,
         )
         self.assertEqual(
-            template.count("proxy_set_header X-Forwarded-For $remote_addr;"), 2
+            template.count("proxy_set_header X-Forwarded-For $remote_addr;"), 3
         )
         self.assertEqual(
-            template.count("proxy_set_header User-Agent $http_user_agent;"), 2
+            template.count("proxy_set_header User-Agent $http_user_agent;"), 3
         )
         self.assertNotIn("$proxy_add_x_forwarded_for", template)
         self.assertNotIn("$http_x_forwarded_for", template)

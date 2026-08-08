@@ -163,6 +163,44 @@ class DockerCLI:
             timeout=60,
         )
 
+    def remove_data_credential(self, image: str, path: Path, filename: str) -> None:
+        """Remove one exact API-owned credential from a retained data bind."""
+        if filename != "reader_session_key":
+            raise DockerCommandError("unsupported managed credential name")
+        script = (
+            "import os,stat,sys;"
+            "d=os.open('/data',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);"
+            "s=os.stat(sys.argv[1],dir_fd=d,follow_symlinks=False);"
+            "ok=stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==os.geteuid() "
+            "and stat.S_IMODE(s.st_mode)==0o600 and s.st_size==32;"
+            "ok or sys.exit(3);"
+            "os.unlink(sys.argv[1],dir_fd=d);os.fsync(d);os.close(d)"
+        )
+        self._run(
+            [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--user",
+                "101:102",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--entrypoint",
+                "python",
+                "--mount",
+                f"type=bind,src={path},dst=/data",
+                image,
+                "-c",
+                script,
+                filename,
+            ],
+            timeout=30,
+        )
+
     def prepare_migration_source(self, image: str, path: Path) -> None:
         """Grant the invoking operator private checkpoint access to stopped v2.1.4 data."""
         operator_gid = os.getgid()

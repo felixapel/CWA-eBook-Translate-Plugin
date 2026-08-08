@@ -170,6 +170,10 @@ class FakeDocker:
                 }
             },
         }
+        if spec.role == "api" and spec.data_dir is not None:
+            session_key = Path(spec.data_dir) / "reader_session_key"
+            session_key.write_bytes(b"s" * 32)
+            session_key.chmod(0o600)
         if self.fail_create_role_after_effect == spec.role:
             raise InstallError(f"{spec.role} create response was lost")
 
@@ -209,6 +213,10 @@ class FakeDocker:
     def remove_network(self, name):
         self.calls.append(("remove_network", name))
         self.networks.pop(name, None)
+
+    def remove_data_credential(self, image, path, filename):
+        self.calls.append(("remove_data_credential", image, str(path), filename))
+        (Path(path) / filename).unlink()
 
 
 class UnraidTemplateTests(unittest.TestCase):

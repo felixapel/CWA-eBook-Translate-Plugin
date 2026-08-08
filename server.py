@@ -334,7 +334,7 @@ def _is_origin_allowed(origin: str | None) -> str | None:
     # Credentialed CWA-session requests may never combine cookies with a
     # subnet-wide origin policy. Cross-origin operators must enumerate the
     # exact reader origin; same-origin proxy mode needs no CORS at all.
-    if AUTHENTICATOR.mode == "cwa_session":
+    if AUTHENTICATOR.mode in {"cwa_session", "reader_session"}:
         return None
     if BT_ALLOW_PRIVATE_LAN and _PRIVATE_ORIGIN_RE.match(origin):
         return origin
@@ -932,9 +932,15 @@ def before_request_hook():
     # Liveness/readiness and preflight stay independent of external auth so
     # orchestration can diagnose an auth-authority outage. Everything else,
     # including metrics and stats, receives a server-owned opaque subject.
+    session_exchange = (
+        AUTHENTICATOR.mode == "reader_session"
+        and request.path == "/session"
+        and request.method == "POST"
+    )
     protected = (
         request.method != "OPTIONS"
         and request.path not in ("/health", "/ready", "/ping")
+        and not session_exchange
     )
     if protected:
         auth_client_key = _client_ip()
@@ -962,7 +968,7 @@ def before_request_hook():
         try:
             try:
                 auth_kwargs = {}
-                if AUTHENTICATOR.mode == "cwa_session":
+                if AUTHENTICATOR.mode in {"cwa_session", "reader_session"}:
                     auth_kwargs["cwa_binding"] = _cwa_session_binding()
                 identity = AUTHENTICATOR.authenticate(
                     request.headers,
@@ -1041,13 +1047,95 @@ def after_request_hook(response):
         # Let cross-origin JS read the request ID and 429 Retry-After header.
         response.headers["Access-Control-Expose-Headers"] = "X-Request-ID, Retry-After"
         response.vary.add("Origin")
-        if AUTHENTICATOR.mode == "cwa_session":
+        if AUTHENTICATOR.mode in {"cwa_session", "reader_session"}:
             response.headers["Access-Control-Allow-Credentials"] = "true"
 
     return response
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
+
+
+@app.route("/session", methods=["POST", "DELETE"])
+def reader_session():
+    """Exchange reader credentials for, or revoke, one short-lived BT session."""
+    broker = getattr(AUTHENTICATOR, "reader_session_broker", None)
+    if AUTHENTICATOR.mode != "reader_session" or broker is None:
+        return jsonify({
+            "error": "not_found",
+            "request_id": getattr(request, "request_id", None),
+        }), 404
+
+    try:
+        binding = _cwa_session_binding()
+    except AuthRejected:
+        return jsonify({
+            "error": "unauthorized",
+            "request_id": request.request_id,
+        }), 401
+    if request.method == "DELETE":
+        try:
+            broker.revoke(request.headers, binding)
+        except Exception as exc:
+            from reader_session import BrokerRejected
+
+            if isinstance(exc, BrokerRejected):
+                return jsonify({
+                    "error": "unauthorized",
+                    "request_id": request.request_id,
+                }), 401
+            raise
+        response = jsonify({"status": "revoked", "request_id": request.request_id})
+        response.headers["Set-Cookie"] = broker.clear_cookie
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    # The credential travels in Authorization or Cookie. A request body is
+    # unnecessary and would expand the sensitive parser surface.
+    if request.content_length not in (None, 0) or request.get_data(cache=False):
+        return jsonify({
+            "error": "bad_request",
+            "request_id": request.request_id,
+        }), 400
+    client_key = _client_ip()
+    if not _check_auth_rate_limit(client_key) or not _acquire_auth_inflight(client_key):
+        response = jsonify({
+            "error": "rate_limited",
+            "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+            "request_id": request.request_id,
+        })
+        response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
+        return response, 429
+    try:
+        try:
+            issue = broker.exchange(request.headers, binding)
+        except Exception as exc:
+            from reader_session import BrokerRejected, BrokerUnavailable
+
+            if isinstance(exc, BrokerRejected):
+                return jsonify({
+                    "error": "unauthorized",
+                    "request_id": request.request_id,
+                }), 401
+            if isinstance(exc, BrokerUnavailable):
+                return jsonify({
+                    "error": "authentication_unavailable",
+                    "request_id": request.request_id,
+                }), 503
+            raise
+    finally:
+        _release_auth_inflight(client_key)
+    response = jsonify({
+        "status": "ok",
+        "expires_in": issue.expires_in,
+        "reader_type": broker.reader_type,
+        "reader_version": broker.reader_version,
+        "request_id": request.request_id,
+    })
+    response.headers["Set-Cookie"] = issue.set_cookie
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.errorhandler(HTTPException)

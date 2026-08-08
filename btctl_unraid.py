@@ -1,4 +1,4 @@
-"""Unraid adapter using local Docker only; no SSH, registry, or CWA overlay."""
+"""Unraid adapter using local Docker only; no SSH, registry, or reader fork."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from btctl_compose import (
     InstallError,
     _container_networks,
     _completed_uninstall_for_reinstall,
-    _has_exact_cwa_version,
+    _has_exact_reader_version,
     _install_attempt_payload,
     _labels,
     _bounded_error,
@@ -65,6 +65,7 @@ class UnraidDocker(Protocol):
     def inspect_network(self, name: str) -> dict | None: ...
     def inspect_image(self, name: str) -> dict | None: ...
     def build_image(self, repository: Path, image: str, labels: dict[str, str]) -> None: ...
+    def remove_data_credential(self, image: str, path: Path, filename: str) -> None: ...
     def create_network(self, name: str, labels: dict[str, str], *, internal: bool) -> None: ...
     def create_container(self, spec: ContainerSpec) -> None: ...
     def connect_network(self, network: str, container: str) -> None: ...
@@ -255,15 +256,15 @@ class UnraidInstaller:
             plan,
             allow_rolled_back=allow_rolled_back_state,
         )
-        cwa = self.docker.inspect_container(config.cwa_container)
-        if cwa is None or cwa.get("State", {}).get("Status") != "running":
-            raise InstallError("configured CWA container is missing or stopped")
-        if not _has_exact_cwa_version(cwa, config.cwa_version):
-            raise InstallError("configured CWA version lacks exact runtime evidence")
-        if config.cwa_network not in _container_networks(cwa):
-            raise InstallError("configured CWA is not on BT_CWA_NETWORK")
-        if self.docker.inspect_network(config.cwa_network) is None:
-            raise InstallError("BT_CWA_NETWORK does not exist")
+        reader = self.docker.inspect_container(config.reader_container)
+        if reader is None or reader.get("State", {}).get("Status") != "running":
+            raise InstallError("configured reader container is missing or stopped")
+        if not _has_exact_reader_version(reader, config.reader_version):
+            raise InstallError("configured reader version lacks exact runtime evidence")
+        if config.reader_network not in _container_networks(reader):
+            raise InstallError("configured reader is not on BT_READER_NETWORK")
+        if self.docker.inspect_network(config.reader_network) is None:
+            raise InstallError("BT_READER_NETWORK does not exist")
         if config.edge_network and self.docker.inspect_network(config.edge_network) is None:
             raise InstallError("BT_EDGE_NETWORK does not exist")
         for role in ("api", "proxy"):
@@ -331,10 +332,19 @@ class UnraidInstaller:
         proxy_env = state_dir / "proxy.env"
         try:
             image_labels = {
+                "io.book-translator.version": config.identity.version,
+                "io.book-translator.revision": config.identity.sha,
+                "io.book-translator.source": "local-checkout",
                 "io.cwa-translate.version": config.identity.version,
                 "io.cwa-translate.revision": config.identity.sha,
                 "io.cwa-translate.source": "local-checkout",
             }
+            if config.reader_type != "cwa":
+                image_labels = {
+                    key: value
+                    for key, value in image_labels.items()
+                    if not key.startswith("io.cwa-translate.")
+                }
             self.docker.build_image(Path(repository), config.image, image_labels)
             verifier = ComposeInstaller(self.docker)
             image_id = verifier._verify_image(
@@ -345,7 +355,15 @@ class UnraidInstaller:
             _write_private(
                 api_env,
                 _environment_text(
-                    {**config.api_environment(), "BT_ROLE": "api"}
+                    {
+                        **config.api_environment(),
+                        "BT_ROLE": "api",
+                        **(
+                            {"BT_READER_CONNECTOR_ID": install_id}
+                            if config.uses_reader_session
+                            else {}
+                        ),
+                    }
                 ),
             )
             _write_private(
@@ -410,8 +428,8 @@ class UnraidInstaller:
                 )
             )
             api_external = (
-                config.cwa_network
-                if config.auth_profile == "cwa-session"
+                config.reader_network
+                if config.uses_reader_session
                 else config.edge_network
             )
             self.docker.connect_network(api_external, api_name)
@@ -433,7 +451,7 @@ class UnraidInstaller:
                     publish_port=config.proxy_port,
                 )
             )
-            self.docker.connect_network(config.cwa_network, proxy_name)
+            self.docker.connect_network(config.reader_network, proxy_name)
             if config.edge_network:
                 self.docker.connect_network(config.edge_network, proxy_name)
             self.docker.start_container(proxy_name)
@@ -561,34 +579,38 @@ class UnraidAdopter:
         store = StateStore(Path(config.state_dir))
         if store.path.exists():
             raise InstallError("deployment state already exists; use doctor")
-        cwa = self.docker.inspect_container(config.cwa_container)
+        reader = self.docker.inspect_container(config.reader_container)
         if (
-            cwa is None
-            or cwa.get("State", {}).get("Status") != "running"
-            or not _has_exact_cwa_version(cwa, config.cwa_version)
-            or config.cwa_network not in _container_networks(cwa)
+            reader is None
+            or reader.get("State", {}).get("Status") != "running"
+            or not _has_exact_reader_version(reader, config.reader_version)
+            or config.reader_network not in _container_networks(reader)
         ):
-            raise InstallError("configured CWA evidence does not match")
+            raise InstallError("configured reader evidence does not match")
         containers = {
             role: self.docker.inspect_container(str(plan.resources[role]["name"]))
             for role in ("api", "proxy")
         }
         for role, container in containers.items():
             labels = container.get("Config", {}).get("Labels", {}) if container else {}
+            neutral = "io.book-translator."
+            legacy = "io.cwa-translate." if config.reader_type == "cwa" else neutral
             if (
                 not container
-                or labels.get("io.cwa-translate.managed-by") != "btctl"
-                or labels.get("io.cwa-translate.role") != role
-                or labels.get("io.cwa-translate.version") != config.identity.version
-                or labels.get("io.cwa-translate.revision") != config.identity.sha
-                or not labels.get("io.cwa-translate.install-id")
+                or labels.get(neutral + "managed-by") != "btctl"
+                or labels.get(neutral + "role") != role
+                or labels.get(neutral + "version") != config.identity.version
+                or labels.get(neutral + "revision") != config.identity.sha
+                or not labels.get(neutral + "install-id")
+                or labels.get(legacy + "install-id")
+                != labels.get(neutral + "install-id")
             ):
                 raise InstallError(f"{role} ownership labels are missing or incompatible")
         install_id = containers["api"]["Config"]["Labels"][
-            "io.cwa-translate.install-id"
+            "io.book-translator.install-id"
         ]
         if containers["proxy"]["Config"]["Labels"].get(
-            "io.cwa-translate.install-id"
+            "io.book-translator.install-id"
         ) != install_id:
             raise InstallError("split runtime install-id labels do not match")
         verifier = ComposeInstaller(self.docker)

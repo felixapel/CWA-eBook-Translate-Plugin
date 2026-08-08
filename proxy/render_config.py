@@ -21,6 +21,10 @@ _SIZE_RE = re.compile(r"^[1-9][0-9]{0,9}[kKmMgG]?$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _PLACEHOLDER_RE = re.compile(r"\$\{(?:BT_|CWA_)[A-Z0-9_]*\}")
+_READER_CONTRACTS = {
+    "cwa": "cwa-epub-v1",
+    "kavita": "kavita-0.9.0.2-epub-v1",
+}
 
 
 class ProxyConfigError(ValueError):
@@ -119,17 +123,56 @@ def _validated_browser_config(env: Mapping[str, str]) -> dict[str, str]:
     credentials = _required(env, "BT_BROWSER_CREDENTIALS")
     supported = {
         "cwa_session": "same-origin",
+        "reader_session": "same-origin",
         "forwarded": "include",
     }
     if auth_mode not in supported or supported[auth_mode] != credentials:
         raise ProxyConfigError(
             "BT_BROWSER_AUTH_MODE and BT_BROWSER_CREDENTIALS are not a supported pair"
         )
-    return {
+    config = {
         "apiUrl": "/bt-api",
         "authMode": auth_mode,
         "credentials": credentials,
     }
+    if auth_mode == "reader_session":
+        reader_type = _required(env, "BT_READER_TYPE")
+        if reader_type not in _READER_CONTRACTS:
+            raise ProxyConfigError("BT_READER_TYPE is unsupported")
+        reader_version = _validated_version(env, "BT_READER_VERSION")
+        contract = _required(env, "BT_READER_CONTRACT_VERSION")
+        if contract != _READER_CONTRACTS[reader_type]:
+            raise ProxyConfigError("BT_READER_CONTRACT_VERSION is unsupported")
+        if reader_type == "kavita" and reader_version != "0.9.0.2":
+            raise ProxyConfigError("BT_READER_VERSION is not certified for Kavita")
+        if reader_type == "cwa" and not (
+            re.fullmatch(r"4\.[0-9]+\.[0-9]+", reader_version)
+            or reader_version == "3.1.4"
+        ):
+            raise ProxyConfigError("BT_READER_VERSION is unsupported for CWA")
+        config.update(
+            {
+                "readerType": reader_type,
+                "readerVersion": reader_version,
+                "readerContractVersion": contract,
+            }
+        )
+    return config
+
+
+def _validated_reader_upstream(env: Mapping[str, str]) -> str:
+    reader_type = env.get("BT_READER_TYPE", "cwa")
+    if reader_type not in _READER_CONTRACTS:
+        raise ProxyConfigError("BT_READER_TYPE is unsupported")
+    generic = env.get("BT_READER_UPSTREAM", "")
+    legacy = env.get("CWA_UPSTREAM", "")
+    if reader_type == "kavita" and legacy:
+        raise ProxyConfigError("CWA_UPSTREAM is forbidden for Kavita")
+    if generic and legacy and generic != legacy:
+        raise ProxyConfigError("BT_READER_UPSTREAM conflicts with CWA_UPSTREAM")
+    selected_name = "BT_READER_UPSTREAM" if generic else "CWA_UPSTREAM"
+    upstream, _, _ = _validated_base_url(env, selected_name)
+    return upstream
 
 
 def _atomic_write(output_path: Path, content: str) -> None:
@@ -153,11 +196,16 @@ def _atomic_write(output_path: Path, content: str) -> None:
 
 
 def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> None:
-    cwa_upstream, _, _ = _validated_base_url(env, "CWA_UPSTREAM")
+    reader_upstream = _validated_reader_upstream(env)
     api_upstream, _, _ = _validated_base_url(env, "BT_API_UPSTREAM")
     _, public_scheme, public_host = _validated_base_url(env, "BT_PUBLIC_ORIGIN")
+    session_cookie_name = (
+        "__Host-bt-session"
+        if public_scheme == "https"
+        else "bt-session"
+    )
     replacements = {
-        "${CWA_UPSTREAM}": cwa_upstream,
+        "${BT_READER_UPSTREAM}": reader_upstream,
         "${BT_API_UPSTREAM}": api_upstream,
         "${BT_PROXY_PORT}": _validated_port(env, "BT_PROXY_PORT"),
         "${BT_UI_VERSION}": _validated_version(env, "BT_UI_VERSION"),
@@ -166,6 +214,7 @@ def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> No
         ),
         "${BT_PUBLIC_SCHEME}": public_scheme,
         "${BT_PUBLIC_HOST}": public_host,
+        "${BT_SESSION_COOKIE_NAME}": session_cookie_name,
         "${BT_CWA_MAX_BODY_SIZE}": _validated_size(
             env, "BT_CWA_MAX_BODY_SIZE"
         ),

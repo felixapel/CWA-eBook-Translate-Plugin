@@ -32,6 +32,7 @@ class FakeDocker:
         self.images = {}
         self.networks = {
             "cwa_default": {"Id": "network-cwa"},
+            "kavita_default": {"Id": "network-kavita"},
             "authentik_backend": {"Id": "network-edge"},
         }
         self.containers = {
@@ -40,7 +41,13 @@ class FakeDocker:
                 "State": {"Status": "running"},
                 "NetworkSettings": {"Networks": {"cwa_default": {}}},
                 "Config": {"Image": "crocodilestick/calibre-web-automated:v4.0.6"},
-            }
+            },
+            "kavita": {
+                "Id": "kavita-id",
+                "State": {"Status": "running"},
+                "NetworkSettings": {"Networks": {"kavita_default": {}}},
+                "Config": {"Image": "jvmilazz0/kavita:0.9.0.2"},
+            },
         }
 
     def require_available(self):
@@ -102,6 +109,11 @@ class FakeDocker:
                 }
                 for volume in service.get("volumes", [])
             ]
+            if role == "api" and service["environment"].get("BT_AUTH_MODE") == "reader_session":
+                data_source = Path(_compose_interpolate(service["volumes"][0]["source"]))
+                session_key = data_source / "reader_session_key"
+                session_key.write_bytes(b"s" * 32)
+                session_key.chmod(0o600)
             self.containers[name] = {
                 "Id": f"{name}-id",
                 "Image": "sha256:image-id",
@@ -175,8 +187,12 @@ class FakeDocker:
             self.containers.pop(service["container_name"], None)
         self.networks.pop(payload["networks"]["private"]["name"], None)
 
+    def remove_data_credential(self, image, path, filename):
+        self.calls.append(("remove_data_credential", image, str(path), filename))
+        (Path(path) / filename).unlink()
 
-def values(root: Path, *, forwarded=False):
+
+def values(root: Path, *, forwarded=False, reader="cwa"):
     result = {
         "BT_INSTALL_PROFILE": "compose-existing",
         "BT_INSTALL_NAME": "cwa-translate-test",
@@ -196,6 +212,25 @@ def values(root: Path, *, forwarded=False):
         "BT_LOCAL_URL": "http://host.docker.internal:2819/v1/chat/completions",
         "LLM_API_KEY": "",
     }
+    if reader == "kavita":
+        for name in (
+            "CWA_UPSTREAM",
+            "BT_CWA_CONTAINER",
+            "BT_CWA_NETWORK",
+            "BT_CWA_VERSION",
+        ):
+            result.pop(name)
+        result.update(
+            {
+                "BT_INSTALL_NAME": "kavita-translate-test",
+                "BT_AUTH_PROFILE": "reader-session",
+                "BT_READER_TYPE": "kavita",
+                "BT_READER_UPSTREAM": "http://kavita:5000",
+                "BT_READER_CONTAINER": "kavita",
+                "BT_READER_NETWORK": "kavita_default",
+                "BT_READER_VERSION": "0.9.0.2",
+            }
+        )
     if forwarded:
         result.update(
             {
@@ -232,14 +267,38 @@ class ComposeRenderTests(unittest.TestCase):
             self.assertEqual(api["image"], self.identity.image)
             self.assertNotIn("ports", api)
             self.assertEqual(proxy["ports"], [{"target": 8080, "published": 8385, "protocol": "tcp"}])
-            self.assertEqual(set(api["networks"]), {"private", "cwa"})
-            self.assertEqual(set(proxy["networks"]), {"private", "cwa"})
+            self.assertEqual(set(api["networks"]), {"private", "reader"})
+            self.assertEqual(set(proxy["networks"]), {"private", "reader"})
             self.assertTrue(api["read_only"])
             self.assertEqual(api["user"], "101:102")
             self.assertFalse(api["privileged"])
             self.assertEqual(api["labels"]["io.cwa-translate.role"], "api")
+            self.assertEqual(api["labels"]["io.book-translator.reader"], "cwa")
             self.assertNotIn("latest", json.dumps(document))
             self.assertNotIn("calibre-web", document["services"])
+
+    def test_kavita_profile_uses_isolated_topology_and_neutral_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = InstallConfig.from_mapping(
+                values(Path(directory), reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+
+            document = render_compose(config, plan, "install-id")
+
+            self.assertEqual(document["networks"]["reader"]["name"], "kavita_default")
+            for service in document["services"].values():
+                self.assertEqual(set(service["networks"]), {"private", "reader"})
+                self.assertEqual(
+                    service["labels"]["io.book-translator.reader"], "kavita"
+                )
+                self.assertFalse(
+                    any(key.startswith("io.cwa-translate.") for key in service["labels"])
+                )
+            self.assertEqual(
+                document["services"]["api"]["environment"]["BT_AUTH_MODE"],
+                "reader_session",
+            )
 
     def test_forwarded_profile_joins_identity_edge_without_publishing_ports(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -257,7 +316,7 @@ class ComposeRenderTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(document["services"]["proxy"]["networks"]),
-                {"private", "cwa", "edge"},
+                {"private", "reader", "edge"},
             )
             self.assertTrue(document["networks"]["edge"]["external"])
 
@@ -488,7 +547,7 @@ class ComposeInstallTests(unittest.TestCase):
                 "crocodilestick/calibre-web-automated:latest"
             )
 
-            with self.assertRaisesRegex(InstallError, "CWA version"):
+            with self.assertRaisesRegex(InstallError, "reader version"):
                 ComposeInstaller(docker).install(config, plan, root)
 
             self.assertNotIn("build_image", [call[0] for call in docker.calls])

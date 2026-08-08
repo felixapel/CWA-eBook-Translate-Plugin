@@ -59,10 +59,10 @@ class ProxyConfigRendererTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = output.read_text()
-        self.assertEqual(rendered.count("proxy_set_header Host books.example.test:8443;"), 2)
-        self.assertEqual(rendered.count("proxy_set_header X-Forwarded-Proto https;"), 2)
-        self.assertEqual(rendered.count("proxy_set_header X-Forwarded-For $remote_addr;"), 2)
-        self.assertEqual(rendered.count("proxy_set_header User-Agent $http_user_agent;"), 2)
+        self.assertEqual(rendered.count("proxy_set_header Host books.example.test:8443;"), 3)
+        self.assertEqual(rendered.count("proxy_set_header X-Forwarded-Proto https;"), 3)
+        self.assertEqual(rendered.count("proxy_set_header X-Forwarded-For $remote_addr;"), 3)
+        self.assertEqual(rendered.count("proxy_set_header User-Agent $http_user_agent;"), 3)
         self.assertNotIn("$proxy_add_x_forwarded_for", rendered)
         self.assertNotIn("$http_x_forwarded_for", rendered)
         self.assertIn("client_max_body_size 2g;", rendered)
@@ -108,6 +108,63 @@ class ProxyConfigRendererTests(unittest.TestCase):
                 "credentials": "include",
             },
         )
+
+    def test_reader_session_proxy_contains_raw_credentials_to_exchange_only(self):
+        result, output, browser_output = self.render({
+            "BT_READER_TYPE": "kavita",
+            "BT_READER_UPSTREAM": "http://kavita:5000",
+            "CWA_UPSTREAM": None,
+            "BT_CWA_IDENTITY_HEADER": "Remote-User",
+            "BT_READER_VERSION": "0.9.0.2",
+            "BT_READER_CONTRACT_VERSION": "kavita-0.9.0.2-epub-v1",
+            "BT_BROWSER_AUTH_MODE": "reader_session",
+            "BT_BROWSER_CREDENTIALS": "same-origin",
+        })
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rendered = output.read_text(encoding="utf-8")
+        self.assertIn("proxy_pass http://kavita:5000;", rendered)
+        self.assertEqual(rendered.count("proxy_set_header Cookie $http_cookie;"), 1)
+        self.assertEqual(
+            rendered.count("proxy_set_header Authorization $http_authorization;"), 1
+        )
+        self.assertIn("proxy_set_header Cookie $bt_session_cookie;", rendered)
+        self.assertIn('proxy_set_header Authorization "";', rendered)
+        self.assertEqual(
+            json.loads(browser_output.read_text()),
+            {
+                "apiUrl": "/bt-api",
+                "authMode": "reader_session",
+                "credentials": "same-origin",
+                "readerType": "kavita",
+                "readerVersion": "0.9.0.2",
+                "readerContractVersion": "kavita-0.9.0.2-epub-v1",
+            },
+        )
+
+    def test_reader_session_requires_exact_reader_contract(self):
+        base = {
+            "BT_READER_TYPE": "kavita",
+            "BT_READER_UPSTREAM": "http://kavita:5000",
+            "CWA_UPSTREAM": None,
+            "BT_CWA_IDENTITY_HEADER": "Remote-User",
+            "BT_READER_VERSION": "0.9.0.2",
+            "BT_READER_CONTRACT_VERSION": "kavita-0.9.0.2-epub-v1",
+            "BT_BROWSER_AUTH_MODE": "reader_session",
+            "BT_BROWSER_CREDENTIALS": "same-origin",
+        }
+        for name, value in (
+            ("BT_READER_TYPE", "unknown"),
+            ("BT_READER_VERSION", "0.9.0.1"),
+            ("BT_READER_CONTRACT_VERSION", "kavita-latest"),
+        ):
+            with self.subTest(name=name):
+                result, output, browser_output = self.render(
+                    {**base, name: value}
+                )
+                self.assertEqual(result.returncode, 78)
+                self.assertFalse(output.exists())
+                self.assertFalse(browser_output.exists())
 
     def test_browser_auth_and_credentials_must_be_a_supported_pair(self):
         for auth_mode, credentials in (

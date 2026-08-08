@@ -261,12 +261,12 @@ class InstallConfigTests(unittest.TestCase):
         api = config.api_environment()
         proxy = config.proxy_environment()
 
-        self.assertEqual(api["BT_AUTH_MODE"], "cwa_session")
+        self.assertEqual(api["BT_AUTH_MODE"], "reader_session")
         self.assertEqual(api["BT_CACHE_OPERATOR_GROUP_ACCESS"], "true")
-        self.assertEqual(proxy["BT_BROWSER_AUTH_MODE"], "cwa_session")
+        self.assertEqual(proxy["BT_BROWSER_AUTH_MODE"], "reader_session")
         self.assertEqual(proxy["BT_BROWSER_CREDENTIALS"], "same-origin")
         self.assertEqual(
-            api["BT_CWA_AUTH_URL"],
+            api["BT_READER_AUTH_URL"],
             "http://calibre-web-automated:8083/ajax/emailstat",
         )
         self.assertEqual(api["BT_TRUSTED_PROXY_HOST"], "translator-proxy")
@@ -277,6 +277,115 @@ class InstallConfigTests(unittest.TestCase):
         self.assertNotIn("BT_INSTALL_PROFILE", api)
         self.assertNotIn("BT_IMAGE", api)
         self.assertNotIn("BT_ALLOW_INSECURE_AUTH", api)
+
+    def test_legacy_and_generic_cwa_reader_inputs_normalize_identically(self):
+        legacy = InstallConfig.from_mapping(self.base, self.identity)
+        generic_values = {
+            **self.base,
+            "BT_READER_TYPE": "cwa",
+            "BT_READER_UPSTREAM": self.base["CWA_UPSTREAM"],
+            "BT_READER_CONTAINER": self.base["BT_CWA_CONTAINER"],
+            "BT_READER_NETWORK": self.base["BT_CWA_NETWORK"],
+            "BT_READER_VERSION": self.base["BT_CWA_VERSION"],
+        }
+        generic = InstallConfig.from_mapping(generic_values, self.identity)
+
+        self.assertEqual(generic.reader_type, "cwa")
+        self.assertEqual(generic.reader_contract_version, "cwa-epub-v1")
+        self.assertEqual(generic.public_contract(), legacy.public_contract())
+        self.assertEqual(
+            DeploymentPlan.from_config(generic).config_fingerprint,
+            DeploymentPlan.from_config(legacy).config_fingerprint,
+        )
+
+    def test_conflicting_generic_and_legacy_cwa_inputs_are_rejected(self):
+        aliases = {
+            "BT_READER_UPSTREAM": "http://other:8083",
+            "BT_READER_CONTAINER": "other",
+            "BT_READER_NETWORK": "other_default",
+            "BT_READER_VERSION": "4.0.7",
+        }
+        for name, value in aliases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ConfigError, name):
+                InstallConfig.from_mapping(
+                    {**self.base, "BT_READER_TYPE": "cwa", name: value},
+                    self.identity,
+                )
+
+    def test_exact_certified_kavita_reader_contract(self):
+        values = {
+            **self.base,
+            "BT_INSTALL_NAME": "kavita-translate",
+            "BT_AUTH_PROFILE": "reader-session",
+            "BT_READER_TYPE": "kavita",
+            "BT_READER_UPSTREAM": "http://kavita:5000",
+            "BT_READER_CONTAINER": "kavita",
+            "BT_READER_NETWORK": "kavita_default",
+            "BT_READER_VERSION": "0.9.0.2",
+            "BT_STATE_DIR": "/srv/kavita-translate/state",
+            "BT_DATA_DIR": "/srv/kavita-translate/data",
+            "BT_BACKUP_DIR": "/srv/kavita-translate/backups",
+        }
+        for legacy_name in (
+            "CWA_UPSTREAM",
+            "BT_CWA_CONTAINER",
+            "BT_CWA_NETWORK",
+            "BT_CWA_VERSION",
+        ):
+            values.pop(legacy_name)
+
+        config = InstallConfig.from_mapping(values, self.identity)
+
+        self.assertEqual(config.reader_type, "kavita")
+        self.assertEqual(config.reader_version, "0.9.0.2")
+        self.assertEqual(config.compatibility_tier, "certified")
+        self.assertEqual(config.reader_contract_version, "kavita-0.9.0.2-epub-v1")
+        self.assertEqual(config.api_environment()["BT_AUTH_MODE"], "reader_session")
+        self.assertEqual(
+            config.api_environment()["BT_READER_AUTH_URL"],
+            "http://kavita:5000/api/Account",
+        )
+        self.assertEqual(config.proxy_environment()["BT_READER_TYPE"], "kavita")
+        self.assertEqual(
+            config.proxy_environment()["BT_READER_UPSTREAM"],
+            "http://kavita:5000",
+        )
+
+        for version in ("0.9.0.1", "v0.9.0.2", "0.9.1.0", "latest"):
+            with self.subTest(version=version), self.assertRaisesRegex(
+                ConfigError, "certified Kavita"
+            ):
+                InstallConfig.from_mapping(
+                    {**values, "BT_READER_VERSION": version}, self.identity
+                )
+
+    def test_kavita_forbids_cwa_only_inputs_and_non_reader_auth(self):
+        base = {
+            **self.base,
+            "BT_READER_TYPE": "kavita",
+            "BT_READER_UPSTREAM": "http://kavita:5000",
+            "BT_READER_CONTAINER": "kavita",
+            "BT_READER_NETWORK": "kavita_default",
+            "BT_READER_VERSION": "0.9.0.2",
+        }
+        for legacy_name in (
+            "CWA_UPSTREAM",
+            "BT_CWA_CONTAINER",
+            "BT_CWA_NETWORK",
+            "BT_CWA_VERSION",
+        ):
+            base.pop(legacy_name)
+        for name, value in (
+            ("BT_CWA_IDENTITY_HEADER", "Remote-User"),
+            ("CWA_UPSTREAM", "http://calibre-web-automated:8083"),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(ConfigError, name):
+                InstallConfig.from_mapping(
+                    {**base, "BT_AUTH_PROFILE": "reader-session", name: value},
+                    self.identity,
+                )
+        with self.assertRaisesRegex(ConfigError, "reader-session"):
+            InstallConfig.from_mapping(base, self.identity)
 
     def test_nginx_facing_origins_reject_variable_or_ambiguous_authorities(self):
         malicious = (
@@ -582,11 +691,35 @@ class PlanAndStateTests(unittest.TestCase):
         self.assertNotIn("never-print-this", encoded)
         self.assertEqual(first["image"], self.identity.image)
         self.assertEqual(first["compatibility_tier"], "tier1")
-        self.assertEqual(first["resources"]["cwa"]["ownership"], "external")
+        self.assertEqual(first["schema_version"], 2)
+        self.assertEqual(first["reader_type"], "cwa")
+        self.assertEqual(first["reader_contract_version"], "cwa-epub-v1")
+        self.assertEqual(first["resources"]["reader"]["ownership"], "external")
         self.assertEqual(first["resources"]["api"]["ownership"], "owned")
         self.assertEqual(first["resources"]["proxy"]["ownership"], "owned")
         self.assertEqual(first["resources"]["api"]["published_ports"], [])
         self.assertEqual(first["resources"]["proxy"]["published_ports"], [8385])
+
+    def test_schema_one_state_loads_without_implicit_rewrite(self):
+        payload = {
+            "schema_version": 1,
+            "install_id": "01234567-89ab-4cde-8123-0123456789ab",
+            "status": "installed",
+            "version": "2.2.0",
+            "revision": "c" * 40,
+            "image": "local/cwa-translate:2.2.0-cccccccccccc",
+            "config_fingerprint": "d" * 64,
+            "install_profile": "compose-existing",
+            "auth_profile": "cwa-session",
+            "resources": {"cwa": {"name": "calibre-web-automated"}},
+        }
+
+        state = DeploymentState.from_dict(payload)
+
+        self.assertEqual(state.schema_version, 1)
+        self.assertEqual(state.reader_type, "cwa")
+        self.assertEqual(state.reader_contract_version, "cwa-epub-v1")
+        self.assertEqual(state.to_dict(), payload)
 
     def test_state_is_private_atomic_schema_versioned_and_secret_free(self):
         with tempfile.TemporaryDirectory() as directory:

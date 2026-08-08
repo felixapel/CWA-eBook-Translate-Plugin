@@ -132,9 +132,11 @@ def _probe_runtime_dependencies(
 ) -> None:
     api = str(plan.resources["api"]["name"])
     proxy = str(plan.resources["proxy"]["name"])
-    docker.probe_http(proxy, f"{config.cwa_upstream}/")
-    if config.auth_profile == "cwa-session":
-        authority = f"{config.cwa_upstream}/ajax/emailstat"
+    docker.probe_http(proxy, f"{config.reader_upstream}/")
+    if config.reader_type == "kavita":
+        authority = f"{config.reader_upstream}/api/Account"
+    elif config.uses_reader_session:
+        authority = f"{config.reader_upstream}/ajax/emailstat"
     else:
         authority = (
             f"{config.authentik_outpost_url}"
@@ -151,6 +153,7 @@ class ComposeDocker(Protocol):
     def inspect_image(self, name: str) -> dict | None: ...
     def build_image(self, repository: Path, image: str, labels: dict[str, str]) -> None: ...
     def prepare_data_directory(self, image: str, path: Path) -> None: ...
+    def remove_data_credential(self, image: str, path: Path, filename: str) -> None: ...
     def compose_validate(self, document: Path, project: str) -> None: ...
     def compose_up(self, document: Path, project: str) -> None: ...
     def wait_healthy(self, names: list[str], timeout_seconds: int) -> None: ...
@@ -161,13 +164,26 @@ class ComposeDocker(Protocol):
 
 
 def _labels(config: InstallConfig, role: str, install_id: str) -> dict[str, str]:
-    return {
+    labels = {
+        "io.book-translator.managed-by": "btctl",
+        "io.book-translator.install-id": install_id,
+        "io.book-translator.role": role,
+        "io.book-translator.version": config.identity.version,
+        "io.book-translator.revision": config.identity.sha,
+        "io.book-translator.reader": config.reader_type,
         "io.cwa-translate.managed-by": "btctl",
         "io.cwa-translate.install-id": install_id,
         "io.cwa-translate.role": role,
         "io.cwa-translate.version": config.identity.version,
         "io.cwa-translate.revision": config.identity.sha,
     }
+    if config.reader_type != "cwa":
+        labels = {
+            key: value
+            for key, value in labels.items()
+            if not key.startswith("io.cwa-translate.")
+        }
+    return labels
 
 
 def _verify_private_network(
@@ -176,16 +192,26 @@ def _verify_private_network(
     network: dict | None,
     *,
     expected_id: str | None = None,
+    allow_legacy_labels: bool = False,
 ) -> str:
     labels = network.get("Labels", {}) if network else {}
     identifier = network.get("Id") if network else None
     expected_labels = _labels(config, "private-network", install_id)
+    labels_match = all(
+        labels.get(key) == value for key, value in expected_labels.items()
+    )
+    if allow_legacy_labels and config.reader_type == "cwa":
+        labels_match = all(
+            labels.get(key) == value
+            for key, value in expected_labels.items()
+            if key.startswith("io.cwa-translate.")
+        )
     if (
         not isinstance(identifier, str)
         or not identifier
         or (expected_id is not None and identifier != expected_id)
         or network.get("Internal") is not True
-        or any(labels.get(key) != value for key, value in expected_labels.items())
+        or not labels_match
     ):
         raise InstallError("private network ownership or isolation does not match")
     return identifier
@@ -205,7 +231,7 @@ def _service_security() -> dict[str, object]:
 def render_compose(
     config: InstallConfig, plan: DeploymentPlan, install_id: str
 ) -> dict[str, object]:
-    """Return a JSON-compatible Compose model with no implicit CWA ownership."""
+    """Return a JSON-compatible model that never claims reader ownership."""
     # Compose treats `$NAME` as interpolation in every string field, including
     # environment values and bind sources. Doubling each dollar preserves the
     # exact validated runtime value.
@@ -218,6 +244,11 @@ def render_compose(
     api_environment = compose_environment({
         **config.api_environment(),
         "BT_ROLE": "api",
+        **(
+            {"BT_READER_CONNECTOR_ID": install_id}
+            if config.uses_reader_session
+            else {}
+        ),
     })
     proxy_environment = compose_environment({
         **config.proxy_environment(),
@@ -225,13 +256,13 @@ def render_compose(
         "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
     })
     api_networks: dict[str, object] = {"private": {"aliases": ["translator-api"]}}
-    if config.auth_profile == "cwa-session":
-        api_networks["cwa"] = {}
+    if config.uses_reader_session:
+        api_networks["reader"] = {}
     else:
         api_networks["edge"] = {}
     proxy_networks: dict[str, object] = {
         "private": {"aliases": ["translator-proxy"]},
-        "cwa": {},
+        "reader": {},
     }
     if config.edge_network:
         proxy_networks["edge"] = {}
@@ -282,7 +313,7 @@ def render_compose(
             "internal": True,
             "labels": _labels(config, "private-network", install_id),
         },
-        "cwa": {"name": config.cwa_network, "external": True},
+        "reader": {"name": config.reader_network, "external": True},
     }
     if config.edge_network:
         networks["edge"] = {"name": config.edge_network, "external": True}
@@ -291,6 +322,69 @@ def render_compose(
         "services": {"api": api, "proxy": proxy},
         "networks": networks,
     }
+
+
+def render_schema1_compose(
+    config: InstallConfig, plan: DeploymentPlan, install_id: str
+) -> dict[str, object]:
+    """Reconstruct the frozen schema-1 CWA artifact for doctor only."""
+    if config.reader_type != "cwa":
+        raise InstallError("schema-1 artifacts can only describe CWA")
+    document = render_compose(config, plan, install_id)
+    networks = document["networks"]
+    assert isinstance(networks, dict)
+    networks["cwa"] = networks.pop("reader")
+    services = document["services"]
+    assert isinstance(services, dict)
+    for service in services.values():
+        assert isinstance(service, dict)
+        service_networks = service["networks"]
+        assert isinstance(service_networks, dict)
+        if "reader" in service_networks:
+            service_networks["cwa"] = service_networks.pop("reader")
+        labels = service["labels"]
+        assert isinstance(labels, dict)
+        for key in list(labels):
+            if key.startswith("io.book-translator."):
+                labels.pop(key)
+    private = networks["private"]
+    assert isinstance(private, dict)
+    private_labels = private["labels"]
+    assert isinstance(private_labels, dict)
+    for key in list(private_labels):
+        if key.startswith("io.book-translator."):
+            private_labels.pop(key)
+    proxy = services["proxy"]
+    assert isinstance(proxy, dict)
+    proxy_environment = proxy["environment"]
+    assert isinstance(proxy_environment, dict)
+    for name in (
+        "BT_READER_TYPE",
+        "BT_READER_UPSTREAM",
+        "BT_READER_VERSION",
+        "BT_READER_CONTRACT_VERSION",
+    ):
+        proxy_environment.pop(name, None)
+    proxy_environment["BT_BROWSER_AUTH_MODE"] = "cwa_session"
+    api = services["api"]
+    assert isinstance(api, dict)
+    api_environment = api["environment"]
+    assert isinstance(api_environment, dict)
+    for name in (
+        "BT_READER_CONNECTOR_ID",
+        "BT_READER_TYPE",
+        "BT_READER_AUTH_URL",
+        "BT_READER_VERSION",
+        "BT_READER_CONTRACT_VERSION",
+        "BT_PUBLIC_ORIGIN",
+        "BT_SESSION_KEY_PATH",
+    ):
+        api_environment.pop(name, None)
+    api_environment["BT_AUTH_MODE"] = "cwa_session"
+    api_environment["BT_CWA_AUTH_URL"] = (
+        f"{config.reader_upstream}/ajax/emailstat"
+    )
+    return document
 
 
 def _write_private_json(path: Path, payload: object) -> None:
@@ -483,7 +577,7 @@ def _verify_data_bind(container: dict, role: str, data_dir: str) -> None:
         raise InstallError("API container data bind does not match the plan")
 
 
-def _has_exact_cwa_version(container: dict, version: str) -> bool:
+def _has_exact_reader_version(container: dict, version: str) -> bool:
     image = container.get("Config", {}).get("Image", "")
     without_digest = image.split("@", 1)[0] if isinstance(image, str) else ""
     last_component = without_digest.rsplit("/", 1)[-1]
@@ -499,6 +593,10 @@ def _has_exact_cwa_version(container: dict, version: str) -> bool:
             "version",
         )
     )
+
+
+# Kept for schema-1 lifecycle imports and downstream operator tooling.
+_has_exact_cwa_version = _has_exact_reader_version
 
 
 class ComposeInstaller:
@@ -522,19 +620,21 @@ class ComposeInstaller:
             plan,
             allow_rolled_back=allow_rolled_back_state,
         )
-        cwa = self.docker.inspect_container(config.cwa_container)
-        if cwa is None:
-            raise InstallError("configured CWA container does not exist")
-        if cwa.get("State", {}).get("Status") != "running":
-            raise InstallError("configured CWA container is not running")
-        if not _has_exact_cwa_version(cwa, config.cwa_version):
+        reader = self.docker.inspect_container(config.reader_container)
+        if reader is None:
+            raise InstallError("configured reader container does not exist")
+        if reader.get("State", {}).get("Status") != "running":
+            raise InstallError("configured reader container is not running")
+        if not _has_exact_reader_version(reader, config.reader_version):
             raise InstallError(
-                "configured CWA version has no exact tag or image-label evidence"
+                "configured reader version has no exact tag or image-label evidence"
             )
-        if config.cwa_network not in _container_networks(cwa):
-            raise InstallError("configured CWA container is not on BT_CWA_NETWORK")
-        if self.docker.inspect_network(config.cwa_network) is None:
-            raise InstallError("BT_CWA_NETWORK does not exist")
+        if config.reader_network not in _container_networks(reader):
+            raise InstallError(
+                "configured reader container is not on BT_READER_NETWORK"
+            )
+        if self.docker.inspect_network(config.reader_network) is None:
+            raise InstallError("BT_READER_NETWORK does not exist")
         if config.edge_network and self.docker.inspect_network(config.edge_network) is None:
             raise InstallError("BT_EDGE_NETWORK does not exist")
         for role in ("api", "proxy"):
@@ -561,14 +661,25 @@ class ComposeInstaller:
             raise InstallError(f"state directory is unsafe: {exc}") from exc
         return previous_state
 
-    def _verify_image(self, config: InstallConfig, image: dict | None) -> str:
+    def _verify_image(
+        self,
+        config: InstallConfig,
+        image: dict | None,
+        *,
+        allow_legacy_labels: bool = False,
+    ) -> str:
         if image is None or not isinstance(image.get("Id"), str):
             raise InstallError("local image build did not produce an inspectable image")
         labels = image.get("Config", {}).get("Labels", {}) or {}
         expected = {
-            "io.cwa-translate.version": config.identity.version,
-            "io.cwa-translate.revision": config.identity.sha,
+            "io.book-translator.version": config.identity.version,
+            "io.book-translator.revision": config.identity.sha,
         }
+        if allow_legacy_labels and config.reader_type == "cwa":
+            expected = {
+                "io.cwa-translate.version": config.identity.version,
+                "io.cwa-translate.revision": config.identity.sha,
+            }
         if any(labels.get(key) != value for key, value in expected.items()):
             raise InstallError("local image identity labels do not match the checkout")
         return image["Id"]
@@ -580,6 +691,8 @@ class ComposeInstaller:
         install_id: str,
         role: str,
         image_id: str,
+        *,
+        allow_legacy_labels: bool = False,
     ) -> tuple[str, dict]:
         name = str(plan.resources[role]["name"])
         container = self.docker.inspect_container(name)
@@ -589,10 +702,24 @@ class ComposeInstaller:
             raise InstallError(f"{role} container image ID does not match the local build")
         labels = container.get("Config", {}).get("Labels", {}) or {}
         expected_labels = _labels(config, role, install_id)
+        if allow_legacy_labels and config.reader_type == "cwa":
+            expected_labels = {
+                key: value
+                for key, value in expected_labels.items()
+                if key.startswith("io.cwa-translate.")
+            }
         if any(labels.get(key) != value for key, value in expected_labels.items()):
             raise InstallError(f"{role} container ownership labels do not match")
         expected_environment = (
-            {**config.api_environment(), "BT_ROLE": "api"}
+            {
+                **config.api_environment(),
+                "BT_ROLE": "api",
+                **(
+                    {"BT_READER_CONNECTOR_ID": install_id}
+                    if config.uses_reader_session
+                    else {}
+                ),
+            }
             if role == "api"
             else {
                 **config.proxy_environment(),
@@ -600,6 +727,26 @@ class ComposeInstaller:
                 "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
             }
         )
+        if allow_legacy_labels and role == "proxy":
+            expected_environment.pop("BT_READER_TYPE", None)
+            expected_environment.pop("BT_READER_UPSTREAM", None)
+            expected_environment.pop("BT_READER_VERSION", None)
+            expected_environment.pop("BT_READER_CONTRACT_VERSION", None)
+        if allow_legacy_labels and role == "api":
+            for name in (
+                "BT_READER_CONNECTOR_ID",
+                "BT_READER_TYPE",
+                "BT_READER_AUTH_URL",
+                "BT_READER_VERSION",
+                "BT_READER_CONTRACT_VERSION",
+                "BT_PUBLIC_ORIGIN",
+                "BT_SESSION_KEY_PATH",
+            ):
+                expected_environment.pop(name, None)
+            expected_environment["BT_AUTH_MODE"] = "cwa_session"
+            expected_environment["BT_CWA_AUTH_URL"] = (
+                f"{config.reader_upstream}/ajax/emailstat"
+            )
         live_environment = _container_environment(container)
         if any(
             live_environment.get(key) != value
@@ -617,10 +764,10 @@ class ComposeInstaller:
         expected_networks = {private_name}
         if role == "api":
             expected_networks.add(
-                config.cwa_network if config.auth_profile == "cwa-session" else config.edge_network
+                config.reader_network if config.uses_reader_session else config.edge_network
             )
         else:
-            expected_networks.add(config.cwa_network)
+            expected_networks.add(config.reader_network)
             if config.edge_network:
                 expected_networks.add(config.edge_network)
         if _container_networks(container) != expected_networks:
@@ -671,10 +818,19 @@ class ComposeInstaller:
         state_committed = False
         try:
             image_labels = {
+                "io.book-translator.version": config.identity.version,
+                "io.book-translator.revision": config.identity.sha,
+                "io.book-translator.source": "local-checkout",
                 "io.cwa-translate.version": config.identity.version,
                 "io.cwa-translate.revision": config.identity.sha,
                 "io.cwa-translate.source": "local-checkout",
             }
+            if config.reader_type != "cwa":
+                image_labels = {
+                    key: value
+                    for key, value in image_labels.items()
+                    if not key.startswith("io.cwa-translate.")
+                }
             self.docker.build_image(Path(repository), config.image, image_labels)
             image_id = self._verify_image(
                 config, self.docker.inspect_image(config.image)
@@ -801,17 +957,19 @@ class ComposeAdopter:
         store = StateStore(Path(config.state_dir))
         if store.path.exists():
             raise InstallError("deployment state already exists; use doctor")
-        cwa = self.docker.inspect_container(config.cwa_container)
-        if cwa is None or cwa.get("State", {}).get("Status") != "running":
-            raise InstallError("configured CWA container is missing or stopped")
-        if not _has_exact_cwa_version(cwa, config.cwa_version):
+        reader = self.docker.inspect_container(config.reader_container)
+        if reader is None or reader.get("State", {}).get("Status") != "running":
+            raise InstallError("configured reader container is missing or stopped")
+        if not _has_exact_reader_version(reader, config.reader_version):
             raise InstallError(
-                "configured CWA version has no exact tag or image-label evidence"
+                "configured reader version has no exact tag or image-label evidence"
             )
-        if config.cwa_network not in _container_networks(cwa):
-            raise InstallError("configured CWA container is not on BT_CWA_NETWORK")
-        if self.docker.inspect_network(config.cwa_network) is None:
-            raise InstallError("BT_CWA_NETWORK does not exist")
+        if config.reader_network not in _container_networks(reader):
+            raise InstallError(
+                "configured reader container is not on BT_READER_NETWORK"
+            )
+        if self.docker.inspect_network(config.reader_network) is None:
+            raise InstallError("BT_READER_NETWORK does not exist")
         if config.edge_network and self.docker.inspect_network(config.edge_network) is None:
             raise InstallError("BT_EDGE_NETWORK does not exist")
 
@@ -831,19 +989,19 @@ class ComposeAdopter:
             labels = container.get("Config", {}).get("Labels", {}) if container else {}
             if (
                 not container
-                or labels.get("io.cwa-translate.managed-by") != "btctl"
-                or labels.get("io.cwa-translate.role") != role
-                or labels.get("io.cwa-translate.version") != config.identity.version
-                or labels.get("io.cwa-translate.revision") != config.identity.sha
-                or not labels.get("io.cwa-translate.install-id")
+                or labels.get("io.book-translator.managed-by") != "btctl"
+                or labels.get("io.book-translator.role") != role
+                or labels.get("io.book-translator.version") != config.identity.version
+                or labels.get("io.book-translator.revision") != config.identity.sha
+                or not labels.get("io.book-translator.install-id")
             ):
                 raise InstallError(f"{role} ownership labels are missing or incompatible")
         install_id = containers["api"]["Config"]["Labels"][
-            "io.cwa-translate.install-id"
+            "io.book-translator.install-id"
         ]
         if (
             containers["proxy"]["Config"]["Labels"].get(
-                "io.cwa-translate.install-id"
+                "io.book-translator.install-id"
             )
             != install_id
         ):

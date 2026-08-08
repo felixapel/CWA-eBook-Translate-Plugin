@@ -34,7 +34,9 @@ from singleflight import (
 
 log = logging.getLogger("book-translator.auth")
 
-_SUPPORTED_MODES = frozenset({"token", "cwa_session", "forwarded", "disabled"})
+_SUPPORTED_MODES = frozenset(
+    {"token", "cwa_session", "reader_session", "forwarded", "disabled"}
+)
 _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+-]{0,63}$")
@@ -244,6 +246,7 @@ class RequestAuthenticator:
         cwa_max_inflight: int = 8,
         cwa_max_response_bytes: int = 262_144,
         http_get: Callable[..., object] | None = None,
+        reader_session_broker: object | None = None,
     ) -> None:
         normalized_mode = str(mode).strip().lower()
         if normalized_mode not in _SUPPORTED_MODES:
@@ -285,6 +288,11 @@ class RequestAuthenticator:
         # fresh trust_env=False Session per probe so HTTP(S)_PROXY cannot
         # receive CWA cookies and response cookies cannot bleed between users.
         self._http_get = http_get
+        self.reader_session_broker = reader_session_broker
+        if self.mode == "reader_session" and self.reader_session_broker is None:
+            raise AuthConfigError(
+                "reader_session mode requires a configured session broker"
+            )
 
         if self.mode == "cwa_session":
             if not cwa_auth_url:
@@ -366,6 +374,16 @@ class RequestAuthenticator:
             for value in source.get("BT_IDENTITY_TRUSTED_PROXIES", "").split(",")
             if value.strip()
         )
+        reader_session_broker = None
+        if str(mode).strip().lower() == "reader_session":
+            try:
+                from reader_session import BrokerConfigError, broker_from_environment
+
+                reader_session_broker = broker_from_environment(
+                    source, http_get=http_get
+                )
+            except BrokerConfigError as exc:
+                raise AuthConfigError(str(exc)) from exc
         authenticator = cls(
             mode=mode,
             api_token=source.get("BT_API_TOKEN", ""),
@@ -386,6 +404,7 @@ class RequestAuthenticator:
                 "BT_CWA_AUTH_MAX_RESPONSE_BYTES", "262144"
             ),
             http_get=http_get,
+            reader_session_broker=reader_session_broker,
         )
         if authenticator.mode == "disabled":
             log.warning(
@@ -410,6 +429,18 @@ class RequestAuthenticator:
             return self._authenticate_token(headers)
         if self.mode == "forwarded":
             return self._authenticate_forwarded(headers, remote_addr)
+        if self.mode == "reader_session":
+            try:
+                from reader_session import BrokerRejected, BrokerUnavailable
+
+                subject = self.reader_session_broker.authenticate(
+                    headers, cwa_binding
+                )
+            except BrokerRejected:
+                raise AuthRejected("authentication rejected") from None
+            except BrokerUnavailable:
+                raise AuthUnavailable("authentication authority unavailable") from None
+            return AuthIdentity(subject, frozenset(), self.mode)
         return self._authenticate_cwa_session(headers, cwa_binding)
 
     def _authenticate_token(self, headers: Mapping[str, str]) -> AuthIdentity:
