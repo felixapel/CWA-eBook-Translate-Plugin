@@ -40,7 +40,9 @@ authority to the translation API.
 - Non-loopback reader-session deployments require HTTPS. Provider credentials
   remain server-side and cache records retain only opaque/hash scopes.
 - CWA and Kavita use separate `btctl` instances. The existing Community
-  Applications combined profile remains CWA-only.
+  Applications combined profile remains CWA-only. Immutable local image names
+  are reader-scoped (`local/cwa-translate` and `local/kavita-translate`) so a
+  build for one connector cannot retag the image beneath the other instance.
 
 ## Consequences
 

@@ -66,11 +66,13 @@ Browser ──► proxy role (:8080) ──► stock reader (CWA :8083 / Kavita 
 ## Deployment control plane
 
 `btctl` validates a strict environment file and derives an immutable local
-image identity from `VERSION` plus the clean checkout SHA. Its deterministic
-`plan` declares every resource and its ownership before Docker is touched.
-Lifecycle state is private, atomic, schema-versioned, and contains no secrets.
-This separates source, configuration, mutable translation data, and backups so
-an update of one cannot silently replace another.
+image identity from the reader type, `VERSION`, and the clean checkout SHA.
+CWA and Kavita use distinct local image repositories so concurrent connector
+instances cannot move each other's immutable tag. The deterministic `plan`
+declares every resource and its ownership before Docker is touched. Lifecycle
+state is private, atomic, schema-versioned, and contains no secrets. This
+separates source, configuration, mutable translation data, and backups so an
+update of one cannot silently replace another.
 
 The Compose adapter writes a private JSON-form Compose document (JSON is a
 Compose-compatible YAML subset), validates it with the local Compose plugin,

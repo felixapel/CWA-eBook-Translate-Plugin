@@ -817,7 +817,10 @@ class InstallConfig:
 
     @property
     def image(self) -> str:
-        return self.identity.image
+        return (
+            f"local/{self.reader_type}-translate:"
+            f"{self.identity.version}-{self.identity.sha[:12]}"
+        )
 
     @property
     def cwa_upstream(self) -> str:

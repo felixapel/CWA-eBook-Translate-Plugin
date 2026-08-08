@@ -340,6 +340,11 @@ class InstallConfigTests(unittest.TestCase):
         self.assertEqual(config.reader_version, "0.9.0.2")
         self.assertEqual(config.compatibility_tier, "certified")
         self.assertEqual(config.reader_contract_version, "kavita-0.9.0.2-epub-v1")
+        self.assertEqual(
+            config.image,
+            "local/kavita-translate:2.2.0-bbbbbbbbbbbb",
+        )
+        self.assertNotEqual(config.image, self.identity.image)
         self.assertEqual(config.api_environment()["BT_AUTH_MODE"], "reader_session")
         self.assertEqual(
             config.api_environment()["BT_READER_AUTH_URL"],
