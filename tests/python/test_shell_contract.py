@@ -60,6 +60,7 @@ class ShellContractTests(unittest.TestCase):
             "DOCKER_HOST=unix:///var/run/docker.sock",
             "[ -S /var/run/docker.sock ]",
             "/run/cwa-translate-btctl-locks",
+            'type=bind,src=$HOST_LOCK_DIRECTORY,dst=$HOST_LOCK_DIRECTORY,readonly',
             '[ "$second" = "$HOST_LOCK_DIRECTORY" ]',
             'environment_snapshot="$temporary/install.env.snapshot"',
             'cmp --silent -- "$temporary/mount-plan" "$temporary/final-mount-plan"',

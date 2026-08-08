@@ -366,6 +366,13 @@ fi
 if [ -d /boot ]; then
     planner_mounts+=(--mount type=bind,src=/boot,dst=/boot,readonly)
 fi
+case "$command" in
+    install|adopt|doctor|uninstall|upgrade|rollback)
+        planner_mounts+=(
+            --mount "type=bind,src=$HOST_LOCK_DIRECTORY,dst=$HOST_LOCK_DIRECTORY,readonly"
+        )
+        ;;
+esac
 
 render_mount_plan() {
     local destination="$1"
