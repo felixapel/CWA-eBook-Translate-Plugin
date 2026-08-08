@@ -244,6 +244,15 @@ curl -sf -H "Cookie: ${PLUGIN_COOKIE}" -H "User-Agent: ${BROWSER_UA}" \
 test "$(curl -sS -o /dev/null -w '%{http_code}' \
     -H "Cookie: ${PLUGIN_COOKIE}" -H 'User-Agent: Wrong-Browser/1.0' \
     "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
+curl -sf -X DELETE \
+    -H "Cookie: ${PLUGIN_COOKIE}; session=cwa-cookie-must-not-reach-api" \
+    -H "User-Agent: ${BROWSER_UA}" \
+    -H 'Origin: https://books.example.test:8443' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/session" \
+    | grep -q '"status":"revoked"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Cookie: ${PLUGIN_COOKIE}" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
 
 # A pinned Kavita fixture proves both stock HTML proxying and native bearer
 # exchange. Its account DTO includes unrelated auth-key data; the broker uses
@@ -323,6 +332,15 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' \
 curl -sf -H "Cookie: ${PLUGIN_COOKIE}" -H "User-Agent: ${BROWSER_UA}" \
     "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics" \
     | grep -q '"total_requests"'
+curl -sf -X DELETE \
+    -H "Cookie: ${PLUGIN_COOKIE}; .AspNetCore.Cookies=oidc-cookie-must-not-reach-api" \
+    -H "User-Agent: ${BROWSER_UA}" \
+    -H 'Origin: https://books.example.test:8443' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/session" \
+    | grep -q '"status":"revoked"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Cookie: ${PLUGIN_COOKIE}" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
 
 # Render the managed Authentik/Nginx edge fragment, validate it with the nginx
 # binary shipped in the candidate, and exercise a successful auth subrequest.

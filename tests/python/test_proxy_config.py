@@ -70,7 +70,10 @@ class ProxyConfigRendererTests(unittest.TestCase):
         self.assertIn("listen 8080;", rendered)
         self.assertIn("proxy_pass http://calibre-web:8083;", rendered)
         self.assertIn("proxy_pass http://book-translator-api:8390/;", rendered)
-        self.assertEqual(rendered.count("proxy_set_header Cookie $http_cookie;"), 2)
+        self.assertEqual(rendered.count("proxy_set_header Cookie $http_cookie;"), 1)
+        self.assertIn(
+            "proxy_set_header Cookie $bt_session_route_cookie;", rendered
+        )
         self.assertNotIn("proxy_set_header Cookie $bt_session_cookie;", rendered)
         self.assertIn('proxy_set_header Remote-User "";', rendered)
         self.assertNotIn("$http_x_forwarded_proto", rendered)
@@ -103,7 +106,11 @@ class ProxyConfigRendererTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = output.read_text(encoding="utf-8")
-        self.assertEqual(rendered.count("proxy_set_header Cookie $http_cookie;"), 1)
+        self.assertNotIn("proxy_set_header Cookie $http_cookie;", rendered)
+        self.assertIn("default $http_cookie;", rendered)
+        self.assertIn(
+            "proxy_set_header Cookie $bt_session_route_cookie;", rendered
+        )
         self.assertIn('proxy_set_header Cookie "";', rendered)
         self.assertEqual(
             json.loads(browser_output.read_text()),
@@ -129,9 +136,16 @@ class ProxyConfigRendererTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = output.read_text(encoding="utf-8")
         self.assertIn("proxy_pass http://kavita:5000;", rendered)
-        self.assertEqual(rendered.count("proxy_set_header Cookie $http_cookie;"), 1)
-        self.assertEqual(
-            rendered.count("proxy_set_header Authorization $http_authorization;"), 1
+        self.assertIn("default $http_cookie;", rendered)
+        self.assertIn("DELETE $bt_session_cookie;", rendered)
+        self.assertIn("default $http_authorization;", rendered)
+        self.assertIn('DELETE "";', rendered)
+        self.assertIn(
+            "proxy_set_header Cookie $bt_session_route_cookie;", rendered
+        )
+        self.assertIn(
+            "proxy_set_header Authorization $bt_session_route_authorization;",
+            rendered,
         )
         self.assertIn("proxy_set_header Cookie $bt_session_cookie;", rendered)
         self.assertIn('proxy_set_header Authorization "";', rendered)
