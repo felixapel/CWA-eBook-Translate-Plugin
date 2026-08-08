@@ -399,7 +399,7 @@ class DockerCLIContractTests(unittest.TestCase):
             DockerCLI().build_image(
                 Path("/checkout"),
                 "local/cwa-translate:2.2.0-abcdef012345",
-                {"io.cwa-translate.revision": "a" * 40},
+                {"io.book-translator.revision": "a" * 40},
             )
 
         archive_arguments = run.call_args_list[0].args[0]
@@ -419,6 +419,60 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertEqual(build_arguments[-1], "-")
         self.assertEqual(run.call_args_list[1].kwargs["input"], b"tar-bytes")
         self.assertNotIn("/checkout", build_arguments)
+
+    def test_image_build_accepts_the_legacy_cwa_revision_label(self):
+        archive = mock.Mock(returncode=0, stdout=b"tar-bytes", stderr=b"")
+        built = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+        with mock.patch("subprocess.run", side_effect=[archive, built]) as run:
+            DockerCLI().build_image(
+                Path("/checkout"),
+                "local/cwa-translate:2.2.0-abcdef012345",
+                {"io.cwa-translate.revision": "b" * 40},
+            )
+
+        self.assertEqual(run.call_args_list[0].args[0][-1], "b" * 40)
+
+    def test_image_build_rejects_conflicting_revision_labels(self):
+        with mock.patch("subprocess.run") as run:
+            with self.assertRaisesRegex(
+                DockerCommandError,
+                "image build requires one exact source revision",
+            ):
+                DockerCLI().build_image(
+                    Path("/checkout"),
+                    "local/book-translator:2.3.0-abcdef012345",
+                    {
+                        "io.book-translator.revision": "a" * 40,
+                        "io.cwa-translate.revision": "b" * 40,
+                    },
+                )
+
+        run.assert_not_called()
+
+    def test_image_build_rejects_any_malformed_revision_label(self):
+        label_sets = (
+            {},
+            {"io.book-translator.revision": "A" * 40},
+            {"io.cwa-translate.revision": "a" * 39},
+            {
+                "io.book-translator.revision": "a" * 40,
+                "io.cwa-translate.revision": "invalid",
+            },
+        )
+
+        for labels in label_sets:
+            with self.subTest(labels=labels), mock.patch("subprocess.run") as run:
+                with self.assertRaisesRegex(
+                    DockerCommandError,
+                    "image build requires one exact source revision",
+                ):
+                    DockerCLI().build_image(
+                        Path("/checkout"),
+                        "local/book-translator:2.3.0-abcdef012345",
+                        labels,
+                    )
+                run.assert_not_called()
 
 
 class UnraidDataPreparationTests(unittest.TestCase):

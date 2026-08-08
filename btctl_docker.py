@@ -91,9 +91,24 @@ class DockerCLI:
     def build_image(
         self, repository: Path, image: str, labels: dict[str, str]
     ) -> None:
-        revision = labels.get("io.cwa-translate.revision", "")
-        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        revision_labels = tuple(
+            labels[key]
+            for key in (
+                "io.book-translator.revision",
+                "io.cwa-translate.revision",
+            )
+            if key in labels
+        )
+        if (
+            not revision_labels
+            or any(
+                not re.fullmatch(r"[0-9a-f]{40}", value)
+                for value in revision_labels
+            )
+            or len(set(revision_labels)) != 1
+        ):
             raise DockerCommandError("image build requires one exact source revision")
+        revision = revision_labels[0]
         git_environment = os.environ.copy()
         git_environment["GIT_NO_REPLACE_OBJECTS"] = "1"
         git_environment["GIT_OPTIONAL_LOCKS"] = "0"
