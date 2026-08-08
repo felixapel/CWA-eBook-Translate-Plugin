@@ -1,6 +1,6 @@
 # Troubleshooting
 
-These checks apply to the managed split deployment and the certified
+These checks apply to the managed split deployment and the CWA-only certified
 Community Applications profile. Do not expose the
 API, add a browser token, broaden a trusted proxy range, or disable
 authentication to make an error disappear.
@@ -21,7 +21,7 @@ For structured output that is easier to share after removing private paths:
 ```
 
 Every check must be `ok`. Doctor validates the saved plan, version+commit image,
-owned containers/network, exact CWA evidence, health, runtime environment,
+owned containers/network, exact reader evidence, health, runtime environment,
 authentication profile, published ports, and generated artifacts. Fix its first
 failed check before debugging the browser.
 
@@ -72,16 +72,20 @@ confirming no other `btctl` operation is running; do not bypass the lock.
 
 ## Toolbar is missing
 
-1. Open the reader through `BT_PUBLIC_ORIGIN`, not CWA's direct port. Stock CWA
-   intentionally has no overlay.
+1. Open the reader through `BT_PUBLIC_ORIGIN`, not the reader's direct port. A
+   stock reader reached directly intentionally has no overlay.
 2. Hard-refresh once (`Ctrl+Shift+R` or `Cmd+Shift+R`).
 3. In Browser DevTools, confirm `GET /bt-config.json` returns `200`, a JSON
    object, and `Cache-Control: no-store`. A missing or invalid managed config
    makes the loader fail closed; page variables cannot override it.
 4. Confirm the reader page loads `/bt-static/loader.js` and that the Console
    has no `[BookTranslator]` error.
-5. If a reverse proxy is present, confirm its main CWA route points to the
-   managed injection proxy. Keep OPDS/Kobo routes pointed directly at CWA.
+5. For CWA, confirm the path begins `/read/`. For Kavita, the only accepted
+   path is `/library/<positive-id>/series/<positive-id>/book/<positive-id>`.
+   Manga, PDF and library pages intentionally do not mount the toolbar.
+6. If a reverse proxy is present, confirm its browser-reader route points to the
+   managed injection proxy. Keep non-browser OPDS/Kobo/mobile routes pointed
+   directly at the stock reader.
 
 ## Translation requests return 401 with `cwa-session`
 
@@ -115,12 +119,38 @@ If Authentik authenticates the browser but CWA never creates a session that its
 anonymous mode and do not put a shared secret in browser storage.
 
 A `503` instead of `401` means the API could not safely evaluate CWA as the
-authority. Check that the CWA container is running, `CWA_UPSTREAM` and
-`BT_CWA_NETWORK` are exact, and the selected auth endpoint is reachable from
+authority. Check that the CWA container is running, `BT_READER_UPSTREAM` and
+`BT_READER_NETWORK` are exact, and the selected auth endpoint is reachable from
 the API container. On a managed split install, `doctor` catches topology and
 runtime drift. On Community Applications, verify the CWA network and auth URL in
 the Unraid Edit screen. In both profiles, API logs contain the bounded authority
 failure without session-cookie contents.
+
+## Translation requests return 401 with Kavita
+
+Kavita requires `BT_AUTH_PROFILE=reader-session`, stock version `0.9.0.2`, and
+an HTTPS public origin outside loopback. Sign out and back in through that
+origin, open the exact EPUB route, and inspect `POST /bt-api/session` first.
+
+- Native login requires a bounded access token in Kavita's own `kavita-user`
+  local-storage object. The connector reads its `token` field only; it never
+  reads or sends a refresh token.
+- Stock OIDC login requires the exact `.AspNetCore.Cookies` cookie, including
+  contiguous `C1`, `C2`, ... chunks when ASP.NET split it. Unrelated cookies
+  are not forwarded to the account probe.
+- The exchange must return `200` with `reader_type: "kavita"`, exact version
+  `0.9.0.2`, and `expires_in` no greater than 300. The cookie itself is HttpOnly
+  and therefore correctly absent from JavaScript storage.
+- A `401` means the native proof, version, origin, observed address or
+  User-Agent did not match. A `503` means `/api/Account` was unreachable or
+  returned a malformed/oversized response. `doctor` catches container,
+  network, version and generated-environment drift.
+
+Do not copy a token into translator configuration or relax the proxy. Ordinary
+`/bt-api/*` routes intentionally strip Kavita Authorization and cookies and
+accept only the opaque plugin session. The frontend performs one fresh exchange
+and one replay after an expired-session `401`; repeated failures require a new
+Kavita login or topology repair.
 
 ## Translation requests return 401 with `authentik-forwarded`
 
@@ -207,16 +237,17 @@ envelopes at the cost of one provider call per paragraph. Keep
 `BT_REQUEST_MAX_ATTEMPTS`, output limits, and the request deadline finite; do
 not hide a systematic provider problem by making them unlimited.
 
-## 502 or 504 after CWA was recreated
+## 502 or 504 after the reader was recreated
 
-The injection proxy resolves `CWA_UPSTREAM` when its Nginx process starts. If
-CWA was recreated with a new address, restart only the translator proxy role,
+The injection proxy resolves `BT_READER_UPSTREAM` when its Nginx process starts.
+If CWA or Kavita was recreated with a new address, restart only the translator proxy role,
 or the single translator container for Community Applications. On a managed
 split install, rerun `doctor`. Do not recreate CWA or the translator API role
 for this symptom.
 
-Also confirm CWA still joins the exact `BT_CWA_NETWORK` and that its running
-image supplies the exact `BT_CWA_VERSION` tag/label expected by the plan.
+Also confirm the reader still joins the exact `BT_READER_NETWORK` and that its
+running image supplies the exact `BT_READER_VERSION` tag/label expected by the
+plan.
 
 ## Rate-limited or slow translation
 
@@ -291,8 +322,9 @@ DRM-free EPUB.
 
 ## Collecting a useful issue report
 
-Include the exact source commit or image digest, `VERSION`, host/profile, CWA
-image tag, reverse-proxy type, browser, and the smallest relevant log window.
+Include the exact source commit or image digest, `VERSION`, host/profile, reader
+type and exact image tag, reverse-proxy type, browser, and the smallest relevant
+log window.
 For managed split installs, also include the redacted first failed doctor
 check; for Community Applications, include the first container startup or
 request error instead. Remove cookies, Authentik headers, public IPs, private

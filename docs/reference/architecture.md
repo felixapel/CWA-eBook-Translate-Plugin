@@ -10,31 +10,41 @@ decisions.
 
 ## Overview
 
-The plugin operates as a decoupled overlay integrated into
-Calibre-Web-Automated (CWA). There are two production deployment profiles:
+The plugin operates as a decoupled overlay in front of a stock reader. Reader
+connectors isolate upstream-specific routes, DOM and authentication from the
+translation/cache/provider core. There are two deployment profiles:
 
 1. **Managed split profile (`btctl`, recommended).** Two isolated non-root
    containers run the same release image with `BT_ROLE=proxy` and
-   `BT_ROLE=api`. nginx sits in front of a **stock** CWA instance
-   (`CWA_UPSTREAM`). HTML responses get a
+   `BT_ROLE=api`. nginx sits in front of a **stock** CWA or pinned Kavita
+   instance (`BT_READER_UPSTREAM`). HTML responses get a
    single `<script src="/bt-static/loader.js">` tag injected before `</head>`;
-   `loader.js` self-guards to `/read/` pages and loads the overlay. The API is
+   `loader.js` self-guards to one certified reader route and loads the overlay.
+   CWA uses its `/read/` EPUB route and iframe/EPUB.js adapter. Kavita v0.9.0.2
+   uses the exact `/library/:libraryId/series/:seriesId/book/:chapterId` route
+   and top-level `.book-content` adapter. The API is
    reachable same-origin under `/bt-api/`, so CORS never applies. Because only
-   one tag is injected (instead of maintaining a forked `read.html`), CWA
-   template updates cannot silently break or drop the plugin. See
-   `proxy/nginx.conf.template` and `docker-entrypoint.sh`. The proxy passes the
-   browser's HttpOnly CWA cookie to the API; the API validates only configured
-   cookie names against CWA's authenticated JSON probe and derives an opaque
-   per-session tenant. `BT_PUBLIC_ORIGIN` fixes the forwarded host/scheme;
+   one tag is injected instead of maintaining a reader fork, upstream template
+   updates become explicit compatibility events. See `proxy/nginx.conf.template`
+   and `docker-entrypoint.sh`.
+
+   In managed native-reader mode, raw reader proof is forwarded only to exact
+   `POST /bt-api/session`. `reader_session.py` allowlists CWA cookies, a Kavita
+   native access bearer, or exact Kavita OIDC cookie chunks and validates the
+   pinned account endpoint. It persists none of that proof. The response is a
+   random, HttpOnly, SameSite-strict plugin cookie valid for at most five
+   minutes and bound to connector, origin, proxy-observed address and
+   User-Agent. Ordinary API locations remove Authorization and reduce cookies
+   to that plugin cookie. `BT_PUBLIC_ORIGIN` fixes the forwarded host/scheme;
    inbound forwarding headers are discarded, the observed peer becomes the
-   only forwarded client hop, and CWA uploads have an operator-configurable
+   only forwarded client hop, and reader uploads have an operator-configurable
    finite body cap.
 2. **Community Applications combined profile (listing-gated).** One non-root
    container runs `BT_ROLE=all`, exposes only its proxy port and keeps API port
    `8390` private. This is production-supported only when the searchable
    listing pins a certified immutable image digest and the host matches the
-   [documented boundary](../install/community-applications.md). Otherwise use
-   `btctl`.
+   [documented CWA-only boundary](../install/community-applications.md).
+   Kavita always uses the split `btctl` profile.
 
 `overlay/read.html` remains a legacy development fixture for investigating CWA
 template compatibility. Mounting it into CWA and publishing the API
@@ -45,8 +55,9 @@ browser-facing translator role; the API owns the writable SQLite volume. The
 combined CA profile preserves the same logical boundary inside one container.
 
 ```
-Browser ──► proxy role (:8080) ──► CWA (:8083, stock)
+Browser ──► proxy role (:8080) ──► stock reader (CWA :8083 / Kavita :5000)
                 │
+                ├── /bt-api/session ──► native proof validation
                 └── /bt-api/* ──► API role (:8390) ──► LLM provider
                                          │
                                          └── SQLite volume (/app/data)
@@ -72,8 +83,16 @@ cannot detach an active API container from its bind source.
 
 ## Component Breakdown
 
-### Frontend (`translator.js`)
-- **Lifecycle Observers**: Hooks into CWA reader using iframe document checking and `epub.js` rendition hooks (`relocated`, `rendered`).
+### Frontend (`loader.js` and `translator.js`)
+
+- **Bootstrap and session exchange**: `loader.js` validates the server-owned
+  browser contract and exact current route before exchanging native reader
+  proof or loading overlay assets. It observes SPA history changes and remains
+  inert on Kavita manga/PDF and unrelated pages.
+- **Reader adapters**: CWA uses iframe document checking and `epub.js`
+  rendition hooks (`relocated`, `rendered`). Kavita discovers only the current
+  `.book-content`, derives book/chapter cache scope from numeric route segments,
+  observes Angular DOM replacement and tears down on navigation.
 - **Translation Management**: Coordinates visible-first translation chunking;
   background sequential whole-chapter prefetch is disabled until the reader
   explicitly enables it.
@@ -83,12 +102,11 @@ cannot detach an active API container from its bind source.
   repeated text in different literary contexts cannot collide.
 
 ### Backend (`book-translator-api`)
-- **Authentication (`auth.py`)**: Fails closed in token, CWA-session, or
-  trusted-forwarded mode before any cache/provider work. Raw credentials and
-  subjects become opaque hashes; CWA checks require the exact protected task
-  endpoint and bounded JSON-list shape, are TTL/cap bounded, and coalesce
-  concurrent duplicates. The frontend attaches cookies only in CWA-session
-  mode.
+- **Authentication (`auth.py`, `reader_session.py`)**: Fails closed in token,
+  managed reader-session, legacy CWA-session, or trusted-forwarded mode before
+  cache/provider work. Native reader proof is isolated to exchange; opaque
+  sessions are in-memory, bounded and short-lived. Subjects become connector-
+  scoped hashes and never expose upstream user ids to cache or metrics.
 - **Flask Server (`server.py`)**: Exposes translation endpoints `/translate`
   and `/translate/batch` along with metrics and health probes. Only shallow
   liveness/readiness routes bypass authentication. Observability uses a fixed

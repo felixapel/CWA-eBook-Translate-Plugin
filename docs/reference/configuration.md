@@ -8,17 +8,18 @@ role settings and redacts secrets from its output. Never commit the edited file.
 
 | Variable | Purpose |
 |---|---|
-| `BT_INSTALL_PROFILE` | `unraid` or `compose-existing`. CWA always remains external. |
+| `BT_INSTALL_PROFILE` | `unraid` or `compose-existing`. The stock reader always remains external. |
 | `BT_INSTALL_NAME` | Stable prefix for owned translator resources. Choose once. |
 | `BT_INGRESS_MODE` | `published` exposes only the proxy; `docker-edge` publishes neither role. |
 | `BT_PROXY_PORT` | Host port for the proxy in `published` mode. |
 | `BT_EDGE_NETWORK` | Existing edge network required by `docker-edge`. |
-| `BT_AUTH_PROFILE` | `cwa-session` by default; `authentik-forwarded` only for the documented advanced topology. |
+| `BT_AUTH_PROFILE` | `cwa-session` for CWA, `reader-session` for Kavita, or CWA-only `authentik-forwarded`. |
 | `BT_PUBLIC_ORIGIN` | Exact browser-facing origin, including scheme and optional port. |
-| `CWA_UPSTREAM` | Must be `http://<BT_CWA_CONTAINER>:8083`. |
-| `BT_CWA_CONTAINER` | Exact running stock CWA container name. |
-| `BT_CWA_NETWORK` | One existing Docker network joined by CWA. |
-| `BT_CWA_VERSION` | Exact stable CWA version observed by the install. |
+| `BT_READER_TYPE` | `cwa` or `kavita`; defaults to `cwa` for schema-1 configuration compatibility. |
+| `BT_READER_UPSTREAM` | Exact stock reader origin: CWA port `8083` or Kavita port `5000`. |
+| `BT_READER_CONTAINER` | Exact running stock reader container name. |
+| `BT_READER_NETWORK` | One existing Docker network joined by the reader. |
+| `BT_READER_VERSION` | Exact reader version observed by the install. Kavita accepts only `0.9.0.2`. |
 | `BT_CWA_IDENTITY_HEADER` | Exact reverse-proxy identity header configured in CWA; the managed proxy strips client copies. |
 | `BT_STATE_DIR` | Private lifecycle state outside the checkout. |
 | `BT_DATA_DIR` | Private translation data outside the checkout. |
@@ -34,6 +35,12 @@ role settings and redacts secrets from its output. Never commit the edited file.
 | `BT_REVERSE_PROXY` | Supported edge type for `auth-snippet`. |
 | `BT_LEGACY_CONTAINER` | Exact combined legacy container used only by `upgrade`. |
 | `BT_LEGACY_DATA_DIR` | Its exact bind-mounted data directory. |
+
+For CWA only, `CWA_UPSTREAM`, `BT_CWA_CONTAINER`, `BT_CWA_NETWORK` and
+`BT_CWA_VERSION` are accepted as legacy aliases. Do not set both forms to
+different values. Kavita forbids every CWA alias and requires an empty
+`BT_CWA_IDENTITY_HEADER`. See the [Kavita guide](../install/kavita.md) for a
+complete isolated environment.
 
 ## Translation runtime settings
 
@@ -70,6 +77,9 @@ configuration.
 | `BT_REQUEST_DEADLINE_SECONDS` | `90` | Absolute request deadline. |
 | `BT_SINGLEFLIGHT_MAX_ENTRIES` | `1024` | Active deduplicated operation cap. |
 
+The certified Community Applications profile is CWA-only. Kavita requires
+separate managed `api` and `proxy` roles.
+
 A malformed grouped response receives one fresh-envelope retry. If it remains
 malformed, paragraphs are recovered sequentially inside the same finite request
 budget. Successful paragraph recovery is not written under the grouped cache
@@ -80,7 +90,7 @@ work budgets fail the request before starting more provider work.
 
 | Variable | Default | Boundary |
 |---|---:|---|
-| `BT_AUTH_MODE` | `token` | `cwa_session`, `forwarded`, `token` or development-only `disabled`. |
+| `BT_AUTH_MODE` | `token` | `reader_session`, legacy low-level `cwa_session`, `forwarded`, `token` or development-only `disabled`. Managed native-reader installs derive `reader_session`. |
 | `BT_ALLOW_INSECURE_AUTH` | `false` | Second acknowledgement required for `disabled`; never use in production. |
 | `BT_API_TOKEN` | empty | Required by token mode; shared tenant and compatibility use only. |
 | `BT_CWA_AUTH_URL` | empty | Exact CWA `/ajax/emailstat` URL for session validation. |
@@ -90,6 +100,16 @@ work budgets fail the request before starting more provider work.
 | `BT_CWA_AUTH_CACHE_MAX_ENTRIES` | `10000` | Validation-cache cap. |
 | `BT_CWA_AUTH_MAX_INFLIGHT` | `8` | Distinct concurrent CWA probe cap. |
 | `BT_CWA_AUTH_MAX_RESPONSE_BYTES` | `262144` | Maximum decompressed CWA probe response. |
+| `BT_READER_TYPE` | empty | Managed `reader_session` reader contract: `cwa` or `kavita`. |
+| `BT_READER_AUTH_URL` | empty | Exact managed account probe: CWA `/ajax/emailstat` or Kavita `/api/Account`. |
+| `BT_READER_VERSION` | empty | Exact version included in the fail-closed browser and API contract. |
+| `BT_READER_CONTRACT_VERSION` | empty | Derived connector contract; never operator-invented. |
+| `BT_READER_CONNECTOR_ID` | empty | Installation UUID binding opaque sessions to one connector. |
+| `BT_READER_AUTH_TIMEOUT_SECONDS` | `2` | Timeout for the native reader account probe. |
+| `BT_READER_AUTH_MAX_RESPONSE_BYTES` | `262144` | Maximum decompressed reader account response. |
+| `BT_SESSION_KEY_PATH` | `/app/data/reader_session_key` | Private owned 256-bit connector key created by lifecycle code. |
+| `BT_SESSION_TTL_SECONDS` | `300` | Opaque session lifetime; values above five minutes are rejected. |
+| `BT_SESSION_MAX_ENTRIES` | `10000` | In-memory opaque session cap. |
 | `BT_IDENTITY_TRUSTED_PROXIES` | empty | Exact trusted peers for forwarded identity. |
 | `BT_AUTH_RATE_LIMIT_PER_MINUTE` | `300` | Pre-authentication attempts per observed client. |
 | `BT_AUTH_MAX_INFLIGHT_PER_CLIENT` | `2` | Concurrent pre-authentication requests per observed client. |
@@ -103,8 +123,12 @@ work budgets fail the request before starting more provider work.
 | `BT_ALLOW_PRIVATE_LAN` | `true` | Broad private-origin convenience for non-cookie modes only. |
 
 The managed proxy replaces inbound forwarding chains with the peer it observed.
-After authentication, quotas and cache scope use an opaque server-owned subject,
-not a request-supplied address or header.
+Raw reader proof can reach only the exact session-exchange route. The broker
+accepts selected CWA cookies, a Kavita access bearer, or exact Kavita OIDC
+cookie chunks, validates the stock account endpoint and discards the proof.
+Ordinary requests receive only the opaque plugin cookie; the bearer and all
+other reader cookies are stripped. After authentication, quotas and cache scope
+use an opaque server-owned subject, not a request-supplied address or header.
 
 ## Cache and fallback settings
 
@@ -126,8 +150,8 @@ The reader stores that choice only in the current tab. Choosing a cloud provider
 as primary is a separate operator decision and sends ordinary requests there.
 
 Cache schema v2 stores translations plus scoped one-way hashes, not source
-paragraphs, CWA cookies or raw user/book identifiers. The legacy v1 table stays
-side by side for rollback but is never read by v2.
+paragraphs, reader credentials or raw user/book identifiers. The legacy v1
+table stays side by side for rollback but is never read by v2.
 
 `BT_CACHE_DIR` and `BT_CACHE_OPERATOR_GROUP_ACCESS` are lifecycle-internal
 filesystem controls. Managed operators set `BT_DATA_DIR`; `btctl` and the image

@@ -8,6 +8,8 @@ requests, not in tracked Markdown.
 
 - [Managed `btctl` installation](install/btctl.md) — Unraid and existing
   Compose profiles, prerequisites, topology and first install.
+- [Kavita managed installation](install/kavita.md) — exact stock-Kavita EPUB
+  boundary, isolated configuration, authentication and acceptance.
 - [Community Applications](install/community-applications.md) — requirements
   and acceptance for the digest-pinned combined-image profile.
 - [Authentik](install/authentik.md) — advanced forwarded-identity deployment.
@@ -41,7 +43,7 @@ requests, not in tracked Markdown.
 |---|---|
 | Current code version | [`VERSION`](../VERSION) |
 | Release history | [`CHANGELOG.md`](../CHANGELOG.md) |
-| Managed install inputs | [`.env.example`](../.env.example) and `btctl` validation |
+| Managed install inputs | [`.env.example`](../.env.example), reader guide and `btctl` validation |
 | Supported environments | `docs/reference/compatibility.md` |
 | Architecture rationale | `docs/decisions/README.md` |
 | Release state and review | Gitea pull request, issue or milestone |

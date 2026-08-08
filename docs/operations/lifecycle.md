@@ -13,7 +13,7 @@ rollback:
 ./btctl doctor --env /absolute/private/path/cwa-translate.env
 ```
 
-It checks source/image identity, private state, CWA evidence, role labels,
+It checks source/image identity, private state, exact reader evidence, role labels,
 health, authentication, networks, ports and generated artifacts. Treat any
 failed or missing check as a failed deployment.
 
@@ -84,19 +84,27 @@ Remove only resources owned by the recorded install:
 ./btctl uninstall --env /absolute/private/path/cwa-translate.env --yes
 ```
 
-The retryable operation preserves CWA, external networks, the local image,
-translation data, backups and final state evidence. Reinstalling the same
-identity and data path after a completed uninstall is supported; a successful
-reinstall moves the prior final record into `BT_STATE_DIR/history/`. Active,
-partial or mismatched state is never overwritten.
+The retryable operation preserves the stock reader, external networks, local
+image, translation database, backups and final state evidence. It removes the
+installation-owned `reader_session_key`, so outstanding opaque browser sessions
+cannot survive an uninstall. Reinstalling the same identity and data path after
+a completed uninstall is supported; a successful reinstall creates a fresh key
+and moves the prior final record into `BT_STATE_DIR/history/`. Active, partial
+or mismatched state is never overwritten.
+
+CWA and Kavita installations have independent schema-2 state and connector
+UUIDs. Never reuse one install's state/data paths for the other. Schema-1 CWA
+state remains readable for lifecycle compatibility, but it cannot be relabeled
+as Kavita. Changing reader type is a separate install/uninstall operation, not
+an in-place upgrade.
 
 ## Failure behavior
 
 - Invalid source identity stops before an operator receives the Docker socket.
-- Invalid configuration, CWA evidence, names, paths or network preconditions
+- Invalid configuration, reader evidence, names, paths or network preconditions
   stops before runtime creation.
 - A failed startup removes only newly created translator containers and their
-  private network; CWA, external networks, data, configuration and backups stay.
+  private network; the reader, external networks, data, configuration and backups stay.
 - State is committed only after live postconditions pass.
 - Do not recover by exposing the API, setting disabled auth, editing generated
   state or applying generated Unraid templates manually.

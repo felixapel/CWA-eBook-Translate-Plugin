@@ -17,6 +17,7 @@ CANONICAL_GUIDES = {
     "install/authentik.md",
     "install/btctl.md",
     "install/community-applications.md",
+    "install/kavita.md",
     "maintainers/development.md",
     "maintainers/release.md",
     "operations/lifecycle.md",

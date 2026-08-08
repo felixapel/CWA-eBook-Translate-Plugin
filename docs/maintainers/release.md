@@ -41,6 +41,10 @@ git diff --check
 python3 scripts/check_docs.py
 python3 -m tests.python.test_translation
 python3 -m tests.python.test_hardening
+python3 -m py_compile btctl.py btctl_container.py btctl_core.py \
+  btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py \
+  btctl_lifecycle.py auth.py reader_session.py server.py translator.py cache.py \
+  singleflight.py work_budget.py proxy/render_config.py
 python3 -m unittest -v \
   tests.python.test_btctl tests.python.test_btctl_container \
   tests.python.test_btctl_compose tests.python.test_btctl_unraid \
@@ -48,6 +52,7 @@ python3 -m unittest -v \
   tests.python.test_work_budget tests.python.test_provider_budget \
   tests.python.test_cache_v2 tests.python.test_context_cache \
   tests.python.test_singleflight tests.python.test_auth \
+  tests.python.test_reader_session \
   tests.python.test_ci_contract tests.python.test_docs_contract \
   tests.python.test_release_contract tests.python.test_supply_chain_contract \
   tests.python.test_shell_contract tests.python.test_container_contract \
@@ -82,9 +87,24 @@ on the exact merge commit.
 Before tagging a runtime change, run physical stock-Unraid and browser
 acceptance on that exact commit. The source-built path must complete
 `plan -> install -> doctor`; the reader must translate a non-sensitive DRM-free
-EPUB through the public route. Community Applications candidates require the
-additional digest-pinned combined-container checklist. Record host, CWA version,
+EPUB through the public route. Record host, exact reader version and image,
 browser, LLM, commit/digest and result in the release issue without secrets.
+
+For Kavita, also prove stock v0.9.0.2, exact EPUB route and `.book-content`,
+native login exchange, chapter navigation, reload, and inactivity on manga/PDF
+routes. When CWA and Kavita coexist, prove their names, ports, state, data,
+backups and lifecycle operations are isolated. Community Applications
+candidates require their separate digest-pinned CWA-only checklist.
+
+## Kavita promotion sequence
+
+Keep audit hardening and a new reader compatibility claim independently
+releasable. Ship the audit corrections in the next unused `2.2.x` patch after
+its normal gates. Introduce Kavita as `2.3.0-rc.1` only after unit, Chromium,
+container and lifecycle gates pass on the exact candidate. Promote `2.3.0`
+only after the physical Kavita checklist above is recorded on that exact code;
+otherwise issue a new release candidate and keep Kavita labeled candidate.
+Do not add Kavita to Community Applications as part of this sequence.
 
 ## Publish source and mirror
 

@@ -4,6 +4,10 @@ Community Applications is the simplest supported profile when a searchable CWA
 Translate listing exists. It runs one combined non-root container that proxies
 stock CWA and keeps the translation API private inside the container.
 
+This profile is CWA-only. It does not accept Kavita variables, routes or
+authentication. Install Kavita with its separate split-role
+[`btctl` guide](kavita.md); do not repurpose the CWA template or share appdata.
+
 If the listing is absent, its template does not pin an immutable digest, or the
 host is outside the certified scope, use the source-built
 [`btctl` profile](btctl.md). Do not install from an unreviewed XML URL or a

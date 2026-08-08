@@ -37,6 +37,7 @@ file, so it needs no running server, no API key, and no network access:
   tests.python.test_work_budget tests.python.test_provider_budget \
   tests.python.test_cache_v2 tests.python.test_context_cache \
   tests.python.test_singleflight tests.python.test_auth \
+  tests.python.test_reader_session \
   tests.python.test_ci_contract tests.python.test_docs_contract \
   tests.python.test_release_contract tests.python.test_supply_chain_contract \
   tests.python.test_shell_contract tests.python.test_container_contract \
@@ -49,7 +50,7 @@ Always also check syntax/compile before committing:
 ```bash
 python3 -m py_compile btctl.py btctl_container.py btctl_core.py \
   btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py \
-  btctl_lifecycle.py auth.py server.py \
+  btctl_lifecycle.py auth.py reader_session.py server.py \
   translator.py cache.py singleflight.py work_budget.py proxy/render_config.py
 bash -n btctl scripts/*.sh
 ```
@@ -95,12 +96,14 @@ BT_API_TOKEN='<token>' python3 -m tools.probes.rate_limit \
   --url http://127.0.0.1:8390 --requests 130 --timeout 5
 ```
 
-For the recommended CWA-session proxy, pass the browser cookie and exact
-login-time User-Agent through environment variables rather than the command
-line, and run the probe from the same client IP that created the session:
+For a managed native-reader proxy, first exchange valid native proof through
+the exact `POST /bt-api/session` route. Pass the issued plugin cookie and the
+same User-Agent through environment variables rather than the command line, and
+run the probe from the same client address that performed the exchange. The
+cookie expires in at most five minutes:
 
 ```bash
-BT_RATE_LIMIT_TEST_COOKIE='session=<opaque-value>' \
+BT_RATE_LIMIT_TEST_COOKIE='__Host-bt-session=<opaque-value>' \
 BT_RATE_LIMIT_TEST_USER_AGENT='Mozilla/5.0 ... exact browser value' \
   python3 -m tools.probes.rate_limit \
   --url https://books.example.test/bt-api
@@ -110,7 +113,7 @@ It exits nonzero on connection/authentication errors, unexpected statuses, or
 if it does not observe both an admitted request and a `429` response. The probe
 ignores inherited `HTTP_PROXY`/`HTTPS_PROXY` settings, refuses redirects and URL
 credentials, streams no response body, and closes each response immediately so
-the token or CWA cookie stays bound to the explicitly selected origin.
+the plugin cookie stays bound to the explicitly selected origin.
 
 The two benchmark scripts enforce the same boundary and also fail on redirects,
 non-2xx responses, or invalid JSON. Use one authentication mechanism only:
@@ -118,22 +121,23 @@ non-2xx responses, or invalid JSON. Use one authentication mechanism only:
 ```bash
 BT_API_TOKEN='<token>' python3 -m tools.benchmarks.benchmark \
   --url http://127.0.0.1:8390
-BT_BENCHMARK_COOKIE='session=<opaque-value>' \
+BT_BENCHMARK_COOKIE='__Host-bt-session=<opaque-value>' \
 BT_BENCHMARK_USER_AGENT='Mozilla/5.0 ... exact browser value' \
   python3 -m tools.benchmarks.benchmark_realistic \
   --url https://books.example.test/bt-api
 ```
 
 Do not paste credentials into a URL or publish benchmark output containing
-private endpoint names. CWA strong sessions bind the cookie to the browser
-User-Agent and observed source address; a mismatched live probe can invalidate
-the session, so sign in again if either value was wrong.
+private endpoint names. A mismatched User-Agent, address or origin intentionally
+fails closed; perform a new native-proof exchange rather than weakening the
+binding.
 
 ## Frontend Development
 
-The frontend consists of `static/translator.js`, `static/translator.css`, and
-`overlay/read.html`. CI reads the exact supported LTS release from
-`.node-version`; use the same version locally.
+The production frontend consists of `static/loader.js`,
+`static/translator.js`, and `static/translator.css`. `overlay/read.html` is a
+legacy CWA development fixture, not a production integration. CI reads the
+exact supported LTS release from `.node-version`; use the same version locally.
 
 ### Syntax Validation & Tests
 
@@ -145,10 +149,12 @@ npx playwright install --with-deps --only-shell chromium
 npm run test:e2e               # real Chromium: loader, DOM, network, a11y, consent
 ```
 
-The browser suite starts a localhost-only CWA reader fixture, intercepts only
-its `/bt-api/translate/batch` route, and fails on browser console errors,
-warnings, page exceptions, or failed requests. To reuse a compatible local
-Chromium instead of Playwright's managed headless shell, set
+The browser suite starts localhost-only CWA and Kavita reader fixtures,
+intercepts only their translation/session boundaries, and fails on browser
+console errors, warnings, page exceptions, or failed requests. It covers the
+CWA iframe and exact Kavita EPUB route/`.book-content` adapter, including SPA
+teardown on unsupported routes. To reuse a compatible local Chromium instead
+of Playwright's managed headless shell, set
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/absolute/path/to/chromium`.
 
 ## Updating Dependency Locks
@@ -178,13 +184,19 @@ safety flags and then run `./scripts/audit-deps.sh`.
 
 ### Manual Testing
 
-The automated Chromium gate covers loader isolation, the reader iframe,
-translation rendering, cloud-fallback consent, and the control accessibility
-tree. CWA/EPUB.js compatibility and theme integration still require the real
-application.
+The automated Chromium gate covers loader isolation, both reader adapters,
+translation rendering, cloud-fallback consent, authentication replay and the
+control accessibility tree. Real CWA/EPUB.js and Kavita/Angular compatibility
+still require the pinned applications.
 
 After any change to `getTranslatableElements`, paragraph detection, or
 rendering, manually verify in a browser: open an EPUB in CWA, cycle
 Original → Bilingual → Translated, change chapters/pages, and check Light /
 Dark / Sepia themes (translation styling is injected into the reader
 `<iframe>` — see `ensureIframeStyles` in `translator.js`).
+
+For Kavita, use stock v0.9.0.2 through the managed HTTPS origin. Open the exact
+`/library/.../series/.../book/...` EPUB route, exercise translation and chapter
+navigation, then navigate to manga, PDF and library pages and confirm the
+toolbar and observers are removed. Test native login and, when supported by the
+target deployment, stock OIDC login. Do not use private book text in evidence.
