@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -64,28 +65,104 @@ class ContainerMountMatrixTests(unittest.TestCase):
                 )
 
     def test_mount_protocol_is_versioned_and_contains_no_configuration(self):
-        plan = MountPlan(
-            command="doctor",
-            socket=True,
-            mounts=(
-                MountSpec(Path("/checkout with spaces"), "ro"),
-                MountSpec(Path("/mnt/user/appdata/cwa-translate/state"), "ro"),
-            ),
-            lock_source=Path("/mnt/user/appdata/cwa-translate"),
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout with spaces"
+            state = root / "state"
+            lock = root / "lock"
+            for path in (checkout, state, lock):
+                path.mkdir()
+            plan = MountPlan(
+                command="doctor",
+                socket=True,
+                environment_sha256="a" * 64,
+                mounts=(
+                    MountSpec.capture(checkout, "ro"),
+                    MountSpec.capture(state, "ro"),
+                ),
+                lock_source=lock,
+            )
 
-        rendered = plan.render()
+            rendered = plan.render()
 
         self.assertEqual(
-            rendered.splitlines()[0], "BTCTL_MOUNT_PLAN\t1\tdoctor\tunraid"
+            rendered.splitlines()[0],
+            f"BTCTL_MOUNT_PLAN\t2\tdoctor\tunraid\t{'a' * 64}",
         )
-        self.assertIn("mount\tro\t/checkout with spaces", rendered)
-        self.assertIn(
-            "lock\tro\t/mnt/user/appdata/cwa-translate\t/run/btctl-lock",
+        self.assertRegex(rendered, rf"mount\tro\t{checkout}\t[0-9:]+[0-9a-f:]+")
+        self.assertRegex(
             rendered,
+            rf"lock\tro\t{lock}\t/run/btctl-lock\t[0-9:]+[0-9a-f:]+",
         )
         self.assertIn("socket\tyes", rendered)
         self.assertNotIn("LLM_API_KEY", rendered)
+
+    def test_mount_source_identity_changes_when_a_path_is_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.mkdir()
+            first = MountSpec.capture(source, "rw")
+            source.rename(Path(directory) / "old-source")
+            source.mkdir()
+            second = MountSpec.capture(source, "rw")
+
+            self.assertNotEqual(first.identity, second.identity)
+
+    def test_mount_plan_is_bound_to_the_exact_environment_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            environment = root / "install.env"
+            environment.write_text("BT_INSTALL_PROFILE=unraid\n", encoding="utf-8")
+            environment.chmod(0o600)
+            managed = root / "share" / "cwa-translate"
+            state = managed / "state"
+            data = managed / "data"
+            backup = root / "share" / "backups"
+            template = root / "boot" / "templates-user"
+            lock = root / "lock"
+            for path in (state, data, backup, template, lock):
+                path.mkdir(parents=True)
+            config = SimpleNamespace(
+                install_profile="unraid",
+                state_dir=str(state),
+                data_dir=str(data),
+                backup_dir=str(backup),
+                unraid_template_dir=str(template),
+            )
+
+            with (
+                mock.patch("btctl_container.HOST_LOCK_SOURCE", lock),
+                mock.patch("btctl_container._validate_repository", return_value=checkout),
+                mock.patch(
+                    "btctl_container._config_for_command", return_value=(config, {})
+                ),
+                mock.patch(
+                    "btctl_container.validate_storage_path",
+                    side_effect=lambda path, _label: path,
+                ),
+                mock.patch(
+                    "btctl_container._validate_template_path",
+                    side_effect=lambda path: path,
+                ),
+                mock.patch(
+                    "btctl_container._storage_minimum", return_value=root / "share"
+                ),
+            ):
+                first = create_mount_plan("doctor", checkout, environment, "a" * 40)
+                environment.write_text(
+                    "BT_INSTALL_PROFILE=unraid\nBT_INSTALL_NAME=changed\n",
+                    encoding="utf-8",
+                )
+                second = create_mount_plan("doctor", checkout, environment, "a" * 40)
+
+            self.assertEqual(
+                first.environment_sha256,
+                hashlib.sha256(b"BT_INSTALL_PROFILE=unraid\n").hexdigest(),
+            )
+            self.assertNotEqual(first.environment_sha256, second.environment_sha256)
+            self.assertNotEqual(first.render(), second.render())
 
 
 class ContainerPathPolicyTests(unittest.TestCase):
@@ -211,12 +288,14 @@ class ContainerPathPolicyTests(unittest.TestCase):
             checkout.mkdir()
             environment = root / "install.env"
             environment.write_text("BT_INSTALL_PROFILE=unraid\n", encoding="utf-8")
+            environment.chmod(0o600)
             managed = root / "share" / "cwa-translate"
             state = managed / "state"
             data = managed / "data"
             backup = root / "share" / "backups"
             template = root / "boot" / "templates-user"
-            for path in (state, data, backup, template):
+            lock = root / "lock"
+            for path in (state, data, backup, template, lock):
                 path.mkdir(parents=True)
             config = SimpleNamespace(
                 install_profile="unraid",
@@ -227,6 +306,7 @@ class ContainerPathPolicyTests(unittest.TestCase):
             )
 
             with (
+                mock.patch("btctl_container.HOST_LOCK_SOURCE", lock),
                 mock.patch("btctl_container._validate_repository", return_value=checkout),
                 mock.patch(
                     "btctl_container._config_for_command",
@@ -249,9 +329,7 @@ class ContainerPathPolicyTests(unittest.TestCase):
                     "uninstall", checkout, environment, "a" * 40
                 )
 
-            self.assertEqual(
-                plan.lock_source, Path("/run/cwa-translate-btctl-locks")
-            )
+            self.assertEqual(plan.lock_source, lock)
             self.assertEqual(self._effective_mode(plan, state), "rw")
             self.assertIsNone(self._effective_mode(plan, data))
 
@@ -262,6 +340,7 @@ class ContainerPathPolicyTests(unittest.TestCase):
             checkout.mkdir()
             environment = root / "install.env"
             environment.write_text("BT_INSTALL_PROFILE=unraid\n", encoding="utf-8")
+            environment.chmod(0o600)
             managed = root / "share" / "cwa-translate"
             managed.mkdir(parents=True)
             state = managed / "state"
@@ -271,6 +350,8 @@ class ContainerPathPolicyTests(unittest.TestCase):
             backup.mkdir()
             template = root / "boot" / "templates-user"
             template.mkdir(parents=True)
+            lock = root / "lock"
+            lock.mkdir()
             config = SimpleNamespace(
                 install_profile="unraid",
                 state_dir=str(state),
@@ -280,6 +361,7 @@ class ContainerPathPolicyTests(unittest.TestCase):
             )
 
             with (
+                mock.patch("btctl_container.HOST_LOCK_SOURCE", lock),
                 mock.patch("btctl_container._validate_repository", return_value=checkout),
                 mock.patch(
                     "btctl_container._config_for_command",
@@ -300,9 +382,7 @@ class ContainerPathPolicyTests(unittest.TestCase):
             ):
                 plan = create_mount_plan("adopt", checkout, environment, "a" * 40)
 
-            self.assertEqual(
-                plan.lock_source, Path("/run/cwa-translate-btctl-locks")
-            )
+            self.assertEqual(plan.lock_source, lock)
             self.assertEqual(self._effective_mode(plan, state), "rw")
             self.assertEqual(self._effective_mode(plan, data), "ro")
 

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -32,6 +34,7 @@ from btctl_unraid import UnraidAdopter, UnraidInstaller
 
 EX_USAGE = 64
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UNRAID_LOCK_DIRECTORY = Path("/run/cwa-translate-btctl-locks")
 _CONTAINER_LOCK_DIRECTORY = Path("/run/btctl-lock")
 
@@ -112,9 +115,24 @@ def _load_values(env_file: Path) -> dict[str, str]:
             )
         if metadata.st_size > 1024 * 1024:
             raise ConfigError("environment file exceeds the 1 MiB safety limit")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        expected_digest = os.environ.get("BTCTL_EXPECTED_ENV_SHA256", "")
+        if expected_digest:
+            if not _SHA256_RE.fullmatch(expected_digest):
+                raise ConfigError("expected environment snapshot digest is invalid")
+            if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+                raise ConfigError(
+                    "container environment snapshot must be root-owned mode 0600"
+                )
+        with os.fdopen(descriptor, "rb") as handle:
             descriptor = None
-            source = handle.read()
+            source_bytes = handle.read((1024 * 1024) + 1)
+        if len(source_bytes) > 1024 * 1024:
+            raise ConfigError("environment file exceeds the 1 MiB safety limit")
+        if expected_digest and not hmac.compare_digest(
+            hashlib.sha256(source_bytes).hexdigest(), expected_digest
+        ):
+            raise ConfigError("environment snapshot changed after planning")
+        source = source_bytes.decode("utf-8")
     except ConfigError:
         raise
     except (OSError, UnicodeError) as exc:

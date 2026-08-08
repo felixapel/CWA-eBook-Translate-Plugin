@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import stat
@@ -9,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from btctl import _docker_for
+from btctl import _docker_for, _load_values
 
 from btctl_core import (
     ConfigError,
@@ -130,6 +131,62 @@ class DockerEnvironmentTests(unittest.TestCase):
                 self.assertNotIn("DOCKER_CONTEXT", os.environ)
                 self.assertNotIn("DOCKER_TLS_VERIFY", os.environ)
                 self.assertNotIn("DOCKER_CERT_PATH", os.environ)
+
+
+class EnvironmentSnapshotTests(unittest.TestCase):
+    def test_container_operator_rejects_environment_snapshot_digest_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / "install.env"
+            environment.write_text("BT_INSTALL_NAME=first\n", encoding="utf-8")
+            environment.chmod(0o600)
+            metadata = environment.stat()
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"BTCTL_EXPECTED_ENV_SHA256": "0" * 64},
+                    clear=False,
+                ),
+                mock.patch(
+                    "btctl.os.fstat",
+                    return_value=mock.Mock(
+                        st_mode=metadata.st_mode,
+                        st_nlink=1,
+                        st_size=metadata.st_size,
+                        st_uid=0,
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(ConfigError, "snapshot changed"):
+                    _load_values(environment)
+
+    def test_container_operator_accepts_the_bound_root_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / "install.env"
+            payload = b"BT_INSTALL_NAME=first\n"
+            environment.write_bytes(payload)
+            environment.chmod(0o600)
+            metadata = environment.stat()
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"BTCTL_EXPECTED_ENV_SHA256": hashlib.sha256(payload).hexdigest()},
+                    clear=False,
+                ),
+                mock.patch(
+                    "btctl.os.fstat",
+                    return_value=mock.Mock(
+                        st_mode=metadata.st_mode,
+                        st_nlink=1,
+                        st_size=metadata.st_size,
+                        st_uid=0,
+                    ),
+                ),
+            ):
+                values = _load_values(environment)
+
+            self.assertEqual(values["BT_INSTALL_NAME"], "first")
 
 
 class OperationLockTests(unittest.TestCase):

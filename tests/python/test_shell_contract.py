@@ -50,6 +50,7 @@ class ShellContractTests(unittest.TestCase):
             "no-new-privileges:true",
             "/var/run/docker.sock",
             "BTCTL_EXPECTED_REVISION",
+            "BTCTL_EXPECTED_ENV_SHA256",
             "core.fsmonitor",
             "GIT_NO_REPLACE_OBJECTS=1",
             "source_exporter_dockerfile",
@@ -60,6 +61,10 @@ class ShellContractTests(unittest.TestCase):
             "[ -S /var/run/docker.sock ]",
             "/run/cwa-translate-btctl-locks",
             '[ "$second" = "$HOST_LOCK_DIRECTORY" ]',
+            'environment_snapshot="$temporary/install.env.snapshot"',
+            'sha256sum --binary -- "$environment_snapshot"',
+            'cmp --silent -- "$temporary/mount-plan" "$temporary/final-mount-plan"',
+            'final_operator_arguments+=(--env "$environment_snapshot")',
         ):
             self.assertIn(contract, source)
         self.assertNotRegex(source, r"(?m)^\s*(?:source|eval)\s")
@@ -68,6 +73,8 @@ class ShellContractTests(unittest.TestCase):
             'cp -- "$SCRIPT_DIR/Dockerfile.btctl"',
             source,
         )
+        self.assertIn('chown 0:0 -- "$environment_snapshot"', source)
+        self.assertIn('chmod 0600 -- "$environment_snapshot"', source)
 
     def test_python_without_git_selects_the_container_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
