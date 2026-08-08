@@ -253,7 +253,7 @@ def render_compose(
     proxy_environment = compose_environment({
         **config.proxy_environment(),
         "BT_ROLE": "proxy",
-        "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
+        "BT_API_UPSTREAM": "http://translator-api:8390",
     })
     api_networks: dict[str, object] = {"private": {"aliases": ["translator-api"]}}
     if config.uses_reader_session:
@@ -724,7 +724,7 @@ class ComposeInstaller:
             else {
                 **config.proxy_environment(),
                 "BT_ROLE": "proxy",
-                "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
+                "BT_API_UPSTREAM": "http://translator-api:8390",
             }
         )
         if allow_legacy_labels and role == "proxy":

@@ -269,6 +269,14 @@ class ComposeRenderTests(unittest.TestCase):
             self.assertEqual(proxy["ports"], [{"target": 8080, "published": 8385, "protocol": "tcp"}])
             self.assertEqual(set(api["networks"]), {"private", "reader"})
             self.assertEqual(set(proxy["networks"]), {"private", "reader"})
+            self.assertEqual(
+                proxy["environment"]["BT_API_UPSTREAM"],
+                "http://translator-api:8390",
+            )
+            self.assertEqual(
+                api["networks"]["private"]["aliases"],
+                ["translator-api"],
+            )
             self.assertTrue(api["read_only"])
             self.assertEqual(api["user"], "101:102")
             self.assertFalse(api["privileged"])
@@ -298,6 +306,10 @@ class ComposeRenderTests(unittest.TestCase):
             self.assertEqual(
                 document["services"]["api"]["environment"]["BT_AUTH_MODE"],
                 "reader_session",
+            )
+            self.assertEqual(
+                document["services"]["proxy"]["environment"]["BT_API_UPSTREAM"],
+                "http://translator-api:8390",
             )
 
     def test_forwarded_profile_joins_identity_edge_without_publishing_ports(self):

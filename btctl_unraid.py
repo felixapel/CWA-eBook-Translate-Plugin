@@ -372,9 +372,7 @@ class UnraidInstaller:
                     {
                         **config.proxy_environment(),
                         "BT_ROLE": "proxy",
-                        "BT_API_UPSTREAM": (
-                            f"http://{plan.resources['api']['name']}:8390"
-                        ),
+                        "BT_API_UPSTREAM": "http://translator-api:8390",
                     }
                 ),
             )

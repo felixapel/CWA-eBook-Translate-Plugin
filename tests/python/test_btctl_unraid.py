@@ -549,6 +549,10 @@ class UnraidInstallTests(unittest.TestCase):
             self.assertEqual(api.image, proxy.image)
             self.assertEqual(api.image, self.identity.image)
             self.assertEqual(os.stat(root / "state" / "api.env").st_mode & 0o777, 0o600)
+            self.assertIn(
+                "BT_API_UPSTREAM=http://translator-api:8390\n",
+                (root / "state" / "proxy.env").read_text(encoding="utf-8"),
+            )
             self.assertNotIn("do-not-copy-to-xml", (root / "state" / "state.json").read_text())
             self.assertEqual(StateStore(root / "state").load(), state)
             self.assertTrue((root / "templates-user" / "my-cwa-translate-api.xml").is_file())

@@ -43,6 +43,10 @@ authority to the translation API.
   Applications combined profile remains CWA-only. Immutable local image names
   are reader-scoped (`local/cwa-translate` and `local/kavita-translate`) so a
   build for one connector cannot retag the image beneath the other instance.
+- The proxy reaches the API only through the `translator-api` alias on the
+  owned private network. It never targets the multi-homed API container name,
+  which Docker can resolve on the external reader network and thereby bypass
+  the exact trusted-proxy peer identity.
 
 ## Consequences
 

@@ -74,6 +74,11 @@ state is private, atomic, schema-versioned, and contains no secrets. This
 separates source, configuration, mutable translation data, and backups so an
 update of one cannot silently replace another.
 
+Both runtime roles also join the external reader network, so their Docker
+container names are intentionally not used for the authenticated internal hop.
+The proxy targets `translator-api` and the API trusts `translator-proxy`; those
+aliases exist only on the owned private network.
+
 The Compose adapter writes a private JSON-form Compose document (JSON is a
 Compose-compatible YAML subset), validates it with the local Compose plugin,
 and starts only the two translator services. Live image IDs, installation
