@@ -32,6 +32,124 @@ test('the loader stays inert outside reader routes', async ({ page }) => {
     expect(failures).toEqual([]);
 });
 
+test('Kavita activates only on the pinned EPUB route and refreshes one rejected session', async ({ page }) => {
+    const failures = observeBrowserFailures(page, {
+        allowedConsole: [/^Failed to load resource:.*status of 401\b/],
+    });
+    await page.addInitScript(() => {
+        localStorage.setItem('kavita-user', JSON.stringify({
+            token: 'e2e-kavita-access',
+            refreshToken: 'must-remain-local'
+        }));
+    });
+    await page.route('**/bt-config.json', route => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+            apiUrl: '/bt-api',
+            authMode: 'reader_session',
+            credentials: 'same-origin',
+            readerType: 'kavita',
+            readerVersion: '0.9.0.2',
+            readerContractVersion: 'kavita-0.9.0.2-epub-v1',
+        }),
+    }));
+    const exchanges = [];
+    await page.route('**/bt-api/session', async route => {
+        exchanges.push({
+            method: route.request().method(),
+            headers: route.request().headers(),
+            body: route.request().postData(),
+        });
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            headers: {
+                'Cache-Control': 'no-store',
+                'Set-Cookie': 'bt-session=e2eopaque012345678901234567890123; Path=/; HttpOnly; SameSite=Strict',
+            },
+            body: JSON.stringify({
+                status: 'ok', expires_in: 300,
+                reader_type: 'kavita', reader_version: '0.9.0.2',
+            }),
+        });
+    });
+    const payloads = [];
+    let batchAttempts = 0;
+    await page.route('**/bt-api/translate/batch', async route => {
+        batchAttempts++;
+        if (batchAttempts === 1) {
+            await route.fulfill({
+                status: 401,
+                contentType: 'application/json',
+                body: JSON.stringify({ error: 'unauthorized' }),
+            });
+            return;
+        }
+        const payload = route.request().postDataJSON();
+        payloads.push(payload);
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                translations: payload.paragraphs.map(text => `ES: ${text}`),
+            }),
+        });
+    });
+
+    await page.goto('/library/7/series/42/book/99');
+    await expect(page.getByRole('toolbar', { name: /book translator/i })).toBeVisible();
+    await page.locator('#bt-toggle').click();
+    await expect.poll(() => exchanges.length).toBe(2);
+    await expect.poll(() => payloads.length).toBe(1);
+
+    expect(exchanges[0].method).toBe('POST');
+    expect(exchanges[0].body).toBeNull();
+    expect(exchanges[0].headers.authorization).toBe('Bearer e2e-kavita-access');
+    expect(JSON.stringify(exchanges)).not.toContain('must-remain-local');
+    expect(payloads[0].book_id).toBe('7:42');
+    expect(payloads[0].chapter_id).toBe('99');
+    await expect(page.locator('#kavita-paragraph .bt-translation')).toHaveText(
+        'ES: A Kavita EPUB paragraph.'
+    );
+
+    const attemptsBeforeManga = batchAttempts;
+    await page.evaluate(() => {
+        history.pushState({}, '', '/library/7/series/42/manga/99');
+        document.querySelector('.book-content').innerHTML =
+            '<p>Manga content must not be translated.</p>';
+    });
+    await expect(page.locator('#bt-bar')).toBeHidden();
+    await page.waitForTimeout(500);
+    expect(batchAttempts).toBe(attemptsBeforeManga);
+    expect(failures).toEqual([]);
+});
+
+test('Kavita manga routes never load the overlay', async ({ page }) => {
+    const failures = observeBrowserFailures(page);
+    await page.route('**/bt-config.json', route => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+            apiUrl: '/bt-api', authMode: 'reader_session',
+            credentials: 'same-origin', readerType: 'kavita',
+            readerVersion: '0.9.0.2',
+            readerContractVersion: 'kavita-0.9.0.2-epub-v1',
+        }),
+    }));
+    let exchangeCount = 0;
+    await page.route('**/bt-api/session', route => {
+        exchangeCount++;
+        return route.abort();
+    });
+
+    await page.goto('/library/7/series/42/manga/99');
+    await page.waitForTimeout(100);
+    await expect(page.locator('#bt-bar')).toHaveCount(0);
+    expect(exchangeCount).toBe(0);
+    expect(failures).toEqual([]);
+});
+
 test('the real overlay translates, reports state, and keeps cloud consent explicit', async ({ page }) => {
     const failures = observeBrowserFailures(page);
     const payloads = [];

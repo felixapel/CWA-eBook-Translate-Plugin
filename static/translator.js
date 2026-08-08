@@ -8,8 +8,24 @@
     const BT_UI_VERSION = '2.2.2';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
+    const configuredReaderType = cfg.readerType || '';
+    const READER_TYPE = configuredReaderType === 'kavita' ? 'kavita' : 'cwa';
+    const STRICT_READER_ROUTE = configuredReaderType === 'cwa'
+        || configuredReaderType === 'kavita';
+    const validKavitaContract = READER_TYPE === 'kavita'
+        && cfg.readerVersion === '0.9.0.2'
+        && cfg.readerContractVersion === 'kavita-0.9.0.2-epub-v1';
+    if (configuredReaderType && configuredReaderType !== 'cwa'
+            && configuredReaderType !== 'kavita') {
+        console.error('[BookTranslator] disabled: unsupported reader type');
+        return;
+    }
+    if (READER_TYPE === 'kavita' && !validKavitaContract) {
+        console.error('[BookTranslator] disabled: unsupported Kavita reader contract');
+        return;
+    }
     const configuredAuthMode = cfg.authMode || (cfg.apiToken ? 'token' : 'cwa_session');
-    const AUTH_MODE = ['cwa_session', 'token', 'forwarded'].includes(configuredAuthMode)
+    const AUTH_MODE = ['cwa_session', 'reader_session', 'token', 'forwarded'].includes(configuredAuthMode)
         ? configuredAuthMode
         : 'cwa_session';
     const configuredCredentials = ['omit', 'same-origin', 'include'].includes(cfg.credentials)
@@ -58,6 +74,21 @@
     let lastRequestEnd = 0;
     let lastFirstVisibleHash = null;
     let pendingFirstVisibleHash = null; // 2-poll debounce for the page-turn detector
+
+    function kavitaRouteParts() {
+        const match = window.location.pathname.match(
+            /^\/library\/([1-9][0-9]*)\/series\/([1-9][0-9]*)\/book\/([1-9][0-9]*)\/?$/
+        );
+        return match ? { libraryId: match[1], seriesId: match[2], chapterId: match[3] } : null;
+    }
+
+    function isSupportedReaderRoute() {
+        if (!STRICT_READER_ROUTE) return true;
+        if (READER_TYPE === 'kavita') return kavitaRouteParts() !== null;
+        return /^\/read\/[^/?#]+(?:\/[^?#]*)?\/?$/.test(window.location.pathname);
+    }
+
+    let readerRouteActive = false;
 
     // UI / status state
     let prefetchEnabled = localStorage.getItem('bt_prefetch') === '1'; // explicit whole-chapter opt-in
@@ -592,6 +623,7 @@
 
     // Single source of truth for the status zone: derives display from state.
     function refreshStatus() {
+        if (typeof document === 'undefined') return;
         const bar = document.getElementById('bt-bar');
         const text = document.getElementById('bt-status-text');
         const progress = document.getElementById('bt-progress');
@@ -677,12 +709,27 @@
     }
 
     // ── DOM Helpers ────────────────────────────────────────────────────
+    function getReaderIframe() {
+        if (READER_TYPE === 'kavita') return null;
+        return document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+    }
+
     function getReaderDoc() {
-        const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+        if (READER_TYPE === 'kavita') {
+            return document.querySelector('.book-content') ? document : null;
+        }
+        const iframe = getReaderIframe();
         if (iframe) {
             try { return iframe.contentDocument || iframe.contentWindow.document; } catch (e) { return null; }
         }
         return null;
+    }
+
+    function getReaderRoot() {
+        if (READER_TYPE === 'kavita') {
+            return document.querySelector('.book-content');
+        }
+        return getReaderDoc() || document;
     }
 
     const HEADING_CLASS_RE = /title|subtitle|chapter|heading|epigraph/i;
@@ -759,15 +806,27 @@
     }
 
     function getParagraphs() {
-        return getTranslatableElements(getReaderDoc() || document);
+        return getTranslatableElements(getReaderRoot());
     }
 
     function getVisibleParagraphs() {
         // Filter the SAME canonical, de-duplicated set used everywhere else, so
         // visible-first covers headings/lists too and the prefetch complement is
         // exact (no element falls through the cracks between the two selectors).
-        const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+        const iframe = getReaderIframe();
         const all = getParagraphs();
+        if (READER_TYPE === 'kavita') {
+            return all.filter(el => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return false;
+                const right = Number.isFinite(rect.right)
+                    ? rect.right : rect.left + rect.width;
+                const bottom = Number.isFinite(rect.bottom)
+                    ? rect.bottom : rect.top + rect.height;
+                return right >= -100 && rect.left < window.innerWidth - 20
+                    && bottom >= -100 && rect.top < window.innerHeight - 20;
+            });
+        }
         if (!iframe || !iframe.contentDocument) {
             return all.slice(0, 5);
         }
@@ -812,6 +871,10 @@
     }
 
     function currentBookId() {
+        if (READER_TYPE === 'kavita') {
+            const route = kavitaRouteParts();
+            return route ? `${route.libraryId}:${route.seriesId}` : 'unscoped';
+        }
         if (cfg.bookId !== undefined && cfg.bookId !== null) {
             return boundedScopeValue(cfg.bookId, 'unscoped');
         }
@@ -825,6 +888,10 @@
     }
 
     function currentChapterId() {
+        if (READER_TYPE === 'kavita') {
+            const route = kavitaRouteParts();
+            return route ? route.chapterId : 'unscoped';
+        }
         try {
             const rendition = window.reader && window.reader.rendition;
             const location = rendition && rendition.currentLocation && rendition.currentLocation();
@@ -841,7 +908,7 @@
         } catch (e) { /* reader is not ready yet */ }
 
         try {
-            const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+            const iframe = getReaderIframe();
             if (iframe) {
                 const doc = iframe.contentDocument;
                 const identity = (doc && doc.documentURI) || iframe.getAttribute('src');
@@ -874,7 +941,7 @@
     function cacheKeyForText(text, elementContext = 'unscoped-element') {
         const scope = translationScope();
         return hashText(JSON.stringify([
-            'cwa-ui-cache/v3', BT_UI_VERSION, SOURCE_LANG, TARGET_LANG,
+            'reader-ui-cache/v4', READER_TYPE, BT_UI_VERSION, SOURCE_LANG, TARGET_LANG,
             scope.book_id, scope.chapter_id, elementContext, text
         ]));
     }
@@ -926,24 +993,41 @@
             const requestCredentials = configuredCredentials || (
                 AUTH_MODE === 'forwarded'
                     ? 'include'
-                    : (AUTH_MODE === 'cwa_session'
+                    : (AUTH_MODE === 'cwa_session' || AUTH_MODE === 'reader_session'
                         ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
                         : 'omit')
             );
-            const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
+            const requestBody = JSON.stringify({
+                paragraphs: texts,
+                source_lang: SOURCE_LANG,
+                target_lang: TARGET_LANG,
+                book_id: scope.book_id,
+                chapter_id: scope.chapter_id,
+                allow_cloud_fallback: allowCloudFallback
+            });
+            const send = () => fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
                 headers,
                 credentials: requestCredentials,
-                body: JSON.stringify({
-                    paragraphs: texts,
-                    source_lang: SOURCE_LANG,
-                    target_lang: TARGET_LANG,
-                    book_id: scope.book_id,
-                    chapter_id: scope.chapter_id,
-                    allow_cloud_fallback: allowCloudFallback
-                }),
+                body: requestBody,
                 signal: controller.signal,
             });
+            let resp = await send();
+            // A 401 is rejected before translation admission, so one session
+            // refresh and one replay cannot duplicate provider work. No other
+            // ambiguous failure is retried automatically.
+            if (resp.status === 401 && AUTH_MODE === 'reader_session'
+                    && typeof window.__BT_REFRESH_SESSION === 'function') {
+                try {
+                    await window.__BT_REFRESH_SESSION();
+                } catch (e) {
+                    return null;
+                }
+                if (controller.signal.aborted) {
+                    return { error: controller.btTimedOut ? 'timeout' : 'aborted' };
+                }
+                resp = await send();
+            }
             if (!resp.ok) {
                 if (resp.status === 429) {
                     let r = {};
@@ -974,7 +1058,7 @@
         isPumpRunning = true;
         
         try {
-            while (translationMode !== 'off') {
+            while (translationMode !== 'off' && readerRouteActive) {
                 const now = Date.now();
                 if (rateLimitUntil > now) {
                     refreshStatus();
@@ -1119,11 +1203,14 @@
     }
 
     async function translateCurrentPage() {
-        if (translationMode === 'off') return;
+        if (translationMode === 'off' || !readerRouteActive) return;
         
         const myGen = generation;
         const idoc = getReaderDoc();
-        if (idoc) { ensureIframeStyles(idoc); applyIframeTheme(idoc); }
+        if (idoc && READER_TYPE === 'cwa') {
+            ensureIframeStyles(idoc);
+            applyIframeTheme(idoc);
+        }
 
         const visibleEls = getVisibleParagraphs();
         
@@ -1256,7 +1343,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     function removeAllTranslations() {
         document.querySelectorAll('.bt-translation, .bt-loading').forEach(el => el.remove());
 
-        const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+        const iframe = getReaderIframe();
         if (iframe && iframe.contentDocument) {
             iframe.contentDocument.querySelectorAll('.bt-translation, .bt-loading').forEach(el => el.remove());
         }
@@ -1269,16 +1356,70 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     // ── Observers & Polling ────────────────────────────────────────────
-    const isBtNode = (n) => n.nodeType === 1 && n.classList &&
-        (n.classList.contains('bt-translation') || n.classList.contains('bt-loading'));
+    const isBtNode = (node) => {
+        if (!node || node.nodeType !== 1) return false;
+        return !!(node.closest && node.closest(
+            '#bt-bar, #bt-menu, #bt-toast, .bt-translation, .bt-loading'
+        ));
+    };
+
+    function mutationContainsReaderContent(mutation) {
+        const target = mutation.target && mutation.target.nodeType === 1
+            ? mutation.target
+            : mutation.target && mutation.target.parentElement;
+        if (target && target.closest
+                && target.closest('#bt-bar, #bt-menu, #bt-toast, [data-original-text]')) {
+            return false;
+        }
+        if (mutation.addedNodes.length === 0) return true;
+        return Array.from(mutation.addedNodes).some(node => !isBtNode(node));
+    }
 
     let translateTimeout = null;
-    let lastDocumentIdentity = null;
-    let iframeObserver = null;
+    let lastContentIdentity = null;
+    let readerObserver = null;
     let mainObserver = null;
 
+    function setOverlayHidden(hidden) {
+        ['bt-bar', 'bt-menu', 'bt-toast'].forEach(id => {
+            const element = document.getElementById(id);
+            if (element) {
+                element.hidden = hidden;
+                // Author CSS can override the user-agent [hidden] rule (the
+                // toolbar normally uses display:flex), so enforce route
+                // deactivation at the inline cascade as well.
+                element.style.display = hidden ? 'none' : '';
+            }
+        });
+        if (hidden) closeMenu();
+    }
+
+    function syncReaderRoute({ initial = false } = {}) {
+        const supported = isSupportedReaderRoute();
+        const wasActive = readerRouteActive;
+        if (!supported) {
+            if (wasActive) {
+                readerRouteActive = false;
+                clearTimeout(translateTimeout);
+                newGeneration();
+                removeAllTranslations();
+            }
+            setOverlayHidden(true);
+            return false;
+        }
+
+        readerRouteActive = true;
+        createFloatingUI();
+        setOverlayHidden(false);
+        if (!wasActive && !initial && translationMode !== 'off') {
+            lastContentIdentity = null;
+            scheduleTranslate('reader_route', { immediate: true, forceRediscover: true });
+        }
+        return true;
+    }
+
     function scheduleTranslate(reason, { immediate = false, forceRediscover = false } = {}) {
-        if (translationMode === 'off') return;
+        if (translationMode === 'off' || !readerRouteActive) return;
         lastTriggerReason = reason;
 
         if (forceRediscover) {
@@ -1299,54 +1440,59 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     function setupObservers() {
         if (!mainObserver) {
             mainObserver = new MutationObserver((mutations) => {
-                let shouldTranslate = false;
-                for (const m of mutations) {
-                    for (const n of m.addedNodes) {
-                        if (!isBtNode(n)) { shouldTranslate = true; break; }
-                    }
-                    if (shouldTranslate) break;
+                if (!readerRouteActive) return;
+                const relevant = mutations.some(mutationContainsReaderContent);
+                if (relevant) {
+                    scheduleTranslate('main_mutation', {
+                        forceRediscover: READER_TYPE === 'kavita'
+                    });
                 }
-                if (shouldTranslate) scheduleTranslate('main_mutation');
             });
             mainObserver.observe(document.body, { childList: true, subtree: true });
         }
 
-        // We check for iframe document changes or page turns
+        // Track CWA iframe documents and Kavita's stable .book-content host.
         setInterval(() => {
-            if (translationMode === 'off') return;
+            if (!syncReaderRoute() || translationMode === 'off') return;
 
-            // 1. Iframe discovery and identity tracking
-            const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
-            if (iframe) {
+            let content = null;
+            if (READER_TYPE === 'kavita') {
+                content = getReaderRoot();
+            } else {
+                const iframe = getReaderIframe();
                 try {
-                    const idoc = iframe.contentDocument || iframe.contentWindow.document;
-                    if (idoc && idoc !== lastDocumentIdentity) {
-                        lastDocumentIdentity = idoc;
-                        
-                        if (iframeObserver) iframeObserver.disconnect();
-                        iframeObserver = new MutationObserver((mutations) => {
-                            let shouldTranslate = false;
-                            for (const m of mutations) {
-                                for (const n of m.addedNodes) {
-                                    if (!isBtNode(n)) { shouldTranslate = true; break; }
-                                }
-                                if (shouldTranslate) break;
-                            }
-                            if (shouldTranslate) scheduleTranslate('iframe_mutation');
-                        });
-                        
-                        if (idoc.body) {
-                            ensureIframeStyles(idoc);   // inject our CSS into the new chapter doc
-                            applyIframeTheme(idoc);
-                            attachIframeShortcut(idoc); // Alt+T works with reader focus too
-                            iframeObserver.observe(idoc.body, { childList: true, subtree: true });
-                            scheduleTranslate('new_document', { immediate: true, forceRediscover: true });
-                        }
-                    }
-                } catch (e) {}
+                    const idoc = iframe && (
+                        iframe.contentDocument || iframe.contentWindow.document
+                    );
+                    content = idoc && idoc.body;
+                } catch (e) { content = null; }
+            }
+            if (content && content !== lastContentIdentity) {
+                lastContentIdentity = content;
+                if (readerObserver) readerObserver.disconnect();
+                readerObserver = new MutationObserver((mutations) => {
+                    if (!readerRouteActive
+                            || !mutations.some(mutationContainsReaderContent)) return;
+                    scheduleTranslate(
+                        READER_TYPE === 'kavita'
+                            ? 'kavita_content_mutation' : 'iframe_mutation',
+                        { forceRediscover: READER_TYPE === 'kavita' }
+                    );
+                });
+                if (READER_TYPE === 'cwa') {
+                    const idoc = content.ownerDocument;
+                    ensureIframeStyles(idoc);
+                    applyIframeTheme(idoc);
+                    attachIframeShortcut(idoc);
+                }
+                readerObserver.observe(content, { childList: true, subtree: true });
+                scheduleTranslate('new_reader_content', {
+                    immediate: true,
+                    forceRediscover: true
+                });
             }
 
-            // 2. Page turn detector.
+            // Position-based page turn detector.
             // BUG (root cause of the status bar flicker): inserting a bilingual
             // translation block under a paragraph increases that paragraph's
             // rendered height, which reflows the layout and can shift WHICH
@@ -1393,6 +1539,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     function attachEpubHooks() {
+        if (READER_TYPE !== 'cwa') return;
         if (window.reader && window.reader.rendition) {
             window.reader.rendition.on('relocated', () => {
                 scheduleTranslate('epub_relocated', { immediate: true, forceRediscover: true });
@@ -1432,10 +1579,11 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     function init() {
-        createFloatingUI();
+        if (!syncReaderRoute({ initial: true })) return;
         setupObservers();
         attachEpubHooks();
         setupKeyboardShortcut();
+        window.addEventListener('bt:reader-route', () => syncReaderRoute());
         // Persist any pending translations if the user closes/reloads the tab.
         window.addEventListener('beforeunload', persistCacheNow);
         // Brief version toast helps Felix confirm the correct JS is loaded after deploys.

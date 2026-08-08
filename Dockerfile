@@ -4,8 +4,8 @@ WORKDIR /app
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
-LABEL org.opencontainers.image.title="CWA eBook Translate Plugin" \
-      org.opencontainers.image.description="Bilingual LLM translation overlay for Calibre-Web-Automated" \
+LABEL org.opencontainers.image.title="eBook Translate Plugin" \
+      org.opencontainers.image.description="Bilingual LLM translation overlay for CWA and Kavita" \
       org.opencontainers.image.source="https://github.com/felixapel/CWA-eBook-Translate-Plugin" \
       org.opencontainers.image.url="https://github.com/felixapel/CWA-eBook-Translate-Plugin" \
       org.opencontainers.image.documentation="https://github.com/felixapel/CWA-eBook-Translate-Plugin#readme" \
@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requireme
 
 # Copy only runtime modules; tests, benchmarks, and operator helpers do not
 # belong in the published execution artifact.
-COPY auth.py cache.py server.py singleflight.py translator.py work_budget.py ./
+COPY auth.py cache.py reader_session.py server.py singleflight.py translator.py work_budget.py ./
 COPY VERSION ./
 COPY static/loader.js static/translator.css static/translator.js ./static/
 COPY proxy/nginx-main.conf proxy/nginx.conf.template proxy/render_config.py ./proxy/

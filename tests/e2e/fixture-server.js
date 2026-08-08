@@ -67,6 +67,28 @@ const server = http.createServer((request, response) => {
         </body></html>`);
         return;
     }
+    if (url.pathname === '/library/7/series/42/book/99') {
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        response.end(`<!doctype html><html lang="en"><head>
+          <meta charset="utf-8">
+          <title>Kavita EPUB reader fixture</title>
+          <script src="/bt-static/loader.js?v=e2e"></script>
+        </head><body>
+          <main class="book-container">
+            <div class="book-content"><p id="kavita-paragraph">A Kavita EPUB paragraph.</p></div>
+          </main>
+        </body></html>`);
+        return;
+    }
+    if (url.pathname === '/library/7/series/42/manga/99') {
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        response.end(`<!doctype html><html lang="en"><head>
+          <meta charset="utf-8">
+          <title>Kavita manga fixture</title>
+          <script src="/bt-static/loader.js?v=e2e"></script>
+        </head><body><main><canvas aria-label="manga page"></canvas></main></body></html>`);
+        return;
+    }
     if (url.pathname === '/library') {
         response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         response.end(`<!doctype html><html lang="en"><head>
