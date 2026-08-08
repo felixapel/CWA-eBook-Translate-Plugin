@@ -39,7 +39,7 @@ _COMMAND_ACCESS: dict[str, tuple[tuple[str, str], ...]] = {
     "doctor": (("state", "ro"), ("data", "ro"), ("template", "ro")),
     "adopt": (("state", "rw"), ("data", "ro"), ("template", "ro")),
     "install": (("state", "rw"), ("data", "rw"), ("template", "rw")),
-    "uninstall": (("state", "rw"), ("template", "rw")),
+    "uninstall": (("state", "rw"), ("data", "ro"), ("template", "rw")),
     "upgrade": (
         ("state", "rw"),
         ("data", "rw"),

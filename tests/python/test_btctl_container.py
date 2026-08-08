@@ -40,7 +40,11 @@ class ContainerMountMatrixTests(unittest.TestCase):
                 ("data", "rw"),
                 ("template", "rw"),
             ),
-            "uninstall": (("state", "rw"), ("template", "rw")),
+            "uninstall": (
+                ("state", "rw"),
+                ("data", "ro"),
+                ("template", "rw"),
+            ),
             "upgrade": (
                 ("state", "rw"),
                 ("data", "rw"),
@@ -281,7 +285,7 @@ class ContainerPathPolicyTests(unittest.TestCase):
                         storage_root=storage_root,
                     )
 
-    def test_existing_state_uses_a_dedicated_lock_mount_without_exposing_siblings(self):
+    def test_uninstall_mounts_only_state_data_template_and_dedicated_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout = root / "checkout"
@@ -331,7 +335,7 @@ class ContainerPathPolicyTests(unittest.TestCase):
 
             self.assertEqual(plan.lock_source, lock)
             self.assertEqual(self._effective_mode(plan, state), "rw")
-            self.assertIsNone(self._effective_mode(plan, data))
+            self.assertEqual(self._effective_mode(plan, data), "ro")
 
     def test_missing_state_parent_write_is_narrowed_by_read_only_data_guard(self):
         with tempfile.TemporaryDirectory() as directory:
