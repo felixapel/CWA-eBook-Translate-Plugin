@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -29,6 +30,7 @@ from btctl_hub import (
     HubState,
     HubStateStore,
     HubTopologyMigration,
+    HubUninstaller,
     render_hub_compose,
 )
 from tests.python.test_btctl_compose import values as split_values
@@ -136,6 +138,9 @@ def split_source(
         database.execute("INSERT INTO translations VALUES (?, ?)", (reader, reader))
         database.commit()
     (data_dir / f"{reader}.marker").write_text(reader, encoding="utf-8")
+    key = data_dir / "reader_session_key"
+    key.write_bytes((reader.encode("ascii") * 32)[:32])
+    key.chmod(0o600)
     return Path(config.state_dir)
 
 
@@ -242,9 +247,10 @@ class HubBtctlTests(unittest.TestCase):
             def inspect_image(self, _name):
                 return self.image
 
-            def prepare_data_directory(self, _image, path):
+            def prepare_hub_data_directory(self, _image, path, readers):
                 self.calls.append("data")
                 path.chmod(0o700)
+                self.calls.append(("data-readers", tuple(readers)))
 
             def compose_validate(self, document, _project):
                 self.calls.append("validate")
@@ -293,6 +299,9 @@ class HubBtctlTests(unittest.TestCase):
             def probe_http(self, _container, _url):
                 self.calls.append("http")
 
+            def probe_reader_auth(self, _container, reader, _url):
+                self.calls.append(("reader-auth", reader))
+
             def probe_sqlite(self, _container, _path):
                 self.calls.append("sqlite")
 
@@ -314,9 +323,55 @@ class HubBtctlTests(unittest.TestCase):
             self.assertEqual(state.status, "installed")
             self.assertEqual(state.resources["hub"]["id"], "hub-container-id")
             self.assertEqual(HubStateStore(Path(config.state_dir)).load(), state)
-            self.assertEqual(docker.calls[:4], ["available", "build", "data", "validate"])
-            self.assertEqual(docker.calls.count("http"), 2)
+            self.assertEqual(
+                docker.calls[:5],
+                [
+                    "available",
+                    "build",
+                    "data",
+                    ("data-readers", ("cwa", "kavita")),
+                    "validate",
+                ],
+            )
+            self.assertEqual(docker.calls.count("http"), 4)
+            self.assertEqual(
+                [call for call in docker.calls if isinstance(call, tuple) and call[0] == "reader-auth"],
+                [("reader-auth", "cwa"), ("reader-auth", "kavita")],
+            )
             self.assertEqual(docker.calls.count("sqlite"), 2)
+
+    def test_hub_dependency_probe_fails_when_one_reader_auth_boundary_is_down(self):
+        class Docker:
+            def __init__(self):
+                self.calls = []
+
+            def probe_http(self, _container, url):
+                self.calls.append(("http", url))
+
+            def probe_reader_auth(self, _container, reader, url):
+                self.calls.append(("auth", reader, url))
+                if reader == "kavita":
+                    raise InstallError("kavita auth unavailable")
+
+            def probe_sqlite(self, _container, path):
+                self.calls.append(("sqlite", path))
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = HubInstallConfig.from_mapping(
+                hub_values(Path(directory)), IDENTITY
+            )
+            docker = Docker()
+
+            with self.assertRaisesRegex(InstallError, "kavita auth unavailable"):
+                HubInstaller(docker)._probe(config)
+
+            self.assertIn(
+                ("http", "http://calibre-web:8083/"), docker.calls
+            )
+            self.assertIn(
+                ("auth", "kavita", "http://kavita:5000/api/Account"),
+                docker.calls,
+            )
 
     def test_topology_migration_rejects_overlapping_source_before_stopping(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -370,6 +425,88 @@ class HubBtctlTests(unittest.TestCase):
             self.assertFalse([call for call in docker.calls if call[0] == "stop"])
             self.assertFalse(migration._journal_path(config).exists())
 
+    def test_topology_migration_rejects_unrelated_target_data_before_stopping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root / "hub"), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            cwa_state = split_source(root, "cwa", docker)
+            kavita_state = split_source(root, "kavita", docker)
+            target = Path(config.data_dir)
+            target.mkdir(parents=True)
+            (target / "unrelated.txt").write_text("do not mutate", encoding="utf-8")
+
+            with self.assertRaisesRegex(InstallError, "empty|unexpected"):
+                HubTopologyMigration(docker).migrate(
+                    config, plan, root, [cwa_state, kavita_state]
+                )
+
+            self.assertFalse([call for call in docker.calls if call[0] == "stop"])
+            self.assertEqual((target / "unrelated.txt").read_text(), "do not mutate")
+
+    def test_topology_migration_recovers_published_and_complete_partial_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root / "hub"), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            cwa_state = split_source(root, "cwa", docker)
+            kavita_state = split_source(root, "kavita", docker)
+            migration = HubTopologyMigration(docker)
+            sources = migration._sources(config, [cwa_state, kavita_state])
+            statuses = migration._verify_source_containers(sources)
+            Path(config.state_dir).mkdir(parents=True)
+            migration._save_journal(
+                config,
+                {
+                    "status": "copying",
+                    "migration_id": "61234567-89ab-4cde-8123-0123456789ab",
+                    "hub_fingerprint": plan.config_fingerprint,
+                    "sources": sources,
+                    "initial_statuses": statuses,
+                    "copied": {},
+                },
+            )
+            target_root = Path(config.data_dir)
+            target_root.mkdir(parents=True)
+            shutil.copytree(Path(str(sources["cwa"]["data_dir"])), target_root / "cwa")
+            shutil.copytree(
+                Path(str(sources["kavita"]["data_dir"])),
+                target_root / ".kavita.migration.partial",
+            )
+            for source in sources.values():
+                for role in ("api", "proxy"):
+                    docker.containers[str(source[f"{role}_name"])]["State"][
+                        "Status"
+                    ] = "exited"
+            installed = HubState.new(
+                install_id="71234567-89ab-4cde-8123-0123456789ab",
+                plan=plan,
+            )
+
+            def commit_hub(*_args, **_kwargs):
+                HubStateStore(Path(config.state_dir)).save(installed)
+                return installed
+
+            with mock.patch(
+                "btctl_hub.HubInstaller.install", side_effect=commit_hub
+            ):
+                result = migration.migrate(
+                    config, plan, root, [kavita_state, cwa_state]
+                )
+
+            self.assertEqual(result, installed)
+            journal = migration._load_journal(config)
+            self.assertEqual(set(journal["copied"]), {"cwa", "kavita"})
+            self.assertFalse((target_root / ".kavita.migration.partial").exists())
+            self.assertTrue((target_root / "kavita" / "kavita.marker").is_file())
+            self.assertEqual(
+                (target_root / "cwa" / "reader_session_key").stat().st_mode
+                & 0o777,
+                0o600,
+            )
+
     def test_topology_migration_failure_restores_only_initially_running_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -400,6 +537,48 @@ class HubBtctlTests(unittest.TestCase):
             )
             self.assertIn(("start", "cwa-translate-test-api"), docker.calls)
             self.assertNotIn(("start", "kavita-translate-test-api"), docker.calls)
+
+    def test_post_stop_journal_failure_restarts_all_original_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root / "hub"), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            cwa_state = split_source(root, "cwa", docker)
+            kavita_state = split_source(root, "kavita", docker)
+            migration = HubTopologyMigration(docker)
+            original_save = migration._save_journal
+            save_count = 0
+
+            def fail_first_copy_evidence(save_config, journal):
+                nonlocal save_count
+                save_count += 1
+                if save_count == 3:
+                    raise InstallError("synthetic journal write failure")
+                return original_save(save_config, journal)
+
+            with mock.patch.object(
+                migration, "_save_journal", side_effect=fail_first_copy_evidence
+            ), self.assertRaisesRegex(InstallError, "journal write failure"):
+                migration.migrate(
+                    config, plan, root, [cwa_state, kavita_state]
+                )
+
+            self.assertEqual(migration._load_journal(config)["status"], "failed")
+            self.assertEqual(
+                {
+                    name
+                    for name, container in docker.containers.items()
+                    if name.endswith(("-api", "-proxy"))
+                    and container["State"]["Status"] == "running"
+                },
+                {
+                    "cwa-translate-test-api",
+                    "cwa-translate-test-proxy",
+                    "kavita-translate-test-api",
+                    "kavita-translate-test-proxy",
+                },
+            )
 
     def test_topology_migration_fails_closed_when_partial_hub_survives(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -463,6 +642,11 @@ class HubBtctlTests(unittest.TestCase):
                 (Path(config.data_dir) / "kavita" / "kavita.marker").read_text(),
                 "kavita",
             )
+            self.assertEqual(
+                (Path(config.data_dir) / "kavita" / "reader_session_key").stat().st_mode
+                & 0o777,
+                0o600,
+            )
             self.assertEqual(migration._load_journal(config)["status"], "committed")
             self.assertFalse([call for call in docker.calls if call[0] == "start"])
 
@@ -487,6 +671,60 @@ class HubBtctlTests(unittest.TestCase):
                     "kavita-translate-test-proxy",
                 },
             )
+
+    def test_hub_uninstall_removes_only_managed_reader_keys_and_is_retry_safe(self):
+        class Docker:
+            def __init__(self):
+                self.calls = []
+
+            def inspect_container(self, _name):
+                return None
+
+            def remove_hub_data_credentials(self, _image, path, readers):
+                self.calls.append(tuple(readers))
+                for reader in readers:
+                    key = Path(path) / reader / "reader_session_key"
+                    if key.exists():
+                        self.assert_private_key(key)
+                        key.unlink()
+
+            @staticmethod
+            def assert_private_key(path):
+                if path.stat().st_mode & 0o777 != 0o600 or path.stat().st_size != 32:
+                    raise AssertionError("test fixture key was not private")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root), IDENTITY)
+            plan = HubPlan.from_config(config)
+            state = HubState.new(
+                install_id="81234567-89ab-4cde-8123-0123456789ab",
+                plan=plan,
+            )
+            HubStateStore(Path(config.state_dir)).save(state)
+            for reader in ("cwa", "kavita"):
+                data = Path(config.data_dir) / reader
+                data.mkdir(parents=True)
+                (data / "keep.marker").write_text(reader, encoding="utf-8")
+                key = data / "reader_session_key"
+                key.write_bytes(b"k" * 32)
+                key.chmod(0o600)
+            docker = Docker()
+
+            removed = HubUninstaller(docker).uninstall(config, plan)
+            repeated = HubUninstaller(docker).uninstall(config, plan)
+
+            self.assertEqual(removed.status, "uninstalled")
+            self.assertEqual(repeated, removed)
+            self.assertEqual(docker.calls, [("cwa", "kavita")])
+            for reader in ("cwa", "kavita"):
+                self.assertFalse(
+                    (Path(config.data_dir) / reader / "reader_session_key").exists()
+                )
+                self.assertTrue(
+                    (Path(config.data_dir) / reader / "keep.marker").is_file()
+                )
+                self.assertTrue(removed.resources[f"session_key_{reader}"]["removed"])
 
 
 if __name__ == "__main__":

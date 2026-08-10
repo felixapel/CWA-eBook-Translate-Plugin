@@ -67,9 +67,10 @@ storage mounts and uses the local Docker socket only for lifecycle commands.
 
 To change providers, first run `uninstall --yes` with the current environment,
 then `plan` and `install --yes` with the replacement private environment.
-Uninstall removes only the verified hub container and always preserves reader
-data; the next install archives the completed ownership state before committing
-the new coherent generation.
+Uninstall removes only the verified hub container, removes the two hub-owned
+`reader_session_key` credentials, and preserves translation databases and other
+reader data. The next install regenerates private keys and archives the completed
+ownership state before committing the new coherent generation.
 
 An unmanaged Compose quick start is also available:
 
@@ -102,8 +103,10 @@ mount multiple independently selected source states exactly. It records every
 container ID and initial running status, stops only those resources, performs
 an offline SQLite checkpoint, copies each reader tree atomically and commits
 schema-3 state only after the hub passes health and dependency probes. A retry
-uses the durable per-reader copy manifests and recovers a hub whose state
-commit completed before the journal commit.
+uses the durable per-reader copy manifests, adopts an exact copy published just
+before an interrupted journal write, and recovers a hub whose state commit
+completed before the journal commit. A first attempt requires an empty hub data
+root; resumes reject every entry not owned by the recorded reader copy operation.
 
 Rollback removes only the verified owned hub, preserves its copied data and
 restarts only source roles recorded as running before cutover:

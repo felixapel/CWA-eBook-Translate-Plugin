@@ -60,8 +60,9 @@ Provider roles are selected entirely through the private environment, with
 shared defaults and optional per-reader overrides. The split profile retains
 its provider-only `btctl reconfigure` workflow. A hub provider change uses a
 reviewed `uninstall` with the old environment followed by `install` with the
-new one; data is retained, while all reader processes restart coherently and
-may require a fresh short-lived session.
+new one; translation data is retained, hub-owned session keys are regenerated,
+and all reader processes restart coherently, so tabs may require a fresh
+short-lived session.
 See the [configuration reference](docs/reference/configuration.md).
 
 Stock Unraid requires root, Bash, Docker and a full checkout including `.git`.

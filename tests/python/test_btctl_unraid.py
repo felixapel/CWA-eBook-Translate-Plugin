@@ -362,6 +362,90 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertIn("find /data -xdev -type d -exec chmod 2750", script)
         self.assertIn("find /data -xdev -type f -exec chmod 0640", script)
 
+    def test_hub_data_preparation_preserves_private_keys_and_reader_directories(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().prepare_hub_data_directory(
+                "local/book-translator-hub:2.3.0-abcdef012345",
+                Path("/srv/book-translator-hub/data"),
+                ("cwa", "kavita"),
+            )
+
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[:3], ["docker", "run", "--rm"])
+        self.assertIn("type=bind,src=/srv/book-translator-hub/data,dst=/data", arguments)
+        self.assertEqual(arguments[-2:], ["cwa", "kavita"])
+        script = arguments[arguments.index("-c") + 1]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for reader in ("cwa", "kavita"):
+                reader_dir = root / reader
+                reader_dir.mkdir()
+                key = reader_dir / "reader_session_key"
+                key.write_bytes(b"s" * 32)
+                key.chmod(0o640)
+                (reader_dir / "translations.db").write_bytes(b"sqlite")
+            with mock.patch(
+                "sys.argv",
+                [
+                    "prepare-hub-data",
+                    str(root),
+                    str(os.geteuid()),
+                    str(os.getgid()),
+                    "cwa",
+                    "kavita",
+                ],
+            ):
+                exec(compile(script, "<prepare-hub-data>", "exec"), {})
+
+            self.assertEqual(root.stat().st_mode & 0o7777, 0o2750)
+            for reader in ("cwa", "kavita"):
+                reader_dir = root / reader
+                self.assertEqual(reader_dir.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(
+                    (reader_dir / "reader_session_key").stat().st_mode & 0o777,
+                    0o600,
+                )
+                self.assertEqual(
+                    (reader_dir / "translations.db").stat().st_mode & 0o777,
+                    0o600,
+                )
+
+    def test_hub_credential_removal_is_exact_and_idempotent(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().remove_hub_data_credentials(
+                "local/book-translator-hub:2.3.0-abcdef012345",
+                Path("/srv/book-translator-hub/data"),
+                ("cwa", "kavita"),
+            )
+
+        arguments = run.call_args.args[0]
+        script = arguments[arguments.index("-c") + 1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for reader in ("cwa", "kavita"):
+                reader_dir = root / reader
+                reader_dir.mkdir()
+                reader_dir.chmod(0o700)
+                (reader_dir / "keep.marker").write_text(reader, encoding="utf-8")
+                key = reader_dir / "reader_session_key"
+                key.write_bytes(b"s" * 32)
+                key.chmod(0o600)
+            for _attempt in range(2):
+                with mock.patch(
+                    "sys.argv",
+                    ["remove-hub-keys", str(root), "cwa", "kavita"],
+                ):
+                    exec(compile(script, "<remove-hub-keys>", "exec"), {})
+
+            for reader in ("cwa", "kavita"):
+                self.assertFalse((root / reader / "reader_session_key").exists())
+                self.assertTrue((root / reader / "keep.marker").is_file())
+
     def test_legacy_data_preparation_preserves_owner_and_grants_operator_checkpoint_access(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
 
@@ -402,6 +486,12 @@ class DockerCLIContractTests(unittest.TestCase):
                 "http://calibre-web-automated:8083/ajax/emailstat",
             )
             auth_arguments = run.call_args.args[0]
+            docker.probe_reader_auth(
+                "book-translator-hub",
+                "cwa",
+                "http://calibre-web-automated:8083/ajax/emailstat",
+            )
+            reader_auth_arguments = run.call_args.args[0]
             docker.probe_sqlite(
                 "cwa-translate-api",
                 "/app/data/translations.db",
@@ -412,6 +502,11 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertIn("http://calibre-web-automated:8083/", http_arguments)
         self.assertEqual(auth_arguments[:3], ["docker", "exec", "cwa-translate-api"])
         self.assertIn("code in (401,403)", auth_arguments[-2])
+        self.assertEqual(
+            reader_auth_arguments[:3], ["docker", "exec", "book-translator-hub"]
+        )
+        self.assertEqual(reader_auth_arguments[-2:], ["cwa", "http://calibre-web-automated:8083/ajax/emailstat"])
+        self.assertIn("kind=='text/html'", reader_auth_arguments[-3])
         self.assertEqual(sqlite_arguments[:3], ["docker", "exec", "cwa-translate-api"])
         self.assertIn("/app/data/translations.db", sqlite_arguments)
         self.assertNotIn("shell", run.call_args.kwargs)

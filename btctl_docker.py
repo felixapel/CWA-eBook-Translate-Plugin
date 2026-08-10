@@ -10,6 +10,103 @@ import time
 from pathlib import Path
 
 
+_PREPARE_HUB_DATA_SCRIPT = r"""
+import os
+import stat
+import sys
+
+root, uid_raw, gid_raw, *readers = sys.argv[1:]
+uid = int(uid_raw)
+gid = int(gid_raw)
+allowed = set(readers)
+
+def reject():
+    raise SystemExit(3)
+
+if not allowed or len(allowed) != len(readers):
+    reject()
+metadata = os.lstat(root)
+if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    reject()
+entries = list(os.scandir(root))
+if any(
+    entry.name not in allowed or not entry.is_dir(follow_symlinks=False)
+    for entry in entries
+):
+    reject()
+all_directories = [root]
+all_files = []
+for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+    current_metadata = os.lstat(current)
+    if not stat.S_ISDIR(current_metadata.st_mode) or stat.S_ISLNK(current_metadata.st_mode):
+        reject()
+    for name in directories:
+        child = os.path.join(current, name)
+        child_metadata = os.lstat(child)
+        if not stat.S_ISDIR(child_metadata.st_mode) or stat.S_ISLNK(child_metadata.st_mode):
+            reject()
+        all_directories.append(child)
+    for name in files:
+        child = os.path.join(current, name)
+        child_metadata = os.lstat(child)
+        if not stat.S_ISREG(child_metadata.st_mode) or child_metadata.st_nlink != 1:
+            reject()
+        all_files.append(child)
+for directory in all_directories:
+    os.chown(directory, uid, gid, follow_symlinks=False)
+    os.chmod(directory, 0o2750 if directory == root else 0o700, follow_symlinks=False)
+for child in all_files:
+    os.chown(child, uid, gid, follow_symlinks=False)
+    os.chmod(child, 0o600, follow_symlinks=False)
+"""
+
+
+_REMOVE_HUB_KEYS_SCRIPT = r"""
+import os
+import stat
+import sys
+
+root, *readers = sys.argv[1:]
+root_fd = os.open(
+    root,
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+)
+reader_descriptors = []
+try:
+    for reader in readers:
+        reader_fd = os.open(
+            reader,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        try:
+            metadata = os.stat(
+                "reader_session_key", dir_fd=reader_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None and (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != 32
+        ):
+            os.close(reader_fd)
+            raise SystemExit(3)
+        reader_descriptors.append((reader_fd, metadata is not None))
+    for reader_fd, present in reader_descriptors:
+        if present:
+            os.unlink("reader_session_key", dir_fd=reader_fd)
+            os.fsync(reader_fd)
+    os.fsync(root_fd)
+finally:
+    for reader_fd, _present in reader_descriptors:
+        os.close(reader_fd)
+    os.close(root_fd)
+"""
+
+
 class DockerCommandError(RuntimeError):
     """Docker could not satisfy an operation; command output stays private."""
 
@@ -178,6 +275,71 @@ class DockerCLI:
             timeout=60,
         )
 
+    def prepare_hub_data_directory(
+        self, image: str, path: Path, readers: tuple[str, ...]
+    ) -> None:
+        """Normalize only the exact per-reader hub trees and private files."""
+        if not readers or len(set(readers)) != len(readers) or any(
+            reader not in {"cwa", "kavita"} for reader in readers
+        ):
+            raise DockerCommandError("hub data preparation readers are invalid")
+        self._run(
+            [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--user",
+                "0:0",
+                "--entrypoint",
+                "python",
+                "--mount",
+                f"type=bind,src={path},dst=/data",
+                image,
+                "-c",
+                _PREPARE_HUB_DATA_SCRIPT,
+                "/data",
+                "101",
+                str(os.getgid()),
+                *readers,
+            ],
+            timeout=60,
+        )
+
+    def remove_hub_data_credentials(
+        self, image: str, path: Path, readers: tuple[str, ...]
+    ) -> None:
+        """Remove exact private hub session keys, accepting an idempotent retry."""
+        if not readers or len(set(readers)) != len(readers) or any(
+            reader not in {"cwa", "kavita"} for reader in readers
+        ):
+            raise DockerCommandError("hub credential readers are invalid")
+        self._run(
+            [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--user",
+                "101:102",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--entrypoint",
+                "python",
+                "--mount",
+                f"type=bind,src={path},dst=/data",
+                image,
+                "-c",
+                _REMOVE_HUB_KEYS_SCRIPT,
+                "/data",
+                *readers,
+            ],
+            timeout=60,
+        )
+
     def remove_data_credential(self, image: str, path: Path, filename: str) -> None:
         """Remove one exact API-owned credential from a retained data bind."""
         if filename != "reader_session_key":
@@ -273,6 +435,30 @@ class DockerCLI:
         )
         self._run(
             ["exec", container, "python", "-c", script, url],
+            timeout=15,
+        )
+
+    def probe_reader_auth(self, container: str, reader: str, url: str) -> None:
+        """Prove the exact native-reader authority is reachable but unauthenticated."""
+        if reader not in {"cwa", "kavita"}:
+            raise DockerCommandError("reader auth probe type is invalid")
+        script = (
+            "import sys,urllib.error,urllib.request;"
+            "NoRedirect=type('NoRedirect',(urllib.request.HTTPRedirectHandler,),"
+            "{'redirect_request':lambda self,*args,**kwargs:None});"
+            "opener=urllib.request.build_opener(NoRedirect);code=0;kind='';"
+            "\ntry:\n r=opener.open(sys.argv[2],timeout=5);code=r.status;"
+            "kind=r.headers.get_content_type();r.read(4097);r.close()"
+            "\nexcept urllib.error.HTTPError as exc:\n code=exc.code;"
+            "kind=exc.headers.get_content_type()"
+            "\nexcept Exception:\n sys.exit(2)"
+            "\nreader=sys.argv[1];"
+            "ok=(code in (401,403) or 300 <= code < 400);"
+            "ok=ok or (reader=='cwa' and code==200 and kind=='text/html');"
+            "sys.exit(0 if ok else 3)"
+        )
+        self._run(
+            ["exec", container, "python", "-c", script, reader, url],
             timeout=15,
         )
 

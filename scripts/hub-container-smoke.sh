@@ -32,6 +32,13 @@ docker network create "$SMOKE_NETWORK" >/dev/null
 docker run --rm --user 0:0 --entrypoint /bin/sh \
     --mount "type=bind,src=${DATA_DIR},dst=/data" \
     "$SMOKE_IMAGE" -c 'chown 101:102 /data && chmod 0700 /data'
+docker run --rm --network none --user 101:102 --entrypoint python \
+    --mount "type=bind,src=${DATA_DIR},dst=/data" \
+    "$SMOKE_IMAGE" -c 'from pathlib import Path
+root=Path("/data")
+for name,byte in (("cwa",b"c"),("kavita",b"k")):
+    directory=root/name;directory.mkdir(mode=0o700)
+    key=directory/"reader_session_key";key.write_bytes(byte*32);key.chmod(0o600)'
 
 sandbox=(
     --read-only
@@ -96,6 +103,10 @@ docker exec "$HUB_CONTAINER" test -f /app/data/cwa/reader_session_key
 docker exec "$HUB_CONTAINER" test -f /app/data/kavita/reader_session_key
 test "$(docker exec "$HUB_CONTAINER" stat -c %a /app/data/cwa/reader_session_key)" = 600
 test "$(docker exec "$HUB_CONTAINER" stat -c %a /app/data/kavita/reader_session_key)" = 600
+docker exec "$HUB_CONTAINER" python -c \
+    'from pathlib import Path
+assert Path("/app/data/cwa/reader_session_key").read_bytes()==b"c"*32
+assert Path("/app/data/kavita/reader_session_key").read_bytes()==b"k"*32'
 docker exec "$HUB_CONTAINER" grep -q '\$bt_cwa_session_cookie' /tmp/nginx/proxy-cwa.conf
 docker exec "$HUB_CONTAINER" grep -q '\$bt_kavita_session_cookie' /tmp/nginx/proxy-kavita.conf
 

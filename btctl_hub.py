@@ -8,6 +8,7 @@ import os
 import copy
 import fcntl
 import re
+import shutil
 import stat
 import tempfile
 import uuid
@@ -29,7 +30,12 @@ from btctl_core import (
     read_private_text,
     redact_mapping,
 )
-from btctl_lifecycle import _secure_copy_atomic, _sqlite_integrity, _tree_manifest
+from btctl_lifecycle import (
+    _make_tree_durable,
+    _secure_copy_atomic,
+    _sqlite_integrity,
+    _tree_manifest,
+)
 from hub_runtime import HubConfig, HubConfigError, _PROCESS_KEYS
 
 
@@ -653,6 +659,15 @@ class HubInstaller:
                 config.install_name,
                 f"http://127.0.0.1:{reader.proxy_port}/bt-api/ping",
             )
+            self.docker.probe_http(
+                config.install_name,
+                f"{reader.upstream}/",
+            )
+            self.docker.probe_reader_auth(
+                config.install_name,
+                reader.name,
+                reader.environment["BT_READER_AUTH_URL"],
+            )
             self.docker.probe_sqlite(
                 config.install_name,
                 f"/app/data/{reader.name}/translations.db",
@@ -724,7 +739,11 @@ class HubInstaller:
         image_id = self._verify_image(config)
         data_dir = Path(config.data_dir)
         ensure_directory_durable(data_dir, enforce_existing_mode=False)
-        self.docker.prepare_data_directory(config.image, data_dir)
+        self.docker.prepare_hub_data_directory(
+            config.image,
+            data_dir,
+            tuple(reader.name for reader in config.runtime.readers),
+        )
         started = False
         compose_path = state_dir / "deployment.hub.compose.json"
         environment_path = state_dir / "hub.env"
@@ -916,6 +935,28 @@ class HubUninstaller:
             raise InstallError("hub container removal did not complete")
         resources = copy.deepcopy(current.resources)
         resources["hub"]["removed"] = True
+        readers = tuple(reader.name for reader in config.runtime.readers)
+        pending_credentials = []
+        for reader in readers:
+            resource = resources.get(f"session_key_{reader}")
+            expected = str(Path(config.data_dir) / reader / "reader_session_key")
+            if (
+                not isinstance(resource, dict)
+                or resource.get("path") != expected
+                or resource.get("ownership") != "owned-credential"
+                or resource.get("retention") != "remove-on-uninstall"
+            ):
+                raise InstallError("hub session credential inventory does not match")
+            if resource.get("removed") is not True:
+                pending_credentials.append(reader)
+        if pending_credentials:
+            self.docker.remove_hub_data_credentials(
+                config.image,
+                Path(config.data_dir),
+                tuple(pending_credentials),
+            )
+            for reader in pending_credentials:
+                resources[f"session_key_{reader}"]["removed"] = True
         completed = replace(current, status="uninstalled", resources=resources)
         store.save(completed)
         return completed
@@ -1077,6 +1118,87 @@ class HubTopologyMigration:
                         f"migration source data paths overlap for {reader} and {other_reader}"
                     )
 
+    @staticmethod
+    def _validate_target_root(
+        config: HubInstallConfig,
+        journal: Mapping[str, object] | None,
+    ) -> None:
+        root = Path(config.data_dir)
+        if root.is_symlink() or not root.is_dir():
+            raise InstallError("hub migration data root is unsafe")
+        entries = list(root.iterdir())
+        if journal is None:
+            if entries:
+                raise InstallError("hub migration data root must be empty")
+            return
+        copied = journal.get("copied", {})
+        if not isinstance(copied, dict):
+            raise InstallError("topology migration copy evidence is invalid")
+        readers = {reader.name for reader in config.runtime.readers}
+        allowed = readers | {f".{reader}.migration.partial" for reader in readers}
+        for entry in entries:
+            if (
+                entry.name not in allowed
+                or entry.is_symlink()
+                or not entry.is_dir()
+            ):
+                raise InstallError("hub migration data root has an unexpected entry")
+
+    @staticmethod
+    def _sync_directory(path: Path) -> None:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _copy_reader_data(
+        self,
+        *,
+        reader: str,
+        source_data: Path,
+        data_root: Path,
+        evidence: object,
+    ) -> dict[str, object]:
+        target = data_root / reader
+        work = data_root / f".{reader}.migration.partial"
+        _sqlite_integrity(source_data, checkpoint=True)
+        source_manifest, source_files = _tree_manifest(source_data)
+        expected = {"manifest": source_manifest, "files": source_files}
+        if evidence:
+            if evidence != expected or work.exists() or work.is_symlink():
+                raise InstallError("copied migration data has drifted")
+            manifest, files = _tree_manifest(target)
+            if {"manifest": manifest, "files": files} != expected:
+                raise InstallError("copied migration data has drifted")
+            return expected
+        if target.exists() or target.is_symlink():
+            if work.exists() or work.is_symlink():
+                raise InstallError("migration copy has conflicting recovery trees")
+            manifest, files = _tree_manifest(target)
+            if {"manifest": manifest, "files": files} != expected:
+                raise InstallError("unjournaled migration copy does not match its source")
+            return expected
+        if work.exists() or work.is_symlink():
+            if work.is_symlink() or not work.is_dir():
+                raise InstallError("migration partial copy is unsafe")
+            manifest, files = _tree_manifest(work)
+            if {"manifest": manifest, "files": files} == expected:
+                _make_tree_durable(work)
+                os.replace(work, target)
+                self._sync_directory(data_root)
+                return expected
+            shutil.rmtree(work)
+            self._sync_directory(data_root)
+        _secure_copy_atomic(source_data, target, work)
+        manifest, files = _tree_manifest(target)
+        if {"manifest": manifest, "files": files} != expected:
+            raise InstallError("published migration copy does not match its source")
+        return expected
+
     def _restart_sources(self, journal: Mapping[str, object]) -> None:
         sources = journal.get("sources", {})
         initial = journal.get("initial_statuses", {})
@@ -1135,6 +1257,8 @@ class HubTopologyMigration:
         lock_paths = [Path(config.state_dir), *normalized]
         with _TopologyLocks(lock_paths):
             ensure_directory_durable(Path(config.state_dir))
+            data_root = Path(config.data_dir)
+            ensure_directory_durable(data_root, enforce_existing_mode=False)
             journal_path = self._journal_path(config)
             if journal_path.exists():
                 journal = self._load_journal(config)
@@ -1147,9 +1271,11 @@ class HubTopologyMigration:
                 if sources != current_sources:
                     raise InstallError("migration sources do not match the journal")
                 self._validate_source_paths(config, sources)
+                self._validate_target_root(config, journal)
             else:
                 sources = self._sources(config, normalized)
                 self._validate_source_paths(config, sources)
+                self._validate_target_root(config, None)
                 statuses = self._verify_source_containers(sources)
                 journal = {
                     "status": "prepared",
@@ -1181,36 +1307,30 @@ class HubTopologyMigration:
                     journal["hub_install_id"] = recovered.install_id
                     self._save_journal(config, journal)
                     return recovered
-            statuses = self._verify_source_containers(sources)
-            for reader, source in sources.items():
-                for role in ("proxy", "api"):
-                    if statuses[reader][role] == "running":
-                        self.docker.stop_container(str(source[f"{role}_name"]))
-            journal["status"] = "copying"
-            self._save_journal(config, journal)
             copied = journal.get("copied", {})
             if not isinstance(copied, dict):
                 raise InstallError("topology migration copy evidence is invalid")
-            data_root = Path(config.data_dir)
-            ensure_directory_durable(data_root, enforce_existing_mode=False)
+            statuses = self._verify_source_containers(sources)
+            journal["status"] = "copying"
+            self._save_journal(config, journal)
             installed_state: HubState | None = None
             try:
                 for reader, source in sources.items():
+                    for role in ("proxy", "api"):
+                        if statuses[reader][role] == "running":
+                            self.docker.stop_container(str(source[f"{role}_name"]))
+                for reader, source in sources.items():
                     source_data = Path(str(source["data_dir"]))
-                    target = data_root / reader
                     evidence = copied.get(reader)
-                    if evidence:
-                        manifest, files = _tree_manifest(target)
-                        if evidence != {"manifest": manifest, "files": files}:
-                            raise InstallError("copied migration data has drifted")
-                        continue
-                    _sqlite_integrity(source_data, checkpoint=True)
-                    work = data_root / f".{reader}.migration.partial"
-                    _secure_copy_atomic(source_data, target, work)
-                    manifest, files = _tree_manifest(target)
-                    copied[reader] = {"manifest": manifest, "files": files}
-                    journal["copied"] = copied
-                    self._save_journal(config, journal)
+                    copied[reader] = self._copy_reader_data(
+                        reader=reader,
+                        source_data=source_data,
+                        data_root=data_root,
+                        evidence=evidence,
+                    )
+                    if not evidence:
+                        journal["copied"] = copied
+                        self._save_journal(config, journal)
                 installed_state = HubInstaller(
                     self.docker,
                     health_timeout_seconds=self.health_timeout_seconds,
@@ -1247,12 +1367,20 @@ class HubTopologyMigration:
                         journal["hub_cleanup"] = "failed"
                 journal["status"] = "failed"
                 journal["error"] = exc.__class__.__name__
-                self._save_journal(config, journal)
+                journal_write_failed = False
+                try:
+                    self._save_journal(config, journal)
+                except BaseException:
+                    journal_write_failed = True
                 if cleanup_failed:
                     raise InstallError(
                         "hub commit failed and cleanup is incomplete; source runtimes remain stopped"
                     ) from exc
                 self._restart_sources(journal)
+                if journal_write_failed:
+                    raise InstallError(
+                        "hub migration failed and its recovery journal could not be updated"
+                    ) from exc
                 raise
 
     def rollback(

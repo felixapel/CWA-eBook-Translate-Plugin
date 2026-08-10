@@ -79,6 +79,29 @@ class HubConfigTests(unittest.TestCase):
         self.assertNotIn("BT_KAVITA_LLM_API_KEY", cwa.environment)
         self.assertNotIn("BT_CWA_LLM_API_KEY", kavita.environment)
 
+    def test_reader_session_security_controls_reach_every_enabled_api(self):
+        env = dual_reader_environment()
+        env.update(
+            {
+                "BT_SESSION_TTL_SECONDS": "60",
+                "BT_SESSION_MAX_ENTRIES": "2500",
+                "BT_READER_AUTH_TIMEOUT_SECONDS": "4",
+                "BT_READER_AUTH_MAX_RESPONSE_BYTES": "131072",
+            }
+        )
+
+        config = HubConfig.from_environment(env)
+
+        for reader in config.readers:
+            self.assertEqual(reader.environment["BT_SESSION_TTL_SECONDS"], "60")
+            self.assertEqual(reader.environment["BT_SESSION_MAX_ENTRIES"], "2500")
+            self.assertEqual(
+                reader.environment["BT_READER_AUTH_TIMEOUT_SECONDS"], "4"
+            )
+            self.assertEqual(
+                reader.environment["BT_READER_AUTH_MAX_RESPONSE_BYTES"], "131072"
+            )
+
     def test_remote_provider_without_key_fails_during_plan_not_after_start(self):
         env = dual_reader_environment()
         env["LLM_API_KEY"] = ""
