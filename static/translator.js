@@ -95,6 +95,10 @@
     // Privacy decision scoped to this reader tab/book. Never restore it from
     // browser storage: every new book session starts with remote fallback off.
     let allowCloudFallback = false;
+    // Fetched from the authenticated API. Until this is known, translation is
+    // fail-closed so book text cannot leave the browser without an honest UI.
+    let providerPolicyState = null;
+    let providerPolicyPromise = null;
     // Honest chapter progress: `chapterDone` counts paragraphs actually
     // processed this session (visible AND prefetch), `inflightCount` the ones
     // currently at the API. The displayed total is computed live as
@@ -227,6 +231,9 @@
             retryPage: 'Retry current page', debug: 'Debug',
             cloudFallback: 'Allow cloud fallback',
             cloudPrivacy: 'Sends book text to the configured remote provider. This choice is not saved and applies only to this book tab.',
+            cloudActive: 'Cloud translation is active: book text is sent to the configured remote primary provider.',
+            cloudSecondary: 'Allow secondary remote fallback',
+            cloudSecondaryPrivacy: 'The primary provider is already remote. This additionally permits the configured remote fallback for this tab.',
             dbgQueue: 'Queue', dbgGen: 'Generation', dbgTrigger: 'Last trigger',
         },
         es: {
@@ -241,6 +248,9 @@
             retryPage: 'Reintentar página actual', debug: 'Depuración',
             cloudFallback: 'Permitir fallback cloud',
             cloudPrivacy: 'Envía texto del libro al proveedor remoto configurado. Esta elección no se guarda y solo aplica a esta pestaña del libro.',
+            cloudActive: 'La traducción cloud está activa: el texto se envía al proveedor primario remoto configurado.',
+            cloudSecondary: 'Permitir fallback remoto secundario',
+            cloudSecondaryPrivacy: 'El proveedor primario ya es remoto. Esto además permite el fallback remoto configurado durante esta pestaña.',
             dbgQueue: 'Cola', dbgGen: 'Generación', dbgTrigger: 'Último disparo',
         },
         fr: {
@@ -526,6 +536,28 @@
         const entryCount = Object.keys(translatedParagraphs).length;
         const modeLabel = t[translationMode] || translationMode;
         const esc = (s) => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+        let privacyControls = '';
+        if (providerPolicyState && providerPolicyState.primary === 'remote') {
+            privacyControls +=
+                `<div class="bt-menu-note bt-menu-warning" data-provider-policy="cloud-active">${t.cloudActive || strings.en.cloudActive}</div>`;
+            if (providerPolicyState.fallback === 'remote') {
+                privacyControls +=
+                    `<button type="button" class="bt-menu-item" data-action="cloud-fallback" role="switch" aria-checked="${allowCloudFallback}">` +
+                        `<span>${t.cloudSecondary || strings.en.cloudSecondary}</span>` +
+                        `<span class="bt-switch${allowCloudFallback ? ' bt-on' : ''}" aria-hidden="true"></span>` +
+                    `</button>` +
+                    `<div class="bt-menu-note bt-menu-warning" data-provider-policy="remote-secondary">${t.cloudSecondaryPrivacy || strings.en.cloudSecondaryPrivacy}</div>`;
+            }
+        } else if (providerPolicyState
+                && providerPolicyState.primary === 'local'
+                && providerPolicyState.fallback === 'remote') {
+            privacyControls =
+                `<button type="button" class="bt-menu-item" data-action="cloud-fallback" role="switch" aria-checked="${allowCloudFallback}">` +
+                    `<span>${t.cloudFallback || strings.en.cloudFallback}</span>` +
+                    `<span class="bt-switch${allowCloudFallback ? ' bt-on' : ''}" aria-hidden="true"></span>` +
+                `</button>` +
+                `<div class="bt-menu-note bt-menu-warning" data-provider-policy="remote-fallback">${t.cloudPrivacy || strings.en.cloudPrivacy}</div>`;
+        }
         menu.innerHTML =
             `<div class="bt-menu-header">${t.bookTranslator}<span class="bt-menu-ver">v${BT_UI_VERSION}</span></div>` +
             `<div class="bt-menu-row"><span>${t.modeLabel}</span><span class="bt-menu-val">${modeLabel}</span></div>` +
@@ -538,11 +570,7 @@
                 `<span>${t.prefetchWhole}</span>` +
                 `<span class="bt-switch${prefetchEnabled ? ' bt-on' : ''}" aria-hidden="true"></span>` +
             `</button>` +
-            `<button type="button" class="bt-menu-item" data-action="cloud-fallback" role="switch" aria-checked="${allowCloudFallback}">` +
-                `<span>${t.cloudFallback}</span>` +
-                `<span class="bt-switch${allowCloudFallback ? ' bt-on' : ''}" aria-hidden="true"></span>` +
-            `</button>` +
-            `<div class="bt-menu-note bt-menu-warning">${t.cloudPrivacy}</div>` +
+            privacyControls +
             `<button type="button" class="bt-menu-item" data-action="retry"><span>↻ ${t.retryPage}</span></button>` +
             `<button type="button" class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></button>` +
             `<button type="button" class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></button>` +
@@ -956,6 +984,78 @@
     // client-side — they are almost always mis-detected wrappers, not prose.
     const CLIENT_MAX_PARAGRAPH_CHARS = 7500;
 
+    function apiRequestCredentials() {
+        return configuredCredentials || (
+            AUTH_MODE === 'forwarded'
+                ? 'include'
+                : (AUTH_MODE === 'cwa_session' || AUTH_MODE === 'reader_session'
+                    ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
+                    : 'omit')
+        );
+    }
+
+    function apiRequestHeaders({ json = false } = {}) {
+        const headers = {};
+        if (json) headers['Content-Type'] = 'application/json';
+        if (AUTH_MODE === 'token' && cfg.apiToken) {
+            headers['X-BT-Token'] = cfg.apiToken;
+        }
+        return headers;
+    }
+
+    function validProviderPolicy(policy) {
+        if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return false;
+        const keys = Object.keys(policy).sort();
+        return keys.length === 3 && keys[0] === 'fallback'
+            && keys[1] === 'generation' && keys[2] === 'primary'
+            && (policy.primary === 'local' || policy.primary === 'remote')
+            && (policy.fallback === null
+                || policy.fallback === 'local'
+                || policy.fallback === 'remote')
+            && typeof policy.generation === 'string'
+            && /^[a-f0-9]{32}$/.test(policy.generation);
+    }
+
+    async function loadProviderPolicy({ force = false } = {}) {
+        if (!force && providerPolicyState) return true;
+        if (providerPolicyPromise) return providerPolicyPromise;
+        if (!TRANSLATOR_URL) return false;
+        if (force) {
+            providerPolicyState = null;
+            allowCloudFallback = false;
+            buildMenu();
+        }
+        providerPolicyPromise = (async () => {
+            const send = () => fetch(`${TRANSLATOR_URL}/provider-policy`, {
+                method: 'GET',
+                headers: apiRequestHeaders(),
+                credentials: apiRequestCredentials(),
+                cache: 'no-store',
+            });
+            try {
+                let response = await send();
+                if (response.status === 401 && AUTH_MODE === 'reader_session'
+                        && typeof window.__BT_REFRESH_SESSION === 'function') {
+                    await window.__BT_REFRESH_SESSION();
+                    response = await send();
+                }
+                if (!response.ok) return false;
+                const policy = await response.json();
+                if (!validProviderPolicy(policy)) return false;
+                providerPolicyState = policy;
+                if (policy.fallback !== 'remote') allowCloudFallback = false;
+                buildMenu();
+                return true;
+            } catch (e) {
+                console.error('[BookTranslator] provider privacy policy unavailable');
+                return false;
+            } finally {
+                providerPolicyPromise = null;
+            }
+        })();
+        return providerPolicyPromise;
+    }
+
     function collectUncached(elements) {
         const out = [];
         const seen = new Set();
@@ -979,6 +1079,9 @@
             console.error('[BookTranslator] HTTPS requires a same-origin or TLS apiUrl');
             return { error: 'configuration' };
         }
+        if (!await loadProviderPolicy()) {
+            return { error: 'configuration' };
+        }
         const controller = new AbortController();
         activeControllers.add(controller);
         // Distinguish OUR safety-net timeout from a deliberate abort
@@ -987,29 +1090,23 @@
         // deliberate abort means the work is stale and can be discarded.
         const timer = setTimeout(() => { controller.btTimedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
         try {
-            const headers = { 'Content-Type': 'application/json' };
-            if (AUTH_MODE === 'token' && cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken;
+            const headers = apiRequestHeaders({ json: true });
             const scope = translationScope();
-            const requestCredentials = configuredCredentials || (
-                AUTH_MODE === 'forwarded'
-                    ? 'include'
-                    : (AUTH_MODE === 'cwa_session' || AUTH_MODE === 'reader_session'
-                        ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
-                        : 'omit')
-            );
-            const requestBody = JSON.stringify({
+            const requestCredentials = apiRequestCredentials();
+            const requestBody = () => JSON.stringify({
                 paragraphs: texts,
                 source_lang: SOURCE_LANG,
                 target_lang: TARGET_LANG,
                 book_id: scope.book_id,
                 chapter_id: scope.chapter_id,
-                allow_cloud_fallback: allowCloudFallback
+                allow_cloud_fallback: allowCloudFallback,
+                provider_policy: providerPolicyState
             });
             const send = () => fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
                 headers,
                 credentials: requestCredentials,
-                body: requestBody,
+                body: requestBody(),
                 signal: controller.signal,
             });
             let resp = await send();
@@ -1023,12 +1120,21 @@
                 } catch (e) {
                     return null;
                 }
+                if (!await loadProviderPolicy({ force: true })) {
+                    return { error: 'configuration' };
+                }
                 if (controller.signal.aborted) {
                     return { error: controller.btTimedOut ? 'timeout' : 'aborted' };
                 }
                 resp = await send();
             }
             if (!resp.ok) {
+                if (resp.status === 409) {
+                    providerPolicyState = null;
+                    allowCloudFallback = false;
+                    await loadProviderPolicy({ force: true });
+                    return { error: 'policy_changed' };
+                }
                 if (resp.status === 429) {
                     let r = {};
                     try { r = await resp.json(); } catch(e) {}
@@ -1580,6 +1686,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
 
     function init() {
         if (!syncReaderRoute({ initial: true })) return;
+        void loadProviderPolicy();
         setupObservers();
         attachEpubHooks();
         setupKeyboardShortcut();

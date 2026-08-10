@@ -74,7 +74,7 @@ for ((index = 0; index < ${#arguments[@]}; index += 1)); do
         --env=*)
             env_file="${argument#--env=}"
             ;;
-        plan|install|adopt|auth-snippet|doctor|uninstall|upgrade|rollback)
+        plan|install|adopt|auth-snippet|doctor|uninstall|upgrade|rollback|reconfigure)
             if [ -z "$command" ]; then
                 command="$argument"
             fi
@@ -159,7 +159,7 @@ if [ -n "$env_file" ]; then
 fi
 
 case "$command" in
-    install|adopt|doctor|uninstall|upgrade|rollback)
+    install|adopt|doctor|uninstall|upgrade|rollback|reconfigure)
         prepare_host_lock_directory
         ;;
 esac
@@ -367,7 +367,7 @@ if [ -d /boot ]; then
     planner_mounts+=(--mount type=bind,src=/boot,dst=/boot,readonly)
 fi
 case "$command" in
-    install|adopt|doctor|uninstall|upgrade|rollback)
+    install|adopt|doctor|uninstall|upgrade|rollback|reconfigure)
         planner_mounts+=(
             --mount "type=bind,src=$HOST_LOCK_DIRECTORY,dst=$HOST_LOCK_DIRECTORY,readonly"
         )

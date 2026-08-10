@@ -36,6 +36,7 @@ class ProviderBudgetTests(unittest.TestCase):
         self.original_response_limit = translator.BT_MAX_UPSTREAM_RESPONSE_BYTES
         self.original_provider_config = (
             translator.LLM_PROVIDER,
+            translator.LLM_API_KEY,
             translator.LLM_MODEL,
             translator.LLM_FALLBACK_PROVIDER,
             translator.LLM_FALLBACK_MODEL,
@@ -44,6 +45,7 @@ class ProviderBudgetTests(unittest.TestCase):
         # Keep this module deterministic even when another test imported the
         # translator before the environment variables above were applied.
         translator.LLM_PROVIDER = "local"
+        translator.LLM_API_KEY = ""
         translator.LLM_MODEL = "fake-model"
         translator.LLM_FALLBACK_PROVIDER = "minimax"
         translator.LLM_FALLBACK_MODEL = "fake-fallback"
@@ -64,6 +66,7 @@ class ProviderBudgetTests(unittest.TestCase):
         translator.BT_MAX_UPSTREAM_RESPONSE_BYTES = self.original_response_limit
         (
             translator.LLM_PROVIDER,
+            translator.LLM_API_KEY,
             translator.LLM_MODEL,
             translator.LLM_FALLBACK_PROVIDER,
             translator.LLM_FALLBACK_MODEL,
@@ -174,8 +177,10 @@ class ProviderBudgetTests(unittest.TestCase):
 
     def test_local_fallback_remains_available_without_cloud_consent(self):
         translator.LLM_PROVIDER = "openai"
+        translator.LLM_API_KEY = "primary-key"
         translator.LLM_MODEL = "remote-primary"
         translator.LLM_FALLBACK_PROVIDER = "local"
+        translator.LLM_FALLBACK_API_KEY = ""
         translator.LLM_FALLBACK_MODEL = "private-fallback"
         translator._primary_provider = None
         translator._fallback_provider = "unset"
@@ -409,8 +414,19 @@ class ProviderBudgetTests(unittest.TestCase):
 
         server_thread = threading.Thread(target=drip_headers, daemon=True)
         server_thread.start()
-        provider = translator._Provider("local", "fake-model", "")
-        provider.url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        endpoint = f"http://127.0.0.1:{port}/v1/chat/completions"
+        provider = translator._Provider(
+            "local",
+            "fake-model",
+            "",
+            spec=translator.ProviderSpec(
+                provider_id="local",
+                endpoint=endpoint,
+                protocol="openai",
+                locality="local",
+                cache_namespace="local",
+            ),
+        )
         translator._primary_provider = provider
         translator._fallback_provider = None
         translator._provider_post = translator._deadline_provider_post

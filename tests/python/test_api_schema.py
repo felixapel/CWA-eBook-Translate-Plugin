@@ -143,6 +143,80 @@ class APISchemaTests(unittest.TestCase):
             translate_paragraphs.call_args.kwargs["allow_cloud_fallback"], True
         )
 
+    def test_provider_policy_returns_locality_and_opaque_generation(self):
+        with mock.patch.object(
+            server,
+            "provider_policy",
+            return_value={"primary": "remote", "fallback": "local"},
+        ):
+            response = self.client.get("/provider-policy")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(), {
+                "primary": "remote",
+                "fallback": "local",
+                "generation": server.PROVIDER_POLICY_GENERATION,
+            }
+        )
+        encoded = response.get_data(as_text=True)
+        for forbidden in ("model", "provider", "endpoint", "url", "key"):
+            self.assertNotIn(forbidden, encoded.casefold())
+
+    def test_stale_browser_provider_generation_rejects_before_translation(self):
+        stale = {
+            "primary": "local",
+            "fallback": None,
+            "generation": "0" * 32,
+        }
+        current = {"primary": "remote", "fallback": "local"}
+        cases = (
+            ("/translate", {"text": "private book text"}),
+            ("/translate/batch", {"paragraphs": ["private book text"]}),
+        )
+        for endpoint, body in cases:
+            with (
+                self.subTest(endpoint=endpoint),
+                mock.patch.object(server, "provider_policy", return_value=current),
+                mock.patch.object(server, "_cache_lookup") as cache_lookup,
+                mock.patch.object(server, "translate_text") as translate_text,
+                mock.patch.object(server, "_translate_paragraphs") as translate_batch,
+            ):
+                response = self.client.post(
+                    endpoint,
+                    json={**body, "provider_policy": stale},
+                )
+
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(
+                response.get_json()["error"], "provider_policy_changed"
+            )
+            cache_lookup.assert_not_called()
+            translate_text.assert_not_called()
+            translate_batch.assert_not_called()
+
+    def test_browser_provider_policy_binding_is_exact(self):
+        invalid = {
+            "primary": "local",
+            "fallback": None,
+            "generation": "not-a-generation",
+        }
+        with mock.patch.object(server, "translate_text") as translate_text:
+            response = self.client.post(
+                "/translate",
+                json={"text": "private book text", "provider_policy": invalid},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        translate_text.assert_not_called()
+
+    def test_managed_reader_without_policy_binding_is_stale(self):
+        with mock.patch.object(server.AUTHENTICATOR, "mode", "reader_session"):
+            self.assertTrue(server._stale_provider_policy({}))
+
+        with mock.patch.object(server.AUTHENTICATOR, "mode", "token"):
+            self.assertFalse(server._stale_provider_policy({}))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

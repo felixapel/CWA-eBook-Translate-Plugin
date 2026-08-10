@@ -30,6 +30,28 @@ Adoption does not change Docker. It rejects unlabeled, partial, insecure or
 ambiguous containers and routes a combined legacy container to the migration
 workflow instead of relabeling it.
 
+## Reconfigure provider roles
+
+Create a second mode-`0600` environment with the same runtime/reader topology
+and only provider values changed. First run without `--yes` to print a redacted
+plan, then confirm:
+
+```bash
+./btctl reconfigure --env /absolute/private/path/new-provider.env
+./btctl reconfigure --env /absolute/private/path/new-provider.env --yes
+./btctl doctor --env /absolute/private/path/new-provider.env
+```
+
+The transaction replaces only the API container or Compose service. Private
+old/new snapshots are digest-bound to a secret-free journal. All configured
+providers, reader authentication and SQLite are probed before new state is
+published. A normal failure restores the old API automatically. If the process
+or host stops mid-cutover, rerun the same confirmed command: it validates the
+journal, restores the old role and then performs a fresh transaction. Do not
+edit or delete `reconfigure.json` or its private snapshots. If automatic
+rollback itself fails, preserve those files and collect `doctor`/Docker inspect
+evidence before changing runtime state.
+
 ## Upgrade from the combined v2.1.4 runtime
 
 Migration supports one exact v2.1.4 container. Keep its live data separate from

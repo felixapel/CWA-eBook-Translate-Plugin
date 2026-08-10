@@ -29,6 +29,7 @@ from btctl_lifecycle import (
     RuntimeUninstaller,
 )
 from btctl_paths import validate_unraid_config_paths
+from btctl_reconfigure import ProviderReconfigurer
 from btctl_unraid import UnraidAdopter, UnraidInstaller
 
 
@@ -95,6 +96,19 @@ def _parser() -> argparse.ArgumentParser:
     rollback.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
     rollback.add_argument("--yes", action="store_true", help="confirm rollback")
     rollback.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    reconfigure = commands.add_parser(
+        "reconfigure",
+        help="transactionally replace only the API role's provider configuration",
+    )
+    reconfigure.add_argument(
+        "--env", required=True, type=Path, help="strict replacement KEY=value file"
+    )
+    reconfigure.add_argument(
+        "--yes", action="store_true", help="confirm the redacted provider cutover"
+    )
+    reconfigure.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
     return parser
 
 
@@ -339,6 +353,18 @@ def main(argv: list[str] | None = None) -> int:
             if not args.yes:
                 raise ConfigError("rollback requires --yes")
             state = LegacyUpgrade(_docker_for(config)).rollback(config, plan)
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "reconfigure":
+            config, plan, _ = _load_config(args.repository, args.env)
+            reconfigurer = ProviderReconfigurer(_docker_for(config))
+            if not args.yes:
+                preview = reconfigurer.preview(config, plan)
+                _print_payload(preview, compact=args.json)
+                raise ConfigError(
+                    "reconfigure requires --yes after reviewing the redacted plan"
+                )
+            state = reconfigurer.reconfigure(config, plan)
             _print_payload(state.to_dict(), compact=args.json)
             return 0
         raise ConfigError("unsupported command")

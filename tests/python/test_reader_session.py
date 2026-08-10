@@ -430,6 +430,10 @@ class ReaderSessionEndpointTests(unittest.TestCase):
                 "text": "same",
                 "source_lang": "English",
                 "target_lang": "English",
+                "provider_policy": {
+                    **self.server.provider_policy(),
+                    "generation": self.server.PROVIDER_POLICY_GENERATION,
+                },
             },
             headers={"User-Agent": "Reader/1.0"},
         )

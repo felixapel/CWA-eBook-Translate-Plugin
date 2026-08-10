@@ -662,6 +662,76 @@ class InstallConfigTests(unittest.TestCase):
                     {**self.base, "BT_LOCAL_URL": endpoint}, self.identity
                 )
 
+    def test_managed_provider_contract_supports_fallback_and_custom_endpoint(self):
+        gemini_primary = InstallConfig.from_mapping(
+            {
+                **self.base,
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.5-flash-lite",
+                "LLM_API_KEY": "gemini-private-key",
+                "LLM_FALLBACK_PROVIDER": "local",
+                "LLM_FALLBACK_MODEL": "gemma4-12b",
+            },
+            self.identity,
+        )
+        primary_env = gemini_primary.api_environment()
+        self.assertEqual(primary_env["LLM_FALLBACK_PROVIDER"], "local")
+        self.assertEqual(primary_env["LLM_FALLBACK_MODEL"], "gemma4-12b")
+        self.assertEqual(primary_env["LLM_FALLBACK_API_KEY"], "")
+        self.assertEqual(
+            primary_env["BT_LOCAL_URL"],
+            "http://host.docker.internal:2819/v1/chat/completions",
+        )
+
+        custom = InstallConfig.from_mapping(
+            {
+                **self.base,
+                "LLM_PROVIDER": "openai-compatible",
+                "LLM_MODEL": "translation-model",
+                "BT_LOCAL_URL": "",
+                "LLM_CUSTOM_ENDPOINT": "https://llm.example.test/v1/chat/completions",
+                "LLM_CUSTOM_API_KEY": "custom-private-key",
+            },
+            self.identity,
+        )
+        custom_env = custom.api_environment()
+        self.assertEqual(
+            custom_env["LLM_CUSTOM_ENDPOINT"],
+            "https://llm.example.test/v1/chat/completions",
+        )
+        self.assertEqual(custom_env["LLM_CUSTOM_API_KEY"], "custom-private-key")
+        self.assertEqual(custom_env["LLM_API_KEY"], "")
+        self.assertNotIn("custom-private-key", repr(custom.public_contract()))
+
+    def test_managed_provider_contract_rejects_ambiguous_or_unsafe_fallbacks(self):
+        invalid_cases = (
+            {
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.5-flash-lite",
+                "LLM_API_KEY": "primary-key",
+                "LLM_FALLBACK_PROVIDER": "gemini",
+                "LLM_FALLBACK_MODEL": "gemini-3.5-flash-lite",
+                "BT_LOCAL_URL": "",
+            },
+            {
+                "LLM_PROVIDER": "openai-compatible",
+                "LLM_MODEL": "translation-model",
+                "LLM_CUSTOM_ENDPOINT": "http://llm.example.test/v1/chat/completions",
+                "LLM_CUSTOM_API_KEY": "custom-key",
+                "BT_LOCAL_URL": "",
+            },
+            {
+                "LLM_PROVIDER": "openai-compatible",
+                "LLM_MODEL": "translation-model",
+                "LLM_CUSTOM_ENDPOINT": "https://llm.example.test/v1/chat/completions/",
+                "LLM_CUSTOM_API_KEY": "custom-key",
+                "BT_LOCAL_URL": "",
+            },
+        )
+        for values in invalid_cases:
+            with self.subTest(values=values), self.assertRaises(ConfigError):
+                InstallConfig.from_mapping({**self.base, **values}, self.identity)
+
     def test_redaction_never_returns_secret_values(self):
         values = {
             "LLM_API_KEY": "cloud-secret",

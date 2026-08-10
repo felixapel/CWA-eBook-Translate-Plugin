@@ -320,6 +320,21 @@ class DockerCLI:
             timeout=30,
         )
 
+    def probe_providers(self, container: str) -> None:
+        """Require every configured translation backend to pass its deep probe."""
+        script = (
+            "import sys;"
+            "from translator import check_backend_health,create_work_budget;"
+            "health=check_backend_health(create_work_budget());"
+            "ok=bool(health) and all(item.get('status')=='ok' "
+            "for item in health.values());"
+            "sys.exit(0 if ok else 3)"
+        )
+        self._run(
+            ["exec", container, "python", "-c", script],
+            timeout=120,
+        )
+
     def compose_validate(self, document: Path, project: str) -> None:
         self._run(
             ["compose", "--project-name", project, "--file", str(document), "config", "--quiet"],
@@ -339,6 +354,29 @@ class DockerCLI:
                 "--no-build",
                 "--pull",
                 "never",
+            ],
+            timeout=300,
+        )
+
+    def compose_recreate_service(
+        self, document: Path, project: str, service: str
+    ) -> None:
+        if service != "api":
+            raise DockerCommandError("provider reconfigure may replace only api")
+        self._run(
+            [
+                "compose",
+                "--project-name",
+                project,
+                "--file",
+                str(document),
+                "up",
+                "--detach",
+                "--no-deps",
+                "--force-recreate",
+                "--pull",
+                "never",
+                service,
             ],
             timeout=300,
         )

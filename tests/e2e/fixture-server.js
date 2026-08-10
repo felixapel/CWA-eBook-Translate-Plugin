@@ -46,6 +46,18 @@ const server = http.createServer((request, response) => {
         }));
         return;
     }
+    if (url.pathname === '/bt-api/provider-policy') {
+        response.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+        });
+        response.end(JSON.stringify({
+            primary: 'local',
+            fallback: 'remote',
+            generation: '0123456789abcdef0123456789abcdef',
+        }));
+        return;
+    }
     if (url.pathname === '/chapter/1') {
         response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         response.end(`<!doctype html><html><body>

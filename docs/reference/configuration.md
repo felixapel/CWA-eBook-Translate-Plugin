@@ -26,10 +26,17 @@ role settings and redacts secrets from its output. Never commit the edited file.
 | `BT_DATA_DIR` | Private translation data outside the checkout. |
 | `BT_BACKUP_DIR` | Backup root outside appdata/data. |
 | `BT_UNRAID_TEMPLATE_DIR` | DockerMan user-template directory for the Unraid profile. |
-| `LLM_PROVIDER` | `local` or a supported cloud adapter. |
+| `LLM_PROVIDER` | `local`, a fixed named adapter, or `openai-compatible`. Defaults remain local. |
 | `LLM_MODEL` | Provider model identifier. |
-| `BT_LOCAL_URL` | Absolute OpenAI-compatible `/v1/chat/completions` endpoint for `local`. |
-| `LLM_API_KEY` | Provider credential; leave empty for an unauthenticated local server. |
+| `BT_LOCAL_URL` | Shared absolute `/v1/chat/completions` endpoint when either role is `local`. |
+| `LLM_API_KEY` | Primary named-provider credential; empty for `local` and `openai-compatible`. |
+| `LLM_CUSTOM_ENDPOINT` | Primary `openai-compatible` public HTTPS URL with exact `/v1/chat/completions` path. |
+| `LLM_CUSTOM_API_KEY` | Dedicated primary custom-endpoint credential. |
+| `LLM_FALLBACK_PROVIDER` | Optional distinct fallback provider. |
+| `LLM_FALLBACK_MODEL` | Required with a fallback provider. |
+| `LLM_FALLBACK_API_KEY` | Fallback named-provider credential. |
+| `LLM_FALLBACK_CUSTOM_ENDPOINT` | Dedicated fallback custom endpoint. |
+| `LLM_FALLBACK_CUSTOM_API_KEY` | Dedicated fallback custom credential. |
 | `BT_IDENTITY_PROXY_IP` | Exact `/32` or `/128` trusted identity peer for Authentik mode. |
 | `BT_AUTHENTIK_VERSION` | Exact accepted Authentik version for the advanced profile. |
 | `BT_AUTHENTIK_OUTPOST_URL` | Private outpost URL for generated edge configuration. |
@@ -143,12 +150,34 @@ use an opaque server-owned subject, not a request-supplied address or header.
 | `LLM_FALLBACK_PROVIDER` | empty | Optional secondary provider. |
 | `LLM_FALLBACK_MODEL` | empty | Secondary model. |
 | `LLM_FALLBACK_API_KEY` | empty | Secondary credential. |
+| `LLM_CUSTOM_ENDPOINT` | empty | Primary custom public HTTPS chat-completions endpoint. |
+| `LLM_CUSTOM_API_KEY` | empty | Credential used only by the primary custom endpoint. |
+| `LLM_FALLBACK_CUSTOM_ENDPOINT` | empty | Fallback custom public HTTPS chat-completions endpoint. |
+| `LLM_FALLBACK_CUSTOM_API_KEY` | empty | Credential used only by the fallback custom endpoint. |
 
 Remote fallback is fail-closed: each `POST /translate` or
 `POST /translate/batch` request must set the JSON boolean
 `allow_cloud_fallback: true` before book text can leave a local primary path.
-The reader stores that choice only in the current tab. Choosing a cloud provider
-as primary is a separate operator decision and sends ordinary requests there.
+The authenticated `GET /provider-policy` response exposes only `local`/`remote`
+locality plus an opaque per-process generation. Every official-reader
+translation echoes that policy; stale generations receive `409` before cache or
+provider work, then the reader refetches policy without replaying book text.
+The reader stores fallback consent only in the current tab. A remote primary
+always shows an active-cloud warning; a second remote fallback still requires
+the tab switch. Provider names, models, URLs and keys never enter that response.
+
+Named-provider endpoints are fixed in code. `openai-compatible` is always
+remote, requires its dedicated key, rejects credentials/query/fragment in the
+URL, rejects non-public destinations at runtime, disables redirects and scopes
+cache identity to a digest of the endpoint. Runtime DNS is bounded by the work
+budget and the transport connects to the vetted address while retaining TLS
+hostname verification, closing DNS-rebinding races. Use `local` for LAN services.
+
+Automatic retry and fallback are limited to connection/DNS timeouts and HTTP
+`408`, `429`, `500`, `502`, `503` and `504`. Configuration failures, TLS
+certificate failures and terminal `4xx` responses such as `400`, `401`, `403`,
+`404`, `409` and `422` do not fail over. A malformed bounded provider response
+may use an allowed fallback but is not retried blindly on the same provider.
 
 Cache schema v2 stores translations plus scoped one-way hashes, not source
 paragraphs, reader credentials or raw user/book identifiers. The legacy v1

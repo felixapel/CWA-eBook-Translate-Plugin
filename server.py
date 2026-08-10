@@ -33,6 +33,8 @@ from translator import (
     cache_lookup_backends, translation_groups, batch_cache_contract,
     single_cache_contract, singleflight_stats, BatchRecoveryTracker,
     RECOVERY_METRIC_NAMES,
+    provider_policy,
+    initialize_provider_configuration,
 )
 from work_budget import WorkBudget, WorkBudgetExceeded
 from cache import (
@@ -180,6 +182,11 @@ log = logging.getLogger("book-translator.server")
 # BT_AUTH_MODE=disabled remains available only as an explicit development/test
 # choice; it is never the default.
 AUTHENTICATOR = RequestAuthenticator.from_environment()
+initialize_provider_configuration()
+# Non-secret process generation. A managed provider reconfigure replaces the
+# API process, so an open reader can prove it learned policy from this exact
+# provider generation without exposing provider/model/endpoint identity.
+PROVIDER_POLICY_GENERATION = uuid.uuid4().hex
 
 app = Flask(__name__)
 
@@ -222,6 +229,32 @@ def _cloud_fallback_consent(data: dict) -> bool:
     if type(consent) is not bool:
         raise ValueError("'allow_cloud_fallback' must be a boolean")
     return consent
+
+
+def _stale_provider_policy(data: dict) -> bool:
+    """Reject official-reader requests bound to an obsolete locality policy."""
+    if "provider_policy" not in data:
+        # Token-mode API clients retain the pre-existing optional contract.
+        # Managed browser modes fail closed so an already-open old reader
+        # cannot bypass the generation boundary after an API replacement.
+        return AUTHENTICATOR.mode in {
+            "cwa_session", "reader_session", "forwarded"
+        }
+    policy = data["provider_policy"]
+    if (
+        not isinstance(policy, dict)
+        or set(policy) != {"primary", "fallback", "generation"}
+        or policy.get("primary") not in {"local", "remote"}
+        or policy.get("fallback") not in {None, "local", "remote"}
+        or not isinstance(policy.get("generation"), str)
+        or len(policy.get("generation")) != 32
+    ):
+        raise ValueError("'provider_policy' must be an exact locality policy")
+    current = {
+        **provider_policy(),
+        "generation": PROVIDER_POLICY_GENERATION,
+    }
+    return policy != current
 
 # ── Language validation (H7) ────────────────────────────────────────────────
 # The selectable set mirrors Gemma 4's pre-training coverage (top-10 most
@@ -1210,6 +1243,17 @@ def health():
     })
 
 
+@app.route("/provider-policy")
+def get_provider_policy():
+    """Return backend locality plus an opaque generation for consent binding."""
+    response = jsonify({
+        **provider_policy(),
+        "generation": PROVIDER_POLICY_GENERATION,
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/health/deep")
 def deep_health():
     """Operator-only provider probe using normal work and concurrency caps."""
@@ -1235,7 +1279,7 @@ def deep_health():
         backend_health = check_backend_health(create_work_budget())
     except WorkBudgetExceeded as exc:
         return _work_budget_response(exc)
-    overall = "ok" if any(
+    overall = "ok" if backend_health and all(
         b.get("status") == "ok" for b in backend_health.values()
     ) else "degraded"
     return jsonify({
@@ -1328,8 +1372,14 @@ def translate():
 
     try:
         allow_cloud_fallback = _cloud_fallback_consent(data)
+        stale_provider_policy = _stale_provider_policy(data)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    if stale_provider_policy:
+        return jsonify({
+            "error": "provider_policy_changed",
+            "request_id": getattr(request, "request_id", None),
+        }), 409
 
     try:
         tenant, book_id, chapter_id = _request_cache_namespace(data)
@@ -1516,8 +1566,14 @@ def translate_batch_endpoint():
 
     try:
         allow_cloud_fallback = _cloud_fallback_consent(data)
+        stale_provider_policy = _stale_provider_policy(data)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    if stale_provider_policy:
+        return jsonify({
+            "error": "provider_policy_changed",
+            "request_id": getattr(request, "request_id", None),
+        }), 409
 
     try:
         tenant, book_id, chapter_id = _request_cache_namespace(data)

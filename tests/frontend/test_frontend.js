@@ -35,6 +35,14 @@ let activeFetches = 0;
 let maxActiveFetches = 0;
 
 global.fetch = async (url, options) => {
+    if (String(url).endsWith('/provider-policy')) {
+        return {
+            ok: true,
+            status: 200,
+            json: async () => ({ primary: 'local', fallback: 'remote', generation: '0123456789abcdef0123456789abcdef' }),
+            headers: { get: () => null }
+        };
+    }
     activeFetches++;
     if (activeFetches > maxActiveFetches) {
         maxActiveFetches = activeFetches;
@@ -135,6 +143,14 @@ async function captureAuthTransport(config, enableCloudFallback = false) {
 
     let captured = null;
     authDom.window.fetch = async (url, options) => {
+        if (String(url).endsWith('/provider-policy')) {
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ primary: 'local', fallback: 'remote', generation: '0123456789abcdef0123456789abcdef' }),
+                headers: { get: () => null }
+            };
+        }
         captured = captured || { url, options };
         const count = JSON.parse(options.body).paragraphs.length;
         return {
@@ -169,6 +185,138 @@ async function captureAuthTransport(config, enableCloudFallback = false) {
     await wait(30);
     authDom.window.close();
     return captured.options;
+}
+
+async function assertProviderPolicyControls() {
+    const cases = [
+        {
+            policy: { primary: 'remote', fallback: 'local', generation: '0123456789abcdef0123456789abcdef' },
+            control: false,
+            markers: ['cloud-active']
+        },
+        {
+            policy: { primary: 'local', fallback: 'remote', generation: '0123456789abcdef0123456789abcdef' },
+            control: true,
+            markers: ['remote-fallback']
+        },
+        {
+            policy: { primary: 'remote', fallback: 'remote', generation: '0123456789abcdef0123456789abcdef' },
+            control: true,
+            markers: ['cloud-active', 'remote-secondary']
+        },
+        {
+            policy: { primary: 'local', fallback: 'local', generation: '0123456789abcdef0123456789abcdef' },
+            control: false,
+            markers: []
+        },
+        {
+            policy: { primary: 'local', fallback: null, generation: '0123456789abcdef0123456789abcdef' },
+            control: false,
+            markers: []
+        }
+    ];
+    for (const scenario of cases) {
+        const policyDom = new JSDOM(
+            '<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>',
+            { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' }
+        );
+        policyDom.window.BOOK_TRANSLATOR = { apiUrl: '/bt-api', authMode: 'cwa_session' };
+        policyDom.window.localStorage.setItem('bt_mode', 'off');
+        policyDom.window.fetch = async (url) => {
+            assert(String(url).endsWith('/provider-policy'));
+            return {
+                ok: true,
+                status: 200,
+                json: async () => scenario.policy,
+                headers: { get: () => null }
+            };
+        };
+        const policyScript = policyDom.window.document.createElement('script');
+        policyScript.textContent = code;
+        policyDom.window.document.body.appendChild(policyScript);
+        const deadline = Date.now() + 2000;
+        while (!policyDom.window.document.querySelector('#bt-menu')
+                && Date.now() < deadline) await wait(10);
+        await wait(20);
+        const control = policyDom.window.document.querySelector(
+            '[data-action="cloud-fallback"]');
+        assert.strictEqual(Boolean(control), scenario.control,
+            `Unexpected remote fallback control for ${JSON.stringify(scenario.policy)}`);
+        const markers = Array.from(policyDom.window.document.querySelectorAll(
+            '[data-provider-policy]')).map(element => element.dataset.providerPolicy);
+        assert.deepStrictEqual(markers, scenario.markers,
+            `Unexpected privacy marker for ${JSON.stringify(scenario.policy)}`);
+        policyDom.window.close();
+    }
+}
+
+async function assertStalePolicyIsRefetchedWithoutTranslationReplay() {
+    const staleDom = new JSDOM(
+        '<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>',
+        { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' }
+    );
+    staleDom.window.BOOK_TRANSLATOR = {
+        apiUrl: '/bt-api',
+        authMode: 'cwa_session',
+    };
+    staleDom.window.localStorage.setItem('bt_mode', 'translated');
+    staleDom.window.localStorage.setItem('bt_prefetch', '0');
+    staleDom.window.localStorage.setItem('bt_lang', 'Spanish');
+    staleDom.window.requestAnimationFrame = cb => setTimeout(cb, 0);
+    const paragraph = staleDom.window.document.querySelector('iframe')
+        .contentDocument.body.appendChild(
+            staleDom.window.document.querySelector('iframe')
+                .contentDocument.createElement('p')
+        );
+    paragraph.textContent = 'policy generation probe';
+    paragraph.getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+
+    let policyCalls = 0;
+    let translationCalls = 0;
+    let submittedPolicy = null;
+    staleDom.window.fetch = async (url, options) => {
+        if (String(url).endsWith('/provider-policy')) {
+            policyCalls++;
+            return {
+                ok: true,
+                status: 200,
+                json: async () => policyCalls === 1
+                    ? { primary: 'local', fallback: null, generation: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }
+                    : { primary: 'remote', fallback: 'local', generation: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },
+                headers: { get: () => null },
+            };
+        }
+        translationCalls++;
+        submittedPolicy = JSON.parse(options.body).provider_policy;
+        return {
+            ok: false,
+            status: 409,
+            json: async () => ({ error: 'provider_policy_changed' }),
+            headers: { get: () => null },
+        };
+    };
+
+    const script = staleDom.window.document.createElement('script');
+    script.textContent = code;
+    staleDom.window.document.body.appendChild(script);
+    const deadline = Date.now() + 2000;
+    while ((policyCalls < 2 || translationCalls < 1)
+            && Date.now() < deadline) await wait(20);
+    await wait(40);
+
+    assert.strictEqual(translationCalls, 1,
+        'A policy-generation 409 must not replay book text automatically');
+    assert.deepStrictEqual(submittedPolicy, {
+        primary: 'local',
+        fallback: null,
+        generation: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    });
+    assert(staleDom.window.document.querySelector(
+        '[data-provider-policy="cloud-active"]'),
+    'A stale reader must refetch and render the new remote-primary warning');
+    staleDom.window.close();
 }
 
 async function assertManagedLoaderContract() {
@@ -311,7 +459,15 @@ async function assertKavitaReaderAdapterContract() {
     kavitaDom.window.localStorage.setItem('bt_lang', 'Spanish');
     kavitaDom.window.requestAnimationFrame = cb => setTimeout(cb, 0);
     const payloads = [];
-    kavitaDom.window.fetch = async (_url, options) => {
+    kavitaDom.window.fetch = async (url, options) => {
+        if (String(url).endsWith('/provider-policy')) {
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ primary: 'local', fallback: null, generation: '0123456789abcdef0123456789abcdef' }),
+                headers: { get: () => null }
+            };
+        }
         const payload = JSON.parse(options.body);
         payloads.push(payload);
         return {
@@ -546,6 +702,9 @@ async function runTest() {
         'Persistent browser caching must be opt-in and keys must be context-scoped'
     );
 
+    await assertProviderPolicyControls();
+    await assertStalePolicyIsRefetchedWithoutTranslationReplay();
+
     const [tokenTransport, forwardedTransport, cwaTransport, consentedTransport] = await Promise.all([
         captureAuthTransport({ authMode: 'token', apiToken: 'browser-token' }),
         captureAuthTransport({ authMode: 'forwarded', apiToken: 'must-not-leak' }),
@@ -566,6 +725,11 @@ async function runTest() {
         'CWA-session mode must not send a compatibility token');
     assert.strictEqual(JSON.parse(tokenTransport.body).allow_cloud_fallback, false,
         'A fresh reader must not consent to cloud fallback');
+    assert.deepStrictEqual(JSON.parse(tokenTransport.body).provider_policy, {
+        primary: 'local',
+        fallback: 'remote',
+        generation: '0123456789abcdef0123456789abcdef'
+    }, 'Every official-reader translation must bind the current provider policy');
     assert.strictEqual(JSON.parse(consentedTransport.body).allow_cloud_fallback, true,
         'The explicit privacy control must consent only subsequent requests');
     assert(!/localStorage\.(?:getItem|setItem)\([^)]*cloud/i.test(code),

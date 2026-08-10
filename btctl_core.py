@@ -13,7 +13,7 @@ import stat
 import subprocess
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
@@ -32,7 +32,7 @@ _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _HOSTNAME_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$"
 )
-_SECRET_NAME_RE = re.compile(r"(?:KEY|PASSWORD|SECRET|TOKEN)$")
+_SECRET_NAME_RE = re.compile(r"(?:KEY|PASSWORD|SECRET|TOKEN|CUSTOM_ENDPOINT)$")
 _INSTALL_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
@@ -55,6 +55,7 @@ _LLM_PROVIDERS = frozenset(
         "minimax",
         "deepseek",
         "openrouter",
+        "openai-compatible",
     }
 )
 STATE_SCHEMA_VERSION = 2
@@ -341,6 +342,29 @@ def _http_url(value: object, name: str) -> str:
     return f"{normalized}{parsed.path}"
 
 
+def _custom_llm_endpoint(value: object, name: str) -> str:
+    """Validate the managed public OpenAI-compatible endpoint contract."""
+    parsed, normalized = _validated_http_parts(value, name)
+    hostname = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or parsed.path != "/v1/chat/completions"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigError(
+            f"{name} must be public HTTPS with exact /v1/chat/completions path"
+        )
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        if not address.is_global:
+            raise ConfigError(f"{name} must not target a non-public IP address")
+    return f"{normalized}{parsed.path}"
+
+
 def _exact_peer(value: object) -> str:
     cleaned = _clean_value(value, "BT_IDENTITY_PROXY_IP")
     try:
@@ -552,7 +576,14 @@ class InstallConfig:
     llm_provider: str
     llm_model: str
     local_url: str
-    llm_api_key: str
+    llm_api_key: str = field(repr=False)
+    llm_custom_endpoint: str
+    llm_custom_api_key: str = field(repr=False)
+    llm_fallback_provider: str
+    llm_fallback_model: str
+    llm_fallback_api_key: str = field(repr=False)
+    llm_fallback_custom_endpoint: str
+    llm_fallback_custom_api_key: str = field(repr=False)
 
     @classmethod
     def from_mapping(
@@ -750,20 +781,134 @@ class InstallConfig:
         llm_api_key = _clean_value(
             values.get("LLM_API_KEY", ""), "LLM_API_KEY", allow_empty=True
         )
-        if llm_provider == "local":
-            if not local_url or llm_api_key:
-                raise ConfigError(
-                    "local provider requires BT_LOCAL_URL and forbids LLM_API_KEY"
-                )
+        llm_custom_endpoint = _clean_value(
+            values.get("LLM_CUSTOM_ENDPOINT", ""),
+            "LLM_CUSTOM_ENDPOINT",
+            allow_empty=True,
+        )
+        llm_custom_api_key = _clean_value(
+            values.get("LLM_CUSTOM_API_KEY", ""),
+            "LLM_CUSTOM_API_KEY",
+            allow_empty=True,
+        )
+        llm_fallback_provider = _clean_value(
+            values.get("LLM_FALLBACK_PROVIDER", ""),
+            "LLM_FALLBACK_PROVIDER",
+            allow_empty=True,
+        )
+        llm_fallback_model = _clean_value(
+            values.get("LLM_FALLBACK_MODEL", ""),
+            "LLM_FALLBACK_MODEL",
+            allow_empty=True,
+        )
+        llm_fallback_api_key = _clean_value(
+            values.get("LLM_FALLBACK_API_KEY", ""),
+            "LLM_FALLBACK_API_KEY",
+            allow_empty=True,
+        )
+        llm_fallback_custom_endpoint = _clean_value(
+            values.get("LLM_FALLBACK_CUSTOM_ENDPOINT", ""),
+            "LLM_FALLBACK_CUSTOM_ENDPOINT",
+            allow_empty=True,
+        )
+        llm_fallback_custom_api_key = _clean_value(
+            values.get("LLM_FALLBACK_CUSTOM_API_KEY", ""),
+            "LLM_FALLBACK_CUSTOM_API_KEY",
+            allow_empty=True,
+        )
+
+        if llm_fallback_provider and llm_fallback_provider not in _LLM_PROVIDERS:
+            raise ConfigError(
+                f"LLM_FALLBACK_PROVIDER must be empty or one of {sorted(_LLM_PROVIDERS)}"
+            )
+        if llm_fallback_model and not _TOKEN_RE.fullmatch(llm_fallback_model):
+            raise ConfigError("LLM_FALLBACK_MODEL contains unsupported characters")
+        if bool(llm_fallback_provider) != bool(llm_fallback_model):
+            raise ConfigError(
+                "LLM_FALLBACK_PROVIDER and LLM_FALLBACK_MODEL must be set together"
+            )
+        if (
+            llm_fallback_provider == llm_provider
+            and llm_fallback_model == llm_model
+        ):
+            raise ConfigError("primary and fallback providers must be distinct")
+
+        uses_local = "local" in {llm_provider, llm_fallback_provider}
+        if uses_local:
+            if not local_url:
+                raise ConfigError("a local provider requires BT_LOCAL_URL")
             local_url = _http_url(local_url, "BT_LOCAL_URL")
             if urlsplit(local_url).path != "/v1/chat/completions":
                 raise ConfigError(
                     "BT_LOCAL_URL must target the exact /v1/chat/completions endpoint"
                 )
-        elif not llm_api_key or local_url:
-            raise ConfigError(
-                "cloud providers require LLM_API_KEY and forbid BT_LOCAL_URL"
-            )
+        elif local_url:
+            raise ConfigError("BT_LOCAL_URL requires a local primary or fallback")
+
+        def validate_provider_role(
+            *,
+            role: str,
+            provider: str,
+            api_key: str,
+            custom_endpoint: str,
+            custom_api_key: str,
+        ) -> str:
+            if not provider:
+                if api_key or custom_endpoint or custom_api_key:
+                    raise ConfigError(
+                        f"{role} provider values require {role} provider selection"
+                    )
+                return custom_endpoint
+            if provider == "local":
+                if api_key or custom_endpoint or custom_api_key:
+                    raise ConfigError(
+                        f"{role} local provider forbids API key and custom endpoint values"
+                    )
+                return custom_endpoint
+            if provider == "openai-compatible":
+                if api_key or not custom_endpoint or not custom_api_key:
+                    endpoint_name = (
+                        "LLM_CUSTOM_ENDPOINT/LLM_CUSTOM_API_KEY"
+                        if role == "primary"
+                        else "LLM_FALLBACK_CUSTOM_ENDPOINT/"
+                        "LLM_FALLBACK_CUSTOM_API_KEY"
+                    )
+                    raise ConfigError(
+                        f"{role} openai-compatible requires {endpoint_name} "
+                        "and forbids the generic API key"
+                    )
+                endpoint_name = (
+                    "LLM_CUSTOM_ENDPOINT"
+                    if role == "primary"
+                    else "LLM_FALLBACK_CUSTOM_ENDPOINT"
+                )
+                return _custom_llm_endpoint(custom_endpoint, endpoint_name)
+            if not api_key or custom_endpoint or custom_api_key:
+                api_key_name = (
+                    "LLM_API_KEY"
+                    if role == "primary"
+                    else "LLM_FALLBACK_API_KEY"
+                )
+                raise ConfigError(
+                    f"{role} named remote provider requires {api_key_name} "
+                    "and forbids custom endpoint values"
+                )
+            return custom_endpoint
+
+        llm_custom_endpoint = validate_provider_role(
+            role="primary",
+            provider=llm_provider,
+            api_key=llm_api_key,
+            custom_endpoint=llm_custom_endpoint,
+            custom_api_key=llm_custom_api_key,
+        )
+        llm_fallback_custom_endpoint = validate_provider_role(
+            role="fallback",
+            provider=llm_fallback_provider,
+            api_key=llm_fallback_api_key,
+            custom_endpoint=llm_fallback_custom_endpoint,
+            custom_api_key=llm_fallback_custom_api_key,
+        )
 
         identity_proxy_peer = ""
         authentik_version = ""
@@ -826,6 +971,13 @@ class InstallConfig:
             llm_model=llm_model,
             local_url=local_url,
             llm_api_key=llm_api_key,
+            llm_custom_endpoint=llm_custom_endpoint,
+            llm_custom_api_key=llm_custom_api_key,
+            llm_fallback_provider=llm_fallback_provider,
+            llm_fallback_model=llm_fallback_model,
+            llm_fallback_api_key=llm_fallback_api_key,
+            llm_fallback_custom_endpoint=llm_fallback_custom_endpoint,
+            llm_fallback_custom_api_key=llm_fallback_custom_api_key,
         )
 
     @property
@@ -865,6 +1017,13 @@ class InstallConfig:
             "LLM_MODEL": self.llm_model,
             "BT_LOCAL_URL": self.local_url,
             "LLM_API_KEY": self.llm_api_key,
+            "LLM_CUSTOM_ENDPOINT": self.llm_custom_endpoint,
+            "LLM_CUSTOM_API_KEY": self.llm_custom_api_key,
+            "LLM_FALLBACK_PROVIDER": self.llm_fallback_provider,
+            "LLM_FALLBACK_MODEL": self.llm_fallback_model,
+            "LLM_FALLBACK_API_KEY": self.llm_fallback_api_key,
+            "LLM_FALLBACK_CUSTOM_ENDPOINT": self.llm_fallback_custom_endpoint,
+            "LLM_FALLBACK_CUSTOM_API_KEY": self.llm_fallback_custom_api_key,
         }
         if self.install_profile == "compose-existing":
             values["BT_CACHE_OPERATOR_GROUP_ACCESS"] = "true"
@@ -941,6 +1100,34 @@ class InstallConfig:
             "local_url": self.local_url,
             "has_api_key": bool(self.llm_api_key),
         }
+        if self.llm_custom_endpoint:
+            common.update(
+                {
+                    "custom_endpoint_sha256": hashlib.sha256(
+                        self.llm_custom_endpoint.encode("utf-8")
+                    ).hexdigest(),
+                    "has_custom_api_key": bool(self.llm_custom_api_key),
+                }
+            )
+        if self.llm_fallback_provider:
+            common.update(
+                {
+                    "llm_fallback_provider": self.llm_fallback_provider,
+                    "llm_fallback_model": self.llm_fallback_model,
+                    "has_fallback_api_key": bool(self.llm_fallback_api_key),
+                }
+            )
+        if self.llm_fallback_custom_endpoint:
+            common.update(
+                {
+                    "fallback_custom_endpoint_sha256": hashlib.sha256(
+                        self.llm_fallback_custom_endpoint.encode("utf-8")
+                    ).hexdigest(),
+                    "has_fallback_custom_api_key": bool(
+                        self.llm_fallback_custom_api_key
+                    ),
+                }
+            )
         if self.reader_image_id:
             common["reader_image_id"] = self.reader_image_id
         if self.reader_type == "cwa":

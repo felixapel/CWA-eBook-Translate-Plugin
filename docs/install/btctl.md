@@ -79,6 +79,36 @@ only for CWA and must not conflict with reader-neutral values.
 the managed proxy strips client-supplied copies before forwarding to CWA. A
 local provider normally leaves `LLM_API_KEY` empty.
 
+The default remains local so updating the project never exports book text by
+surprise. A named Gemini primary with a local vLLM fallback is configured as:
+
+```dotenv
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-3.5-flash-lite
+LLM_API_KEY=<Gemini API key>
+LLM_CUSTOM_ENDPOINT=
+LLM_CUSTOM_API_KEY=
+
+LLM_FALLBACK_PROVIDER=local
+LLM_FALLBACK_MODEL=gemma4-12b
+LLM_FALLBACK_API_KEY=
+LLM_FALLBACK_CUSTOM_ENDPOINT=
+LLM_FALLBACK_CUSTOM_API_KEY=
+BT_LOCAL_URL=http://192.168.1.50:8000/v1/chat/completions
+```
+
+Gemini uses Google's fixed OpenAI-compatible endpoint documented in the
+[Gemini API reference](https://ai.google.dev/gemini-api/docs/openai). An API
+key is distinct from a consumer Gemini, ChatGPT, Codex or Antigravity
+subscription; managed deployments do not import browser sessions or consumer
+subscription credentials.
+
+For another public OpenAI-compatible service, set
+`LLM_PROVIDER=openai-compatible`, leave `LLM_API_KEY` empty and use the
+dedicated `LLM_CUSTOM_ENDPOINT` and `LLM_CUSTOM_API_KEY`. Custom URLs must use
+public HTTPS and the exact `/v1/chat/completions` path. Private/LAN endpoints
+belong under `local`.
+
 For Kavita, use a second private environment and follow the complete
 [Kavita installation contract](kavita.md). Do not convert an active CWA
 installation in place or share its install name, public origin, state, data or
@@ -148,6 +178,28 @@ state. The Unraid profile writes API/proxy DockerMan templates that reference
 private role environment files and the immutable local image. The additional
 network cannot be represented safely in DockerMan's single-network form, so do
 not press **Apply** on generated templates; use `btctl` for lifecycle changes.
+
+## Change providers without replacing the proxy
+
+Copy the current private environment file, change only provider variables and
+review the redacted provider cutover:
+
+```bash
+./btctl reconfigure --env /absolute/private/path/new-provider.env
+./btctl reconfigure --env /absolute/private/path/new-provider.env --yes
+./btctl doctor --env /absolute/private/path/new-provider.env
+```
+
+`reconfigure` rejects changes to reader, ingress, auth, storage, image or
+network identity. It snapshots both private configurations, journals no raw
+key or endpoint, replaces only the API role and requires every configured
+backend plus reader authentication/cache dependencies to pass. State is
+published only after verification. A failed or interrupted cutover restores
+the old private environment and API role before a fresh retry. The proxy,
+private network, data, installation UUID, connector UUID and on-disk session
+key remain unchanged. In-memory five-minute reader sessions are process-local,
+so an API replacement may require one automatic session exchange in an open
+reader tab.
 
 ## Acceptance
 

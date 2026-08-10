@@ -13,7 +13,7 @@ modifying either image.
 - Offers 100+ source and target language choices. Translation quality depends
   on the selected model and language pair.
 - Prioritizes visible paragraphs; whole-chapter prefetch is an explicit opt-in.
-- Supports local OpenAI-compatible servers and optional cloud providers.
+- Supports local, fixed named cloud and public custom OpenAI-compatible backends.
 - Keeps provider credentials server-side and requires explicit consent before
   a configured local provider falls back to a cloud provider.
 - Uses a private, bounded SQLite cache scoped by authenticated reader context.
@@ -55,6 +55,12 @@ local provider normally leaves `LLM_API_KEY` empty. Then run:
 `plan` validates and reports the intended resources without changing the reader
 or deployment state. `install` commits state only after live postconditions pass.
 `doctor` is read-only and every check must report `ok`.
+
+Provider roles are selected entirely through the private environment. Existing
+installs can review and apply a provider-only API replacement with
+`btctl reconfigure`; proxy, reader, networks and translation data remain in
+place. See the [configuration reference](docs/reference/configuration.md) for
+separate primary/fallback keys, Gemini and custom-endpoint contracts.
 
 Stock Unraid requires root, Bash, Docker and a full checkout including `.git`.
 It does not require host Python, host Git or NerdTools to run `./btctl`; the

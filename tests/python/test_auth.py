@@ -789,6 +789,10 @@ class ServerAuthenticationIntegrationTests(unittest.TestCase):
             "text": "hello",
             "source_lang": "English",
             "target_lang": "English",
+            "provider_policy": {
+                **server.provider_policy(),
+                "generation": server.PROVIDER_POLICY_GENERATION,
+            },
         }
 
         alice = self.client.post(

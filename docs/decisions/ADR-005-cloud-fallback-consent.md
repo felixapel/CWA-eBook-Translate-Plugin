@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-12
+- Amended by: [ADR-014](ADR-014-configurable-provider-backends.md)
 
 ## Context
 
@@ -25,7 +26,9 @@ choice applies to subsequent requests in that book tab only. It is never
 persisted in browser storage or supplied by the proxy bootstrap.
 
 Configuring a cloud provider as the primary provider remains an explicit
-operator-level deployment choice and is outside this fallback decision.
+operator-level deployment choice. ADR-014 adds an authenticated locality-only
+policy: the reader shows an active-cloud warning, while a second remote
+fallback still requires this per-tab consent.
 
 ## Consequences
 

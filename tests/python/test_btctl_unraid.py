@@ -416,6 +416,18 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertIn("/app/data/translations.db", sqlite_arguments)
         self.assertNotIn("shell", run.call_args.kwargs)
 
+    def test_provider_probe_requires_every_configured_backend(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().probe_providers("cwa-translate-api")
+
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[:3], ["docker", "exec", "cwa-translate-api"])
+        script = arguments[-1]
+        self.assertIn("all(item.get('status')=='ok'", script)
+        self.assertIn("check_backend_health", script)
+
     def test_image_version_probe_uses_immutable_networkless_sandbox(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
 
