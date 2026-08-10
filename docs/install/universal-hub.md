@@ -98,15 +98,25 @@ from the existing CWA and Kavita `btctl` installs:
 ./btctl doctor --env /absolute/private/path/book-translator-hub.env
 ```
 
-Migration requires host Python 3.11+ and Git because the launcher must lock and
-mount multiple independently selected source states exactly. It records every
-container ID and initial running status, stops only those resources, performs
-an offline SQLite checkpoint, copies each reader tree atomically and commits
+Run `migrate-topology` as root, including with the `compose-existing` profile.
+Managed split runtimes keep their reader session keys owned by runtime UID 101
+at mode `0600`; root can preserve those credentials without weakening their
+permissions. Fresh hub installation and ordinary split lifecycle commands keep
+their existing operator requirements.
+
+Migration also requires host Python 3.11+ and Git because the launcher must
+lock and mount multiple independently selected source states exactly. It
+records every container ID and initial running status, stops only those
+resources, performs an offline SQLite checkpoint, copies each reader tree
+atomically and commits
 schema-3 state only after the hub passes health and dependency probes. A retry
 uses the durable per-reader copy manifests, adopts an exact copy published just
 before an interrupted journal write, and recovers a hub whose state commit
 completed before the journal commit. A first attempt requires an empty hub data
 root; resumes reject every entry not owned by the recorded reader copy operation.
+If the verified hub is active but the final journal commit fails, its source
+runtimes remain stopped; rerun the same command to complete that commit
+idempotently.
 
 Rollback removes only the verified owned hub, preserves its copied data and
 restarts only source roles recorded as running before cutover:

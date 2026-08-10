@@ -145,6 +145,13 @@ def split_source(
 
 
 class HubBtctlTests(unittest.TestCase):
+    def setUp(self):
+        self.root_patch = mock.patch("btctl_hub._effective_uid", return_value=0)
+        self.root_patch.start()
+
+    def tearDown(self):
+        self.root_patch.stop()
+
     def test_plan_is_schema_three_and_never_contains_provider_secrets(self):
         with tempfile.TemporaryDirectory() as directory:
             config = HubInstallConfig.from_mapping(hub_values(Path(directory)), IDENTITY)
@@ -445,6 +452,26 @@ class HubBtctlTests(unittest.TestCase):
             self.assertFalse([call for call in docker.calls if call[0] == "stop"])
             self.assertEqual((target / "unrelated.txt").read_text(), "do not mutate")
 
+    def test_topology_migration_requires_root_before_private_source_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root / "hub"), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            cwa_state = split_source(root, "cwa", docker)
+            kavita_state = split_source(root, "kavita", docker)
+
+            with mock.patch(
+                "btctl_hub._effective_uid", return_value=1000
+            ), self.assertRaisesRegex(InstallError, "must run as root"):
+                HubTopologyMigration(docker).migrate(
+                    config, plan, root, [cwa_state, kavita_state]
+                )
+
+            self.assertFalse([call for call in docker.calls if call[0] == "stop"])
+            self.assertFalse(Path(config.state_dir).exists())
+            self.assertFalse(Path(config.data_dir).exists())
+
     def test_topology_migration_recovers_published_and_complete_partial_copies(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -579,6 +606,60 @@ class HubBtctlTests(unittest.TestCase):
                     "kavita-translate-test-proxy",
                 },
             )
+
+    def test_final_journal_failure_leaves_verified_hub_resumable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root / "hub"), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            cwa_state = split_source(root, "cwa", docker)
+            kavita_state = split_source(root, "kavita", docker)
+            migration = HubTopologyMigration(docker)
+            installed = HubState.new(
+                install_id="71234567-89ab-4cde-8123-0123456789ab",
+                plan=plan,
+            )
+            original_save = migration._save_journal
+
+            def commit_hub(*_args, **_kwargs):
+                HubStateStore(Path(config.state_dir)).save(installed)
+                return installed
+
+            def fail_committed_save(save_config, journal):
+                if journal.get("status") == "committed":
+                    raise InstallError("synthetic final journal failure")
+                return original_save(save_config, journal)
+
+            with mock.patch(
+                "btctl_hub.HubInstaller.install", side_effect=commit_hub
+            ), mock.patch.object(
+                migration, "_save_journal", side_effect=fail_committed_save
+            ), self.assertRaisesRegex(InstallError, "journal commit is pending"):
+                migration.migrate(
+                    config, plan, root, [cwa_state, kavita_state]
+                )
+
+            self.assertEqual(migration._load_journal(config)["status"], "copying")
+            self.assertEqual(
+                HubStateStore(Path(config.state_dir)).load().status, "installed"
+            )
+            self.assertTrue(
+                (Path(config.data_dir) / "cwa" / "reader_session_key").is_file()
+            )
+            self.assertTrue(
+                (Path(config.data_dir) / "kavita" / "reader_session_key").is_file()
+            )
+            self.assertFalse([call for call in docker.calls if call[0] == "start"])
+
+            with mock.patch("btctl_hub.HubInstaller._verify_hub"):
+                resumed = migration.migrate(
+                    config, plan, root, [kavita_state, cwa_state]
+                )
+
+            self.assertEqual(resumed, installed)
+            self.assertEqual(migration._load_journal(config)["status"], "committed")
+            self.assertFalse([call for call in docker.calls if call[0] == "start"])
 
     def test_topology_migration_fails_closed_when_partial_hub_survives(self):
         with tempfile.TemporaryDirectory() as directory:

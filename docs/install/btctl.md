@@ -10,6 +10,8 @@ New ordinary installs should use the
 container security/restart boundaries or CWA Authentik-forwarded identity are
 required. Existing split states remain supported and are the source of the
 explicit `migrate-topology` workflow; they are never rewritten implicitly.
+That offline credential-preserving migration must run as root even when its
+source profile is `compose-existing`.
 
 ```text
 browser / reverse proxy -> <install>-proxy -> stock CWA or Kavita

@@ -44,6 +44,11 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ACTIVE_STATES = {"installed", "adopted"}
 
 
+def _effective_uid() -> int:
+    """Return the host operator UID; isolated for deterministic policy tests."""
+    return os.geteuid()
+
+
 def is_hub_configuration(values: Mapping[str, str]) -> bool:
     return values.get("BT_TOPOLOGY") == "hub"
 
@@ -1253,6 +1258,10 @@ class HubTopologyMigration:
         repository: Path,
         source_paths: list[Path],
     ) -> HubState:
+        if _effective_uid() != 0:
+            raise InstallError(
+                "topology migration must run as root to preserve private source credentials"
+            )
         normalized = [self._state_directory(path) for path in source_paths]
         lock_paths = [Path(config.state_dir), *normalized]
         with _TopologyLocks(lock_paths):
@@ -1341,10 +1350,6 @@ class HubTopologyMigration:
                     allow_existing_data=True,
                     _operation_locked=True,
                 )
-                journal["status"] = "committed"
-                journal["hub_install_id"] = installed_state.install_id
-                self._save_journal(config, journal)
-                return installed_state
             except BaseException as exc:
                 cleanup_failed = False
                 if installed_state is not None:
@@ -1382,6 +1387,15 @@ class HubTopologyMigration:
                         "hub migration failed and its recovery journal could not be updated"
                     ) from exc
                 raise
+            journal["status"] = "committed"
+            journal["hub_install_id"] = installed_state.install_id
+            try:
+                self._save_journal(config, journal)
+            except BaseException as exc:
+                raise InstallError(
+                    "hub is active but its migration journal commit is pending; rerun migrate-topology"
+                ) from exc
+            return installed_state
 
     def rollback(
         self, config: HubInstallConfig, plan: HubPlan
