@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -121,7 +122,7 @@ class FakeDocker:
                 )
                 database = data_source / "translations.db"
                 if not database.exists():
-                    with sqlite3.connect(database) as connection:
+                    with closing(sqlite3.connect(database)) as connection:
                         connection.execute("PRAGMA user_version = 2")
             self.containers[name] = {
                 "Id": f"{name}-id",

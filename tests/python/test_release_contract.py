@@ -292,7 +292,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         changelog = (ROOT / "CHANGELOG.md").read_text()
         self.assertEqual(changelog.count("\n## [Unreleased]\n"), 1)
         unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-        self.assertRegex(unreleased, r"(?m)^### (?:Added|Changed|Deprecated|Removed|Fixed|Security)$")
+        if unreleased.strip():
+            self.assertRegex(
+                unreleased,
+                r"(?m)^### (?:Added|Changed|Deprecated|Removed|Fixed|Security)$",
+            )
 
     def test_v214_compose_upgrade_is_offline_external_and_reversible(self):
         lifecycle = (ROOT / "docs" / "operations" / "lifecycle.md").read_text()
@@ -366,11 +370,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_release_reuses_every_required_ci_contract(self):
         workflow = GITEA_RELEASE.read_text()
         for command in (
-            "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py",
+            "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py reader_session.py server.py",
             "python3 -m tests.python.test_translation",
             "python3 -m tests.python.test_hardening",
             "tests.python.test_btctl_auth tests.python.test_btctl_lifecycle",
-            "tests.python.test_singleflight tests.python.test_auth tests.python.test_ci_contract tests.python.test_docs_contract",
+            "tests.python.test_singleflight tests.python.test_auth tests.python.test_reader_session tests.python.test_ci_contract tests.python.test_docs_contract",
             "tests.python.test_release_contract",
             "npm ci",
             "npm audit --audit-level=high",

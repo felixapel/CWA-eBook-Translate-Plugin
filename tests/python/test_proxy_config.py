@@ -107,7 +107,8 @@ class ProxyConfigRendererTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = output.read_text(encoding="utf-8")
         self.assertNotIn("proxy_set_header Cookie $http_cookie;", rendered)
-        self.assertIn("default $http_cookie;", rendered)
+        self.assertIn("POST $http_cookie;", rendered)
+        self.assertNotIn("default $http_cookie;", rendered)
         self.assertIn(
             "proxy_set_header Cookie $bt_session_route_cookie;", rendered
         )
@@ -136,10 +137,12 @@ class ProxyConfigRendererTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rendered = output.read_text(encoding="utf-8")
         self.assertIn("proxy_pass http://kavita:5000;", rendered)
-        self.assertIn("default $http_cookie;", rendered)
+        self.assertIn('default "";', rendered)
+        self.assertIn("POST $http_cookie;", rendered)
+        self.assertNotIn("default $http_cookie;", rendered)
         self.assertIn("DELETE $bt_session_cookie;", rendered)
-        self.assertIn("default $http_authorization;", rendered)
-        self.assertIn('DELETE "";', rendered)
+        self.assertIn("POST $http_authorization;", rendered)
+        self.assertNotIn("default $http_authorization;", rendered)
         self.assertIn(
             "proxy_set_header Cookie $bt_session_route_cookie;", rendered
         )

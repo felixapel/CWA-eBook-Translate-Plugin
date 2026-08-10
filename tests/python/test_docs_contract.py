@@ -87,6 +87,36 @@ class DocumentationContractTests(unittest.TestCase):
                 for error in errors
             ))
 
+    def test_checker_treats_the_full_prerelease_as_the_current_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = self.copy_repository_fixture(Path(temp_dir))
+            original_version = (fixture / "VERSION").read_text(
+                encoding="utf-8"
+            ).strip()
+            candidate = "9.8.7-rc.1"
+            (fixture / "VERSION").write_text(candidate + "\n", encoding="utf-8")
+            readme_path = fixture / "README.md"
+            readme_path.write_text(
+                readme_path.read_text(encoding="utf-8").replace(
+                    f"git switch --detach v{original_version}",
+                    f"git switch --detach v{candidate}",
+                ),
+                encoding="utf-8",
+            )
+            claude_path = fixture / "CLAUDE.md"
+            claude_path.write_text(
+                claude_path.read_text(encoding="utf-8")
+                + f"\nThe current candidate is v{candidate}.\n",
+                encoding="utf-8",
+            )
+
+            errors = collect_errors(fixture)
+
+            self.assertFalse(any(
+                "README.md contains stale current-series releases" in error
+                for error in errors
+            ))
+
     def test_checker_validates_support_template_links(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = self.copy_repository_fixture(Path(temp_dir))

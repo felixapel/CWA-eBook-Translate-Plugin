@@ -17,6 +17,7 @@ FRONTEND_WORKFLOWS = (
     GITEA_CI,
     ROOT / ".gitea" / "workflows" / "release.yml",
 )
+BACKEND_WORKFLOWS = (GITHUB_CI, GITEA_CI, RELEASE)
 BACKEND_UNIT_COMMAND = "python3 -m unittest -v " + " ".join((
     "tests.python.test_btctl",
     "tests.python.test_btctl_container",
@@ -30,6 +31,7 @@ BACKEND_UNIT_COMMAND = "python3 -m unittest -v " + " ".join((
     "tests.python.test_context_cache",
     "tests.python.test_singleflight",
     "tests.python.test_auth",
+    "tests.python.test_reader_session",
     "tests.python.test_ci_contract",
     "tests.python.test_docs_contract",
     "tests.python.test_release_contract",
@@ -55,7 +57,7 @@ class CIContractTests(unittest.TestCase):
             "python3 -m tests.python.test_translation",
             "python3 -m tests.python.test_hardening",
             BACKEND_UNIT_COMMAND,
-            "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
+            "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py reader_session.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
             "bash -n btctl install_unraid.sh scripts/btctl-bootstrap-smoke.sh",
         ):
             self.assertIn(command, self.workflow)
@@ -70,6 +72,13 @@ class CIContractTests(unittest.TestCase):
             "tests.python.test_docs_contract",
         ):
             self.assertIn(suite, workflow)
+
+    def test_reader_session_boundary_is_required_everywhere(self):
+        for workflow in BACKEND_WORKFLOWS:
+            source = workflow.read_text()
+            with self.subTest(workflow=workflow):
+                self.assertIn("reader_session.py", source)
+                self.assertIn("tests.python.test_reader_session", source)
 
     def test_node_install_and_audit_include_locked_dev_tree(self):
         self.assertRegex(self.workflow, r"(?m)^\s*- run: npm ci\s*$")

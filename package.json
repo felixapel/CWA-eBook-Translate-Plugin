@@ -1,8 +1,8 @@
 {
   "name": "cwa-ebook-translate-plugin",
-  "version": "2.2.2",
+  "version": "2.3.0-rc.1",
   "private": true,
-  "description": "Bilingual paragraph-level LLM translation for the Calibre-Web-Automated reader.",
+  "description": "Bilingual paragraph-level LLM translation for CWA and Kavita readers.",
   "directories": {
     "doc": "docs"
   },

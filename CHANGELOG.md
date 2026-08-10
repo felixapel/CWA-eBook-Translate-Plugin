@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0-rc.1] - 2026-08-10
+
 ### Security
 
 - Added a reader-neutral, five-minute maximum session broker. Raw CWA cookies,

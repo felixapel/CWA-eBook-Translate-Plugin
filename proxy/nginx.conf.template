@@ -19,16 +19,18 @@ map $http_cookie $bt_session_cookie {
     "~*(?:^|;[[:space:]]*)(${BT_SESSION_COOKIE_NAME}=[^;]{1,128})(?:;|$)" $1;
 }
 
-# Session creation needs the one-time reader proof. Revocation is already
-# authenticated by the plugin cookie and must not forward CWA/OIDC cookies.
+# Only POST session creation needs the one-time reader proof. Revocation is
+# authenticated by the plugin cookie; every other method must forward neither
+# reader cookies nor bearer credentials, even when the API rejects that method.
 map $request_method $bt_session_route_cookie {
-    default $http_cookie;
+    default "";
+    POST $http_cookie;
     DELETE $bt_session_cookie;
 }
 
 map $request_method $bt_session_route_authorization {
-    default $http_authorization;
-    DELETE "";
+    default "";
+    POST $http_authorization;
 }
 
 server {

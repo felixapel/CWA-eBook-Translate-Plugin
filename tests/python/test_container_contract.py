@@ -302,7 +302,10 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn("validate_api_auth", entrypoint)
         self.assertIn("BT_API_TOKEN is required", entrypoint)
         self.assertIn("disabled auth requires BT_ALLOW_INSECURE_AUTH=true", entrypoint)
-        self.assertIn("default $http_cookie;", proxy)
+        self.assertIn("POST $http_cookie;", proxy)
+        self.assertNotIn("default $http_cookie;", proxy)
+        self.assertIn("POST $http_authorization;", proxy)
+        self.assertNotIn("default $http_authorization;", proxy)
         self.assertIn("DELETE $bt_session_cookie;", proxy)
         self.assertIn(
             "proxy_set_header Cookie $bt_session_route_cookie;", proxy

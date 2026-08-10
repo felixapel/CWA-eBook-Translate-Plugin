@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -225,7 +226,7 @@ class FakeDocker:
             if mounts:
                 database = Path(mounts[0]["Source"]) / "translations.db"
                 if not database.exists():
-                    with sqlite3.connect(database) as connection:
+                    with closing(sqlite3.connect(database)) as connection:
                         connection.execute("PRAGMA user_version = 2")
 
     def stop_container(self, name):

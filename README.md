@@ -30,7 +30,7 @@ API role. Use the current annotated release:
 git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git cwa-translate
 cd cwa-translate
 git fetch --tags
-git switch --detach v2.2.2
+git switch --detach v2.3.0-rc.1
 ```
 
 Copy the managed configuration outside the checkout and make it private:

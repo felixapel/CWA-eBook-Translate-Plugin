@@ -45,7 +45,11 @@ OBSOLETE_PATHS = {
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 ADR_RE = re.compile(r"ADR-\d{3}-[a-z0-9-]+\.md$")
-VERSION_RE = re.compile(r"(?<![A-Za-z0-9])v(\d+\.\d+\.\d+)(?![A-Za-z0-9])")
+VERSION_RE = re.compile(
+    r"(?<![A-Za-z0-9])v(\d+\.\d+\.\d+"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)"
+    r"(?!(?:[A-Za-z0-9-]|\.[0-9A-Za-z-]))"
+)
 VALID_ADR_STATUSES = {"Accepted", "Deprecated", "Proposed", "Superseded"}
 
 
