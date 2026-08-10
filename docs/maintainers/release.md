@@ -42,7 +42,7 @@ python3 scripts/check_docs.py
 python3 -m tests.python.test_translation
 python3 -m tests.python.test_hardening
 python3 -m py_compile btctl.py btctl_container.py btctl_core.py \
-  btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py \
+  btctl_compose.py btctl_docker.py btctl_paths.py btctl_reconfigure.py btctl_unraid.py btctl_auth.py \
   btctl_lifecycle.py auth.py reader_session.py server.py translator.py cache.py \
   singleflight.py work_budget.py proxy/render_config.py
 python3 -m unittest -v \

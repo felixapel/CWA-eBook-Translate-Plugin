@@ -34,6 +34,7 @@ class ContainerContractTests(unittest.TestCase):
     def test_operator_image_is_distinct_from_the_production_runtime(self):
         dockerfile = (ROOT / "Dockerfile.btctl").read_text()
         self.assertIn("FROM source-exporter AS operator", dockerfile)
+        self.assertIn("btctl_reconfigure.py", dockerfile)
         self.assertIn('ENTRYPOINT ["python3", "/opt/btctl/btctl.py"]', dockerfile)
         self.assertNotIn("USER appuser", dockerfile)
         self.assertNotIn("docker-entrypoint.sh", dockerfile)

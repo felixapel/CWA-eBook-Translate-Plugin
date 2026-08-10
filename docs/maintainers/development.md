@@ -49,7 +49,7 @@ file, so it needs no running server, no API key, and no network access:
 Always also check syntax/compile before committing:
 ```bash
 python3 -m py_compile btctl.py btctl_container.py btctl_core.py \
-  btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py \
+  btctl_compose.py btctl_docker.py btctl_paths.py btctl_reconfigure.py btctl_unraid.py btctl_auth.py \
   btctl_lifecycle.py auth.py reader_session.py server.py \
   translator.py cache.py singleflight.py work_budget.py proxy/render_config.py
 bash -n btctl scripts/*.sh
