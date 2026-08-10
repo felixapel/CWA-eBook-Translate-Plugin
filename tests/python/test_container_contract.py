@@ -35,6 +35,7 @@ class ContainerContractTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile.btctl").read_text()
         self.assertIn("FROM source-exporter AS operator", dockerfile)
         self.assertIn("btctl_reconfigure.py", dockerfile)
+        self.assertIn("btctl_hub.py", dockerfile)
         self.assertIn('ENTRYPOINT ["python3", "/opt/btctl/btctl.py"]', dockerfile)
         self.assertNotIn("USER appuser", dockerfile)
         self.assertNotIn("docker-entrypoint.sh", dockerfile)
@@ -232,6 +233,23 @@ class ContainerContractTests(unittest.TestCase):
         ):
             self.assertIn(token, smoke)
         self.assertNotIn("gosu", smoke)
+
+    def test_hub_smoke_proves_two_listeners_and_fail_fast_supervision(self):
+        path = ROOT / "scripts" / "hub-container-smoke.sh"
+        source = path.read_text(encoding="utf-8")
+        self.assertTrue(path.stat().st_mode & 0o111)
+        for token in (
+            "BT_ROLE=hub",
+            "BT_ENABLE_CWA=true",
+            "BT_ENABLE_KAVITA=true",
+            "proxy-cwa.conf",
+            "proxy-kavita.conf",
+            "127.0.0.1:8391",
+            "reader_session_key",
+            "State.Status",
+        ):
+            self.assertIn(token, source)
+        self.assertNotRegex(source, r"-p[^\n]*839[12]")
 
     def test_kavita_container_fixture_is_literal_compilable_python(self):
         fixture = ROOT / "tests" / "python" / "test_kavita_auth_fixture.py"

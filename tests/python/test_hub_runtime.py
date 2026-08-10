@@ -79,6 +79,13 @@ class HubConfigTests(unittest.TestCase):
         self.assertNotIn("BT_KAVITA_LLM_API_KEY", cwa.environment)
         self.assertNotIn("BT_CWA_LLM_API_KEY", kavita.environment)
 
+    def test_remote_provider_without_key_fails_during_plan_not_after_start(self):
+        env = dual_reader_environment()
+        env["LLM_API_KEY"] = ""
+
+        with self.assertRaisesRegex(HubConfigError, "remote provider requires"):
+            HubConfig.from_environment(env)
+
     def test_total_concurrency_is_split_without_oversubscription(self):
         config = HubConfig.from_environment(dual_reader_environment())
 

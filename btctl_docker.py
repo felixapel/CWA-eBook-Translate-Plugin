@@ -483,6 +483,45 @@ class DockerCLI:
         arguments.append(spec.image)
         self._run(arguments, timeout=120)
 
+    def create_hub_container(self, spec) -> None:
+        """Create the schema-3 universal container without a shell."""
+        arguments = [
+            "create",
+            "--name",
+            spec.name,
+            "--network",
+            spec.primary_network,
+            "--env-file",
+            str(spec.env_file),
+            "--user",
+            "101:102",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--restart",
+            "unless-stopped",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=128m,uid=101,gid=102,mode=700",
+            "--pids-limit",
+            "384",
+            "--memory",
+            "2g",
+            "--cpus",
+            "2.5",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "--mount",
+            f"type=bind,src={spec.data_dir},dst=/app/data",
+        ]
+        for published, target in spec.ports:
+            arguments.extend(["--publish", f"{published}:{target}/tcp"])
+        for key, value in sorted(spec.labels.items()):
+            arguments.extend(["--label", f"{key}={value}"])
+        arguments.append(spec.image)
+        self._run(arguments, timeout=120)
+
     def connect_network(self, network: str, container: str) -> None:
         self._run(["network", "connect", network, container], timeout=60)
 

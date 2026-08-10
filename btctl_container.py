@@ -16,6 +16,7 @@ from typing import Mapping
 from btctl import _load_values, _release_identity
 from btctl_compose import InstallError
 from btctl_core import ConfigError, InstallConfig
+from btctl_hub import HubInstallConfig, is_hub_configuration
 from btctl_lifecycle import MigrationJournalStore
 from btctl_paths import (
     paths_overlap as _paths_overlap,
@@ -244,11 +245,19 @@ def _config_for_command(
     repository: Path,
     env_file: Path,
     expected_revision: str,
-) -> tuple[InstallConfig, Mapping[str, str]]:
+) -> tuple[InstallConfig | HubInstallConfig, Mapping[str, str]]:
     identity = _release_identity(repository)
     if identity.sha != expected_revision:
         raise ConfigError("mount plan revision does not match the verified checkout")
     values = _load_values(env_file)
+    if is_hub_configuration(values):
+        config = HubInstallConfig.from_mapping(values, identity)
+        if config.install_profile != "unraid":
+            raise ConfigError(
+                "the containerized fallback supports only BT_INSTALL_PROFILE=unraid; "
+                "compose-existing requires host Python 3.11+"
+            )
+        return config, values
     legacy_plan = bool(
         values.get("BT_LEGACY_CONTAINER") and values.get("BT_LEGACY_DATA_DIR")
     )
@@ -274,7 +283,7 @@ def create_mount_plan(
     env_file: Path,
     expected_revision: str,
 ) -> MountPlan:
-    access = command_path_access(command)
+    requested_access = command_path_access(command)
     checkout = _validate_repository(repository)
     environment = _validate_mount_text(env_file, "environment file")
     if environment.is_symlink() or not environment.is_file():
@@ -282,6 +291,11 @@ def create_mount_plan(
     environment_sha256 = _environment_digest(environment)
     config, values = _config_for_command(
         command, checkout, environment, expected_revision
+    )
+    access = tuple(
+        item
+        for item in requested_access
+        if not isinstance(config, HubInstallConfig) or item[0] not in {"template", "legacy"}
     )
     final_environment_sha256 = _environment_digest(environment)
     if final_environment_sha256 != environment_sha256:
@@ -291,9 +305,13 @@ def create_mount_plan(
         "state": validate_storage_path(Path(config.state_dir), "BT_STATE_DIR"),
         "data": validate_storage_path(Path(config.data_dir), "BT_DATA_DIR"),
         "backup": validate_storage_path(Path(config.backup_dir), "BT_BACKUP_DIR"),
-        "template": _validate_template_path(Path(config.unraid_template_dir)),
     }
-    legacy_text = legacy_data_path(command, config, values)
+    if not isinstance(config, HubInstallConfig):
+        paths["template"] = _validate_template_path(Path(config.unraid_template_dir))
+    legacy_text = (
+        "" if isinstance(config, HubInstallConfig)
+        else legacy_data_path(command, config, values)
+    )
     if legacy_text:
         paths["legacy"] = validate_storage_path(
             Path(legacy_text), "BT_LEGACY_DATA_DIR"

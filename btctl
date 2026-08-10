@@ -35,6 +35,13 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     fail "$EX_NOPERM" \
         "the containerized Unraid path must run as root (compatible host Python 3.11+ and Git were not both available)"
 fi
+
+case " ${*} " in
+    *" migrate-topology "*|*" rollback-topology "*)
+        fail "$EX_USAGE" \
+            "topology migration requires host Python 3.11+ and Git so every source state can be mounted exactly"
+        ;;
+esac
 command -v "$DOCKER_BIN" >/dev/null 2>&1 \
     || fail 1 "Docker is required for the stock-Unraid bootstrap"
 [ -S /var/run/docker.sock ] \
@@ -74,7 +81,7 @@ for ((index = 0; index < ${#arguments[@]}; index += 1)); do
         --env=*)
             env_file="${argument#--env=}"
             ;;
-        plan|install|adopt|auth-snippet|doctor|uninstall|upgrade|rollback|reconfigure)
+        plan|install|adopt|auth-snippet|doctor|uninstall|upgrade|rollback|reconfigure|migrate-topology|rollback-topology)
             if [ -z "$command" ]; then
                 command="$argument"
             fi

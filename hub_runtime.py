@@ -178,6 +178,67 @@ def _provider_environment(source: Mapping[str, str], reader: str) -> dict[str, s
     return environment
 
 
+def _validate_provider_environment(environment: Mapping[str, str], reader: str) -> None:
+    providers = {
+        "local", "openai", "anthropic", "gemini", "groq", "together",
+        "minimax", "deepseek", "openrouter", "openai-compatible",
+    }
+
+    def validate_role(prefix: str, *, fallback: bool) -> None:
+        provider = environment.get(prefix + "PROVIDER", "")
+        model = environment.get(prefix + "MODEL", "")
+        api_key = environment.get(prefix + "API_KEY", "")
+        custom_endpoint = environment.get(prefix + "CUSTOM_ENDPOINT", "")
+        custom_key = environment.get(prefix + "CUSTOM_API_KEY", "")
+        if fallback and not provider and not model and not api_key and not custom_endpoint and not custom_key:
+            return
+        if provider not in providers or not model:
+            raise HubConfigError(f"{reader} provider and model must be explicit and supported")
+        if provider == "local":
+            local_url = environment.get("BT_LOCAL_URL", "")
+            try:
+                parsed = urlsplit(local_url)
+            except ValueError as exc:
+                raise HubConfigError(f"{reader} local provider URL is invalid") from exc
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.path != "/v1/chat/completions"
+                or parsed.query
+                or parsed.fragment
+                or api_key
+                or custom_endpoint
+                or custom_key
+            ):
+                raise HubConfigError(
+                    f"{reader} local provider requires one exact local endpoint and no key"
+                )
+        elif provider == "openai-compatible":
+            try:
+                parsed = urlsplit(custom_endpoint)
+            except ValueError as exc:
+                raise HubConfigError(f"{reader} custom provider endpoint is invalid") from exc
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.path != "/v1/chat/completions"
+                or parsed.query
+                or parsed.fragment
+                or api_key
+                or not custom_key
+            ):
+                raise HubConfigError(
+                    f"{reader} custom provider requires HTTPS endpoint and dedicated key"
+                )
+        elif not api_key or custom_endpoint or custom_key:
+            raise HubConfigError(
+                f"{reader} remote provider requires its generic API key only"
+            )
+
+    validate_role("LLM_", fallback=False)
+    validate_role("LLM_FALLBACK_", fallback=True)
+
+
 def _allocations(
     source: Mapping[str, str], readers: tuple[str, ...], name: str, default: int
 ) -> dict[str, int]:
@@ -265,7 +326,7 @@ class HubConfig:
                 raise HubConfigError("CWA reader version is unsupported")
             auth_profile = _required(values, prefix + "AUTH_PROFILE")
             supported_auth = (
-                {"cwa-session", "reader-session"}
+                {"reader-session"}
                 if reader == "cwa"
                 else {"reader-session"}
             )
@@ -279,6 +340,7 @@ class HubConfig:
             api_port, proxy_port = _INTERNAL_PORTS[reader]
 
             environment = _provider_environment(values, reader)
+            _validate_provider_environment(environment, reader)
             environment.update(
                 {
                     "PORT": str(api_port),
