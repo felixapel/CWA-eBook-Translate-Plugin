@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
-from btctl_core import ConfigError, ReleaseIdentity
+from btctl_compose import InstallError
+from btctl_core import (
+    ConfigError,
+    DeploymentPlan,
+    DeploymentState,
+    InstallConfig,
+    ReleaseIdentity,
+    StateStore,
+)
 from btctl_hub import (
     HUB_STATE_SCHEMA_VERSION,
     HubInstallConfig,
@@ -15,8 +28,10 @@ from btctl_hub import (
     HubPlan,
     HubState,
     HubStateStore,
+    HubTopologyMigration,
     render_hub_compose,
 )
+from tests.python.test_btctl_compose import values as split_values
 
 
 IDENTITY = ReleaseIdentity(
@@ -57,6 +72,71 @@ def hub_values(root: Path) -> dict[str, str]:
         "BT_MAX_CONCURRENT": "2",
         "BT_MAX_UPSTREAM_INFLIGHT": "2",
     }
+
+
+class TopologyDocker:
+    """Small exact-runtime fake for split-to-hub transaction tests."""
+
+    def __init__(self):
+        self.containers: dict[str, dict[str, object]] = {}
+        self.calls: list[tuple[object, ...]] = []
+
+    def inspect_container(self, name):
+        return self.containers.get(name)
+
+    def stop_container(self, name):
+        self.calls.append(("stop", name))
+        self.containers[name]["State"]["Status"] = "exited"
+
+    def start_container(self, name):
+        self.calls.append(("start", name))
+        self.containers[name]["State"]["Status"] = "running"
+
+    def wait_healthy(self, names, timeout):
+        self.calls.append(("healthy", tuple(names), timeout))
+
+
+def split_source(
+    root: Path,
+    reader: str,
+    docker: TopologyDocker,
+    *,
+    api_status: str = "running",
+) -> Path:
+    source_root = root / f"split-{reader}"
+    config = InstallConfig.from_mapping(
+        split_values(source_root, reader=reader), IDENTITY
+    )
+    plan = DeploymentPlan.from_config(config)
+    resources = copy.deepcopy(plan.resources)
+    for role in ("api", "proxy"):
+        name = str(resources[role]["name"])
+        identifier = f"{reader}-{role}-id"
+        resources[role]["id"] = identifier
+        docker.containers[name] = {
+            "Id": identifier,
+            "State": {"Status": api_status if role == "api" else "running"},
+        }
+    state = replace(
+        DeploymentState.new(
+            install_id=(
+                "31234567-89ab-4cde-8123-0123456789ab"
+                if reader == "cwa"
+                else "41234567-89ab-4cde-8123-0123456789ab"
+            ),
+            plan=plan,
+        ),
+        resources=resources,
+    )
+    StateStore(Path(config.state_dir)).save(state)
+    data_dir = Path(config.data_dir)
+    data_dir.mkdir(mode=0o700, parents=True)
+    with closing(sqlite3.connect(data_dir / "translations.db")) as database:
+        database.execute("CREATE TABLE translations (key TEXT PRIMARY KEY, value TEXT)")
+        database.execute("INSERT INTO translations VALUES (?, ?)", (reader, reader))
+        database.commit()
+    (data_dir / f"{reader}.marker").write_text(reader, encoding="utf-8")
+    return Path(config.state_dir)
 
 
 class HubBtctlTests(unittest.TestCase):
@@ -237,6 +317,147 @@ class HubBtctlTests(unittest.TestCase):
             self.assertEqual(docker.calls[:4], ["available", "build", "data", "validate"])
             self.assertEqual(docker.calls.count("http"), 2)
             self.assertEqual(docker.calls.count("sqlite"), 2)
+
+    def test_topology_migration_rejects_overlapping_source_before_stopping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            migration = HubTopologyMigration(docker)
+            overlapping_data = Path(config.data_dir)
+            overlapping_data.mkdir(parents=True)
+            with closing(sqlite3.connect(overlapping_data / "translations.db")):
+                pass
+            sources = {
+                "cwa": {
+                    "reader": "cwa",
+                    "state_dir": str(root / "split-cwa-state"),
+                    "install_id": "31234567-89ab-4cde-8123-0123456789ab",
+                    "api_name": "cwa-api",
+                    "api_id": "cwa-api-id",
+                    "proxy_name": "cwa-proxy",
+                    "proxy_id": "cwa-proxy-id",
+                    "data_dir": config.data_dir,
+                },
+                "kavita": {
+                    "reader": "kavita",
+                    "state_dir": str(root / "split-kavita-state"),
+                    "install_id": "41234567-89ab-4cde-8123-0123456789ab",
+                    "api_name": "kavita-api",
+                    "api_id": "kavita-api-id",
+                    "proxy_name": "kavita-proxy",
+                    "proxy_id": "kavita-proxy-id",
+                    "data_dir": str(root / "split-kavita-data"),
+                },
+            }
+            statuses = {
+                reader: {"api": "running", "proxy": "running"}
+                for reader in sources
+            }
+
+            with mock.patch.object(migration, "_sources", return_value=sources), \
+                    mock.patch.object(
+                        migration, "_verify_source_containers", return_value=statuses
+                    ), self.assertRaisesRegex(InstallError, "overlap"):
+                migration.migrate(
+                    config,
+                    plan,
+                    root,
+                    [root / "split-cwa-state", root / "split-kavita-state"],
+                )
+
+            self.assertFalse([call for call in docker.calls if call[0] == "stop"])
+            self.assertFalse(migration._journal_path(config).exists())
+
+    def test_topology_migration_failure_restores_only_initially_running_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root / "hub"), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            cwa_state = split_source(root, "cwa", docker)
+            kavita_state = split_source(root, "kavita", docker, api_status="exited")
+            migration = HubTopologyMigration(docker)
+
+            with mock.patch(
+                "btctl_hub.HubInstaller.install",
+                side_effect=InstallError("synthetic hub failure"),
+            ), self.assertRaisesRegex(InstallError, "synthetic hub failure"):
+                migration.migrate(
+                    config, plan, root, [cwa_state, kavita_state]
+                )
+
+            journal = migration._load_journal(config)
+            self.assertEqual(journal["status"], "failed")
+            self.assertEqual(
+                docker.containers["cwa-translate-test-api"]["State"]["Status"],
+                "running",
+            )
+            self.assertEqual(
+                docker.containers["kavita-translate-test-api"]["State"]["Status"],
+                "exited",
+            )
+            self.assertIn(("start", "cwa-translate-test-api"), docker.calls)
+            self.assertNotIn(("start", "kavita-translate-test-api"), docker.calls)
+
+    def test_committed_topology_migration_copies_both_readers_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root / "hub"), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            cwa_state = split_source(root, "cwa", docker)
+            kavita_state = split_source(root, "kavita", docker)
+            migration = HubTopologyMigration(docker)
+            installed = HubState.new(
+                install_id="51234567-89ab-4cde-8123-0123456789ab",
+                plan=plan,
+            )
+
+            def commit_hub(*_args, **_kwargs):
+                HubStateStore(Path(config.state_dir)).save(installed)
+                return installed
+
+            with mock.patch(
+                "btctl_hub.HubInstaller.install", side_effect=commit_hub
+            ):
+                result = migration.migrate(
+                    config, plan, root, [kavita_state, cwa_state]
+                )
+
+            self.assertEqual(result, installed)
+            self.assertEqual(
+                (Path(config.data_dir) / "cwa" / "cwa.marker").read_text(), "cwa"
+            )
+            self.assertEqual(
+                (Path(config.data_dir) / "kavita" / "kavita.marker").read_text(),
+                "kavita",
+            )
+            self.assertEqual(migration._load_journal(config)["status"], "committed")
+            self.assertFalse([call for call in docker.calls if call[0] == "start"])
+
+            uninstalled = replace(installed, status="uninstalled")
+            with mock.patch(
+                "btctl_hub.HubUninstaller.uninstall", return_value=uninstalled
+            ):
+                rolled_back = migration.rollback(config, plan)
+
+            self.assertEqual(rolled_back.status, "rolled_back")
+            self.assertEqual(migration._load_journal(config)["status"], "rolled_back")
+            self.assertEqual(
+                {
+                    call[1]
+                    for call in docker.calls
+                    if call[0] == "start"
+                },
+                {
+                    "cwa-translate-test-api",
+                    "cwa-translate-test-proxy",
+                    "kavita-translate-test-api",
+                    "kavita-translate-test-proxy",
+                },
+            )
 
 
 if __name__ == "__main__":

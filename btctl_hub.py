@@ -56,6 +56,12 @@ def _clean_name(values: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    left = first.resolve()
+    right = second.resolve()
+    return left == right or left in right.parents or right in left.parents
+
+
 def _runtime_environment(values: Mapping[str, str], runtime: HubConfig) -> dict[str, str]:
     environment = {
         name: value
@@ -1031,6 +1037,46 @@ class HubTopologyMigration:
                 statuses[reader][role] = status
         return statuses
 
+    @staticmethod
+    def _validate_source_paths(
+        config: HubInstallConfig, sources: Mapping[str, dict[str, object]]
+    ) -> None:
+        hub_paths = {
+            "hub state": Path(config.state_dir),
+            "hub data": Path(config.data_dir),
+            "hub backup": Path(config.backup_dir),
+        }
+        source_paths: dict[str, Path] = {}
+        for reader, source in sources.items():
+            data_dir = Path(str(source.get("data_dir", "")))
+            state_dir = Path(str(source.get("state_dir", "")))
+            if (
+                not data_dir.is_absolute()
+                or data_dir == Path("/")
+                or ".." in data_dir.parts
+                or data_dir.is_symlink()
+                or not data_dir.is_dir()
+            ):
+                raise InstallError("migration source data path is unsafe")
+            database = data_dir / "translations.db"
+            if database.is_symlink() or not database.is_file():
+                raise InstallError("migration source translations.db is missing")
+            if _paths_overlap(data_dir, state_dir):
+                raise InstallError("migration source state and data paths overlap")
+            for label, hub_path in hub_paths.items():
+                if _paths_overlap(data_dir, hub_path) or _paths_overlap(
+                    state_dir, hub_path
+                ):
+                    raise InstallError(f"migration source paths overlap {label}")
+            source_paths[reader] = data_dir
+        ordered = sorted(source_paths.items())
+        for index, (reader, path) in enumerate(ordered):
+            for other_reader, other_path in ordered[index + 1:]:
+                if _paths_overlap(path, other_path):
+                    raise InstallError(
+                        f"migration source data paths overlap for {reader} and {other_reader}"
+                    )
+
     def _restart_sources(self, journal: Mapping[str, object]) -> None:
         sources = journal.get("sources", {})
         initial = journal.get("initial_statuses", {})
@@ -1100,8 +1146,10 @@ class HubTopologyMigration:
                 current_sources = self._sources(config, normalized)
                 if sources != current_sources:
                     raise InstallError("migration sources do not match the journal")
+                self._validate_source_paths(config, sources)
             else:
                 sources = self._sources(config, normalized)
+                self._validate_source_paths(config, sources)
                 statuses = self._verify_source_containers(sources)
                 journal = {
                     "status": "prepared",
