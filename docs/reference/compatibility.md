@@ -29,8 +29,9 @@ The project tracks the stable CWA reader contract using the
 The source boundary is the
 [Kavita v0.9.0.2 release](https://github.com/Kareadita/Kavita/releases/tag/v0.9.0.2)
 at the [exact reviewed commit](https://github.com/Kareadita/Kavita/commit/6bcd5689385d0e96824982d843c54f15ce784ddc).
-CWA and Kavita connectors must be separate installations with distinct names,
-origins, ports, state, data and backup directories.
+CWA and Kavita connectors may share one universal hub container, but always
+retain distinct origins, ports, connector IDs, cookies, databases and keys.
+Split installations remain supported when separate container boundaries matter.
 
 ## Host and container runtime
 
@@ -44,9 +45,10 @@ origins, ports, state, data and backup directories.
 | Native Windows or macOS | Not a managed production target | A Linux Docker host/VM may be used, but there is no native installer or release acceptance matrix. |
 
 Managed roles require Docker health checks, read-only root filesystems, tmpfs,
-capability dropping, an internal network, and bind-mount semantics. Alternative
-container engines are unsupported unless they reproduce and test those exact
-contracts.
+capability dropping and bind-mount semantics. Split roles additionally require
+an owned internal API network; hub APIs bind only to container loopback.
+Alternative container engines are unsupported unless they reproduce and test
+those exact contracts.
 
 ## Browser and reader
 
@@ -62,9 +64,10 @@ contracts.
 
 | Topology | Status | Boundary |
 |---|---|---|
+| Universal hub reader sessions | Recommended | One container may enable CWA, Kavita or both. Each reader keeps an exact public origin/port and isolated five-minute opaque session cookie. APIs stay on loopback. |
 | Native CWA session, same-origin proxy | Recommended and CI-certified | `BT_AUTH_PROFILE=cwa-session`; CWA v4.0.6 with `config_session=1`, reverse-proxy-header login disabled, and its default `TRUSTED_PROXY_COUNT=1` is covered by unit and container regression fixtures. Selected cookies are exchanged for a five-minute maximum opaque plugin session bound to the proxy-observed address/User-Agent. The API has no host port. Custom trusted-proxy hop counts are not yet certified. |
 | Kavita native bearer or stock OIDC cookie, same-origin proxy | CI-certified candidate | `BT_AUTH_PROFILE=reader-session`; proof reaches only `POST /bt-api/session`, is validated by exact `/api/Account`, then discarded. Ordinary API calls receive only the opaque plugin cookie. Refresh tokens and arbitrary cookies are rejected. HTTPS is required outside loopback. |
-| Authentik forwarded identity | Managed advanced profile | Requires `docker-edge`, exact `/32` or `/128` edge peer, a patched Authentik version, and the generated direct API route. See [Authentik](../install/authentik.md). |
+| Authentik forwarded identity | Managed advanced split-only profile | Requires `docker-edge`, exact `/32` or `/128` edge peer, a patched Authentik version, and the generated direct API route. It is rejected by the hub. See [Authentik](../install/authentik.md). |
 | Nginx edge | Generated and contract-tested | Merge the fragment into the existing HTTPS/Authentik server configuration. SWAG and Nginx Proxy Manager still require product-specific config validation. |
 | Traefik edge | Generated and contract-tested | Existing entrypoint, TLS, certificate, and Authentik settings remain operator-owned. |
 | Caddy edge | Generated and contract-tested | Merge the handler inside the existing Authentik-protected site block. |

@@ -1,6 +1,7 @@
 # Kavita managed installation
 
-Kavita support uses the same `btctl` split deployment as CWA: one stock reader,
+Kavita support can use the recommended [universal hub](universal-hub.md) or the
+same `btctl` split deployment as CWA: one stock reader,
 one injection proxy and one private translation API. It does not fork Kavita,
 mount files into its container or write translated text back to the library.
 
@@ -13,12 +14,14 @@ Only the web EPUB route
 `.book-content` DOM are active. Manga, PDF, OPDS, mobile apps, writeback and
 other Kavita versions are outside the accepted contract.
 
-## Isolate it from CWA
+## Split-profile isolation from CWA
 
-A CWA and a Kavita connector may use the same source checkout and image, but
-they must be separate installations. Give each one a distinct install name,
-public port/origin, state directory, data directory and backup directory. Never
-point both API roles at one SQLite directory or one `reader_session_key`.
+When using the split profile, CWA and Kavita may use the same source checkout
+and image but must be separate installations. Give each one a distinct install
+name, public port/origin, state directory, data directory and backup directory.
+The universal hub instead derives separate reader subdirectories and keys from
+one data root. Never point two split API roles at one SQLite directory or one
+`reader_session_key`.
 
 ```text
 browser -> kavita-translate-proxy -> stock Kavita :5000

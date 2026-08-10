@@ -1,9 +1,15 @@
 # Managed `btctl` installation
 
-`btctl` is the lifecycle authority for the recommended split deployment. It
+`btctl` remains the lifecycle authority for the supported split deployment. It
 builds one immutable local image from an exact clean checkout, runs separate
 non-root proxy and API roles, and never edits or owns the stock reader
 container.
+
+New ordinary installs should use the
+[universal hub guide](universal-hub.md). Keep this split topology when separate
+container security/restart boundaries or CWA Authentik-forwarded identity are
+required. Existing split states remain supported and are the source of the
+explicit `migrate-topology` workflow; they are never rewritten implicitly.
 
 ```text
 browser / reverse proxy -> <install>-proxy -> stock CWA or Kavita

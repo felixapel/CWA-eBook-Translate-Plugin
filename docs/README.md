@@ -6,8 +6,10 @@ requests, not in tracked Markdown.
 
 ## Install
 
+- [Universal CWA and Kavita hub](install/universal-hub.md) — recommended
+  one-container install, per-reader switches and split-topology migration.
 - [Managed `btctl` installation](install/btctl.md) — Unraid and existing
-  Compose profiles, prerequisites, topology and first install.
+  Compose split profiles, prerequisites and advanced isolation.
 - [Kavita managed installation](install/kavita.md) — exact stock-Kavita EPUB
   boundary, isolated configuration, authentication and acceptance.
 - [Community Applications](install/community-applications.md) — requirements
@@ -43,7 +45,7 @@ requests, not in tracked Markdown.
 |---|---|
 | Current code version | [`VERSION`](../VERSION) |
 | Release history | [`CHANGELOG.md`](../CHANGELOG.md) |
-| Managed install inputs | [`.env.example`](../.env.example), reader guide and `btctl` validation |
+| Managed install inputs | [`.env.hub.example`](../.env.hub.example), [`.env.example`](../.env.example), reader guide and `btctl` validation |
 | Supported environments | `docs/reference/compatibility.md` |
 | Architecture rationale | `docs/decisions/README.md` |
 | Release state and review | Gitea pull request, issue or milestone |

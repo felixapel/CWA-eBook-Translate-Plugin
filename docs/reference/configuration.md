@@ -4,6 +4,21 @@ Managed operators should copy [`.env.example`](../../.env.example) outside the
 checkout and edit only that copy. `btctl` validates the file, derives internal
 role settings and redacts secrets from its output. Never commit the edited file.
 
+The recommended universal topology uses [`.env.hub.example`](../../.env.hub.example).
+Set `BT_TOPOLOGY=hub`, `BT_ENABLE_CWA` and/or `BT_ENABLE_KAVITA`, then provide
+each enabled reader's `BT_<READER>_PUBLIC_ORIGIN`, `READER_UPSTREAM`,
+`READER_CONTAINER`, `READER_NETWORK`, `READER_VERSION`, `AUTH_PROFILE`,
+`READER_CONNECTOR_ID` and `PUBLISHED_PORT`. Hub authentication is exactly
+`reader-session`; Authentik-forwarded identity remains split-only.
+
+Shared `LLM_*` and `BT_LOCAL_URL` values apply to every enabled reader. A
+present `BT_CWA_LLM_*`/`BT_CWA_LOCAL_URL` or
+`BT_KAVITA_LLM_*`/`BT_KAVITA_LOCAL_URL` replaces the corresponding shared
+value for only that reader. Present empty secrets deliberately clear inherited
+secrets. `BT_MAX_CONCURRENT` and `BT_MAX_UPSTREAM_INFLIGHT` are total hub
+budgets; either omit reader allocations for an automatic fair split or define
+all enabled-reader allocations without exceeding the total.
+
 ## Managed installation inputs
 
 | Variable | Purpose |
@@ -60,7 +75,7 @@ configuration.
 
 | Variable | Default | Boundary |
 |---|---:|---|
-| `BT_ROLE` | `auto` | `api` or `proxy` for managed split installs; `all` only for the certified, digest-pinned Community Applications profile. |
+| `BT_ROLE` | `auto` | `hub` for the universal topology; `api` or `proxy` for managed split installs; `all` only for the certified, digest-pinned Community Applications profile. |
 | `PORT` | `8390` | API listen port inside the container. |
 | `BT_PROXY_PORT` | `8080` | Proxy listen port inside the container. |
 | `BT_CWA_MAX_BODY_SIZE` | `2g` | Finite nginx upload limit for CWA traffic. |
@@ -85,8 +100,8 @@ configuration.
 | `BT_REQUEST_DEADLINE_SECONDS` | `90` | Absolute request deadline. |
 | `BT_SINGLEFLIGHT_MAX_ENTRIES` | `1024` | Active deduplicated operation cap. |
 
-The certified Community Applications profile is CWA-only. Kavita requires
-separate managed `api` and `proxy` roles.
+The certified Community Applications profile is CWA-only. Kavita uses the
+universal hub or separate managed `api` and `proxy` roles.
 
 A malformed grouped response receives one fresh-envelope retry. If it remains
 malformed, paragraphs are recovered sequentially inside the same finite request

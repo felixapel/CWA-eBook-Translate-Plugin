@@ -12,9 +12,17 @@ decisions.
 
 The plugin operates as a decoupled overlay in front of a stock reader. Reader
 connectors isolate upstream-specific routes, DOM and authentication from the
-translation/cache/provider core. There are two deployment profiles:
+translation/cache/provider core. There are three deployment profiles:
 
-1. **Managed split profile (`btctl`, recommended).** Two isolated non-root
+1. **Universal hub (`btctl`, recommended).** One non-root container runs a
+   distinct Gunicorn API process per enabled reader plus one namespaced nginx
+   listener per reader. APIs bind only to loopback and use separate databases,
+   session keys, connector IDs and cookies. `BT_ENABLE_CWA` and
+   `BT_ENABLE_KAVITA` enable either or both without changing the image. Any
+   child exit stops the complete container. This simplifies deployment at the
+   cost of one shared compromise and restart boundary. See
+   [ADR-015](../decisions/ADR-015-universal-reader-hub.md).
+2. **Managed split profile (`btctl`, advanced isolation).** Two isolated non-root
    containers run the same release image with `BT_ROLE=proxy` and
    `BT_ROLE=api`. nginx sits in front of a **stock** CWA or pinned Kavita
    instance (`BT_READER_UPSTREAM`). HTML responses get a
@@ -39,20 +47,20 @@ translation/cache/provider core. There are two deployment profiles:
    inbound forwarding headers are discarded, the observed peer becomes the
    only forwarded client hop, and reader uploads have an operator-configurable
    finite body cap.
-2. **Community Applications combined profile (listing-gated).** One non-root
+3. **Community Applications combined profile (listing-gated).** One non-root
    container runs `BT_ROLE=all`, exposes only its proxy port and keeps API port
    `8390` private. This is production-supported only when the searchable
    listing pins a certified immutable image digest and the host matches the
    [documented CWA-only boundary](../install/community-applications.md).
-   Kavita always uses the split `btctl` profile.
+   Kavita uses the universal hub or split `btctl` profile.
 
 `overlay/read.html` remains a legacy development fixture for investigating CWA
 template compatibility. Mounting it into CWA and publishing the API
 cross-origin is not a supported production installation method.
 
-The diagram below shows the recommended split data flow. The proxy is the only
-browser-facing translator role; the API owns the writable SQLite volume. The
-combined CA profile preserves the same logical boundary inside one container.
+The hub preserves the logical proxy/API boundary in separate processes and
+reader namespaces. The split profile places those processes in separate
+containers when stronger containment or Authentik direct API routing is needed.
 
 ```
 Browser ──► proxy role (:8080) ──► stock reader (CWA :8083 / Kavita :5000)

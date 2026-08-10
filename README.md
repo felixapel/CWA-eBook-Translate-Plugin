@@ -22,9 +22,10 @@ modifying either image.
 
 ## Supported installation
 
-The production path is `btctl`. It builds an immutable local image from an
-exact clean release checkout and manages a browser-facing proxy plus a private
-API role. Use the current annotated release:
+The production path is the universal `btctl` hub. It builds an immutable local
+image from an exact clean release checkout and runs CWA, Kavita or both through
+one hardened container while keeping separate internal API processes, caches,
+keys and cookies. Use the current annotated release:
 
 ```bash
 git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git cwa-translate
@@ -37,35 +38,38 @@ Copy the managed configuration outside the checkout and make it private:
 
 ```bash
 install -d -m 0700 /absolute/private/path
-cp .env.example /absolute/private/path/cwa-translate.env
-chmod 0600 /absolute/private/path/cwa-translate.env
+cp .env.hub.example /absolute/private/path/book-translator-hub.env
+chmod 0600 /absolute/private/path/book-translator-hub.env
 ```
 
-Set the exact reader container, network, version, public origin, storage paths
-and LLM endpoint. The example defaults to CWA. Kavita requires the isolated,
-exact-version configuration in the [Kavita guide](docs/install/kavita.md). A
-local provider normally leaves `LLM_API_KEY` empty. Then run:
+Set each enabled reader's exact container, network, version, public origin,
+storage paths and LLM endpoint. A local provider normally leaves `LLM_API_KEY`
+empty. Then run:
 
 ```bash
-./btctl plan --env /absolute/private/path/cwa-translate.env
-./btctl install --env /absolute/private/path/cwa-translate.env --yes
-./btctl doctor --env /absolute/private/path/cwa-translate.env
+./btctl plan --env /absolute/private/path/book-translator-hub.env
+./btctl install --env /absolute/private/path/book-translator-hub.env --yes
+./btctl doctor --env /absolute/private/path/book-translator-hub.env
 ```
 
 `plan` validates and reports the intended resources without changing the reader
 or deployment state. `install` commits state only after live postconditions pass.
 `doctor` is read-only and every check must report `ok`.
 
-Provider roles are selected entirely through the private environment. Existing
-installs can review and apply a provider-only API replacement with
-`btctl reconfigure`; proxy, reader, networks and translation data remain in
-place. See the [configuration reference](docs/reference/configuration.md) for
-separate primary/fallback keys, Gemini and custom-endpoint contracts.
+Provider roles are selected entirely through the private environment, with
+shared defaults and optional per-reader overrides. The split profile retains
+its provider-only `btctl reconfigure` workflow. A hub provider change uses a
+reviewed `uninstall` with the old environment followed by `install` with the
+new one; data is retained, while all reader processes restart coherently and
+may require a fresh short-lived session.
+See the [configuration reference](docs/reference/configuration.md).
 
 Stock Unraid requires root, Bash, Docker and a full checkout including `.git`.
 It does not require host Python, host Git or NerdTools to run `./btctl`; the
-launcher uses a temporary containerized operator when needed. Linux hosts with
-an existing Compose-managed CWA use `BT_INSTALL_PROFILE=compose-existing`.
+launcher uses a temporary containerized operator when needed. Linux hosts use
+`BT_INSTALL_PROFILE=compose-existing`. Operators who need independent
+container isolation or CWA Authentik-forwarded identity can retain the split
+profile.
 
 Community Applications uses a separate CWA-only combined-image profile. Install
 it only from a searchable listing whose template pins an immutable image digest;
@@ -98,6 +102,7 @@ Manga, PDF and library writeback are not supported.
 ## Documentation
 
 - [Documentation map](docs/README.md)
+- [Universal CWA and Kavita hub](docs/install/universal-hub.md)
 - [Managed `btctl` install](docs/install/btctl.md)
 - [Kavita managed install](docs/install/kavita.md)
 - [Community Applications](docs/install/community-applications.md)

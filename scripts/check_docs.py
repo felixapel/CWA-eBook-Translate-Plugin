@@ -18,6 +18,7 @@ CANONICAL_GUIDES = {
     "install/btctl.md",
     "install/community-applications.md",
     "install/kavita.md",
+    "install/universal-hub.md",
     "maintainers/development.md",
     "maintainers/release.md",
     "operations/lifecycle.md",
