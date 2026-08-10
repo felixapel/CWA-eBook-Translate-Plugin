@@ -1,0 +1,366 @@
+"""Fail-closed configuration and supervision for the universal hub role."""
+
+from __future__ import annotations
+
+import ipaddress
+import os
+import re
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Mapping
+from urllib.parse import urlsplit
+
+
+class HubConfigError(ValueError):
+    """The universal runtime environment is incomplete or ambiguous."""
+
+
+_READERS = ("cwa", "kavita")
+_INTERNAL_PORTS = {
+    "cwa": (8391, 8080),
+    "kavita": (8392, 8081),
+}
+_PROVIDER_OVERRIDES = {
+    "LLM_PROVIDER": "LLM_PROVIDER",
+    "LLM_MODEL": "LLM_MODEL",
+    "LLM_API_KEY": "LLM_API_KEY",
+    "LLM_CUSTOM_ENDPOINT": "LLM_CUSTOM_ENDPOINT",
+    "LLM_CUSTOM_API_KEY": "LLM_CUSTOM_API_KEY",
+    "LLM_FALLBACK_PROVIDER": "LLM_FALLBACK_PROVIDER",
+    "LLM_FALLBACK_MODEL": "LLM_FALLBACK_MODEL",
+    "LLM_FALLBACK_API_KEY": "LLM_FALLBACK_API_KEY",
+    "LLM_FALLBACK_CUSTOM_ENDPOINT": "LLM_FALLBACK_CUSTOM_ENDPOINT",
+    "LLM_FALLBACK_CUSTOM_API_KEY": "LLM_FALLBACK_CUSTOM_API_KEY",
+    "LOCAL_URL": "BT_LOCAL_URL",
+}
+_PROCESS_KEYS = {
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONPATH",
+    "TZ",
+    "BT_ALLOW_PRIVATE_LAN",
+    "BT_API_TOKEN",
+    "BT_AUTH_MAX_INFLIGHT_PER_CLIENT",
+    "BT_AUTH_RATE_LIMIT_PER_MINUTE",
+    "BT_BATCH_MAX_TOKENS",
+    "BT_BATCH_SIZE",
+    "BT_CACHE_HARDEN_EXISTING_DIR",
+    "BT_CACHE_HIT_FLUSH_THRESHOLD",
+    "BT_CACHE_MAX_ENTRIES",
+    "BT_CACHE_OPERATOR_GROUP_ACCESS",
+    "BT_CACHE_SCOPE_MAX_CHARS",
+    "BT_CACHE_TTL_DAYS",
+    "BT_CONTEXT_WINDOW",
+    "BT_MAX_BATCH_PARAGRAPHS",
+    "BT_MAX_CONTENT_LENGTH",
+    "BT_MAX_PARAGRAPH_CHARS",
+    "BT_MAX_TOKENS",
+    "BT_MAX_UPSTREAM_RESPONSE_BYTES",
+    "BT_OUTPUT_TOKEN_FACTOR",
+    "BT_OUTPUT_TOKEN_FLOOR",
+    "BT_RATE_LIMIT_MAX_CLIENTS",
+    "BT_RATE_LIMIT_PER_MINUTE",
+    "BT_RATE_LIMIT_RETRY_AFTER",
+    "BT_REQUEST_DEADLINE_SECONDS",
+    "BT_REQUEST_MAX_ATTEMPTS",
+    "BT_REQUEST_MAX_INPUT_BYTES",
+    "BT_REQUEST_MAX_OUTPUT_TOKENS",
+    "BT_SINGLEFLIGHT_MAX_ENTRIES",
+    "BT_TIMEOUT",
+    "BT_UPSTREAM_QUEUE_TIMEOUT",
+    *_PROVIDER_OVERRIDES.values(),
+}
+
+
+def _boolean(source: Mapping[str, str], name: str) -> bool:
+    value = source.get(name, "false")
+    if value not in {"true", "false"}:
+        raise HubConfigError(f"{name} must be exactly true or false")
+    return value == "true"
+
+
+def _required(source: Mapping[str, str], name: str) -> str:
+    value = source.get(name, "")
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or not value.isascii()
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise HubConfigError(f"{name} must be one clean non-empty ASCII value")
+    return value
+
+
+def _positive_int(source: Mapping[str, str], name: str, default: int) -> int:
+    raw = source.get(name, str(default))
+    if not isinstance(raw, str) or not raw.isdecimal():
+        raise HubConfigError(f"{name} must be a positive integer")
+    value = int(raw, 10)
+    if value <= 0:
+        raise HubConfigError(f"{name} must be a positive integer")
+    return value
+
+
+def _origin(source: Mapping[str, str], name: str, *, upstream_port: int | None = None) -> str:
+    raw = _required(source, name)
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise HubConfigError(f"{name} must be one exact http(s) origin") from exc
+    hostname = parsed.hostname or ""
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HubConfigError(f"{name} must be one exact http(s) origin")
+    if upstream_port is not None and (parsed.scheme != "http" or port != upstream_port):
+        raise HubConfigError(f"{name} must use http on port {upstream_port}")
+    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        normalized_host += f":{port}"
+    if parsed.netloc.casefold() != normalized_host.casefold():
+        raise HubConfigError(f"{name} must contain one exact authority")
+    if upstream_port is None and parsed.scheme != "https":
+        loopback = hostname.casefold() == "localhost"
+        try:
+            loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            pass
+        if not loopback:
+            raise HubConfigError(f"{name} requires HTTPS outside loopback development")
+    return f"{parsed.scheme}://{normalized_host}"
+
+
+def _connector_id(source: Mapping[str, str], name: str) -> str:
+    value = _required(source, name)
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise HubConfigError(f"{name} must be a canonical UUID") from exc
+    if str(parsed) != value:
+        raise HubConfigError(f"{name} must be a canonical UUID")
+    return value
+
+
+def _provider_environment(source: Mapping[str, str], reader: str) -> dict[str, str]:
+    environment = {
+        name: value
+        for name, value in source.items()
+        if name in _PROCESS_KEYS and isinstance(value, str)
+    }
+    prefix = f"BT_{reader.upper()}_"
+    for override, target in _PROVIDER_OVERRIDES.items():
+        name = prefix + override
+        if name in source:
+            value = source[name]
+            if not isinstance(value, str):
+                raise HubConfigError(f"{name} must be a string")
+            environment[target] = value
+    return environment
+
+
+def _allocations(
+    source: Mapping[str, str], readers: tuple[str, ...], name: str, default: int
+) -> dict[str, int]:
+    total = _positive_int(source, name, default)
+    override_names = {reader: f"BT_{reader.upper()}_{name[3:]}" for reader in readers}
+    present = [reader for reader, override in override_names.items() if override in source]
+    if present:
+        if len(present) != len(readers):
+            raise HubConfigError(f"all enabled readers must define a {name} allocation")
+        values = {
+            reader: _positive_int(source, override_names[reader], 1)
+            for reader in readers
+        }
+        if sum(values.values()) > total:
+            raise HubConfigError(f"per-reader {name} allocations exceed the hub total")
+        return values
+    if len(readers) == 1:
+        return {readers[0]: total}
+    if total < len(readers):
+        raise HubConfigError(f"{name} must provide at least one slot per enabled reader")
+    base, remainder = divmod(total, len(readers))
+    return {
+        reader: base + (1 if index < remainder else 0)
+        for index, reader in enumerate(readers)
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class ReaderRuntime:
+    name: str
+    api_port: int
+    proxy_port: int
+    published_port: int
+    public_origin: str
+    upstream: str
+    version: str
+    auth_profile: str
+    environment: dict[str, str] = field(repr=False)
+    proxy_environment: dict[str, str] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class HubConfig:
+    readers: tuple[ReaderRuntime, ...]
+
+    @classmethod
+    def from_environment(cls, source: Mapping[str, str] | None = None) -> "HubConfig":
+        values = source if source is not None else os.environ
+        enabled = tuple(
+            reader
+            for reader in _READERS
+            if _boolean(values, f"BT_ENABLE_{reader.upper()}")
+        )
+        if not enabled:
+            raise HubConfigError("at least one reader must be enabled")
+
+        concurrency = _allocations(values, enabled, "BT_MAX_CONCURRENT", 2)
+        upstream_inflight = _allocations(
+            values, enabled, "BT_MAX_UPSTREAM_INFLIGHT", 2
+        )
+        runtimes: list[ReaderRuntime] = []
+        published_ports: set[int] = set()
+        for reader in enabled:
+            prefix = f"BT_{reader.upper()}_"
+            expected_upstream_port = 8083 if reader == "cwa" else 5000
+            public_origin = _origin(values, prefix + "PUBLIC_ORIGIN")
+            upstream = _origin(
+                values,
+                prefix + "READER_UPSTREAM",
+                upstream_port=expected_upstream_port,
+            )
+            version = _required(values, prefix + "READER_VERSION")
+            if reader == "kavita" and version != "0.9.0.2":
+                raise HubConfigError("Kavita reader version is not certified")
+            if reader == "cwa" and not (
+                re.fullmatch(r"4\.[0-9]+\.[0-9]+", version) or version == "3.1.4"
+            ):
+                raise HubConfigError("CWA reader version is unsupported")
+            auth_profile = _required(values, prefix + "AUTH_PROFILE")
+            supported_auth = (
+                {"cwa-session", "reader-session", "authentik-forwarded"}
+                if reader == "cwa"
+                else {"reader-session"}
+            )
+            if auth_profile not in supported_auth:
+                raise HubConfigError(f"{prefix}AUTH_PROFILE is unsupported")
+            connector_id = _connector_id(values, prefix + "READER_CONNECTOR_ID")
+            published_port = _positive_int(values, prefix + "PUBLISHED_PORT", 0)
+            if published_port > 65535 or published_port in published_ports:
+                raise HubConfigError("enabled reader published ports must be distinct")
+            published_ports.add(published_port)
+            api_port, proxy_port = _INTERNAL_PORTS[reader]
+
+            environment = _provider_environment(values, reader)
+            environment.update(
+                {
+                    "PORT": str(api_port),
+                    "DB_PATH": f"/app/data/{reader}/translations.db",
+                    "BT_CACHE_DIR": f"/app/data/{reader}",
+                    "BT_AUTH_MODE": (
+                        "forwarded"
+                        if auth_profile == "authentik-forwarded"
+                        else "reader_session"
+                    ),
+                    "BT_READER_TYPE": reader,
+                    "BT_READER_AUTH_URL": (
+                        upstream + "/ajax/emailstat"
+                        if reader == "cwa"
+                        else upstream + "/api/Account"
+                    ),
+                    "BT_READER_VERSION": version,
+                    "BT_READER_CONTRACT_VERSION": (
+                        "cwa-epub-v1"
+                        if reader == "cwa"
+                        else "kavita-0.9.0.2-epub-v1"
+                    ),
+                    "BT_READER_CONNECTOR_ID": connector_id,
+                    "BT_PUBLIC_ORIGIN": public_origin,
+                    "BT_SESSION_KEY_PATH": f"/app/data/{reader}/reader_session_key",
+                    "BT_SESSION_COOKIE_NAME": (
+                        f"__Host-bt-{reader}-session"
+                        if public_origin.startswith("https://")
+                        else f"bt-{reader}-session"
+                    ),
+                    "BT_TRUSTED_PROXIES": "127.0.0.1/32",
+                    "BT_MAX_CONCURRENT": str(concurrency[reader]),
+                    "BT_MAX_UPSTREAM_INFLIGHT": str(upstream_inflight[reader]),
+                }
+            )
+            if auth_profile == "authentik-forwarded":
+                environment.update(
+                    {
+                        "BT_IDENTITY_TRUSTED_PROXIES": "127.0.0.1/32",
+                        "BT_FORWARDED_SUBJECT_HEADER": "X-authentik-uid",
+                        "BT_FORWARDED_ROLES_HEADER": "",
+                    }
+                )
+
+            browser_auth = (
+                "forwarded" if auth_profile == "authentik-forwarded" else "reader_session"
+            )
+            proxy_environment = {
+                "BT_PROXY_NAMESPACE": reader,
+                "BT_PROXY_PORT": str(proxy_port),
+                "BT_API_UPSTREAM": f"http://127.0.0.1:{api_port}",
+                "BT_PUBLIC_ORIGIN": public_origin,
+                "BT_READER_TYPE": reader,
+                "BT_READER_UPSTREAM": upstream,
+                "BT_READER_VERSION": version,
+                "BT_READER_CONTRACT_VERSION": environment[
+                    "BT_READER_CONTRACT_VERSION"
+                ],
+                "BT_BROWSER_AUTH_MODE": browser_auth,
+                "BT_BROWSER_CREDENTIALS": (
+                    "include" if browser_auth == "forwarded" else "same-origin"
+                ),
+                "BT_SESSION_COOKIE_NAME": environment["BT_SESSION_COOKIE_NAME"],
+                "BT_BROWSER_CONFIG_PATH": f"/tmp/nginx/browser-config-{reader}.json",
+                "BT_CWA_MAX_BODY_SIZE": values.get("BT_CWA_MAX_BODY_SIZE", "2g"),
+                "BT_CWA_IDENTITY_HEADER": values.get(
+                    "BT_CWA_IDENTITY_HEADER", "Remote-User"
+                ),
+                "BT_UI_VERSION": values.get("BT_UI_VERSION", "dev"),
+            }
+            runtimes.append(
+                ReaderRuntime(
+                    name=reader,
+                    api_port=api_port,
+                    proxy_port=proxy_port,
+                    published_port=published_port,
+                    public_origin=public_origin,
+                    upstream=upstream,
+                    version=version,
+                    auth_profile=auth_profile,
+                    environment=environment,
+                    proxy_environment=proxy_environment,
+                )
+            )
+        return cls(tuple(runtimes))
+
+
+def main() -> int:
+    """Entrypoint placeholder; process supervision is added in the next slice."""
+    try:
+        HubConfig.from_environment()
+    except HubConfigError as exc:
+        print(f"[hub] ERROR: {exc}", file=os.sys.stderr)
+        return 78
+    print("[hub] ERROR: runtime supervisor is unavailable", file=os.sys.stderr)
+    return 70
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
