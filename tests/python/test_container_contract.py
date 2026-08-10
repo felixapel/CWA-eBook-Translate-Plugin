@@ -59,9 +59,17 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn('BT_ROLE="${BT_ROLE:-auto}"', entrypoint)
         self.assertIn('exec gunicorn --bind', entrypoint)
         self.assertIn('exec nginx -c /app/proxy/nginx-main.conf', entrypoint)
+        self.assertIn("api|proxy|all|hub", entrypoint)
+        self.assertIn("exec python /app/hub_runtime.py", entrypoint)
         self.assertIn("umask 027", entrypoint)
         self.assertIn('stat -c %a /app/data', entrypoint)
         self.assertNotIn("chmod 700 /app/data", entrypoint)
+
+    def test_image_packages_the_hub_without_publishing_an_api_port(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("hub_runtime.py", dockerfile)
+        self.assertIn("EXPOSE 8390 8080 8081", dockerfile)
+        self.assertIn("hub_runtime.py --healthcheck", dockerfile)
 
     def test_api_roles_initialize_cache_before_serving(self):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
@@ -88,7 +96,7 @@ class ContainerContractTests(unittest.TestCase):
             "scgi_temp_path /tmp/nginx/scgi_temp;",
             "access_log /dev/stdout bt_privacy;",
             "error_log /dev/stderr warn;",
-            "include /tmp/nginx/proxy.conf;",
+            "include /tmp/nginx/proxy*.conf;",
         ):
             self.assertIn(directive, config)
         self.assertIn("log_format bt_privacy", config)
@@ -307,9 +315,10 @@ class ContainerContractTests(unittest.TestCase):
         self.assertNotIn("default $http_cookie;", proxy)
         self.assertIn("POST $http_authorization;", proxy)
         self.assertNotIn("default $http_authorization;", proxy)
-        self.assertIn("DELETE $bt_session_cookie;", proxy)
+        self.assertIn("DELETE $bt${BT_PROXY_NAMESPACE}_session_cookie;", proxy)
         self.assertIn(
-            "proxy_set_header Cookie $bt_session_route_cookie;", proxy
+            "proxy_set_header Cookie $bt${BT_PROXY_NAMESPACE}_session_route_cookie;",
+            proxy,
         )
         self.assertIn('proxy_set_header ${BT_CWA_IDENTITY_HEADER} "";', proxy)
         self.assertIn('proxy_set_header X-BT-Subject "";', proxy)

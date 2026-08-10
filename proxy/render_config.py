@@ -21,6 +21,10 @@ _SIZE_RE = re.compile(r"^[1-9][0-9]{0,9}[kKmMgG]?$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$")
+_PROXY_NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_BROWSER_CONFIG_PATH_RE = re.compile(
+    r"^/tmp/nginx/browser-config(?:-[a-z][a-z0-9_-]{0,31})?\.json$"
+)
 _PLACEHOLDER_RE = re.compile(r"\$\{(?:BT_|CWA_)[A-Z0-9_]*\}")
 _READER_CONTRACTS = {
     "cwa": "cwa-epub-v1",
@@ -137,6 +141,22 @@ def _validated_session_cookie_name(
     return value
 
 
+def _validated_proxy_namespace(env: Mapping[str, str]) -> str:
+    value = env.get("BT_PROXY_NAMESPACE", "")
+    if not value:
+        return ""
+    if not isinstance(value, str) or not _PROXY_NAMESPACE_RE.fullmatch(value):
+        raise ProxyConfigError("BT_PROXY_NAMESPACE must be a bounded lowercase token")
+    return "_" + value
+
+
+def _validated_browser_config_path(env: Mapping[str, str]) -> str:
+    value = env.get("BT_BROWSER_CONFIG_PATH", "/tmp/nginx/browser-config.json")
+    if not isinstance(value, str) or not _BROWSER_CONFIG_PATH_RE.fullmatch(value):
+        raise ProxyConfigError("BT_BROWSER_CONFIG_PATH is outside the runtime directory")
+    return value
+
+
 def _validated_browser_config(env: Mapping[str, str]) -> dict[str, str]:
     auth_mode = _required(env, "BT_BROWSER_AUTH_MODE")
     credentials = _required(env, "BT_BROWSER_CREDENTIALS")
@@ -222,7 +242,10 @@ def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> No
     session_cookie_name = _validated_session_cookie_name(
         env, secure=public_scheme == "https"
     )
+    proxy_namespace = _validated_proxy_namespace(env)
     replacements = {
+        "${BT_PROXY_NAMESPACE}": proxy_namespace,
+        "${BT_BROWSER_CONFIG_PATH}": _validated_browser_config_path(env),
         "${BT_READER_UPSTREAM}": reader_upstream,
         "${BT_API_UPSTREAM}": api_upstream,
         "${BT_PROXY_PORT}": _validated_port(env, "BT_PROXY_PORT"),
@@ -235,7 +258,7 @@ def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> No
         "${BT_SESSION_COOKIE_NAME}": session_cookie_name,
         "${BT_API_COOKIE_SOURCE}": {
             "cwa_session": "$http_cookie",
-            "reader_session": "$bt_session_cookie",
+            "reader_session": f"$bt{proxy_namespace}_session_cookie",
             "forwarded": '""',
         }[browser_config["authMode"]],
         "${BT_CWA_MAX_BODY_SIZE}": _validated_size(
@@ -263,6 +286,18 @@ def render_browser_config(output_path: Path, config: Mapping[str, str]) -> None:
     )
 
 
+def render_outputs(
+    template_path: Path,
+    nginx_output_path: Path,
+    browser_output_path: Path,
+    env: Mapping[str, str],
+) -> None:
+    """Render one reader listener and its matching browser contract."""
+    browser_config = _validated_browser_config(env)
+    render(template_path, nginx_output_path, env)
+    render_browser_config(browser_output_path, browser_config)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 4:
         print(
@@ -271,9 +306,7 @@ def main(argv: list[str]) -> int:
         )
         return 64
     try:
-        browser_config = _validated_browser_config(os.environ)
-        render(Path(argv[1]), Path(argv[2]), os.environ)
-        render_browser_config(Path(argv[3]), browser_config)
+        render_outputs(Path(argv[1]), Path(argv[2]), Path(argv[3]), os.environ)
     except (ProxyConfigError, OSError) as exc:
         # Never print environment values: upstream URLs may contain private
         # names, and rejected credential-bearing URLs must not reach logs.

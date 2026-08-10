@@ -7,14 +7,14 @@
 #   /bt-static/*  → overlay JS/CSS served from this container
 #   everything    → proxied to CWA; HTML gets ONE <script> tag injected
 
-map $http_upgrade $connection_upgrade {
+map $http_upgrade $bt${BT_PROXY_NAMESPACE}_connection_upgrade {
     default upgrade;
     ''      close;
 }
 
 # Ordinary translation calls receive only the plugin's short-lived session.
 # Raw reader cookies are confined to the exact exchange endpoint below.
-map $http_cookie $bt_session_cookie {
+map $http_cookie $bt${BT_PROXY_NAMESPACE}_session_cookie {
     default "";
     "~*(?:^|;[[:space:]]*)(${BT_SESSION_COOKIE_NAME}=[^;]{1,128})(?:;|$)" $1;
 }
@@ -22,13 +22,13 @@ map $http_cookie $bt_session_cookie {
 # Only POST session creation needs the one-time reader proof. Revocation is
 # authenticated by the plugin cookie; every other method must forward neither
 # reader cookies nor bearer credentials, even when the API rejects that method.
-map $request_method $bt_session_route_cookie {
+map $request_method $bt${BT_PROXY_NAMESPACE}_session_route_cookie {
     default "";
     POST $http_cookie;
-    DELETE $bt_session_cookie;
+    DELETE $bt${BT_PROXY_NAMESPACE}_session_cookie;
 }
 
-map $request_method $bt_session_route_authorization {
+map $request_method $bt${BT_PROXY_NAMESPACE}_session_route_authorization {
     default "";
     POST $http_authorization;
 }
@@ -55,8 +55,8 @@ server {
         proxy_set_header Host ${BT_PUBLIC_HOST};
         # This is the only API route allowed to receive raw reader proof. The
         # broker applies an exact cookie/JWT allowlist and never persists it.
-        proxy_set_header Cookie $bt_session_route_cookie;
-        proxy_set_header Authorization $bt_session_route_authorization;
+        proxy_set_header Cookie $bt${BT_PROXY_NAMESPACE}_session_route_cookie;
+        proxy_set_header Authorization $bt${BT_PROXY_NAMESPACE}_session_route_authorization;
         proxy_set_header X-BT-Subject "";
         proxy_set_header X-BT-Roles "";
         proxy_set_header X-authentik-uid "";
@@ -105,7 +105,7 @@ server {
     }
 
     location = /bt-config.json {
-        alias /tmp/nginx/browser-config.json;
+        alias ${BT_BROWSER_CONFIG_PATH};
         default_type application/json;
         add_header Cache-Control "no-store" always;
         add_header Pragma "no-cache" always;
@@ -134,7 +134,7 @@ server {
         proxy_set_header X-authentik-uid "";
         proxy_set_header X-authentik-groups "";
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Connection $bt${BT_PROXY_NAMESPACE}_connection_upgrade;
         proxy_connect_timeout 2s;
         proxy_read_timeout 300s;
 

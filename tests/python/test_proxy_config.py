@@ -174,12 +174,35 @@ class ProxyConfigRendererTests(unittest.TestCase):
             "BT_BROWSER_AUTH_MODE": "reader_session",
             "BT_BROWSER_CREDENTIALS": "same-origin",
             "BT_SESSION_COOKIE_NAME": "__Host-bt-kavita-session",
+            "BT_PROXY_NAMESPACE": "kavita",
+            "BT_BROWSER_CONFIG_PATH": "/tmp/nginx/browser-config-kavita.json",
         })
 
         self.assertEqual(result.returncode, 0, result.stderr)
         rendered = output.read_text(encoding="utf-8")
         self.assertIn("__Host-bt-kavita-session=", rendered)
         self.assertNotIn("__Host-bt-session=", rendered)
+        self.assertIn("$bt_kavita_session_cookie", rendered)
+        self.assertIn(
+            "proxy_set_header Cookie $bt_kavita_session_cookie;", rendered
+        )
+        self.assertNotIn("proxy_set_header Cookie $bt_session_cookie;", rendered)
+        self.assertIn(
+            "alias /tmp/nginx/browser-config-kavita.json;", rendered
+        )
+
+    def test_proxy_namespace_and_browser_config_path_reject_nginx_injection(self):
+        for name, value in (
+            ("BT_PROXY_NAMESPACE", "kavita; include /tmp/evil"),
+            ("BT_BROWSER_CONFIG_PATH", "/etc/passwd"),
+            ("BT_BROWSER_CONFIG_PATH", "/tmp/nginx/config.json; include /tmp/evil"),
+        ):
+            with self.subTest(name=name):
+                result, output, browser_output = self.render({name: value})
+                self.assertEqual(result.returncode, 78)
+                self.assertFalse(output.exists())
+                self.assertFalse(browser_output.exists())
+                self.assertIn(name, result.stderr)
 
     def test_reader_session_requires_exact_reader_contract(self):
         base = {

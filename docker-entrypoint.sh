@@ -19,12 +19,16 @@ if [ "$BT_ROLE" = "auto" ]; then
 fi
 
 case "$BT_ROLE" in
-    api|proxy|all) ;;
+    api|proxy|all|hub) ;;
     *)
-        echo "[entrypoint] ERROR: BT_ROLE must be api, proxy, all, or auto" >&2
+        echo "[entrypoint] ERROR: BT_ROLE must be api, proxy, all, hub, or auto" >&2
         exit 64
         ;;
 esac
+
+if [ "$BT_ROLE" = "hub" ]; then
+    exec python /app/hub_runtime.py
+fi
 
 if [ "$BT_ROLE" = "all" ]; then
     export BT_TRUSTED_PROXIES="${BT_TRUSTED_PROXIES:-127.0.0.1/32}"

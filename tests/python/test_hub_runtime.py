@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import stat
+import tempfile
 import unittest
+from pathlib import Path
 
-from hub_runtime import HubConfig, HubConfigError
+from hub_runtime import HubConfig, HubConfigError, prepare_runtime, process_specs, supervise
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def dual_reader_environment() -> dict[str, str]:
@@ -106,6 +112,102 @@ class HubConfigTests(unittest.TestCase):
         self.assertEqual(
             config.readers[0].environment["BT_MAX_UPSTREAM_INFLIGHT"], "2"
         )
+
+    def test_process_specs_bind_apis_to_loopback_and_start_one_nginx(self):
+        specs = process_specs(HubConfig.from_environment(dual_reader_environment()))
+
+        self.assertEqual(tuple(spec.name for spec in specs), ("api-cwa", "api-kavita", "nginx"))
+        self.assertIn("127.0.0.1:8391", specs[0].argv)
+        self.assertIn("127.0.0.1:8392", specs[1].argv)
+        self.assertEqual(specs[0].environment["BT_READER_TYPE"], "cwa")
+        self.assertEqual(specs[1].environment["BT_READER_TYPE"], "kavita")
+        self.assertNotIn("BT_KAVITA_LLM_API_KEY", specs[0].environment)
+
+    def test_prepare_runtime_renders_both_readers_and_preflights_before_start(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((tuple(argv), kwargs))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data"
+            runtime = root / "nginx"
+            data.mkdir(mode=0o700)
+
+            prepare_runtime(
+                HubConfig.from_environment(dual_reader_environment()),
+                data_root=data,
+                runtime_dir=runtime,
+                template_path=ROOT / "proxy" / "nginx.conf.template",
+                runner=runner,
+            )
+
+            self.assertTrue((runtime / "proxy-cwa.conf").is_file())
+            self.assertTrue((runtime / "proxy-kavita.conf").is_file())
+            self.assertTrue((runtime / "browser-config-cwa.json").is_file())
+            self.assertTrue((runtime / "browser-config-kavita.json").is_file())
+            self.assertEqual(stat.S_IMODE((data / "cwa").stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE((data / "kavita").stat().st_mode), 0o700)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(calls[-1][0][:2], ("nginx", "-t"))
+
+    def test_prepare_runtime_accepts_private_operator_group_data_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "data"
+            runtime = Path(directory) / "nginx"
+            data.mkdir()
+            data.chmod(0o2750)
+
+            prepare_runtime(
+                HubConfig.from_environment(dual_reader_environment()),
+                data_root=data,
+                runtime_dir=runtime,
+                template_path=ROOT / "proxy" / "nginx.conf.template",
+                runner=lambda *_args, **_kwargs: None,
+            )
+
+            self.assertEqual(stat.S_IMODE(data.stat().st_mode), 0o2750)
+
+    def test_supervisor_terminates_every_child_when_one_exits(self):
+        processes = []
+
+        class FakeProcess:
+            def __init__(self, name):
+                self.name = name
+                self.terminated = False
+                self.waited = False
+
+            def poll(self):
+                return 7 if self.name == "api-cwa" else None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                self.waited = True
+                return 7 if self.name == "api-cwa" else 0
+
+            def kill(self):
+                self.terminated = True
+
+        def popen(argv, *, env):
+            name = ("api-cwa", "api-kavita", "nginx")[len(processes)]
+            process = FakeProcess(name)
+            processes.append(process)
+            return process
+
+        result = supervise(
+            HubConfig.from_environment(dual_reader_environment()),
+            popen_factory=popen,
+            sleep=lambda _: None,
+            install_signal_handlers=False,
+        )
+
+        self.assertEqual(result, 7)
+        self.assertEqual(len(processes), 3)
+        self.assertTrue(all(process.terminated for process in processes))
+        self.assertTrue(all(process.waited for process in processes))
 
 
 if __name__ == "__main__":

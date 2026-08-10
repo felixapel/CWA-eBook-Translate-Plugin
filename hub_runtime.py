@@ -5,11 +5,19 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
+
+from proxy.render_config import ProxyConfigError, render_outputs
 
 
 class HubConfigError(ValueError):
@@ -212,6 +220,13 @@ class ReaderRuntime:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessSpec:
+    name: str
+    argv: tuple[str, ...]
+    environment: dict[str, str] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class HubConfig:
     readers: tuple[ReaderRuntime, ...]
 
@@ -351,15 +366,229 @@ class HubConfig:
         return cls(tuple(runtimes))
 
 
-def main() -> int:
-    """Entrypoint placeholder; process supervision is added in the next slice."""
+def process_specs(config: HubConfig) -> tuple[ProcessSpec, ...]:
+    """Return the exact fail-fast child process contract for one hub."""
+    specs = [
+        ProcessSpec(
+            name=f"api-{reader.name}",
+            argv=(
+                "gunicorn",
+                "--bind",
+                f"127.0.0.1:{reader.api_port}",
+                "--workers",
+                "1",
+                "--threads",
+                "8",
+                "--timeout",
+                "120",
+                "server:app",
+            ),
+            environment=dict(reader.environment),
+        )
+        for reader in config.readers
+    ]
+    nginx_environment = {
+        name: value
+        for name, value in config.readers[0].environment.items()
+        if name in {"HOME", "LANG", "LC_ALL", "PATH", "TZ"}
+    }
+    specs.append(
+        ProcessSpec(
+            name="nginx",
+            argv=(
+                "nginx",
+                "-c",
+                "/app/proxy/nginx-main.conf",
+                "-e",
+                "/dev/stderr",
+                "-g",
+                "daemon off;",
+            ),
+            environment=nginx_environment,
+        )
+    )
+    return tuple(specs)
+
+
+def _ensure_private_directory(path: Path, *, create: bool) -> None:
+    if path.is_symlink():
+        raise HubConfigError("hub data directories must not be symbolic links")
+    if create:
+        path.mkdir(mode=0o700, parents=False, exist_ok=True)
     try:
-        HubConfig.from_environment()
-    except HubConfigError as exc:
-        print(f"[hub] ERROR: {exc}", file=os.sys.stderr)
+        metadata = path.stat()
+    except OSError as exc:
+        raise HubConfigError("hub data directory is unavailable") from exc
+    mode = metadata.st_mode & 0o7777
+    if (
+        not path.is_dir()
+        or metadata.st_uid != os.geteuid()
+        or mode not in {0o700, 0o750, 0o2700, 0o2750}
+    ):
+        raise HubConfigError(
+            "hub data directories must be owned and privately mode 0700 or 2750"
+        )
+
+
+def prepare_runtime(
+    config: HubConfig,
+    *,
+    data_root: Path = Path("/app/data"),
+    runtime_dir: Path = Path("/tmp/nginx"),
+    template_path: Path = Path("/app/proxy/nginx.conf.template"),
+    runner=subprocess.run,
+) -> None:
+    """Validate all mutable state and generated config before serving traffic."""
+    _ensure_private_directory(data_root, create=False)
+    runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for stale in (
+        "proxy-cwa.conf",
+        "proxy-kavita.conf",
+        "browser-config-cwa.json",
+        "browser-config-kavita.json",
+    ):
+        try:
+            (runtime_dir / stale).unlink()
+        except FileNotFoundError:
+            pass
+    for temporary in (
+        "client_temp",
+        "proxy_temp",
+        "fastcgi_temp",
+        "uwsgi_temp",
+        "scgi_temp",
+    ):
+        (runtime_dir / temporary).mkdir(mode=0o700, exist_ok=True)
+
+    for reader in config.readers:
+        _ensure_private_directory(data_root / reader.name, create=True)
+        render_outputs(
+            template_path,
+            runtime_dir / f"proxy-{reader.name}.conf",
+            runtime_dir / f"browser-config-{reader.name}.json",
+            reader.proxy_environment,
+        )
+        runner(
+            (
+                sys.executable,
+                "-c",
+                "from cache import init_db; init_db(); import server",
+            ),
+            env=reader.environment,
+            check=True,
+        )
+
+    nginx = process_specs(config)[-1]
+    runner(
+        (
+            "nginx",
+            "-t",
+            "-c",
+            "/app/proxy/nginx-main.conf",
+            "-e",
+            "/dev/stderr",
+        ),
+        env=nginx.environment,
+        check=True,
+    )
+
+
+def _stop_processes(processes: list[object]) -> None:
+    for process in processes:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    for process in processes:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.wait()
+
+
+def supervise(
+    config: HubConfig,
+    *,
+    popen_factory=subprocess.Popen,
+    sleep=time.sleep,
+    install_signal_handlers: bool = True,
+) -> int:
+    """Run every enabled reader and fail the whole container on one child exit."""
+    processes: list[object] = []
+    stopping = False
+    old_handlers: dict[signal.Signals, object] = {}
+
+    def request_stop(_signum, _frame) -> None:
+        nonlocal stopping
+        stopping = True
+
+    if install_signal_handlers:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            old_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_stop)
+    try:
+        for spec in process_specs(config):
+            print(f"[hub] event=child_start name={spec.name}", file=sys.stderr)
+            processes.append(popen_factory(spec.argv, env=spec.environment))
+        while not stopping:
+            for spec, process in zip(process_specs(config), processes):
+                returncode = process.poll()
+                if returncode is not None:
+                    print(
+                        f"[hub] event=child_exit name={spec.name} status={returncode}",
+                        file=sys.stderr,
+                    )
+                    _stop_processes(processes)
+                    return returncode or 1
+            sleep(1)
+        _stop_processes(processes)
+        return 0
+    finally:
+        if install_signal_handlers:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+
+
+def healthcheck(config: HubConfig | None = None) -> int:
+    selected = config or HubConfig.from_environment()
+    for reader in selected.readers:
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{reader.proxy_port}/bt-api/ping",
+                method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=4) as response:
+                if response.status != 200:
+                    return 1
+        except (OSError, urllib.error.URLError):
+            return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Validate, preflight, and run the universal one-container topology."""
+    arguments = argv if argv is not None else sys.argv[1:]
+    try:
+        config = HubConfig.from_environment()
+        if arguments == ["--healthcheck"]:
+            return healthcheck(config)
+        if arguments:
+            raise HubConfigError("unsupported hub runtime argument")
+        prepare_runtime(config)
+        for reader in config.readers:
+            print(
+                "[hub] event=reader_ready "
+                f"reader={reader.name} listener={reader.proxy_port} api={reader.api_port}",
+                file=sys.stderr,
+            )
+        return supervise(config)
+    except (HubConfigError, ProxyConfigError, OSError, subprocess.SubprocessError) as exc:
+        print(f"[hub] ERROR: {exc}", file=sys.stderr)
         return 78
-    print("[hub] ERROR: runtime supervisor is unavailable", file=os.sys.stderr)
-    return 70
 
 
 if __name__ == "__main__":
