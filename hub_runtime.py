@@ -265,7 +265,7 @@ class HubConfig:
                 raise HubConfigError("CWA reader version is unsupported")
             auth_profile = _required(values, prefix + "AUTH_PROFILE")
             supported_auth = (
-                {"cwa-session", "reader-session", "authentik-forwarded"}
+                {"cwa-session", "reader-session"}
                 if reader == "cwa"
                 else {"reader-session"}
             )
@@ -314,18 +314,7 @@ class HubConfig:
                     "BT_MAX_UPSTREAM_INFLIGHT": str(upstream_inflight[reader]),
                 }
             )
-            if auth_profile == "authentik-forwarded":
-                environment.update(
-                    {
-                        "BT_IDENTITY_TRUSTED_PROXIES": "127.0.0.1/32",
-                        "BT_FORWARDED_SUBJECT_HEADER": "X-authentik-uid",
-                        "BT_FORWARDED_ROLES_HEADER": "",
-                    }
-                )
-
-            browser_auth = (
-                "forwarded" if auth_profile == "authentik-forwarded" else "reader_session"
-            )
+            browser_auth = "reader_session"
             proxy_environment = {
                 "BT_PROXY_NAMESPACE": reader,
                 "BT_PROXY_PORT": str(proxy_port),

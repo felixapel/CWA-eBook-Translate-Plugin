@@ -1,0 +1,48 @@
+# Recommended universal topology: one hardened container, one listener per
+# enabled reader, and isolated API processes/state inside the container.
+#
+# Quick start:
+#   cp .env.hub.example .env.hub
+#   chmod 600 .env.hub
+#   docker compose --env-file .env.hub -f docker-compose.hub.yml up -d --build
+
+services:
+  book-translator-hub:
+    image: ${BT_IMAGE:-cwa-ebook-translate-plugin:local}
+    build: .
+    container_name: ${BT_INSTALL_NAME:-book-translator-hub}
+    env_file:
+      - ${BT_HUB_ENV_FILE:-.env.hub}
+    environment:
+      BT_ROLE: hub
+    ports:
+      - "${BT_CWA_PUBLISHED_PORT:-8385}:8080"
+      - "${BT_KAVITA_PUBLISHED_PORT:-8386}:8081"
+    volumes:
+      - type: bind
+        source: ${BT_DATA_DIR:?Set BT_DATA_DIR to a private persistent directory}
+        target: /app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=101,gid=102,mode=700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 384
+    mem_limit: 2g
+    cpus: 2.5
+    restart: unless-stopped
+    networks:
+      - cwa-reader
+      - kavita-reader
+
+networks:
+  cwa-reader:
+    name: ${BT_CWA_READER_NETWORK:?Set BT_CWA_READER_NETWORK}
+    external: true
+  kavita-reader:
+    name: ${BT_KAVITA_READER_NETWORK:?Set BT_KAVITA_READER_NETWORK}
+    external: true

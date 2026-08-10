@@ -182,6 +182,25 @@ class ContainerContractTests(unittest.TestCase):
         self.assertGreaterEqual(compose.count("- ALL"), 2)
         self.assertGreaterEqual(compose.count("/tmp:rw,noexec,nosuid"), 2)
 
+    def test_universal_compose_is_one_hardened_service_with_two_reader_edges(self):
+        compose = (ROOT / "docker-compose.hub.yml").read_text(encoding="utf-8")
+        example = (ROOT / ".env.hub.example").read_text(encoding="utf-8")
+
+        self.assertEqual(compose.count("    build: .\n"), 1)
+        self.assertRegex(compose, r"(?m)^  book-translator-hub:$")
+        self.assertNotRegex(compose, r"(?m)^  book-translator-(?:api|proxy):$")
+        self.assertIn("BT_ROLE: hub", compose)
+        self.assertIn('"${BT_CWA_PUBLISHED_PORT:-8385}:8080"', compose)
+        self.assertIn('"${BT_KAVITA_PUBLISHED_PORT:-8386}:8081"', compose)
+        self.assertIn("read_only: true", compose)
+        self.assertIn("no-new-privileges:true", compose)
+        self.assertIn("cap_drop:", compose)
+        self.assertIn("- ALL", compose)
+        self.assertIn("/tmp:rw,noexec,nosuid", compose)
+        self.assertIn("BT_ENABLE_CWA=true", example)
+        self.assertIn("BT_ENABLE_KAVITA=true", example)
+        self.assertNotRegex(example, r"(?m)^LLM_API_KEY=.+$")
+
     def test_ci_runs_both_roles_with_the_production_sandbox(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         smoke_path = ROOT / "scripts" / "container-smoke.sh"

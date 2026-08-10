@@ -113,6 +113,14 @@ class HubConfigTests(unittest.TestCase):
             config.readers[0].environment["BT_MAX_UPSTREAM_INFLIGHT"], "2"
         )
 
+    def test_hub_rejects_forwarded_auth_that_requires_a_separate_identity_edge(self):
+        env = dual_reader_environment()
+        env["BT_ENABLE_KAVITA"] = "false"
+        env["BT_CWA_AUTH_PROFILE"] = "authentik-forwarded"
+
+        with self.assertRaisesRegex(HubConfigError, "AUTH_PROFILE is unsupported"):
+            HubConfig.from_environment(env)
+
     def test_process_specs_bind_apis_to_loopback_and_start_one_nginx(self):
         specs = process_specs(HubConfig.from_environment(dual_reader_environment()))
 
