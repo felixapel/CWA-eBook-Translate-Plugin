@@ -20,6 +20,7 @@ role settings and redacts secrets from its output. Never commit the edited file.
 | `BT_READER_CONTAINER` | Exact running stock reader container name. |
 | `BT_READER_NETWORK` | One existing Docker network joined by the reader. |
 | `BT_READER_VERSION` | Exact reader version observed by the install. Kavita accepts only `0.9.0.2`. |
+| `BT_READER_IMAGE_ID` | Optional exact `sha256:<64 lowercase hex>` runtime image ID. Required when the reader container uses a mutable tag and has no exact application-version label. |
 | `BT_CWA_IDENTITY_HEADER` | Exact reverse-proxy identity header configured in CWA; the managed proxy strips client copies. |
 | `BT_STATE_DIR` | Private lifecycle state outside the checkout. |
 | `BT_DATA_DIR` | Private translation data outside the checkout. |

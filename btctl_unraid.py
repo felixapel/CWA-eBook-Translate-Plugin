@@ -262,7 +262,9 @@ class UnraidInstaller:
         reader = self.docker.inspect_container(config.reader_container)
         if reader is None or reader.get("State", {}).get("Status") != "running":
             raise InstallError("configured reader container is missing or stopped")
-        if not _has_exact_reader_version(reader, config.reader_version):
+        if not _has_exact_reader_version(
+            reader, config.reader_version, config.reader_image_id
+        ):
             raise InstallError("configured reader version lacks exact runtime evidence")
         if config.reader_network not in _container_networks(reader):
             raise InstallError("configured reader is not on BT_READER_NETWORK")
@@ -629,7 +631,9 @@ class UnraidAdopter:
         if (
             reader is None
             or reader.get("State", {}).get("Status") != "running"
-            or not _has_exact_reader_version(reader, config.reader_version)
+            or not _has_exact_reader_version(
+                reader, config.reader_version, config.reader_image_id
+            )
             or config.reader_network not in _container_networks(reader)
         ):
             raise InstallError("configured reader evidence does not match")

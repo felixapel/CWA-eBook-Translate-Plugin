@@ -339,6 +339,7 @@ class InstallConfigTests(unittest.TestCase):
 
         self.assertEqual(config.reader_type, "kavita")
         self.assertEqual(config.reader_version, "0.9.0.2")
+        self.assertEqual(config.reader_image_id, "")
         self.assertEqual(config.compatibility_tier, "certified")
         self.assertEqual(config.reader_contract_version, "kavita-0.9.0.2-epub-v1")
         self.assertEqual(
@@ -363,6 +364,23 @@ class InstallConfigTests(unittest.TestCase):
             ):
                 InstallConfig.from_mapping(
                     {**values, "BT_READER_VERSION": version}, self.identity
+                )
+
+        exact_image_id = "sha256:" + "1" * 64
+        pinned = InstallConfig.from_mapping(
+            {**values, "BT_READER_IMAGE_ID": exact_image_id}, self.identity
+        )
+        self.assertEqual(pinned.reader_image_id, exact_image_id)
+        self.assertEqual(
+            DeploymentPlan.from_config(pinned).resources["reader"]["image_id"],
+            exact_image_id,
+        )
+        for image_id in ("latest", "sha256:1234", "sha256:" + "A" * 64):
+            with self.subTest(image_id=image_id), self.assertRaisesRegex(
+                ConfigError, "BT_READER_IMAGE_ID"
+            ):
+                InstallConfig.from_mapping(
+                    {**values, "BT_READER_IMAGE_ID": image_id}, self.identity
                 )
 
     def test_kavita_forbids_cwa_only_inputs_and_non_reader_auth(self):

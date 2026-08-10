@@ -535,6 +535,7 @@ class InstallConfig:
     reader_container: str
     reader_network: str
     reader_version: str
+    reader_image_id: str
     reader_contract_version: str
     compatibility_tier: str
     cwa_identity_header: str
@@ -606,6 +607,17 @@ class InstallConfig:
         if not _NETWORK_RE.fullmatch(reader_network):
             raise ConfigError("BT_READER_NETWORK must be one exact Docker network name")
         reader_version = reader_value("BT_READER_VERSION", "BT_CWA_VERSION")
+        reader_image_id = _clean_value(
+            values.get("BT_READER_IMAGE_ID", ""),
+            "BT_READER_IMAGE_ID",
+            allow_empty=True,
+        )
+        if reader_image_id and not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", reader_image_id
+        ):
+            raise ConfigError(
+                "BT_READER_IMAGE_ID must be an exact lowercase sha256 image ID"
+            )
 
         parsed_reader_upstream = urlsplit(reader_upstream)
         expected_port = 8083 if reader_type == "cwa" else 5000
@@ -796,6 +808,7 @@ class InstallConfig:
             reader_container=reader_container,
             reader_network=reader_network,
             reader_version=reader_version,
+            reader_image_id=reader_image_id,
             reader_contract_version=reader_contract_version,
             compatibility_tier=compatibility,
             cwa_identity_header=cwa_identity_header,
@@ -928,6 +941,8 @@ class InstallConfig:
             "local_url": self.local_url,
             "has_api_key": bool(self.llm_api_key),
         }
+        if self.reader_image_id:
+            common["reader_image_id"] = self.reader_image_id
         if self.reader_type == "cwa":
             # This projection deliberately remains byte-for-byte compatible
             # with schema-1 CWA fingerprints.
@@ -1013,6 +1028,8 @@ class DeploymentPlan:
                 "published_ports": proxy_ports,
             },
         }
+        if config.reader_image_id:
+            resources["reader"]["image_id"] = config.reader_image_id
         if config.uses_reader_session:
             resources["session_key"] = {
                 "path": str(Path(config.data_dir) / "reader_session_key"),

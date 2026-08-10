@@ -622,7 +622,11 @@ def _verify_data_bind(container: dict, role: str, data_dir: str) -> None:
         raise InstallError("API container data bind does not match the plan")
 
 
-def _has_exact_reader_version(container: dict, version: str) -> bool:
+def _has_exact_reader_version(
+    container: dict, version: str, expected_image_id: str = ""
+) -> bool:
+    if expected_image_id:
+        return container.get("Image") == expected_image_id
     image = container.get("Config", {}).get("Image", "")
     without_digest = image.split("@", 1)[0] if isinstance(image, str) else ""
     last_component = without_digest.rsplit("/", 1)[-1]
@@ -670,7 +674,9 @@ class ComposeInstaller:
             raise InstallError("configured reader container does not exist")
         if reader.get("State", {}).get("Status") != "running":
             raise InstallError("configured reader container is not running")
-        if not _has_exact_reader_version(reader, config.reader_version):
+        if not _has_exact_reader_version(
+            reader, config.reader_version, config.reader_image_id
+        ):
             raise InstallError(
                 "configured reader version has no exact tag or image-label evidence"
             )
@@ -1055,7 +1061,9 @@ class ComposeAdopter:
         reader = self.docker.inspect_container(config.reader_container)
         if reader is None or reader.get("State", {}).get("Status") != "running":
             raise InstallError("configured reader container is missing or stopped")
-        if not _has_exact_reader_version(reader, config.reader_version):
+        if not _has_exact_reader_version(
+            reader, config.reader_version, config.reader_image_id
+        ):
             raise InstallError(
                 "configured reader version has no exact tag or image-label evidence"
             )

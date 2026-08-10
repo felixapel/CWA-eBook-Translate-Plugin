@@ -41,6 +41,7 @@ BT_READER_UPSTREAM=http://kavita:5000
 BT_READER_CONTAINER=kavita
 BT_READER_NETWORK=kavita_default
 BT_READER_VERSION=0.9.0.2
+BT_READER_IMAGE_ID=sha256:<64 lowercase hex from docker inspect>
 BT_CWA_IDENTITY_HEADER=
 
 BT_STATE_DIR=/mnt/user/appdata/kavita-translate/state
@@ -51,6 +52,11 @@ BT_BACKUP_DIR=/mnt/user/backups/kavita-translate
 Use the real container and network names. `BT_READER_UPSTREAM` must be exactly
 `http://<BT_READER_CONTAINER>:5000`. HTTPS is mandatory for a non-loopback
 `BT_PUBLIC_ORIGIN`; the session cookie uses the `__Host-` boundary.
+If the container image is tagged `latest`, first verify Kavita itself reports
+exactly `0.9.0.2`, then copy the immutable value from
+`docker inspect --format '{{.Image}}' <BT_READER_CONTAINER>` into
+`BT_READER_IMAGE_ID`. Installation fails if the running image changes. An exact
+application-version tag or label remains sufficient when no image ID is set.
 
 Then use the normal lifecycle:
 

@@ -599,6 +599,30 @@ class UnraidInstallTests(unittest.TestCase):
             self.assertTrue((root / "templates-user" / "my-cwa-translate-api.xml").is_file())
             self.assertTrue((root / "templates-user" / "my-cwa-translate-proxy.xml").is_file())
 
+    def test_latest_kavita_accepts_only_the_configured_runtime_image_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_image_id = "sha256:" + "1" * 64
+            config = InstallConfig.from_mapping(
+                {
+                    **values(root, reader="kavita"),
+                    "BT_READER_IMAGE_ID": runtime_image_id,
+                },
+                self.identity,
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker()
+            docker.containers["kavita"]["Config"]["Image"] = (
+                "jvmilazz0/kavita:latest"
+            )
+            docker.containers["kavita"]["Image"] = runtime_image_id
+
+            self.assertIsNone(UnraidInstaller(docker)._preflight(config, plan))
+
+            docker.containers["kavita"]["Image"] = "sha256:" + "2" * 64
+            with self.assertRaisesRegex(InstallError, "reader version"):
+                UnraidInstaller(docker)._preflight(config, plan)
+
     def test_failure_removes_only_created_roles_and_private_network(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Managed reader preflight can now bind a mutable container tag to an explicit
+  immutable Docker image ID; the install and doctor fail closed if that exact
+  runtime image changes.
 - Generalized schema-2 lifecycle state, generated resources and browser
   contracts from CWA-specific fields to explicit stock-reader connectors while
   retaining schema-1 CWA compatibility.

@@ -195,7 +195,9 @@ class DeploymentDoctor:
             if (
                 reader is None
                 or reader.get("State", {}).get("Status") != "running"
-                or not _has_exact_reader_version(reader, config.reader_version)
+                or not _has_exact_reader_version(
+                    reader, config.reader_version, config.reader_image_id
+                )
                 or config.reader_network not in _container_networks(reader)
             ):
                 raise InstallError("external reader runtime evidence does not match")
