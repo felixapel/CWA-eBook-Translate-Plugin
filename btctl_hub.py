@@ -1235,6 +1235,16 @@ class HubTopologyMigration:
                     except BaseException:
                         journal["hub_cleanup"] = "failed"
                         cleanup_failed = True
+                else:
+                    try:
+                        cleanup_failed = (
+                            self.docker.inspect_container(config.install_name)
+                            is not None
+                        )
+                    except BaseException:
+                        cleanup_failed = True
+                    if cleanup_failed:
+                        journal["hub_cleanup"] = "failed"
                 journal["status"] = "failed"
                 journal["error"] = exc.__class__.__name__
                 self._save_journal(config, journal)

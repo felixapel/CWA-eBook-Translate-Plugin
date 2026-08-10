@@ -401,6 +401,35 @@ class HubBtctlTests(unittest.TestCase):
             self.assertIn(("start", "cwa-translate-test-api"), docker.calls)
             self.assertNotIn(("start", "kavita-translate-test-api"), docker.calls)
 
+    def test_topology_migration_fails_closed_when_partial_hub_survives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root / "hub"), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = TopologyDocker()
+            cwa_state = split_source(root, "cwa", docker)
+            kavita_state = split_source(root, "kavita", docker)
+            migration = HubTopologyMigration(docker)
+
+            def leave_partial_hub(*_args, **_kwargs):
+                docker.containers[config.install_name] = {
+                    "Id": "partial-hub-id",
+                    "State": {"Status": "running"},
+                }
+                raise InstallError("synthetic partial hub failure")
+
+            with mock.patch(
+                "btctl_hub.HubInstaller.install", side_effect=leave_partial_hub
+            ), self.assertRaisesRegex(InstallError, "cleanup is incomplete"):
+                migration.migrate(
+                    config, plan, root, [cwa_state, kavita_state]
+                )
+
+            journal = migration._load_journal(config)
+            self.assertEqual(journal["status"], "failed")
+            self.assertEqual(journal["hub_cleanup"], "failed")
+            self.assertFalse([call for call in docker.calls if call[0] == "start"])
+
     def test_committed_topology_migration_copies_both_readers_and_rolls_back(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
