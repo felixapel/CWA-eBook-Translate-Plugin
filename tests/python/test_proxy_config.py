@@ -164,6 +164,23 @@ class ProxyConfigRendererTests(unittest.TestCase):
             },
         )
 
+    def test_reader_specific_session_cookie_is_rendered_without_cross_reader_alias(self):
+        result, output, _ = self.render({
+            "BT_READER_TYPE": "kavita",
+            "BT_READER_UPSTREAM": "http://kavita:5000",
+            "CWA_UPSTREAM": None,
+            "BT_READER_VERSION": "0.9.0.2",
+            "BT_READER_CONTRACT_VERSION": "kavita-0.9.0.2-epub-v1",
+            "BT_BROWSER_AUTH_MODE": "reader_session",
+            "BT_BROWSER_CREDENTIALS": "same-origin",
+            "BT_SESSION_COOKIE_NAME": "__Host-bt-kavita-session",
+        })
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = output.read_text(encoding="utf-8")
+        self.assertIn("__Host-bt-kavita-session=", rendered)
+        self.assertNotIn("__Host-bt-session=", rendered)
+
     def test_reader_session_requires_exact_reader_contract(self):
         base = {
             "BT_READER_TYPE": "kavita",

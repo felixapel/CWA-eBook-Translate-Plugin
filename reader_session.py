@@ -257,6 +257,7 @@ class ReaderSessionBroker:
         connector_id: str,
         public_origin: str,
         secret_key: bytes,
+        cookie_name: str | None = None,
         ttl_seconds: int = 300,
         max_entries: int = 10_000,
         timeout_seconds: float = 2.0,
@@ -283,7 +284,17 @@ class ReaderSessionBroker:
         self.auth_url = _validate_auth_url(reader_type, auth_url)
         self.connector_id = connector_id
         self.public_origin, self.secure_cookie = _clean_origin(public_origin)
-        self.cookie_name = "__Host-bt-session" if self.secure_cookie else "bt-session"
+        default_cookie_name = "__Host-bt-session" if self.secure_cookie else "bt-session"
+        selected_cookie_name = cookie_name or default_cookie_name
+        if not isinstance(selected_cookie_name, str) or not _COOKIE_NAME_RE.fullmatch(
+            selected_cookie_name
+        ):
+            raise BrokerConfigError("BT_SESSION_COOKIE_NAME is invalid")
+        if self.secure_cookie != selected_cookie_name.startswith("__Host-"):
+            raise BrokerConfigError(
+                "BT_SESSION_COOKIE_NAME must match the public origin security boundary"
+            )
+        self.cookie_name = selected_cookie_name
         self.ttl_seconds = ttl
         self.max_entries = _positive_int(max_entries, "BT_SESSION_MAX_ENTRIES")
         self.timeout_seconds = _positive_float(
@@ -641,6 +652,7 @@ def broker_from_environment(
         connector_id=source.get("BT_READER_CONNECTOR_ID", ""),
         public_origin=source.get("BT_PUBLIC_ORIGIN", ""),
         secret_key=load_or_create_session_key(key_path),
+        cookie_name=source.get("BT_SESSION_COOKIE_NAME") or None,
         ttl_seconds=source.get("BT_SESSION_TTL_SECONDS", "300"),
         max_entries=source.get("BT_SESSION_MAX_ENTRIES", "10000"),
         timeout_seconds=source.get("BT_READER_AUTH_TIMEOUT_SECONDS", "2"),

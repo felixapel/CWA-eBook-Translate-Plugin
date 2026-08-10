@@ -20,6 +20,7 @@ _HOSTNAME_RE = re.compile(
 _SIZE_RE = re.compile(r"^[1-9][0-9]{0,9}[kKmMgG]?$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+_COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$")
 _PLACEHOLDER_RE = re.compile(r"\$\{(?:BT_|CWA_)[A-Z0-9_]*\}")
 _READER_CONTRACTS = {
     "cwa": "cwa-epub-v1",
@@ -118,6 +119,24 @@ def _validated_header_name(env: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _validated_session_cookie_name(
+    env: Mapping[str, str], *, secure: bool
+) -> str:
+    default = "__Host-bt-session" if secure else "bt-session"
+    value = env.get("BT_SESSION_COOKIE_NAME", "") or default
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value.isascii()
+        or not _COOKIE_NAME_RE.fullmatch(value)
+        or secure != value.startswith("__Host-")
+    ):
+        raise ProxyConfigError(
+            "BT_SESSION_COOKIE_NAME must match the public origin security boundary"
+        )
+    return value
+
+
 def _validated_browser_config(env: Mapping[str, str]) -> dict[str, str]:
     auth_mode = _required(env, "BT_BROWSER_AUTH_MODE")
     credentials = _required(env, "BT_BROWSER_CREDENTIALS")
@@ -200,10 +219,8 @@ def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> No
     reader_upstream = _validated_reader_upstream(env)
     api_upstream, _, _ = _validated_base_url(env, "BT_API_UPSTREAM")
     _, public_scheme, public_host = _validated_base_url(env, "BT_PUBLIC_ORIGIN")
-    session_cookie_name = (
-        "__Host-bt-session"
-        if public_scheme == "https"
-        else "bt-session"
+    session_cookie_name = _validated_session_cookie_name(
+        env, secure=public_scheme == "https"
     )
     replacements = {
         "${BT_READER_UPSTREAM}": reader_upstream,

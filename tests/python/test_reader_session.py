@@ -62,7 +62,7 @@ class ReaderSessionBrokerTests(unittest.TestCase):
 
         return get
 
-    def broker(self, *, reader_type="kavita", transport=None):
+    def broker(self, *, reader_type="kavita", transport=None, cookie_name=None):
         return ReaderSessionBroker(
             reader_type=reader_type,
             auth_url=(
@@ -73,12 +73,41 @@ class ReaderSessionBrokerTests(unittest.TestCase):
             reader_version="0.9.0.2" if reader_type == "kavita" else "4.0.6",
             connector_id="01234567-89ab-4cde-8123-0123456789ab",
             public_origin="https://books.example.test",
+            cookie_name=cookie_name,
             secret_key=b"s" * 32,
             http_get=transport
             or self.transport(json.dumps({"id": 7, "kavitaVersion": "0.9.0.2"}).encode()),
             clock=self.clock,
             token_factory=lambda: next(self.tokens),
         )
+
+    def test_reader_specific_cookie_name_is_used_for_issue_and_authentication(self):
+        broker = self.broker(cookie_name="__Host-bt-kavita-session")
+
+        issue = broker.exchange(
+            {
+                "Origin": "https://books.example.test",
+                "Authorization": "Bearer access-token",
+            },
+            self.binding(),
+        )
+
+        self.assertIn("__Host-bt-kavita-session=", issue.set_cookie)
+        self.assertEqual(
+            broker.authenticate(
+                {"Cookie": f"__Host-bt-kavita-session={issue.token}"},
+                self.binding(),
+            ),
+            issue.subject,
+        )
+        with self.assertRaises(BrokerRejected):
+            broker.authenticate(
+                {"Cookie": f"__Host-bt-session={issue.token}"}, self.binding()
+            )
+
+    def test_secure_reader_cookie_name_must_keep_host_prefix(self):
+        with self.assertRaisesRegex(BrokerConfigError, "BT_SESSION_COOKIE_NAME"):
+            self.broker(cookie_name="bt-kavita-session")
 
     @staticmethod
     def binding():
