@@ -359,13 +359,13 @@ class ReaderSessionBroker:
         oidc_names = {
             name for name in cookies if name == _KAVITA_COOKIE or name.startswith(_KAVITA_COOKIE + "C")
         }
-        if set(cookies) != oidc_names:
-            raise BrokerRejected("authentication rejected")
         has_oidc = _KAVITA_COOKIE in cookies
-        if bool(bearer) == has_oidc:
+        if bearer and oidc_names:
             raise BrokerRejected("authentication rejected")
         if bearer:
             return {"Authorization": f"Bearer {bearer}"}, prior
+        if not has_oidc:
+            raise BrokerRejected("authentication rejected")
 
         base = cookies[_KAVITA_COOKIE]
         match = _CHUNKED_RE.fullmatch(base)
@@ -377,13 +377,13 @@ class ReaderSessionBroker:
                 _KAVITA_COOKIE,
                 *(_KAVITA_COOKIE + f"C{index}" for index in range(1, count + 1)),
             }
-            if set(cookies) != expected:
+            if oidc_names != expected:
                 raise BrokerRejected("authentication rejected")
             ordered_names = [_KAVITA_COOKIE] + [
                 _KAVITA_COOKIE + f"C{index}" for index in range(1, count + 1)
             ]
         else:
-            if set(cookies) != {_KAVITA_COOKIE}:
+            if oidc_names != {_KAVITA_COOKIE}:
                 raise BrokerRejected("authentication rejected")
             ordered_names = [_KAVITA_COOKIE]
         return {

@@ -123,7 +123,6 @@ class ReaderSessionBrokerTests(unittest.TestCase):
         for invalid in (
             cookie + "; .AspNetCore.CookiesC3=extra",
             ".AspNetCore.Cookies=chunks-2; .AspNetCore.CookiesC1=missing-two",
-            ".AspNetCore.Cookies=value; unrelated=secret",
         ):
             with self.subTest(invalid=invalid), self.assertRaises(BrokerRejected):
                 self.broker().exchange(
@@ -139,6 +138,75 @@ class ReaderSessionBrokerTests(unittest.TestCase):
                 },
                 self.binding(),
             )
+
+    def test_kavita_exchange_discards_unrelated_ambient_cookies(self):
+        single_oidc_broker = self.broker()
+        single_oidc_broker.exchange(
+            {
+                "Origin": "https://books.example.test",
+                "Cookie": "theme=dark; .AspNetCore.Cookies=single; stale-plugin=value",
+            },
+            self.binding(),
+        )
+        self.assertEqual(
+            self.calls[0][1]["headers"]["Cookie"],
+            ".AspNetCore.Cookies=single",
+        )
+
+        chunked_oidc_broker = self.broker()
+        chunked_oidc_broker.exchange(
+            {
+                "Origin": "https://books.example.test",
+                "Cookie": (
+                    "theme=dark; .AspNetCore.Cookies=chunks-2; "
+                    ".AspNetCore.CookiesC1=first; "
+                    ".AspNetCore.CookiesC2=second; stale-plugin=value"
+                ),
+            },
+            self.binding(),
+        )
+
+        self.assertEqual(
+            self.calls[1][1]["headers"]["Cookie"],
+            ".AspNetCore.Cookies=chunks-2; "
+            ".AspNetCore.CookiesC1=first; .AspNetCore.CookiesC2=second",
+        )
+
+        native_broker = self.broker()
+        native_broker.exchange(
+            {
+                "Origin": "https://books.example.test",
+                "Authorization": "Bearer access-token",
+                "Cookie": "theme=dark; stale-plugin=value",
+            },
+            self.binding(),
+        )
+
+        self.assertEqual(
+            self.calls[2][1]["headers"],
+            {
+                "Accept": "application/json",
+                "Authorization": "Bearer access-token",
+                "X-Forwarded-For": "203.0.113.9",
+                "User-Agent": "Reader/1.0",
+            },
+        )
+
+        calls_before_rejections = len(self.calls)
+        for headers in (
+            {
+                "Origin": "https://books.example.test",
+                "Cookie": "theme=dark; stale-plugin=value",
+            },
+            {
+                "Origin": "https://books.example.test",
+                "Authorization": "Bearer access-token",
+                "Cookie": ".AspNetCore.CookiesC1=orphan; theme=dark",
+            },
+        ):
+            with self.subTest(headers=headers), self.assertRaises(BrokerRejected):
+                self.broker().exchange(headers, self.binding())
+        self.assertEqual(len(self.calls), calls_before_rejections)
 
     def test_normal_requests_accept_only_bound_short_lived_plugin_cookie(self):
         broker = self.broker()
