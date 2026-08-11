@@ -41,7 +41,7 @@ Select a provider with a normal server-side API contract. A Gemini example is:
 
 ```dotenv
 LLM_PROVIDER=gemini
-LLM_MODEL=gemini-2.5-flash
+LLM_MODEL=gemini-3.5-flash-lite
 LLM_API_KEY=<Google AI Studio or project API key>
 ```
 
