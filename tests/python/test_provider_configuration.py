@@ -20,6 +20,26 @@ def _budget() -> WorkBudget:
 
 
 class ProviderConfigurationTests(unittest.TestCase):
+    def test_expired_budget_never_consumes_dns_thread_capacity(self):
+        original_slots = translator._DNS_RESOLVER_SLOTS
+        slots = threading.BoundedSemaphore(1)
+        translator._DNS_RESOLVER_SLOTS = slots
+        expired_budget = mock.Mock()
+        expired_budget.ensure_active.side_effect = WorkBudgetExceeded("deadline")
+        try:
+            with (
+                mock.patch.object(translator._socket, "getaddrinfo") as resolve,
+                self.assertRaises(WorkBudgetExceeded),
+            ):
+                translator._bounded_getaddrinfo(
+                    "expired.example.test", 443, budget=expired_budget
+                )
+            resolve.assert_not_called()
+            self.assertTrue(slots.acquire(blocking=False))
+            slots.release()
+        finally:
+            translator._DNS_RESOLVER_SLOTS = original_slots
+
     def test_hung_custom_dns_resolution_has_bounded_thread_capacity(self):
         release = threading.Event()
         started = threading.Event()

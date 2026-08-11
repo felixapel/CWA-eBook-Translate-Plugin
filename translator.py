@@ -167,6 +167,10 @@ def _bounded_getaddrinfo(
     budget: Optional[WorkBudget] = None,
 ) -> list[tuple]:
     """Resolve without allowing libc DNS latency to escape the request clock."""
+    timeout = 5.0
+    if budget is not None:
+        budget.ensure_active()
+        timeout = min(timeout, budget.remaining_seconds())
     resolver_slots = _DNS_RESOLVER_SLOTS
     if not resolver_slots.acquire(blocking=False):
         raise _CustomEndpointDNSFailure("custom endpoint DNS capacity exhausted")
@@ -184,12 +188,8 @@ def _bounded_getaddrinfo(
             completed.set()
             resolver_slots.release()
 
-    timeout = 5.0
-    if budget is not None:
-        budget.ensure_active()
-        timeout = min(timeout, budget.remaining_seconds())
-    worker = _threading.Thread(target=resolve, daemon=True)
     try:
+        worker = _threading.Thread(target=resolve, daemon=True)
         worker.start()
     except BaseException:
         resolver_slots.release()
