@@ -604,6 +604,7 @@ class ProviderBudgetTests(unittest.TestCase):
             ("BT_UPSTREAM_QUEUE_TIMEOUT", "inf"),
             ("BT_UPSTREAM_QUEUE_TIMEOUT", "nan"),
             ("BT_MAX_UPSTREAM_RESPONSE_BYTES", "0"),
+            ("BT_BATCH_SOURCE_TOKEN_BUDGET", "-1"),
         ):
             with self.subTest(name=name, value=value):
                 env = os.environ.copy()

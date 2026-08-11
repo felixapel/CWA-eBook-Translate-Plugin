@@ -68,6 +68,15 @@ LLM_FALLBACK_CUSTOM_API_KEY = os.environ.get(
 BT_TIMEOUT = int(os.environ.get("BT_TIMEOUT", "60"))
 BT_MAX_CONCURRENT = int(os.environ.get("BT_MAX_CONCURRENT", "2"))
 BT_BATCH_SIZE = int(os.environ.get("BT_BATCH_SIZE", "5"))
+# Optional source-side budget for adaptive batching. Zero preserves the
+# historical count-only contract; a positive value adds a deterministic token
+# ceiling while still allowing one oversized paragraph as a singleton.
+BT_BATCH_SOURCE_TOKEN_BUDGET = int(os.environ.get(
+    "BT_BATCH_SOURCE_TOKEN_BUDGET", "0"))
+if BT_BATCH_SOURCE_TOKEN_BUDGET < 0:
+    raise ValueError(
+        "BT_BATCH_SOURCE_TOKEN_BUDGET must be zero or greater"
+    )
 # Token ceilings (hard upper bounds). The ACTUAL max_tokens sent per request is
 # scaled to the input size (see _output_cap) so a rambling/stuck model can't burn
 # thousands of tokens translating a short paragraph — the main cause of 8-20s and
@@ -1614,14 +1623,46 @@ def _build_context_block(all_texts: list[str], idxs: list[int]) -> Optional[str]
 
 
 def translation_groups(
-    texts: list[str], batch_size: int | None = None
+    texts: list[str],
+    batch_size: int | None = None,
+    source_token_budget: int | None = None,
 ) -> list[list[int]]:
-    """Return stable non-empty paragraph groups using original indices."""
+    """Return stable non-empty groups bounded by count and source tokens."""
     size = BT_BATCH_SIZE if batch_size is None else batch_size
     if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
         raise ValueError("batch_size must be a positive integer")
+    token_budget = (
+        BT_BATCH_SOURCE_TOKEN_BUDGET
+        if source_token_budget is None
+        else source_token_budget
+    )
+    if (
+        isinstance(token_budget, bool)
+        or not isinstance(token_budget, int)
+        or token_budget < 0
+    ):
+        raise ValueError("source_token_budget must be a non-negative integer")
     work = [index for index, text in enumerate(texts) if text.strip()]
-    return [work[offset:offset + size] for offset in range(0, len(work), size)]
+    if token_budget == 0:
+        return [work[offset:offset + size] for offset in range(0, len(work), size)]
+
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_tokens = 0
+    for index in work:
+        paragraph_tokens = _estimate_tokens(texts[index].strip())
+        if current and (
+            len(current) >= size
+            or current_tokens + paragraph_tokens > token_budget
+        ):
+            groups.append(current)
+            current = []
+            current_tokens = 0
+        current.append(index)
+        current_tokens += paragraph_tokens
+    if current:
+        groups.append(current)
+    return groups
 
 
 def batch_cache_contract(
@@ -1879,6 +1920,14 @@ def translate_batch_detailed(
             )
             and all(group == sorted(group) for group in groups)
             and all(len(group) <= max(1, BT_BATCH_SIZE) for group in groups)
+            and all(
+                BT_BATCH_SOURCE_TOKEN_BUDGET == 0
+                or len(group) == 1
+                or sum(
+                    _estimate_tokens(texts[index].strip()) for index in group
+                ) <= BT_BATCH_SOURCE_TOKEN_BUDGET
+                for group in groups
+            )
             and flattened == sorted(flattened)
         )
         if groups and not valid:

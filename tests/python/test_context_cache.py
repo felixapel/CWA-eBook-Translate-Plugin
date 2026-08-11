@@ -32,6 +32,59 @@ class TranslationContractTests(unittest.TestCase):
             [[0, 2], [3, 5]],
         )
 
+    def test_adaptive_groups_respect_count_and_source_token_limits(self) -> None:
+        self.assertEqual(
+            translator.translation_groups(
+                ["abcdefg", "日本語", "abcdefg", "", "日本語"],
+                batch_size=3,
+                source_token_budget=4,
+            ),
+            [[0, 1], [2, 4]],
+        )
+
+    def test_adaptive_groups_keep_an_oversized_paragraph_as_a_singleton(self) -> None:
+        self.assertEqual(
+            translator.translation_groups(
+                ["日本語日本語日本語", "short"],
+                batch_size=10,
+                source_token_budget=4,
+            ),
+            [[0], [1]],
+        )
+
+    def test_zero_source_token_budget_preserves_count_only_grouping(self) -> None:
+        paragraphs = ["a", "b", "c", "d"]
+        self.assertEqual(
+            translator.translation_groups(
+                paragraphs, batch_size=3, source_token_budget=0
+            ),
+            translator.translation_groups(paragraphs, batch_size=3),
+        )
+
+    def test_source_token_budget_rejects_invalid_values(self) -> None:
+        for invalid in (-1, True, 1.5):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    translator.translation_groups(
+                        ["paragraph"],
+                        batch_size=5,
+                        source_token_budget=invalid,
+                    )
+
+    def test_selected_groups_cannot_bypass_the_source_token_budget(self) -> None:
+        with (
+            mock.patch.object(translator, "BT_BATCH_SIZE", 10),
+            mock.patch.object(translator, "BT_BATCH_SOURCE_TOKEN_BUDGET", 4),
+            mock.patch.object(translator, "_translate_group") as translate_group,
+        ):
+            with self.assertRaisesRegex(ValueError, "selected_groups"):
+                translator.translate_batch_detailed(
+                    ["日本語日本語", "abcdefg"],
+                    selected_groups=[[0, 1]],
+                    budget=budget(),
+                )
+        translate_group.assert_not_called()
+
     def test_single_item_batch_without_context_uses_single_contract(self) -> None:
         with mock.patch.object(translator, "BT_CONTEXT_WINDOW", 0):
             single = translator.single_cache_contract("English", "Spanish")
