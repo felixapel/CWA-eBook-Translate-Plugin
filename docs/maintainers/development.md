@@ -17,6 +17,8 @@ The backend is a Flask application running in python.
    ```bash
    python -m pip install --require-hashes --only-binary=:all: \
      -r requirements/requirements.txt
+   python -m pip install --require-hashes --only-binary=:all: \
+     -r requirements/requirements-audit.txt
    ```
 3. Run the development server:
    ```bash
@@ -30,29 +32,16 @@ file, so it needs no running server, no API key, and no network access:
 ```bash
 .venv/bin/python3 -m tests.python.test_translation
 .venv/bin/python3 -m tests.python.test_hardening
-.venv/bin/python3 -m unittest -v \
-  tests.python.test_btctl tests.python.test_btctl_container \
-  tests.python.test_btctl_compose tests.python.test_btctl_unraid \
-  tests.python.test_btctl_auth tests.python.test_btctl_lifecycle \
-  tests.python.test_work_budget tests.python.test_provider_budget \
-  tests.python.test_cache_v2 tests.python.test_context_cache \
-  tests.python.test_singleflight tests.python.test_auth \
-  tests.python.test_reader_session \
-  tests.python.test_ci_contract tests.python.test_docs_contract \
-  tests.python.test_release_contract tests.python.test_supply_chain_contract \
-  tests.python.test_shell_contract tests.python.test_container_contract \
-  tests.python.test_cleanup_token tests.python.test_api_schema \
-  tests.python.test_error_privacy tests.python.test_observability \
-  tests.python.test_proxy_config tests.python.test_live_scripts
+.venv/bin/python3 -m coverage erase
+.venv/bin/python3 -m coverage run --branch --source=. \
+  --omit='.venv/*,tests/*,tools/*' -m unittest discover -v tests/python
+.venv/bin/python3 -m coverage report --precision=1 --show-missing --fail-under=60
 ```
 
 Always also check syntax/compile before committing:
 ```bash
-python3 -m py_compile btctl.py btctl_container.py btctl_core.py \
-  btctl_compose.py btctl_docker.py btctl_paths.py btctl_reconfigure.py btctl_unraid.py btctl_auth.py \
-  btctl_lifecycle.py auth.py reader_session.py server.py \
-  translator.py cache.py singleflight.py work_budget.py proxy/render_config.py
-bash -n btctl scripts/*.sh
+git ls-files -z -- '*.py' | xargs -0 -r python3 -m py_compile
+bash -n btctl install_unraid.sh scripts/*.sh
 ```
 
 The installer contract is self-contained and uses disposable Git repositories;

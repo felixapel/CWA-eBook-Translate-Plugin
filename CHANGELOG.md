@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded lifecycle, troubleshooting, compatibility and security guidance for
   hub operation, Gemini API errors, private key handling, regenerated browser
   sessions and per-reader isolation.
+- Moved generated Compose credentials into mode-`0600` raw environment files,
+  introduced split state schema 3, retained read-only doctor/uninstall support
+  for former inline-environment schema 2, and required Docker Compose 2.30 or
+  newer for new Compose installations.
+- Reduced reader latency with a one-paragraph first visible request followed by
+  bounded five-paragraph batches, removed the unconditional client delay,
+  reused fixed-provider HTTP connections per worker, and committed each cache
+  batch in one SQLite transaction.
+- Added keyboard retry and settings-dialog focus management, bounded custom DNS
+  resolver capacity, full discovered backend coverage, universal hub smoke and
+  opt-in deep provider diagnosis.
 
 ### Fixed
 
@@ -25,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including omission of deprecated sampling fields and invalid prefilled model
   turns.
 
-## [2.3.0-rc.1] - 2026-08-10
+## [2.3.0-rc.1] - Unreleased candidate
 
 ### Security
 

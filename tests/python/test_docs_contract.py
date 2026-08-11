@@ -55,7 +55,13 @@ class DocumentationContractTests(unittest.TestCase):
     def test_checker_uses_repository_version_as_release_truth(self):
         version = (Path(REPOSITORY) / "VERSION").read_text(encoding="utf-8").strip()
         readme = (Path(REPOSITORY) / "README.md").read_text(encoding="utf-8")
-        self.assertIn(f"git switch --detach v{version}", readme)
+        if "-" in version:
+            self.assertIn(
+                f"Version `{version}` is still an unreleased candidate", readme
+            )
+            self.assertNotIn(f"git switch --detach v{version}", readme)
+        else:
+            self.assertIn(f"git switch --detach v{version}", readme)
 
     def test_checker_derives_current_series_and_checks_agent_guidance(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -66,10 +72,8 @@ class DocumentationContractTests(unittest.TestCase):
             (fixture / "VERSION").write_text("9.8.7\n", encoding="utf-8")
             readme_path = fixture / "README.md"
             readme_path.write_text(
-                readme_path.read_text(encoding="utf-8").replace(
-                    f"git switch --detach v{original_version}",
-                    "git switch --detach v9.8.7",
-                ),
+                readme_path.read_text(encoding="utf-8")
+                + "\ngit switch --detach v9.8.7\n",
                 encoding="utf-8",
             )
             claude_path = fixture / "CLAUDE.md"
@@ -98,8 +102,8 @@ class DocumentationContractTests(unittest.TestCase):
             readme_path = fixture / "README.md"
             readme_path.write_text(
                 readme_path.read_text(encoding="utf-8").replace(
-                    f"git switch --detach v{original_version}",
-                    f"git switch --detach v{candidate}",
+                    f"Version `{original_version}` is still an unreleased candidate",
+                    f"Version `{candidate}` is still an unreleased candidate",
                 ),
                 encoding="utf-8",
             )
