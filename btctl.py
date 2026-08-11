@@ -86,6 +86,11 @@ def _parser() -> argparse.ArgumentParser:
         "doctor", help="read-only verification of state, ownership, auth, and runtime"
     )
     doctor.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    doctor.add_argument(
+        "--deep",
+        action="store_true",
+        help="after structural checks, make one bounded probe of each provider",
+    )
     doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     uninstall = commands.add_parser(
         "uninstall", help="remove only owned runtime while preserving data and backups"
@@ -372,9 +377,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.repository, args.env, allow_legacy_cwa=True
             )
             if isinstance(config, HubInstallConfig):
-                report = HubDoctor(_docker_for(config)).run(config, plan)
+                report = HubDoctor(_docker_for(config)).run(
+                    config, plan, deep=args.deep
+                )
             else:
-                report = DeploymentDoctor(_docker_for(config)).run(config, plan)
+                report = DeploymentDoctor(_docker_for(config)).run(
+                    config, plan, deep=args.deep
+                )
             _print_payload(report.to_dict(), compact=args.json)
             return 0 if report.ok else 1
         if args.command == "uninstall":

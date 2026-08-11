@@ -68,6 +68,7 @@ class LifecycleDocker(Protocol):
     def probe_http(self, container: str, url: str) -> None: ...
     def probe_auth(self, container: str, url: str) -> None: ...
     def probe_sqlite(self, container: str, database_path: str) -> None: ...
+    def probe_providers(self, container: str) -> None: ...
     def probe_image_version(self, image_id: str, expected_version: str) -> None: ...
     def prepare_migration_source(self, image_id: str, path: Path) -> None: ...
     def remove_data_credential(self, image: str, path: Path, filename: str) -> None: ...
@@ -158,11 +159,17 @@ class DeploymentDoctor:
         config: InstallConfig,
         plan: DeploymentPlan,
         *,
+        deep: bool = False,
         _operation_locked: bool = False,
     ) -> DoctorReport:
         if not _operation_locked:
             with OperationLock(Path(config.state_dir), create=False):
-                return self.run(config, plan, _operation_locked=True)
+                return self.run(
+                    config,
+                    plan,
+                    deep=deep,
+                    _operation_locked=True,
+                )
         checks: list[dict[str, str]] = []
 
         def check(name: str, operation) -> bool:
@@ -373,6 +380,16 @@ class DeploymentDoctor:
                 raise InstallError("identity-edge artifact digest does not match state")
 
         check("artifacts", verify_artifacts)
+        if deep and all(item["status"] == "ok" for item in checks):
+            def verify_providers() -> None:
+                try:
+                    self.docker.probe_providers(
+                        str(plan.resources["api"]["name"])
+                    )
+                except Exception as exc:
+                    raise InstallError("provider deep probe failed") from exc
+
+            check("providers", verify_providers)
         return DoctorReport(
             all(item["status"] == "ok" for item in checks), checks
         )

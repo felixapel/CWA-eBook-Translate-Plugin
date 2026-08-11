@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-from hub_runtime import HubConfig, HubConfigError, prepare_runtime, process_specs, supervise
+from hub_runtime import (
+    HubConfig,
+    HubConfigError,
+    healthcheck_providers,
+    prepare_runtime,
+    process_specs,
+    supervise,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -160,6 +168,26 @@ class HubConfigTests(unittest.TestCase):
         self.assertEqual(specs[0].environment["BT_READER_TYPE"], "cwa")
         self.assertEqual(specs[1].environment["BT_READER_TYPE"], "kavita")
         self.assertNotIn("BT_KAVITA_LLM_API_KEY", specs[0].environment)
+
+    def test_provider_healthcheck_uses_isolated_reader_env_and_fixed_argv(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((tuple(argv), kwargs))
+            return subprocess.CompletedProcess(argv, 0)
+
+        result = healthcheck_providers(
+            HubConfig.from_environment(dual_reader_environment()),
+            runner=runner,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], calls[1][0])
+        self.assertNotIn("shared-secret", " ".join(calls[0][0]))
+        self.assertEqual(calls[0][1]["env"]["LLM_PROVIDER"], "gemini")
+        self.assertEqual(calls[1][1]["env"]["LLM_PROVIDER"], "local")
+        self.assertLessEqual(calls[0][1]["timeout"], 120)
 
     def test_prepare_runtime_renders_both_readers_and_preflights_before_start(self):
         calls = []

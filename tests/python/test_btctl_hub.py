@@ -24,6 +24,7 @@ from btctl_core import (
 )
 from btctl_hub import (
     HUB_STATE_SCHEMA_VERSION,
+    HubDoctor,
     HubInstallConfig,
     HubInstaller,
     HubPlan,
@@ -378,6 +379,64 @@ class HubBtctlTests(unittest.TestCase):
             self.assertIn(
                 ("auth", "kavita", "http://kavita:5000/api/Account"),
                 docker.calls,
+            )
+
+    def test_hub_doctor_deep_probes_only_after_structural_success(self):
+        class Docker:
+            def __init__(self):
+                self.calls = []
+
+            def require_available(self):
+                self.calls.append(("available",))
+
+            def probe_hub_providers(self, container):
+                self.calls.append(("probe_hub_providers", container))
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = HubInstallConfig.from_mapping(
+                hub_values(Path(directory)), IDENTITY
+            )
+            plan = HubPlan.from_config(config)
+            state = HubState.new(
+                install_id="21234567-89ab-4cde-8123-0123456789ab",
+                plan=plan,
+            )
+            docker = Docker()
+            doctor = HubDoctor(docker)
+            with (
+                mock.patch.object(HubStateStore, "load", return_value=state),
+                mock.patch.object(HubInstaller, "_verify_readers"),
+                mock.patch.object(HubInstaller, "_verify_hub"),
+                mock.patch.object(HubInstaller, "_probe"),
+                mock.patch.object(HubDoctor, "_verify_data"),
+            ):
+                ordinary = doctor.run(config, plan)
+                deep = doctor.run(config, plan, deep=True)
+
+            self.assertTrue(ordinary.ok, ordinary.to_dict())
+            self.assertTrue(deep.ok, deep.to_dict())
+            self.assertEqual(
+                [call for call in docker.calls if call[0] == "probe_hub_providers"],
+                [("probe_hub_providers", config.install_name)],
+            )
+
+            with (
+                mock.patch.object(HubStateStore, "load", return_value=state),
+                mock.patch.object(HubInstaller, "_verify_readers"),
+                mock.patch.object(HubInstaller, "_verify_hub"),
+                mock.patch.object(HubInstaller, "_probe"),
+                mock.patch.object(
+                    HubDoctor,
+                    "_verify_data",
+                    side_effect=InstallError("structural drift"),
+                ),
+            ):
+                failed = doctor.run(config, plan, deep=True)
+
+            self.assertFalse(failed.ok)
+            self.assertEqual(
+                [call for call in docker.calls if call[0] == "probe_hub_providers"],
+                [("probe_hub_providers", config.install_name)],
             )
 
     def test_topology_migration_rejects_overlapping_source_before_stopping(self):

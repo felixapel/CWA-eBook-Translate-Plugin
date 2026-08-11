@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from btctl import _docker_for, _load_values
+from btctl import _docker_for, _load_values, _parser
 
 from btctl_core import (
     ConfigError,
@@ -30,6 +30,18 @@ from btctl_core import (
 
 ROOT = Path(__file__).resolve().parents[2]
 BTCTL = ROOT / "btctl.py"
+
+
+class ParserTests(unittest.TestCase):
+    def test_doctor_deep_is_explicit_and_defaults_off(self):
+        parser = _parser()
+        ordinary = parser.parse_args(["doctor", "--env", "install.env"])
+        deep = parser.parse_args(
+            ["doctor", "--env", "install.env", "--deep"]
+        )
+
+        self.assertFalse(ordinary.deep)
+        self.assertTrue(deep.deep)
 
 
 class ReleaseIdentityTests(unittest.TestCase):

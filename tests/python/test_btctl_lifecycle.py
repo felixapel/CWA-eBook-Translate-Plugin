@@ -29,6 +29,9 @@ from tests.python.test_btctl_compose import FakeDocker, values
 
 
 class LifecycleDocker(FakeDocker):
+    def probe_providers(self, container):
+        self.calls.append(("probe_providers", container))
+
     def probe_image_version(self, image_id, expected_version):
         self.calls.append(("probe_image_version", image_id, expected_version))
 
@@ -532,6 +535,46 @@ class LifecycleTests(unittest.TestCase):
             drift = DeploymentDoctor(docker).run(config, plan)
             self.assertFalse(drift.ok)
             self.assertIn("runtime", " ".join(str(check) for check in drift.checks))
+
+    def test_doctor_deep_probes_only_after_structural_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, plan, docker, _ = self.installed(Path(directory))
+
+            ordinary = DeploymentDoctor(docker).run(config, plan)
+            self.assertTrue(ordinary.ok, ordinary.to_dict())
+            self.assertFalse(
+                [call for call in docker.calls if call[0] == "probe_providers"]
+            )
+
+            deep = DeploymentDoctor(docker).run(config, plan, deep=True)
+            self.assertTrue(deep.ok, deep.to_dict())
+            self.assertEqual(
+                [call for call in docker.calls if call[0] == "probe_providers"],
+                [("probe_providers", plan.resources["api"]["name"])],
+            )
+
+            docker.containers[config.reader_container]["State"]["Status"] = "exited"
+            failed = DeploymentDoctor(docker).run(config, plan, deep=True)
+            self.assertFalse(failed.ok)
+            self.assertEqual(
+                [call for call in docker.calls if call[0] == "probe_providers"],
+                [("probe_providers", plan.resources["api"]["name"])],
+            )
+
+    def test_doctor_deep_sanitizes_provider_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, plan, docker, _ = self.installed(Path(directory))
+
+            def fail(_container):
+                raise RuntimeError("private-key-value model-name endpoint")
+
+            docker.probe_providers = fail
+            report = DeploymentDoctor(docker).run(config, plan, deep=True)
+
+            self.assertFalse(report.ok)
+            provider = report.checks[-1]
+            self.assertEqual(provider["name"], "providers")
+            self.assertEqual(provider["detail"], "provider deep probe failed")
 
     def test_doctor_accepts_exact_compose_operator_group_mode(self):
         with tempfile.TemporaryDirectory() as directory:

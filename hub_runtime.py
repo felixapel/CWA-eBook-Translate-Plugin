@@ -624,6 +624,37 @@ def healthcheck(config: HubConfig | None = None) -> int:
     return 0
 
 
+def healthcheck_providers(
+    config: HubConfig | None = None,
+    *,
+    runner=subprocess.run,
+) -> int:
+    """Probe every reader provider in an isolated, bounded child process."""
+    selected = config or HubConfig.from_environment()
+    script = (
+        "from translator import check_backend_health,create_work_budget;"
+        "h=check_backend_health(create_work_budget());"
+        "raise SystemExit(0 if h and all("
+        "v.get('status')=='ok' for v in h.values()) else 3)"
+    )
+    for reader in selected.readers:
+        try:
+            result = runner(
+                [sys.executable, "-c", script],
+                env=reader.environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return 1
+        if result.returncode != 0:
+            return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Validate, preflight, and run the universal one-container topology."""
     arguments = argv if argv is not None else sys.argv[1:]
@@ -631,6 +662,8 @@ def main(argv: list[str] | None = None) -> int:
         config = HubConfig.from_environment()
         if arguments == ["--healthcheck"]:
             return healthcheck(config)
+        if arguments == ["--healthcheck-providers"]:
+            return healthcheck_providers(config)
         if arguments:
             raise HubConfigError("unsupported hub runtime argument")
         prepare_runtime(config)

@@ -821,7 +821,41 @@ class HubDoctor:
     def __init__(self, docker):
         self.docker = docker
 
-    def run(self, config: HubInstallConfig, plan: HubPlan) -> HubDoctorReport:
+    @staticmethod
+    def _verify_data(config: HubInstallConfig) -> None:
+        root = Path(config.data_dir)
+        metadata = root.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 101
+            or stat.S_IMODE(metadata.st_mode) != 0o2750
+        ):
+            raise InstallError("hub data root ownership or mode does not match")
+        for reader in config.runtime.readers:
+            directory = root / reader.name
+            key = directory / "reader_session_key"
+            directory_metadata = directory.lstat()
+            key_metadata = key.lstat()
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or directory_metadata.st_uid != 101
+                or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+                or not stat.S_ISREG(key_metadata.st_mode)
+                or key_metadata.st_uid != 101
+                or stat.S_IMODE(key_metadata.st_mode) != 0o600
+                or key_metadata.st_size != 32
+            ):
+                raise InstallError(
+                    f"{reader.name} session credential ownership does not match"
+                )
+
+    def run(
+        self,
+        config: HubInstallConfig,
+        plan: HubPlan,
+        *,
+        deep: bool = False,
+    ) -> HubDoctorReport:
         checks: list[dict[str, str]] = []
 
         def check(name: str, operation) -> bool:
@@ -866,34 +900,15 @@ class HubDoctor:
         )
         check("runtime-dependencies", lambda: installer._probe(config))
 
-        def verify_data() -> None:
-            root = Path(config.data_dir)
-            metadata = root.lstat()
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != 101
-                or stat.S_IMODE(metadata.st_mode) != 0o2750
-            ):
-                raise InstallError("hub data root ownership or mode does not match")
-            for reader in config.runtime.readers:
-                directory = root / reader.name
-                key = directory / "reader_session_key"
-                directory_metadata = directory.lstat()
-                key_metadata = key.lstat()
-                if (
-                    not stat.S_ISDIR(directory_metadata.st_mode)
-                    or directory_metadata.st_uid != 101
-                    or stat.S_IMODE(directory_metadata.st_mode) != 0o700
-                    or not stat.S_ISREG(key_metadata.st_mode)
-                    or key_metadata.st_uid != 101
-                    or stat.S_IMODE(key_metadata.st_mode) != 0o600
-                    or key_metadata.st_size != 32
-                ):
-                    raise InstallError(
-                        f"{reader.name} session credential ownership does not match"
-                    )
+        check("data-isolation", lambda: self._verify_data(config))
+        if deep and all(item["status"] == "ok" for item in checks):
+            def verify_providers() -> None:
+                try:
+                    self.docker.probe_hub_providers(config.install_name)
+                except Exception as exc:
+                    raise InstallError("provider deep probe failed") from exc
 
-        check("data-isolation", verify_data)
+            check("providers", verify_providers)
         return HubDoctorReport(all(item["status"] == "ok" for item in checks), checks)
 
 

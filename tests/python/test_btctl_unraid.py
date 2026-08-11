@@ -523,6 +523,26 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertIn("all(item.get('status')=='ok'", script)
         self.assertIn("check_backend_health", script)
 
+    def test_hub_provider_probe_uses_fixed_secret_free_command(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().probe_hub_providers("book-translator-hub")
+
+        arguments = run.call_args.args[0]
+        self.assertEqual(
+            arguments,
+            [
+                "docker",
+                "exec",
+                "book-translator-hub",
+                "python",
+                "/app/hub_runtime.py",
+                "--healthcheck-providers",
+            ],
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 240)
+
     def test_image_version_probe_uses_immutable_networkless_sandbox(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
 

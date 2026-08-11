@@ -521,6 +521,19 @@ class DockerCLI:
             timeout=120,
         )
 
+    def probe_hub_providers(self, container: str) -> None:
+        """Probe each reader-specific provider inside one universal hub."""
+        self._run(
+            [
+                "exec",
+                container,
+                "python",
+                "/app/hub_runtime.py",
+                "--healthcheck-providers",
+            ],
+            timeout=240,
+        )
+
     def compose_validate(self, document: Path, project: str) -> None:
         self._run(
             ["compose", "--project-name", project, "--file", str(document), "config", "--quiet"],
