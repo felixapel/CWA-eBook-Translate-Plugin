@@ -1,10 +1,12 @@
 # Configuration reference
 
-Managed operators should copy [`.env.example`](../../.env.example) outside the
-checkout and edit only that copy. `btctl` validates the file, derives internal
-role settings and redacts secrets from its output. Never commit the edited file.
+Managed operators should copy the template for their topology outside the
+checkout and edit only that copy. The recommended universal topology uses
+[`.env.hub.example`](../../.env.hub.example); the advanced split topology uses
+[`.env.example`](../../.env.example). `btctl` validates the file, derives
+internal role settings and redacts secrets from its output. Never commit the
+edited file.
 
-The recommended universal topology uses [`.env.hub.example`](../../.env.hub.example).
 Set `BT_TOPOLOGY=hub`, `BT_ENABLE_CWA` and/or `BT_ENABLE_KAVITA`, then provide
 each enabled reader's `BT_<READER>_PUBLIC_ORIGIN`, `READER_UPSTREAM`,
 `READER_CONTAINER`, `READER_NETWORK`, `READER_VERSION`, `AUTH_PROFILE`,
@@ -41,10 +43,10 @@ all enabled-reader allocations without exceeding the total.
 | `BT_DATA_DIR` | Private translation data outside the checkout. |
 | `BT_BACKUP_DIR` | Backup root outside appdata/data. |
 | `BT_UNRAID_TEMPLATE_DIR` | DockerMan user-template directory for the Unraid profile. |
-| `LLM_PROVIDER` | `local`, a fixed named adapter, or `openai-compatible`. Defaults remain local. |
+| `LLM_PROVIDER` | `local`, a fixed named adapter, or `openai-compatible`. The split example defaults to local; the hub example selects Gemini explicitly. |
 | `LLM_MODEL` | Provider model identifier. |
 | `BT_LOCAL_URL` | Shared absolute `/v1/chat/completions` endpoint when either role is `local`. |
-| `LLM_API_KEY` | Primary named-provider credential; empty for `local` and `openai-compatible`. |
+| `LLM_API_KEY` | Primary named-provider credential; empty for `local` and `openai-compatible`, which uses its dedicated key variable. |
 | `LLM_CUSTOM_ENDPOINT` | Primary `openai-compatible` public HTTPS URL with exact `/v1/chat/completions` path. |
 | `LLM_CUSTOM_API_KEY` | Dedicated primary custom-endpoint credential. |
 | `LLM_FALLBACK_PROVIDER` | Optional distinct fallback provider. |
@@ -187,6 +189,13 @@ URL, rejects non-public destinations at runtime, disables redirects and scopes
 cache identity to a digest of the endpoint. Runtime DNS is bounded by the work
 budget and the transport connects to the vetted address while retaining TLS
 hostname verification, closing DNS-rebinding races. Use `local` for LAN services.
+
+The named adapters are `openai`, `anthropic`, `gemini`, `groq`, `together`,
+`minimax`, `deepseek` and `openrouter`. For Gemini, the hub example uses the
+stable `gemini-3.5-flash-lite` model and a Google AI Studio/project API key;
+`BT_LOCAL_URL` may remain empty. Restrict the key to the Gemini API and keep it
+only in the private server-side environment. Consumer ChatGPT, Codex, Gemini or
+Antigravity subscriptions and browser sessions are not supported API auth.
 
 Automatic retry and fallback are limited to connection/DNS timeouts and HTTP
 `408`, `429`, `500`, `502`, `503` and `504`. Configuration failures, TLS

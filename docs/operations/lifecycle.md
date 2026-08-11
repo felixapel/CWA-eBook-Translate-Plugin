@@ -1,8 +1,10 @@
 # Managed lifecycle and recovery
 
 Use the same private environment file and the same operator account for every
-operation. The Unraid profile runs as root; `compose-existing` may use a trusted
-Docker-capable account with a private primary group.
+operation. This guide covers the universal hub and the managed split topology;
+sections that apply to only one topology say so explicitly. The Unraid profile
+runs as root; `compose-existing` may use a trusted Docker-capable account with a
+private primary group.
 
 ## Verify
 
@@ -10,7 +12,7 @@ Run the read-only verifier after install, host or Docker restart, upgrade and
 rollback:
 
 ```bash
-./btctl doctor --env /absolute/private/path/cwa-translate.env
+./btctl doctor --env /absolute/private/path/deployment.env
 ```
 
 It checks source/image identity, private state, exact reader evidence, role labels,
@@ -19,8 +21,8 @@ failed or missing check as a failed deployment.
 
 ## Recover lost state
 
-If only `state.json` was lost, `adopt` can reconstruct it from an exact healthy,
-already-labelled split runtime:
+For a split deployment only, if `state.json` was lost, `adopt` can reconstruct
+it from an exact healthy, already-labelled runtime:
 
 ```bash
 ./btctl adopt --env /absolute/private/path/cwa-translate.env
@@ -30,11 +32,28 @@ Adoption does not change Docker. It rejects unlabeled, partial, insecure or
 ambiguous containers and routes a combined legacy container to the migration
 workflow instead of relabeling it.
 
-## Reconfigure provider roles
+## Change providers
 
-Create a second mode-`0600` environment with the same runtime/reader topology
-and only provider values changed. First run without `--yes` to print a redacted
-plan, then confirm:
+The universal hub treats all enabled readers as one restart and security
+boundary. Keep the exact old environment, create a separate mode-`0600`
+replacement, then run:
+
+```bash
+./btctl uninstall --env /absolute/private/path/old-hub.env --yes
+./btctl plan --env /absolute/private/path/new-hub.env
+./btctl install --env /absolute/private/path/new-hub.env --yes
+./btctl doctor --env /absolute/private/path/new-hub.env
+```
+
+Translation databases and backups remain in place, while hub-owned reader
+session keys are regenerated. Refresh or sign in again in open reader tabs. If
+the replacement cannot pass `doctor`, use its environment to remove a committed
+replacement, reinstall the retained old environment, and verify it before
+resuming use.
+
+For a split deployment, create a second mode-`0600` environment with the same
+runtime/reader topology and only provider values changed. First run without
+`--yes` to print a redacted plan, then confirm:
 
 ```bash
 ./btctl reconfigure --env /absolute/private/path/new-provider.env
@@ -114,11 +133,13 @@ a completed uninstall is supported; a successful reinstall creates a fresh key
 and moves the prior final record into `BT_STATE_DIR/history/`. Active, partial
 or mismatched state is never overwritten.
 
-CWA and Kavita installations have independent schema-2 state and connector
-UUIDs. Never reuse one install's state/data paths for the other. Schema-1 CWA
-state remains readable for lifecycle compatibility, but it cannot be relabeled
-as Kavita. Changing reader type is a separate install/uninstall operation, not
-an in-place upgrade.
+Split CWA and Kavita installations have independent schema-2 state and
+connector UUIDs. The universal hub records one schema-3 topology while retaining
+separate reader data, keys and cookies below its owned root. Never reuse one
+split install's state/data paths for the other. Schema-1 CWA state remains
+readable for lifecycle compatibility, but it cannot be relabeled as Kavita.
+Changing reader type is a separate install/uninstall operation, not an in-place
+upgrade.
 
 ## Failure behavior
 

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Documented the universal one-container hub as the default CWA/Kavita install,
+  with explicit reader switches, topology-specific provider cutover and rollback,
+  and split deployment retained as an advanced isolation option.
+- Made Gemini a complete server-side backend in quick-start examples using the
+  stable `gemini-3.5-flash-lite` model; local vLLM and fallback providers are now
+  described as optional instead of implied deployment requirements.
+- Expanded lifecycle, troubleshooting, compatibility and security guidance for
+  hub operation, Gemini API errors, private key handling, regenerated browser
+  sessions and per-reader isolation.
+
+### Fixed
+
+- Updated Gemini/OpenAI-compatible request contracts for current Gemini models,
+  including omission of deprecated sampling fields and invalid prefilled model
+  turns.
+
 ## [2.3.0-rc.1] - 2026-08-10
 
 ### Security

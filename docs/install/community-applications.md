@@ -5,7 +5,8 @@ Translate listing exists. It runs one combined non-root container that proxies
 stock CWA and keeps the translation API private inside the container.
 
 This profile is CWA-only. It does not accept Kavita variables, routes or
-authentication. Install Kavita with its separate split-role
+authentication. Install Kavita with the recommended
+[universal hub](universal-hub.md), or use its advanced split-role
 [`btctl` guide](kavita.md); do not repurpose the CWA template or share appdata.
 
 If the listing is absent, its template does not pin an immutable digest, or the

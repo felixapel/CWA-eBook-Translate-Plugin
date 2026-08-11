@@ -73,15 +73,17 @@ Review `plan` before installing. It must identify `reader_type` as `kavita`,
 the exact version as `0.9.0.2`, and two resources named from
 `kavita-translate`. `doctor` must report every check as `ok`.
 
-The provider block is reader-neutral. For a faster cloud primary with the
-existing local vLLM as automatic fallback, use the Gemini/local example in the
-[managed installation guide](btctl.md). The Kavita toolbar obtains an
+The provider block is reader-neutral. For a fast cloud backend without a local
+GPU dependency, use the Gemini-only example in the recommended
+[universal hub](universal-hub.md) or the split-profile example in the
+[managed installation guide](btctl.md). A local backend or fallback is optional.
+The Kavita toolbar obtains an
 authenticated locality-only policy: it shows that cloud translation is active
 without exposing provider/model/URL/key details. If the local service is the
 primary and a remote service is the fallback, the remote fallback remains off
 until the reader enables it for that tab.
 
-Provider changes after installation use the same provider-only transaction:
+On a split installation, provider changes use the provider-only transaction:
 
 ```bash
 ./btctl reconfigure --env /absolute/private/path/kavita-new-provider.env
@@ -91,6 +93,10 @@ Provider changes after installation use the same provider-only transaction:
 The API process is replaced, but the Kavita proxy, connector identity, data and
 on-disk session key are preserved. An already open reader may perform one new
 opaque-session exchange after the cutover.
+
+The universal hub intentionally changes provider configuration as one coherent
+container generation. Follow its documented old-environment `uninstall`, new-
+environment `install` and `doctor` sequence instead of running `reconfigure`.
 
 ## Authentication boundary
 

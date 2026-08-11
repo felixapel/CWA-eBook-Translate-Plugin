@@ -18,8 +18,8 @@ requests, not in tracked Markdown.
 
 ## Operate
 
-- [Lifecycle and recovery](operations/lifecycle.md) — doctor, adopt, upgrade,
-  rollback, uninstall and failure behavior.
+- [Lifecycle and recovery](operations/lifecycle.md) — hub and split verification,
+  provider changes, adopt, upgrade, rollback, uninstall and failure behavior.
 - [Troubleshooting](operations/troubleshooting.md) — symptom-led diagnosis and
   safe evidence collection.
 

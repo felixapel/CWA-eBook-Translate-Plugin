@@ -77,8 +77,8 @@ those exact contracts.
 
 | Provider type | Status | Notes |
 |---|---|---|
-| Local OpenAI-compatible chat completions | Primary path | vLLM, Ollama, LM Studio, and llama.cpp are supported through an absolute `/v1/chat/completions` URL. `LLM_API_KEY` may remain empty. |
-| OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter | Adapter-supported | Endpoints are fixed and credentials remain server-side. A remote primary is shown as active; remote fallback requires per-tab consent. `/health/deep` succeeds only when every configured backend passes. |
+| Local OpenAI-compatible chat completions | Supported | vLLM, Ollama, LM Studio, and llama.cpp are supported through an absolute `/v1/chat/completions` URL. `LLM_API_KEY` may remain empty. A local service is optional, not a prerequisite for cloud providers. |
+| OpenAI, Anthropic, Gemini, Groq, Together, MiniMax, DeepSeek, OpenRouter | Supported named adapters | Endpoints are fixed and credentials remain server-side. The hub example uses stable `gemini-3.5-flash-lite` as a complete backend. A remote primary is shown as active; remote fallback requires per-tab consent. `/health/deep` succeeds only when every configured backend passes. |
 | Public custom OpenAI-compatible servers | Contract-compatible, not automatically certified | Use provider ID `openai-compatible`, a dedicated key and public HTTPS exact `/v1/chat/completions` path. Redirects, ambient proxies and private/reserved destinations are rejected. |
 | Consumer ChatGPT/Codex/Gemini/Antigravity subscriptions | Unsupported | Interactive product subscriptions are not server API credentials. Use a normal provider API key; do not export browser sessions or subscription tokens. |
 

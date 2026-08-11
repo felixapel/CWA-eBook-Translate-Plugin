@@ -1,4 +1,4 @@
-# Contributing to CWA eBook Translate
+# Contributing to eBook Translate
 
 Thanks for helping improve the project. Keep changes narrow, explain the user
 problem, and include a regression test for behavior changes.

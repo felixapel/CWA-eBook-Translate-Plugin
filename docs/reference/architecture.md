@@ -134,5 +134,9 @@ cannot detach an active API container from its bind source.
   cannot alter the context seen by a later provider call.
 - **LLM Client (`translator.py`)**: Multi-provider wrapper that supports batch
   translation prompts with dynamic context windows (`BT_CONTEXT_WINDOW`).
+  Named cloud adapters own fixed HTTPS endpoints and server-side credentials;
+  `local` and public `openai-compatible` endpoints are explicit alternatives,
+  not mandatory fallback layers. The hub may inherit one provider policy for
+  both readers or apply isolated per-reader overrides.
   Remote fallback providers require explicit consent on each request; requests
   with different consent policies never share cache lookup or in-flight work.

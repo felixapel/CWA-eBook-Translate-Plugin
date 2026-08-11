@@ -43,7 +43,16 @@ Select a provider with a normal server-side API contract. A Gemini example is:
 LLM_PROVIDER=gemini
 LLM_MODEL=gemini-3.5-flash-lite
 LLM_API_KEY=<Google AI Studio or project API key>
+BT_LOCAL_URL=
 ```
+
+[`gemini-3.5-flash-lite`](https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite)
+is a stable Gemini API model intended for low-latency, high-throughput work.
+Create a dedicated key in Google AI Studio, [restrict it to the Gemini
+API](https://ai.google.dev/gemini-api/docs/api-key), place it only in the
+mode-`0600` environment file and never put it in a Compose file, command line,
+browser setting or support log. The Gemini adapter owns its fixed HTTPS
+endpoint; no endpoint variable is required.
 
 For a local backend use `LLM_PROVIDER=local`, leave `LLM_API_KEY` empty and set
 the exact `BT_LOCAL_URL`. Per-reader overrides use
@@ -65,12 +74,19 @@ On stock Unraid without compatible host Python/Git, the existing containerized
 launcher supports plan, install, doctor and uninstall. It validates exact
 storage mounts and uses the local Docker socket only for lifecycle commands.
 
-To change providers, first run `uninstall --yes` with the current environment,
-then `plan` and `install --yes` with the replacement private environment.
+To change providers, retain two private files: the exact current environment
+for removal/rollback and a reviewed replacement. First run `uninstall --yes`
+with the current environment, then `plan` and `install --yes` with the
+replacement private environment.
 Uninstall removes only the verified hub container, removes the two hub-owned
 `reader_session_key` credentials, and preserves translation databases and other
 reader data. The next install regenerates private keys and archives the completed
 ownership state before committing the new coherent generation.
+
+If the replacement fails, the old environment and retained image/data are the
+rollback boundary: uninstall any successfully committed replacement with its
+own environment, reinstall the old environment, run `doctor`, then refresh open
+reader tabs. Never edit generated state to make the provider identity match.
 
 An unmanaged Compose quick start is also available:
 

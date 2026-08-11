@@ -87,8 +87,9 @@ only for CWA and must not conflict with reader-neutral values.
 the managed proxy strips client-supplied copies before forwarding to CWA. A
 local provider normally leaves `LLM_API_KEY` empty.
 
-The default remains local so updating the project never exports book text by
-surprise. A named Gemini primary with a local vLLM fallback is configured as:
+The split-profile template defaults to local so updating an existing deployment
+never exports book text by surprise. Gemini can be used as the complete backend
+without a local model or fallback:
 
 ```dotenv
 LLM_PROVIDER=gemini
@@ -96,20 +97,22 @@ LLM_MODEL=gemini-3.5-flash-lite
 LLM_API_KEY=<Gemini API key>
 LLM_CUSTOM_ENDPOINT=
 LLM_CUSTOM_API_KEY=
-
-LLM_FALLBACK_PROVIDER=local
-LLM_FALLBACK_MODEL=gemma4-12b
+LLM_FALLBACK_PROVIDER=
+LLM_FALLBACK_MODEL=
 LLM_FALLBACK_API_KEY=
 LLM_FALLBACK_CUSTOM_ENDPOINT=
 LLM_FALLBACK_CUSTOM_API_KEY=
-BT_LOCAL_URL=http://192.168.1.50:8000/v1/chat/completions
+BT_LOCAL_URL=
 ```
 
 Gemini uses Google's fixed OpenAI-compatible endpoint documented in the
 [Gemini API reference](https://ai.google.dev/gemini-api/docs/openai). An API
 key is distinct from a consumer Gemini, ChatGPT, Codex or Antigravity
 subscription; managed deployments do not import browser sessions or consumer
-subscription credentials.
+subscription credentials. A local or remote fallback may be added separately
+after reviewing the consent and retry boundaries in the
+[configuration reference](../reference/configuration.md); it is never required
+for Gemini.
 
 For another public OpenAI-compatible service, set
 `LLM_PROVIDER=openai-compatible`, leave `LLM_API_KEY` empty and use the

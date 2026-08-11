@@ -42,9 +42,23 @@ cp .env.hub.example /absolute/private/path/book-translator-hub.env
 chmod 0600 /absolute/private/path/book-translator-hub.env
 ```
 
-Set each enabled reader's exact container, network, version, public origin,
-storage paths and LLM endpoint. A local provider normally leaves `LLM_API_KEY`
-empty. Then run:
+Set each enabled reader's exact container, network, version, public origin and
+storage paths. The template defaults to Google's stable, low-latency Gemini
+model; add a server-side Google AI Studio or project API key and leave the
+local URL empty:
+
+```dotenv
+BT_ENABLE_CWA=true
+BT_ENABLE_KAVITA=true
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-3.5-flash-lite
+LLM_API_KEY=<Google AI Studio or project API key>
+BT_LOCAL_URL=
+```
+
+Named providers use their fixed HTTPS API endpoints. Local and custom
+OpenAI-compatible backends are also supported through environment variables;
+they are optional, not required fallbacks. Then run:
 
 ```bash
 ./btctl plan --env /absolute/private/path/book-translator-hub.env
@@ -63,7 +77,8 @@ reviewed `uninstall` with the old environment followed by `install` with the
 new one; translation data is retained, hub-owned session keys are regenerated,
 and all reader processes restart coherently, so tabs may require a fresh
 short-lived session.
-See the [configuration reference](docs/reference/configuration.md).
+See the [configuration reference](docs/reference/configuration.md). A ChatGPT,
+Codex, Gemini or Antigravity consumer subscription is not an API credential.
 
 Stock Unraid requires root, Bash, Docker and a full checkout including `.git`.
 It does not require host Python, host Git or NerdTools to run `./btctl`; the
