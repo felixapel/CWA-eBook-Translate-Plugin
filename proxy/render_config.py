@@ -157,7 +157,28 @@ def _validated_browser_config_path(env: Mapping[str, str]) -> str:
     return value
 
 
-def _validated_browser_config(env: Mapping[str, str]) -> dict[str, str]:
+def _validated_bounded_integer(
+    env: Mapping[str, str],
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = env.get(name, str(default))
+    if not isinstance(raw, str) or not raw.isdecimal():
+        raise ProxyConfigError(
+            f"{name} must be an integer from {minimum} to {maximum}"
+        )
+    value = int(raw, 10)
+    if not minimum <= value <= maximum:
+        raise ProxyConfigError(
+            f"{name} must be an integer from {minimum} to {maximum}"
+        )
+    return value
+
+
+def _validated_browser_config(env: Mapping[str, str]) -> dict[str, object]:
     auth_mode = _required(env, "BT_BROWSER_AUTH_MODE")
     credentials = _required(env, "BT_BROWSER_CREDENTIALS")
     supported = {
@@ -173,6 +194,16 @@ def _validated_browser_config(env: Mapping[str, str]) -> dict[str, str]:
         "apiUrl": "/bt-api",
         "authMode": auth_mode,
         "credentials": credentials,
+        "batchSize": _validated_bounded_integer(
+            env, "BT_BATCH_SIZE", default=5, minimum=1, maximum=50
+        ),
+        "prefetchGapMs": _validated_bounded_integer(
+            env,
+            "BT_CLIENT_PREFETCH_GAP_MS",
+            default=0,
+            minimum=0,
+            maximum=10_000,
+        ),
     }
     if auth_mode == "reader_session":
         reader_type = _required(env, "BT_READER_TYPE")
@@ -279,7 +310,7 @@ def render(template_path: Path, output_path: Path, env: Mapping[str, str]) -> No
     _atomic_write(output_path, rendered)
 
 
-def render_browser_config(output_path: Path, config: Mapping[str, str]) -> None:
+def render_browser_config(output_path: Path, config: Mapping[str, object]) -> None:
     _atomic_write(
         output_path,
         json.dumps(dict(config), sort_keys=True, separators=(",", ":")) + "\n",

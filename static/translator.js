@@ -8,6 +8,10 @@
     const BT_UI_VERSION = '2.3.0-rc.1';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
+    function boundedInteger(value, minimum, maximum, fallback) {
+        return Number.isInteger(value) && value >= minimum && value <= maximum
+            ? value : fallback;
+    }
     const configuredReaderType = cfg.readerType || '';
     const READER_TYPE = configuredReaderType === 'kavita' ? 'kavita' : 'cwa';
     const STRICT_READER_ROUTE = configuredReaderType === 'cwa'
@@ -70,6 +74,7 @@
     let prefetchQueue = [];
     let isPumpRunning = false;
     let rateLimitUntil = 0;
+    let nextPrefetchAt = 0;
     let firstVisibleBatchCompleted = false;
     let lastFirstVisibleHash = null;
     let pendingFirstVisibleHash = null; // 2-poll debounce for the page-turn detector
@@ -1017,8 +1022,9 @@
 
     // ── Translation engine ─────────────────────────────────────────────
     const FIRST_VISIBLE_CHUNK = 1; // minimize time to the first translated paragraph
-    const VISIBLE_CHUNK = 5;       // amortize later visible work without a large burst
-    const PREFETCH_CHUNK = 5;      // bounded background batches
+    const VISIBLE_CHUNK = boundedInteger(cfg.batchSize, 1, 50, 5);
+    const PREFETCH_CHUNK = VISIBLE_CHUNK;
+    const PREFETCH_GAP_MS = boundedInteger(cfg.prefetchGapMs, 0, 10000, 0);
     const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
 
     // Server rejects paragraphs beyond BT_MAX_PARAGRAPH_CHARS (default 8000)
@@ -1180,6 +1186,12 @@
                 if (resp.status === 429) {
                     let r = {};
                     try { r = await resp.json(); } catch(e) {}
+                    const safeAdmission = r.retry_safe === true
+                        && (r.scope === 'api_admission'
+                            || r.scope === 'auth_admission');
+                    if (!safeAdmission) {
+                        return { error: 'provider_unavailable' };
+                    }
                     let after = Number(r.retry_after || resp.headers.get('Retry-After'));
                     if (!Number.isFinite(after) || after <= 0) {
                         after = BT_CLIENT_RATE_LIMIT_BACKOFF_MS / 1000;
@@ -1230,6 +1242,14 @@
                 if (visibleQueue.length === 0 && prefetchQueue.length === 0) {
                     break; // Nothing to do
                 }
+
+                if (visibleQueue.length === 0 && prefetchQueue.length > 0
+                        && nextPrefetchAt > now) {
+                    await new Promise(resolve => setTimeout(
+                        resolve, Math.min(250, nextPrefetchAt - now)
+                    ));
+                    continue;
+                }
                 
                 let isVisible = false;
                 let batch = [];
@@ -1276,6 +1296,7 @@
                 };
 
                 let data = null;
+                nextPrefetchAt = Date.now() + PREFETCH_GAP_MS;
                 try {
                     data = await postBatch(batch.map(b => b.text));
                 } catch (e) {

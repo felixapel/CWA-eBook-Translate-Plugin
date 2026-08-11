@@ -29,8 +29,9 @@ assert(/id="bt-source-lang"/.test(code)
         && /source_lang:\s*SOURCE_LANG/.test(code),
     'The reader must expose and persist a bounded source-language selector');
 assert(/const FIRST_VISIBLE_CHUNK = 1;/.test(code)
-        && /const VISIBLE_CHUNK = 5;/.test(code)
-        && /const PREFETCH_CHUNK = 5;/.test(code),
+        && /const VISIBLE_CHUNK = boundedInteger\(cfg\.batchSize, 1, 50, 5\);/.test(code)
+        && /const PREFETCH_CHUNK = VISIBLE_CHUNK;/.test(code)
+        && /const PREFETCH_GAP_MS = boundedInteger\(cfg\.prefetchGapMs, 0, 10000, 0\);/.test(code),
     'The queue must optimize first-paint latency while bounding later batches');
 assert(!/BT_CLIENT_MIN_REQUEST_GAP_MS/.test(code),
     'Successful requests must not pay an unconditional client-side delay');
@@ -335,6 +336,120 @@ async function assertStalePolicyIsRefetchedWithoutTranslationReplay() {
     staleDom.window.close();
 }
 
+async function assertAmbiguous429IsTerminal() {
+    const retryDom = new JSDOM(
+        '<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>',
+        { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' }
+    );
+    retryDom.window.BOOK_TRANSLATOR = {
+        apiUrl: '/bt-api', authMode: 'cwa_session'
+    };
+    retryDom.window.localStorage.setItem('bt_mode', 'translated');
+    retryDom.window.localStorage.setItem('bt_prefetch', '0');
+    retryDom.window.localStorage.setItem('bt_lang', 'Spanish');
+    retryDom.window.requestAnimationFrame = cb => setTimeout(cb, 0);
+    const paragraph = retryDom.window.document.querySelector('iframe')
+        .contentDocument.body.appendChild(
+            retryDom.window.document.querySelector('iframe')
+                .contentDocument.createElement('p')
+        );
+    paragraph.textContent = 'ambiguous 429 probe';
+    paragraph.getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+
+    let translationCalls = 0;
+    retryDom.window.fetch = async (url) => {
+        if (String(url).endsWith('/provider-policy')) {
+            return {
+                ok: true, status: 200,
+                json: async () => ({
+                    primary: 'local', fallback: null,
+                    generation: '0123456789abcdef0123456789abcdef'
+                }),
+                headers: { get: () => null },
+            };
+        }
+        translationCalls++;
+        return {
+            ok: false,
+            status: 429,
+            json: async () => ({
+                error: 'rate_limited', retry_after: 1,
+                scope: 'unknown'
+            }),
+            headers: { get: () => '1' },
+        };
+    };
+
+    const script = retryDom.window.document.createElement('script');
+    script.textContent = code;
+    retryDom.window.document.body.appendChild(script);
+    await wait(1300);
+
+    assert.strictEqual(translationCalls, 1,
+        'A 429 without retry_safe must never replay possibly-admitted book text');
+    assert.strictEqual(
+        retryDom.window.document.getElementById('bt-bar').dataset.state,
+        'error',
+        'An ambiguous 429 must become an actionable terminal failure'
+    );
+    retryDom.window.close();
+}
+
+async function assertConfiguredBatchSizeIsUsed() {
+    const batchDom = new JSDOM(
+        '<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>',
+        { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' }
+    );
+    batchDom.window.BOOK_TRANSLATOR = {
+        apiUrl: '/bt-api', authMode: 'cwa_session', batchSize: 3
+    };
+    batchDom.window.localStorage.setItem('bt_mode', 'translated');
+    batchDom.window.localStorage.setItem('bt_prefetch', '0');
+    batchDom.window.localStorage.setItem('bt_lang', 'Spanish');
+    batchDom.window.requestAnimationFrame = cb => setTimeout(cb, 0);
+    const document = batchDom.window.document.querySelector('iframe').contentDocument;
+    document.body.innerHTML = '<p>one</p><p>two</p><p>three</p><p>four</p><p>five</p>';
+    document.querySelectorAll('p').forEach(paragraph => {
+        paragraph.getBoundingClientRect = () => ({
+            width: 100, height: 20, left: 0, top: 0
+        });
+    });
+    const batchLengths = [];
+    batchDom.window.fetch = async (url, options) => {
+        if (String(url).endsWith('/provider-policy')) {
+            return {
+                ok: true, status: 200,
+                json: async () => ({
+                    primary: 'local', fallback: null,
+                    generation: '0123456789abcdef0123456789abcdef'
+                }),
+                headers: { get: () => null },
+            };
+        }
+        const payload = JSON.parse(options.body);
+        batchLengths.push(payload.paragraphs.length);
+        return {
+            ok: true, status: 200,
+            json: async () => ({
+                translations: payload.paragraphs.map(text => `ES: ${text}`)
+            }),
+            headers: { get: () => null },
+        };
+    };
+    const script = batchDom.window.document.createElement('script');
+    script.textContent = code;
+    batchDom.window.document.body.appendChild(script);
+    const deadline = Date.now() + 2000;
+    while (batchLengths.reduce((sum, count) => sum + count, 0) < 5
+            && Date.now() < deadline) await wait(20);
+
+    assert.deepStrictEqual(batchLengths, [1, 3, 1],
+        'Managed batchSize must preserve first paint and enlarge later batches');
+    batchDom.window.close();
+}
+
 async function assertManagedLoaderContract() {
     const loaderDom = new JSDOM(
         '<!DOCTYPE html><html><head></head><body></body></html>',
@@ -349,7 +464,8 @@ async function assertManagedLoaderContract() {
         return {
             ok: true,
             json: async () => ({
-                apiUrl: '/bt-api', authMode: 'forwarded', credentials: 'include'
+                apiUrl: '/bt-api', authMode: 'forwarded', credentials: 'include',
+                batchSize: 10, prefetchGapMs: 1000
             })
         };
     };
@@ -367,6 +483,8 @@ async function assertManagedLoaderContract() {
     assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.authMode, 'forwarded');
     assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.credentials, 'include');
     assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.apiToken, '');
+    assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.batchSize, 10);
+    assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.prefetchGapMs, 1000);
     assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.targetLang, 'Spanish');
     assert(loaderDom.window.document.querySelector('link[href*="translator.css"]'));
     assert(loaderDom.window.document.querySelector('script[src*="translator.js"]'));
@@ -547,7 +665,10 @@ async function runTest() {
     // Let's provide a 429 response first for the visible request.
     fetchResponses.push({
         status: 429,
-        body: { error: 'rate_limited', retry_after: 1 } // wait 1s
+        body: {
+            error: 'rate_limited', retry_after: 1,
+            retry_safe: true, scope: 'api_admission'
+        } // wait 1s
     });
     
     await wait(800);
@@ -719,6 +840,8 @@ async function runTest() {
 
     await assertProviderPolicyControls();
     await assertStalePolicyIsRefetchedWithoutTranslationReplay();
+    await assertAmbiguous429IsTerminal();
+    await assertConfiguredBatchSizeIsUsed();
 
     const [tokenTransport, forwardedTransport, cwaTransport, consentedTransport] = await Promise.all([
         captureAuthTransport({ authMode: 'token', apiToken: 'browser-token' }),

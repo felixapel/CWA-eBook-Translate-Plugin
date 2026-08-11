@@ -56,6 +56,7 @@ _PROCESS_KEYS = {
     "BT_AUTH_RATE_LIMIT_PER_MINUTE",
     "BT_BATCH_MAX_TOKENS",
     "BT_BATCH_SIZE",
+    "BT_BATCH_SOURCE_TOKEN_BUDGET",
     "BT_CACHE_HARDEN_EXISTING_DIR",
     "BT_CACHE_HIT_FLUSH_THRESHOLD",
     "BT_CACHE_MAX_ENTRIES",
@@ -63,6 +64,7 @@ _PROCESS_KEYS = {
     "BT_CACHE_SCOPE_MAX_CHARS",
     "BT_CACHE_TTL_DAYS",
     "BT_CONTEXT_WINDOW",
+    "BT_CLIENT_PREFETCH_GAP_MS",
     "BT_MAX_BATCH_PARAGRAPHS",
     "BT_MAX_CONTENT_LENGTH",
     "BT_MAX_PARAGRAPH_CHARS",
@@ -403,6 +405,10 @@ class HubConfig:
                     "BT_CWA_IDENTITY_HEADER", "Remote-User"
                 ),
                 "BT_UI_VERSION": values.get("BT_UI_VERSION", "dev"),
+                "BT_BATCH_SIZE": environment.get("BT_BATCH_SIZE", "5"),
+                "BT_CLIENT_PREFETCH_GAP_MS": environment.get(
+                    "BT_CLIENT_PREFETCH_GAP_MS", "0"
+                ),
             }
             runtimes.append(
                 ReaderRuntime(
