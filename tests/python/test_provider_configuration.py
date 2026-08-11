@@ -37,6 +37,62 @@ class ProviderConfigurationTests(unittest.TestCase):
             def close(self):
                 return None
 
+        def provider_post(url, **kwargs):
+            captured.update(
+                {
+                    "url": url,
+                    "headers": kwargs["headers"],
+                    "payload": kwargs["json"],
+                }
+            )
+            return Response()
+
+        with mock.patch.object(
+            translator, "_provider_post", side_effect=provider_post
+        ):
+            result = translator._translate_openai(
+                provider,
+                "source text",
+                "translate faithfully",
+                timeout=5,
+                max_tokens=256,
+                budget=_budget(),
+            )
+
+        self.assertEqual(result, "translated")
+        self.assertEqual(
+            captured["url"],
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        )
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer gemini-key")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "model": "gemini-3.5-flash-lite",
+                "max_tokens": 256,
+                "messages": [
+                    {"role": "system", "content": "translate faithfully"},
+                    {"role": "user", "content": "source text"},
+                ],
+            },
+        )
+
+    def test_non_gemini_openai_request_keeps_sampling_parameter(self):
+        provider = translator._Provider("openai", "gpt-test", "openai-key")
+        captured = {}
+
+        class Response:
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "translated"}}]}
+
+            def close(self):
+                return None
+
         def provider_post(_url, **kwargs):
             captured.update(kwargs["json"])
             return Response()
@@ -54,9 +110,7 @@ class ProviderConfigurationTests(unittest.TestCase):
             )
 
         self.assertEqual(result, "translated")
-        self.assertNotIn("temperature", captured)
-        self.assertEqual(captured["model"], "gemini-3.5-flash-lite")
-        self.assertEqual(captured["max_tokens"], 256)
+        self.assertEqual(captured["temperature"], 0.3)
 
     def test_named_gemini_endpoint_is_fixed_and_remote(self):
         provider = translator._provider_from_config(
