@@ -235,9 +235,12 @@ individual recovery fails for another provider reason, that paragraph gets a
 sanitized translation-error marker and the reader exposes its explicit retry
 action instead of discarding healthy siblings.
 
-The reader never automatically retries these failures. Only a bounded `429`
-admission rejection, before provider work starts, is retried automatically; use
-the visible manual retry for every other failure.
+The reader never automatically retries these failures. Only a bounded HTTP
+`429` carrying `retry_safe: true` and an explicit pre-provider admission scope
+is retried automatically; use the visible manual retry for every other
+failure. A Gemini/provider `429` inside a successful partial batch is reported
+as `provider_rate_limited` with bounded retry metadata and is terminal until
+the user retries, because the browser cannot prove the provider did no work.
 
 If recovery happens frequently, verify the configured model supports the
 OpenAI-compatible chat contract and has enough output capacity, then lower
@@ -265,11 +268,22 @@ toggling translation or reloading, which creates more queued work. Measure the
 actual local/provider latency with a short text first, then adjust only one
 bounded setting at a time.
 
-Useful controls include `BT_RATE_LIMIT_PER_MINUTE`,
-client request pacing, `BT_MAX_UPSTREAM_INFLIGHT`, request deadline,
-and output-token limits. Never set an unlimited production value. For cloud
-providers, project quota and provider latency matter; for local providers,
-model size, context, target language and GPU memory normally dominate latency.
+Start with the fixed-cardinality `/metrics` fields `provider_calls`,
+`batch_groups_total`, `batch_paragraphs_total`,
+`batch_group_size_buckets` and `batch_group_source_token_buckets`. The ratio of
+paragraphs to provider attempts shows whether grouping is actually reducing
+RPM pressure; `provider_calls.rate_limited` distinguishes provider `429`s from
+the API's own `outcomes.api_rate_limited` admission counter. Counters are
+process-local and reset when the API process restarts.
+
+For an RPM-limited cloud model, raise `BT_BATCH_SIZE` gradually and use a
+positive `BT_BATCH_SOURCE_TOKEN_BUDGET` so unusually long paragraphs cannot
+create an unbounded prompt. `BT_CLIENT_PREFETCH_GAP_MS` paces only opt-in
+background work. Keep `BT_MAX_UPSTREAM_INFLIGHT`, request deadline, attempt and
+output-token limits finite. `BT_BATCH_SOURCE_TOKEN_BUDGET=0` restores
+count-only grouping immediately. Project quota is shared with consumers the
+service cannot observe, so this project intentionally does not claim to be a
+project-wide quota coordinator.
 
 ## Translation formatting, duplicates, or stale behavior
 

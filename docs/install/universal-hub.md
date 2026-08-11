@@ -46,6 +46,10 @@ LLM_PROVIDER=gemini
 LLM_MODEL=gemini-3.5-flash-lite
 LLM_API_KEY=<Google AI Studio or project API key>
 BT_LOCAL_URL=
+BT_BATCH_SIZE=10
+BT_BATCH_SOURCE_TOKEN_BUDGET=450
+BT_BATCH_MAX_TOKENS=1200
+BT_CLIENT_PREFETCH_GAP_MS=1000
 ```
 
 [`gemini-3.5-flash-lite`](https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite)
@@ -55,6 +59,15 @@ API](https://ai.google.dev/gemini-api/docs/api-key), place it only in the
 mode-`0600` environment file and never put it in a Compose file, command line,
 browser setting or support log. The Gemini adapter owns its fixed HTTPS
 endpoint; no endpoint variable is required.
+
+The example uses a cloud-oriented batch profile. The first visible paragraph
+still translates alone; later visible calls contain up to ten paragraphs and
+the API splits a group before its estimated source exceeds 450 tokens.
+Whole-chapter prefetch remains opt-in and waits one second between request
+starts. This reduces request pressure without adding latency to visible work.
+Use `/metrics` and adjust one value at a time for a different model or quota.
+Set `BT_BATCH_SOURCE_TOKEN_BUDGET=0` and
+`BT_CLIENT_PREFETCH_GAP_MS=0` to restore the historical scheduling behavior.
 
 For a local backend use `LLM_PROVIDER=local`, leave `LLM_API_KEY` empty and set
 the exact `BT_LOCAL_URL`. Per-reader overrides use

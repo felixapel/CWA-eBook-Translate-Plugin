@@ -110,7 +110,9 @@ cannot detach an active API container from its bind source.
   observes Angular DOM replacement and tears down on navigation.
 - **Translation Management**: Coordinates visible-first translation chunking;
   background sequential whole-chapter prefetch is disabled until the reader
-  explicitly enables it.
+  explicitly enables it. Managed batch size and background-only pacing come
+  from a bounded, non-secret server-owned browser contract. Only explicit
+  pre-provider admission `429`s are replayed automatically.
 - **Client Cache**: Keeps context-scoped translations in memory. Durable
   `localStorage` is an explicit opt-in for trusted single-user browsers; keys
   include release, languages, book, chapter, and stable DOM position so
@@ -134,6 +136,9 @@ cannot detach an active API container from its bind source.
   cannot alter the context seen by a later provider call.
 - **LLM Client (`translator.py`)**: Multi-provider wrapper that supports batch
   translation prompts with dynamic context windows (`BT_CONTEXT_WINDOW`).
+  Stable document-order grouping is bounded by paragraph count and an optional
+  deterministic source-token budget; fixed provider-attempt and `429` counters
+  allow operators to evaluate request reduction without content-derived labels.
   Named cloud adapters own fixed HTTPS endpoints and server-side credentials;
   `local` and public `openai-compatible` endpoints are explicit alternatives,
   not mandatory fallback layers. The hub may inherit one provider policy for
