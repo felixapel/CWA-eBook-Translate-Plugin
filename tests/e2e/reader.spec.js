@@ -233,6 +233,158 @@ test('the real overlay translates, reports state, and keeps cloud consent explic
     expect(failures).toEqual([]);
 });
 
+test('attaching the reader observer does not cancel or duplicate active translation work', async ({ page }) => {
+    const failures = observeBrowserFailures(page);
+    const payloads = [];
+
+    await page.route('**/bt-api/translate/batch', async route => {
+        const payload = route.request().postDataJSON();
+        payloads.push(payload);
+        // Keep the first request active beyond the legacy 350 ms observer poll.
+        // Late observer attachment used to abort this admitted request and send
+        // the same paragraph again, wasting provider quota.
+        if (payloads.length === 1) await new Promise(resolve => setTimeout(resolve, 500));
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                translations: payload.paragraphs.map(text => `ES: ${text}`),
+            }),
+        });
+    });
+
+    await page.goto('/read/42');
+    await page.locator('#bt-toggle').click();
+
+    const chapter = page.frameLocator('iframe[title="Book chapter"]');
+    await expect(chapter.locator('#paragraph-two .bt-translation')).toHaveText(
+        'ES: A second paragraph checks queue order.'
+    );
+    expect(payloads.flatMap(payload => payload.paragraphs)).toEqual([
+        'A quiet production test paragraph.',
+        'A second paragraph checks queue order.',
+    ]);
+    expect(failures).toEqual([]);
+});
+
+test('route re-entry attaches its observer before starting translation work', async ({ page }) => {
+    const failures = observeBrowserFailures(page);
+    const payloads = [];
+
+    await page.route('**/bt-api/translate/batch', async route => {
+        const payload = route.request().postDataJSON();
+        payloads.push(payload);
+        if (payloads.length === 1) await new Promise(resolve => setTimeout(resolve, 500));
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                translations: payload.paragraphs.map(text => `ES: ${text}`),
+            }),
+        });
+    });
+
+    await page.goto('/read/42');
+    await page.evaluate(() => {
+        history.pushState({}, '', '/library');
+        window.dispatchEvent(new Event('bt:reader-route'));
+    });
+    await expect(page.locator('#bt-bar')).toBeHidden();
+    await page.evaluate(() => document.querySelector('#bt-toggle').click());
+    await page.evaluate(() => {
+        history.pushState({}, '', '/read/42');
+        window.dispatchEvent(new Event('bt:reader-route'));
+    });
+
+    const chapter = page.frameLocator('iframe[title="Book chapter"]');
+    await expect(chapter.locator('#paragraph-two .bt-translation')).toHaveText(
+        'ES: A second paragraph checks queue order.'
+    );
+    expect(payloads.flatMap(payload => payload.paragraphs)).toEqual([
+        'A quiet production test paragraph.',
+        'A second paragraph checks queue order.',
+    ]);
+    expect(failures).toEqual([]);
+});
+
+test('polling fallback attaches a delayed iframe without replaying admitted work', async ({ page }) => {
+    const failures = observeBrowserFailures(page);
+    const payloads = [];
+
+    await page.route('**/bt-api/translate/batch', async route => {
+        const payload = route.request().postDataJSON();
+        payloads.push(payload);
+        if (payloads.length === 1) await new Promise(resolve => setTimeout(resolve, 500));
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                translations: payload.paragraphs.map(text => `ES: ${text}`),
+            }),
+        });
+    });
+
+    await page.goto('/read/delayed');
+    await page.locator('#bt-toggle').click();
+
+    const chapter = page.frameLocator('iframe[title="Book chapter"]');
+    await expect(chapter.locator('#paragraph-two .bt-translation')).toHaveText(
+        'ES: A second paragraph checks queue order.'
+    );
+    expect(payloads.flatMap(payload => payload.paragraphs)).toEqual([
+        'A quiet production test paragraph.',
+        'A second paragraph checks queue order.',
+    ]);
+    expect(failures).toEqual([]);
+});
+
+test('replacing an observed iframe attaches the new document before translation', async ({ page }) => {
+    const failures = observeBrowserFailures(page);
+    const payloads = [];
+
+    await page.route('**/bt-api/translate/batch', async route => {
+        const payload = route.request().postDataJSON();
+        payloads.push(payload);
+        if (payloads.length === 1) await new Promise(resolve => setTimeout(resolve, 500));
+        await route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                translations: payload.paragraphs.map(text => `ES: ${text}`),
+            }),
+        });
+    });
+
+    await page.goto('/read/42');
+    // Ensure the original document has been observed, then replace it and
+    // populate the new same-origin document in one task. The mutation callback
+    // must attach before the next browser action starts translation.
+    await page.waitForTimeout(400);
+    await page.evaluate(() => {
+        const replacement = document.createElement('iframe');
+        replacement.title = 'Book chapter';
+        document.querySelector('iframe[title="Book chapter"]').replaceWith(replacement);
+        const doc = replacement.contentDocument;
+        doc.open();
+        doc.write(`<!doctype html><html><body><main class="chapter">
+          <p id="replacement-one">A replacement chapter paragraph.</p>
+          <p id="replacement-two">A second replacement paragraph.</p>
+        </main></body></html>`);
+        doc.close();
+    });
+    await page.locator('#bt-toggle').click();
+
+    const chapter = page.frameLocator('iframe[title="Book chapter"]');
+    await expect(chapter.locator('#replacement-two .bt-translation')).toHaveText(
+        'ES: A second replacement paragraph.'
+    );
+    expect(payloads.flatMap(payload => payload.paragraphs)).toEqual([
+        'A replacement chapter paragraph.',
+        'A second replacement paragraph.',
+    ]);
+    expect(failures).toEqual([]);
+});
+
 test('forwarded auth presents the SSO cookie to the identity edge without a token', async ({ page, context }) => {
     const failures = observeBrowserFailures(page);
     await context.addCookies([{

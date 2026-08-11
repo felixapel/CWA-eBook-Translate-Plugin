@@ -769,6 +769,10 @@
     // ── DOM Helpers ────────────────────────────────────────────────────
     function getReaderIframe() {
         if (READER_TYPE === 'kavita') return null;
+        // A detached/closed document can still have queued MutationObserver
+        // callbacks (notably during SPA teardown and test-window disposal).
+        if (typeof document === 'undefined' || !document
+                || typeof document.querySelector !== 'function') return null;
         return document.querySelector('#viewer iframe, .epub-container iframe, iframe');
     }
 
@@ -1520,6 +1524,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     let lastContentIdentity = null;
     let readerObserver = null;
     let mainObserver = null;
+    const watchedReaderIframes = new WeakSet();
 
     function setOverlayHidden(hidden) {
         ['bt-bar', 'bt-menu', 'bt-toast'].forEach(id => {
@@ -1554,6 +1559,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         setOverlayHidden(false);
         if (!wasActive && !initial && translationMode !== 'off') {
             lastContentIdentity = null;
+            attachReaderContentObserver();
             scheduleTranslate('reader_route', { immediate: true, forceRediscover: true });
         }
         return true;
@@ -1578,60 +1584,89 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         }
     }
 
+    function watchReaderIframe(iframe) {
+        if (!iframe || watchedReaderIframes.has(iframe)) return;
+        watchedReaderIframes.add(iframe);
+        iframe.addEventListener('load', () => {
+            if (readerRouteActive) {
+                attachReaderContentObserver({ rediscover: true });
+            }
+        });
+    }
+
+    function attachReaderContentObserver({ rediscover = false } = {}) {
+        let content = null;
+        if (READER_TYPE === 'kavita') {
+            content = getReaderRoot();
+        } else {
+            const iframe = getReaderIframe();
+            watchReaderIframe(iframe);
+            try {
+                const idoc = iframe && (
+                    iframe.contentDocument || iframe.contentWindow.document
+                );
+                content = idoc && idoc.body;
+            } catch (e) { content = null; }
+        }
+        if (!content || content === lastContentIdentity) return false;
+
+        const replacesObservedContent = lastContentIdentity !== null;
+        lastContentIdentity = content;
+        if (readerObserver) readerObserver.disconnect();
+        readerObserver = new MutationObserver((mutations) => {
+            if (!readerRouteActive
+                    || !mutations.some(mutationContainsReaderContent)) return;
+            scheduleTranslate(
+                READER_TYPE === 'kavita'
+                    ? 'kavita_content_mutation' : 'iframe_mutation',
+                { forceRediscover: READER_TYPE === 'kavita' }
+            );
+        });
+        if (READER_TYPE === 'cwa') {
+            const idoc = content.ownerDocument;
+            ensureIframeStyles(idoc);
+            applyIframeTheme(idoc);
+            attachIframeShortcut(idoc);
+        }
+        readerObserver.observe(content, { childList: true, subtree: true });
+        if (rediscover && translationMode !== 'off') {
+            scheduleTranslate('new_reader_content', {
+                immediate: true,
+                // First attachment may race with work discovered by the main
+                // observer. Only a confirmed document replacement makes that
+                // work stale enough to abort and replay.
+                forceRediscover: replacesObservedContent
+            });
+        }
+        return true;
+    }
+
     function setupObservers() {
         if (!mainObserver) {
             mainObserver = new MutationObserver((mutations) => {
                 if (!readerRouteActive) return;
                 const relevant = mutations.some(mutationContainsReaderContent);
                 if (relevant) {
-                    scheduleTranslate('main_mutation', {
-                        forceRediscover: READER_TYPE === 'kavita'
-                    });
+                    // Reconcile the reader root before it can admit work. The
+                    // content observer handles mutations inside the current
+                    // root; this path handles a root/iframe replacement.
+                    attachReaderContentObserver({ rediscover: true });
                 }
             });
             mainObserver.observe(document.body, { childList: true, subtree: true });
         }
 
+        // The reader document normally exists by DOMContentLoaded. Attach now
+        // so the first polling tick cannot mistake it for a chapter change and
+        // abort already-admitted provider work. The poll remains as a fallback
+        // for readers that replace or create their content asynchronously.
+        attachReaderContentObserver();
+
         // Track CWA iframe documents and Kavita's stable .book-content host.
         setInterval(() => {
-            if (!syncReaderRoute() || translationMode === 'off') return;
-
-            let content = null;
-            if (READER_TYPE === 'kavita') {
-                content = getReaderRoot();
-            } else {
-                const iframe = getReaderIframe();
-                try {
-                    const idoc = iframe && (
-                        iframe.contentDocument || iframe.contentWindow.document
-                    );
-                    content = idoc && idoc.body;
-                } catch (e) { content = null; }
-            }
-            if (content && content !== lastContentIdentity) {
-                lastContentIdentity = content;
-                if (readerObserver) readerObserver.disconnect();
-                readerObserver = new MutationObserver((mutations) => {
-                    if (!readerRouteActive
-                            || !mutations.some(mutationContainsReaderContent)) return;
-                    scheduleTranslate(
-                        READER_TYPE === 'kavita'
-                            ? 'kavita_content_mutation' : 'iframe_mutation',
-                        { forceRediscover: READER_TYPE === 'kavita' }
-                    );
-                });
-                if (READER_TYPE === 'cwa') {
-                    const idoc = content.ownerDocument;
-                    ensureIframeStyles(idoc);
-                    applyIframeTheme(idoc);
-                    attachIframeShortcut(idoc);
-                }
-                readerObserver.observe(content, { childList: true, subtree: true });
-                scheduleTranslate('new_reader_content', {
-                    immediate: true,
-                    forceRediscover: true
-                });
-            }
+            if (!syncReaderRoute()) return;
+            attachReaderContentObserver({ rediscover: true });
+            if (translationMode === 'off') return;
 
             // Position-based page turn detector.
             // BUG (root cause of the status bar flicker): inserting a bilingual
