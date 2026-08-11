@@ -1,12 +1,20 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-from btctl_core import DeploymentPlan, InstallConfig, ReleaseIdentity, StateStore
+from btctl_core import (
+    DeploymentPlan,
+    InstallAttemptStore,
+    InstallConfig,
+    ReleaseIdentity,
+    StateStore,
+)
 from btctl_lifecycle import RuntimeUninstaller
 from btctl_docker import DockerCLI, DockerCommandError
 from btctl_unraid import (
@@ -19,7 +27,7 @@ from btctl_unraid import (
 )
 
 
-def values(root: Path, *, forwarded=False):
+def values(root: Path, *, forwarded=False, reader="cwa"):
     result = {
         "BT_INSTALL_PROFILE": "unraid",
         "BT_INSTALL_NAME": "cwa-translate-test",
@@ -51,6 +59,26 @@ def values(root: Path, *, forwarded=False):
             "BT_AUTHENTIK_OUTPOST_URL": "http://authentik-outpost:9000",
             "BT_REVERSE_PROXY": "caddy",
         })
+    if reader == "kavita":
+        for name in (
+            "CWA_UPSTREAM",
+            "BT_CWA_CONTAINER",
+            "BT_CWA_NETWORK",
+            "BT_CWA_VERSION",
+        ):
+            result.pop(name)
+        result.update(
+            {
+                "BT_INSTALL_NAME": "kavita-translate-test",
+                "BT_AUTH_PROFILE": "reader-session",
+                "BT_READER_TYPE": "kavita",
+                "BT_READER_UPSTREAM": "http://kavita:5000",
+                "BT_READER_CONTAINER": "kavita",
+                "BT_READER_NETWORK": "kavita_default",
+                "BT_READER_VERSION": "0.9.0.2",
+                "BT_CWA_IDENTITY_HEADER": "",
+            }
+        )
     return result
 
 
@@ -69,6 +97,7 @@ class FakeDocker:
         self.images = {}
         self.networks = {
             "cwa_default": {"Id": "cwa-network"},
+            "kavita_default": {"Id": "kavita-network"},
             "authentik_backend": {"Id": "edge-network"},
         }
         self.containers = {
@@ -77,7 +106,13 @@ class FakeDocker:
                 "State": {"Status": "running"},
                 "Config": {"Image": "crocodilestick/calibre-web-automated:v4.0.6"},
                 "NetworkSettings": {"Networks": {"cwa_default": {}}},
-            }
+            },
+            "kavita": {
+                "Id": "kavita-id",
+                "State": {"Status": "running"},
+                "Config": {"Image": "jvmilazz0/kavita:0.9.0.2"},
+                "NetworkSettings": {"Networks": {"kavita_default": {}}},
+            },
         }
 
     def require_available(self):
@@ -164,6 +199,15 @@ class FakeDocker:
                 }
             },
         }
+        if (
+            spec.role == "api"
+            and spec.data_dir is not None
+            and "BT_AUTH_MODE=reader_session"
+            in spec.env_file.read_text(encoding="utf-8").splitlines()
+        ):
+            session_key = Path(spec.data_dir) / "reader_session_key"
+            session_key.write_bytes(b"s" * 32)
+            session_key.chmod(0o600)
         if self.fail_create_role_after_effect == spec.role:
             raise InstallError(f"{spec.role} create response was lost")
 
@@ -177,6 +221,13 @@ class FakeDocker:
             "Status": "running",
             "Health": {"Status": "healthy"},
         }
+        if name.endswith("-api"):
+            mounts = self.containers[name].get("Mounts", [])
+            if mounts:
+                database = Path(mounts[0]["Source"]) / "translations.db"
+                if not database.exists():
+                    with closing(sqlite3.connect(database)) as connection:
+                        connection.execute("PRAGMA user_version = 2")
 
     def stop_container(self, name):
         self.calls.append(("stop_container", name))
@@ -203,6 +254,10 @@ class FakeDocker:
     def remove_network(self, name):
         self.calls.append(("remove_network", name))
         self.networks.pop(name, None)
+
+    def remove_data_credential(self, image, path, filename):
+        self.calls.append(("remove_data_credential", image, str(path), filename))
+        (Path(path) / filename).unlink()
 
 
 class UnraidTemplateTests(unittest.TestCase):
@@ -236,6 +291,21 @@ class UnraidTemplateTests(unittest.TestCase):
 
 
 class DockerCLIContractTests(unittest.TestCase):
+    def test_compose_raw_env_requires_version_230_before_validation(self):
+        old = mock.Mock(returncode=0, stdout="2.29.9\n", stderr="")
+        with mock.patch("subprocess.run", return_value=old) as run:
+            with self.assertRaisesRegex(DockerCommandError, "2.30.0"):
+                DockerCLI().compose_validate(Path("/private/compose.json"), "project")
+        self.assertEqual(run.call_count, 1)
+
+    def test_supported_compose_version_runs_validation_without_shell(self):
+        version = mock.Mock(returncode=0, stdout="v2.30.0\n", stderr="")
+        validated = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch("subprocess.run", side_effect=[version, validated]) as run:
+            DockerCLI().compose_validate(Path("/private/compose.json"), "project")
+        self.assertEqual(run.call_count, 2)
+        self.assertIsInstance(run.call_args.args[0], list)
+
     def test_inspect_distinguishes_verified_absence_from_docker_failure(self):
         missing = mock.Mock(
             returncode=1,
@@ -307,6 +377,90 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertIn("find /data -xdev -type d -exec chmod 2750", script)
         self.assertIn("find /data -xdev -type f -exec chmod 0640", script)
 
+    def test_hub_data_preparation_preserves_private_keys_and_reader_directories(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().prepare_hub_data_directory(
+                "local/book-translator-hub:2.3.0-abcdef012345",
+                Path("/srv/book-translator-hub/data"),
+                ("cwa", "kavita"),
+            )
+
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[:3], ["docker", "run", "--rm"])
+        self.assertIn("type=bind,src=/srv/book-translator-hub/data,dst=/data", arguments)
+        self.assertEqual(arguments[-2:], ["cwa", "kavita"])
+        script = arguments[arguments.index("-c") + 1]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for reader in ("cwa", "kavita"):
+                reader_dir = root / reader
+                reader_dir.mkdir()
+                key = reader_dir / "reader_session_key"
+                key.write_bytes(b"s" * 32)
+                key.chmod(0o640)
+                (reader_dir / "translations.db").write_bytes(b"sqlite")
+            with mock.patch(
+                "sys.argv",
+                [
+                    "prepare-hub-data",
+                    str(root),
+                    str(os.geteuid()),
+                    str(os.getgid()),
+                    "cwa",
+                    "kavita",
+                ],
+            ):
+                exec(compile(script, "<prepare-hub-data>", "exec"), {})
+
+            self.assertEqual(root.stat().st_mode & 0o7777, 0o2750)
+            for reader in ("cwa", "kavita"):
+                reader_dir = root / reader
+                self.assertEqual(reader_dir.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(
+                    (reader_dir / "reader_session_key").stat().st_mode & 0o777,
+                    0o600,
+                )
+                self.assertEqual(
+                    (reader_dir / "translations.db").stat().st_mode & 0o777,
+                    0o600,
+                )
+
+    def test_hub_credential_removal_is_exact_and_idempotent(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().remove_hub_data_credentials(
+                "local/book-translator-hub:2.3.0-abcdef012345",
+                Path("/srv/book-translator-hub/data"),
+                ("cwa", "kavita"),
+            )
+
+        arguments = run.call_args.args[0]
+        script = arguments[arguments.index("-c") + 1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for reader in ("cwa", "kavita"):
+                reader_dir = root / reader
+                reader_dir.mkdir()
+                reader_dir.chmod(0o700)
+                (reader_dir / "keep.marker").write_text(reader, encoding="utf-8")
+                key = reader_dir / "reader_session_key"
+                key.write_bytes(b"s" * 32)
+                key.chmod(0o600)
+            for _attempt in range(2):
+                with mock.patch(
+                    "sys.argv",
+                    ["remove-hub-keys", str(root), "cwa", "kavita"],
+                ):
+                    exec(compile(script, "<remove-hub-keys>", "exec"), {})
+
+            for reader in ("cwa", "kavita"):
+                self.assertFalse((root / reader / "reader_session_key").exists())
+                self.assertTrue((root / reader / "keep.marker").is_file())
+
     def test_legacy_data_preparation_preserves_owner_and_grants_operator_checkpoint_access(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
 
@@ -347,6 +501,12 @@ class DockerCLIContractTests(unittest.TestCase):
                 "http://calibre-web-automated:8083/ajax/emailstat",
             )
             auth_arguments = run.call_args.args[0]
+            docker.probe_reader_auth(
+                "book-translator-hub",
+                "cwa",
+                "http://calibre-web-automated:8083/ajax/emailstat",
+            )
+            reader_auth_arguments = run.call_args.args[0]
             docker.probe_sqlite(
                 "cwa-translate-api",
                 "/app/data/translations.db",
@@ -357,9 +517,46 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertIn("http://calibre-web-automated:8083/", http_arguments)
         self.assertEqual(auth_arguments[:3], ["docker", "exec", "cwa-translate-api"])
         self.assertIn("code in (401,403)", auth_arguments[-2])
+        self.assertEqual(
+            reader_auth_arguments[:3], ["docker", "exec", "book-translator-hub"]
+        )
+        self.assertEqual(reader_auth_arguments[-2:], ["cwa", "http://calibre-web-automated:8083/ajax/emailstat"])
+        self.assertIn("kind=='text/html'", reader_auth_arguments[-3])
         self.assertEqual(sqlite_arguments[:3], ["docker", "exec", "cwa-translate-api"])
         self.assertIn("/app/data/translations.db", sqlite_arguments)
         self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_provider_probe_requires_every_configured_backend(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().probe_providers("cwa-translate-api")
+
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[:3], ["docker", "exec", "cwa-translate-api"])
+        script = arguments[-1]
+        self.assertIn("all(item.get('status')=='ok'", script)
+        self.assertIn("check_backend_health", script)
+
+    def test_hub_provider_probe_uses_fixed_secret_free_command(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().probe_hub_providers("book-translator-hub")
+
+        arguments = run.call_args.args[0]
+        self.assertEqual(
+            arguments,
+            [
+                "docker",
+                "exec",
+                "book-translator-hub",
+                "python",
+                "/app/hub_runtime.py",
+                "--healthcheck-providers",
+            ],
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 240)
 
     def test_image_version_probe_uses_immutable_networkless_sandbox(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
@@ -385,7 +582,7 @@ class DockerCLIContractTests(unittest.TestCase):
             DockerCLI().build_image(
                 Path("/checkout"),
                 "local/cwa-translate:2.2.0-abcdef012345",
-                {"io.cwa-translate.revision": "a" * 40},
+                {"io.book-translator.revision": "a" * 40},
             )
 
         archive_arguments = run.call_args_list[0].args[0]
@@ -405,6 +602,60 @@ class DockerCLIContractTests(unittest.TestCase):
         self.assertEqual(build_arguments[-1], "-")
         self.assertEqual(run.call_args_list[1].kwargs["input"], b"tar-bytes")
         self.assertNotIn("/checkout", build_arguments)
+
+    def test_image_build_accepts_the_legacy_cwa_revision_label(self):
+        archive = mock.Mock(returncode=0, stdout=b"tar-bytes", stderr=b"")
+        built = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+        with mock.patch("subprocess.run", side_effect=[archive, built]) as run:
+            DockerCLI().build_image(
+                Path("/checkout"),
+                "local/cwa-translate:2.2.0-abcdef012345",
+                {"io.cwa-translate.revision": "b" * 40},
+            )
+
+        self.assertEqual(run.call_args_list[0].args[0][-1], "b" * 40)
+
+    def test_image_build_rejects_conflicting_revision_labels(self):
+        with mock.patch("subprocess.run") as run:
+            with self.assertRaisesRegex(
+                DockerCommandError,
+                "image build requires one exact source revision",
+            ):
+                DockerCLI().build_image(
+                    Path("/checkout"),
+                    "local/book-translator:2.3.0-abcdef012345",
+                    {
+                        "io.book-translator.revision": "a" * 40,
+                        "io.cwa-translate.revision": "b" * 40,
+                    },
+                )
+
+        run.assert_not_called()
+
+    def test_image_build_rejects_any_malformed_revision_label(self):
+        label_sets = (
+            {},
+            {"io.book-translator.revision": "A" * 40},
+            {"io.cwa-translate.revision": "a" * 39},
+            {
+                "io.book-translator.revision": "a" * 40,
+                "io.cwa-translate.revision": "invalid",
+            },
+        )
+
+        for labels in label_sets:
+            with self.subTest(labels=labels), mock.patch("subprocess.run") as run:
+                with self.assertRaisesRegex(
+                    DockerCommandError,
+                    "image build requires one exact source revision",
+                ):
+                    DockerCLI().build_image(
+                        Path("/checkout"),
+                        "local/book-translator:2.3.0-abcdef012345",
+                        labels,
+                    )
+                run.assert_not_called()
 
 
 class UnraidDataPreparationTests(unittest.TestCase):
@@ -481,10 +732,38 @@ class UnraidInstallTests(unittest.TestCase):
             self.assertEqual(api.image, proxy.image)
             self.assertEqual(api.image, self.identity.image)
             self.assertEqual(os.stat(root / "state" / "api.env").st_mode & 0o777, 0o600)
+            self.assertIn(
+                "BT_API_UPSTREAM=http://translator-api:8390\n",
+                (root / "state" / "proxy.env").read_text(encoding="utf-8"),
+            )
             self.assertNotIn("do-not-copy-to-xml", (root / "state" / "state.json").read_text())
             self.assertEqual(StateStore(root / "state").load(), state)
             self.assertTrue((root / "templates-user" / "my-cwa-translate-api.xml").is_file())
             self.assertTrue((root / "templates-user" / "my-cwa-translate-proxy.xml").is_file())
+
+    def test_latest_kavita_accepts_only_the_configured_runtime_image_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_image_id = "sha256:" + "1" * 64
+            config = InstallConfig.from_mapping(
+                {
+                    **values(root, reader="kavita"),
+                    "BT_READER_IMAGE_ID": runtime_image_id,
+                },
+                self.identity,
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker()
+            docker.containers["kavita"]["Config"]["Image"] = (
+                "jvmilazz0/kavita:latest"
+            )
+            docker.containers["kavita"]["Image"] = runtime_image_id
+
+            self.assertIsNone(UnraidInstaller(docker)._preflight(config, plan))
+
+            docker.containers["kavita"]["Image"] = "sha256:" + "2" * 64
+            with self.assertRaisesRegex(InstallError, "reader version"):
+                UnraidInstaller(docker)._preflight(config, plan)
 
     def test_failure_removes_only_created_roles_and_private_network(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -498,13 +777,146 @@ class UnraidInstallTests(unittest.TestCase):
                     config, plan, root
                 )
 
-            removed = [call[1] for call in docker.calls if call[0].startswith("remove_")]
+            removed = [
+                call[1]
+                for call in docker.calls
+                if call[0] in {"remove_container", "remove_network"}
+            ]
             self.assertEqual(
                 removed,
-                ["cwa-translate-test-proxy", "cwa-translate-test-api", "cwa-translate-test-private"],
+                [
+                    "cwa-translate-test-proxy",
+                    "cwa-translate-test-api",
+                    "cwa-translate-test-private",
+                ],
+            )
+            self.assertIn(
+                "remove_data_credential", [call[0] for call in docker.calls]
             )
             self.assertIn("calibre-web-automated", docker.containers)
             self.assertFalse((root / "state" / "state.json").exists())
+
+    def test_failed_reader_session_start_removes_new_key_and_can_retry(self):
+        for reader in ("cwa", "kavita"):
+            with (
+                self.subTest(reader=reader),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                config_values = values(root, reader=reader)
+                config_values["BT_AUTH_PROFILE"] = "reader-session"
+                config = InstallConfig.from_mapping(config_values, self.identity)
+                plan = DeploymentPlan.from_config(config)
+                docker = FakeDocker(fail_proxy_health=True)
+                installer = UnraidInstaller(
+                    docker, prepare_data=lambda path: path.mkdir(exist_ok=True)
+                )
+
+                with self.assertRaisesRegex(InstallError, "health"):
+                    installer.install(config, plan, root)
+
+                session_key = Path(config.data_dir) / "reader_session_key"
+                self.assertFalse(session_key.exists())
+                database = Path(config.data_dir) / "translations.db"
+                self.assertTrue(database.exists())
+                attempt_store = InstallAttemptStore(Path(config.state_dir))
+                self.assertEqual(attempt_store.load()["status"], "cleaned")
+                docker.fail_proxy_health = False
+                state = installer.install(config, plan, root)
+                self.assertEqual(state.status, "installed")
+                self.assertFalse(attempt_store.path.exists())
+                self.assertTrue(database.exists())
+
+    def test_failed_session_key_cleanup_retains_recovery_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_proxy_health=True)
+
+            def fail_credential_cleanup(image, path, filename):
+                docker.calls.append(
+                    ("remove_data_credential", image, str(path), filename)
+                )
+                raise InstallError("credential removal failed")
+
+            docker.remove_data_credential = fail_credential_cleanup
+            with self.assertRaisesRegex(
+                InstallError, "health.*reader session credential.*removal failed"
+            ):
+                UnraidInstaller(
+                    docker, prepare_data=lambda path: path.mkdir(exist_ok=True)
+                ).install(config, plan, root)
+
+            self.assertTrue((Path(config.data_dir) / "reader_session_key").exists())
+            journal = InstallAttemptStore(Path(config.state_dir)).load()
+            self.assertEqual(journal["status"], "cleanup-failed")
+            self.assertTrue(
+                any(
+                    "reader session credential" in error
+                    for error in journal["cleanup_errors"]
+                )
+            )
+
+    def test_cleaned_retry_evidence_survives_a_pre_runtime_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_proxy_health=True)
+            installer = UnraidInstaller(
+                docker, prepare_data=lambda path: path.mkdir(exist_ok=True)
+            )
+            with self.assertRaisesRegex(InstallError, "health"):
+                installer.install(config, plan, root)
+
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            cleaned = attempt_store.load()
+            original_build = docker.build_image
+
+            def fail_build(repository, image, labels):
+                raise InstallError("build failed before runtime")
+
+            docker.fail_proxy_health = False
+            docker.build_image = fail_build
+            with self.assertRaisesRegex(InstallError, "build failed"):
+                installer.install(config, plan, root)
+
+            self.assertEqual(attempt_store.load(), cleaned)
+            docker.build_image = original_build
+            self.assertEqual(installer.install(config, plan, root).status, "installed")
+
+    def test_cleaned_retry_requires_the_exact_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(
+                values(root, reader="kavita"), self.identity
+            )
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_proxy_health=True)
+            installer = UnraidInstaller(
+                docker, prepare_data=lambda path: path.mkdir(exist_ok=True)
+            )
+            with self.assertRaisesRegex(InstallError, "health"):
+                installer.install(config, plan, root)
+
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            mismatched = attempt_store.load()
+            mismatched["config_fingerprint"] = "0" * 64
+            attempt_store.save(mismatched)
+            build_count = sum(call[0] == "build_image" for call in docker.calls)
+
+            docker.fail_proxy_health = False
+            with self.assertRaisesRegex(InstallError, "unfinished install attempt"):
+                installer.install(config, plan, root)
+
+            self.assertEqual(
+                sum(call[0] == "build_image" for call in docker.calls), build_count
+            )
 
     def test_ambiguous_network_create_cleans_only_exact_labeled_network(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -622,6 +1034,33 @@ class UnraidInstallTests(unittest.TestCase):
 
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
             self.assertNotIn("build_image", [call[0] for call in docker.calls])
+
+    def test_cleanup_errors_are_aggregated_and_leave_recovery_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = InstallConfig.from_mapping(values(root), self.identity)
+            plan = DeploymentPlan.from_config(config)
+            docker = FakeDocker(fail_proxy_health=True)
+            original_remove = docker.remove_container
+
+            def remove_container(name):
+                if name.endswith("-proxy"):
+                    raise InstallError("proxy removal failed")
+                original_remove(name)
+
+            docker.remove_container = remove_container
+            with self.assertRaisesRegex(
+                InstallError, "proxy health failed.*cleanup.*proxy removal failed"
+            ):
+                UnraidInstaller(
+                    docker, prepare_data=lambda path: path.mkdir()
+                ).install(config, plan, root)
+
+            journal = InstallAttemptStore(Path(config.state_dir)).load()
+            self.assertEqual(journal["status"], "cleanup-failed")
+            self.assertTrue(
+                any("proxy" in error for error in journal["cleanup_errors"])
+            )
 
 
 class UnraidAdoptTests(unittest.TestCase):

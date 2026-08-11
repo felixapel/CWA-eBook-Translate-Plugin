@@ -14,20 +14,29 @@ CWA_NETWORK="${SMOKE_PREFIX}-cwa-net"
 CWA_CONTAINER="${SMOKE_PREFIX}-cwa"
 CWA_IMAGE="${SMOKE_PREFIX}-fixture-cwa:4.0.6"
 CWA_FIXTURE="$ROOT_DIR/cwa-fixture.py"
+KAVITA_NETWORK="${SMOKE_PREFIX}-kavita-net"
+KAVITA_CONTAINER="${SMOKE_PREFIX}-kavita"
+KAVITA_IMAGE="${SMOKE_PREFIX}-fixture-kavita:0.9.0.2"
+KAVITA_FIXTURE="$(pwd)/tests/python/test_kavita_auth_fixture.py"
 LEGACY_IMAGE="${SMOKE_PREFIX}-fixture-legacy:2.1.4"
 LEGACY_CONTAINER="${SMOKE_PREFIX}-legacy"
 FRESH_INSTALL="${SMOKE_PREFIX}-fresh"
+KAVITA_INSTALL="${SMOKE_PREFIX}-kavita-translate"
 MIGRATION_INSTALL="${SMOKE_PREFIX}-migration"
 
 cleanup() {
     docker rm -f -v \
         "${FRESH_INSTALL}-proxy" "${FRESH_INSTALL}-api" \
+        "${KAVITA_INSTALL}-proxy" "${KAVITA_INSTALL}-api" \
         "${MIGRATION_INSTALL}-proxy" "${MIGRATION_INSTALL}-api" \
-        "$LEGACY_CONTAINER" "$CWA_CONTAINER" >/dev/null 2>&1 || true
+        "$LEGACY_CONTAINER" "$CWA_CONTAINER" "$KAVITA_CONTAINER" \
+        >/dev/null 2>&1 || true
     docker network rm \
-        "${FRESH_INSTALL}-private" "${MIGRATION_INSTALL}-private" \
-        "$CWA_NETWORK" >/dev/null 2>&1 || true
-    docker image rm "$CWA_IMAGE" "$LEGACY_IMAGE" >/dev/null 2>&1 || true
+        "${FRESH_INSTALL}-private" "${KAVITA_INSTALL}-private" \
+        "${MIGRATION_INSTALL}-private" "$CWA_NETWORK" "$KAVITA_NETWORK" \
+        >/dev/null 2>&1 || true
+    docker image rm "$CWA_IMAGE" "$KAVITA_IMAGE" "$LEGACY_IMAGE" \
+        >/dev/null 2>&1 || true
     if [ -d "$ROOT_DIR" ]; then
         docker run --rm --user 0:0 \
             --entrypoint /bin/sh \
@@ -82,6 +91,37 @@ write_environment() {
             printf 'BT_LEGACY_CONTAINER=%s\n' "$LEGACY_CONTAINER"
             printf 'BT_LEGACY_DATA_DIR=%s\n' "$legacy_data_dir"
         fi
+    } >"$path"
+    chmod 0600 "$path"
+}
+
+write_kavita_environment() {
+    local path="$1"
+    local proxy_port="$2"
+    local state_dir="$3"
+    local data_dir="$4"
+    local backup_dir="$5"
+    {
+        printf 'BT_INSTALL_PROFILE=compose-existing\n'
+        printf 'BT_INSTALL_NAME=%s\n' "$KAVITA_INSTALL"
+        printf 'BT_INGRESS_MODE=published\n'
+        printf 'BT_PROXY_PORT=%s\n' "$proxy_port"
+        printf 'BT_EDGE_NETWORK=\n'
+        printf 'BT_AUTH_PROFILE=reader-session\n'
+        printf 'BT_PUBLIC_ORIGIN=http://127.0.0.1:%s\n' "$proxy_port"
+        printf 'BT_READER_TYPE=kavita\n'
+        printf 'BT_READER_UPSTREAM=http://%s:5000\n' "$KAVITA_CONTAINER"
+        printf 'BT_READER_CONTAINER=%s\n' "$KAVITA_CONTAINER"
+        printf 'BT_READER_NETWORK=%s\n' "$KAVITA_NETWORK"
+        printf 'BT_READER_VERSION=0.9.0.2\n'
+        printf 'BT_CWA_IDENTITY_HEADER=\n'
+        printf 'BT_STATE_DIR=%s\n' "$state_dir"
+        printf 'BT_DATA_DIR=%s\n' "$data_dir"
+        printf 'BT_BACKUP_DIR=%s\n' "$backup_dir"
+        printf 'LLM_PROVIDER=local\n'
+        printf 'LLM_MODEL=smoke-model\n'
+        printf 'BT_LOCAL_URL=http://host.docker.internal:2819/v1/chat/completions\n'
+        printf 'LLM_API_KEY=\n'
     } >"$path"
     chmod 0600 "$path"
 }
@@ -161,6 +201,24 @@ done
 docker exec "$CWA_CONTAINER" python -c \
     'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8083/", timeout=1).close()'
 
+test -r "$KAVITA_FIXTURE"
+docker network create "$KAVITA_NETWORK" >/dev/null
+docker tag "$SMOKE_IMAGE" "$KAVITA_IMAGE"
+docker run -d --name "$KAVITA_CONTAINER" --network "$KAVITA_NETWORK" \
+    --read-only --tmpfs /tmp \
+    --mount "type=bind,src=${KAVITA_FIXTURE},dst=/app/test_kavita_auth_fixture.py,readonly" \
+    --entrypoint python "$KAVITA_IMAGE" /app/test_kavita_auth_fixture.py >/dev/null
+for _ in $(seq 1 30); do
+    if docker exec "$KAVITA_CONTAINER" python -c \
+        'import socket; socket.create_connection(("127.0.0.1", 5000), 1).close()' \
+        >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+docker exec "$KAVITA_CONTAINER" python -c \
+    'import socket; socket.create_connection(("127.0.0.1", 5000), 1).close()'
+
 # Fresh lifecycle: install, state-loss adoption, conservative uninstall, and
 # reinstall with preserved data and archived terminal evidence.
 FRESH_STATE="$ROOT_DIR/fresh-state"
@@ -178,6 +236,52 @@ assert_doctor "$FRESH_ENV"
 test "$(docker inspect "${FRESH_INSTALL}-api" --format '{{.Config.User}}')" = "101:102"
 test -z "$(docker port "${FRESH_INSTALL}-api")"
 curl -fsS "http://127.0.0.1:${FRESH_PORT}/bt-api/ping" | grep -q '"status":"ok"'
+
+# Install the pinned Kavita connector concurrently, exercise its native-token
+# exchange, then remove only its owned resources. CWA must remain healthy and
+# both readers/data directories must remain external throughout.
+KAVITA_STATE="$ROOT_DIR/kavita-state"
+KAVITA_DATA="$ROOT_DIR/kavita-data"
+KAVITA_BACKUP="$ROOT_DIR/kavita-backup"
+KAVITA_ENV="$ROOT_DIR/kavita.env"
+KAVITA_PORT="$(free_port)"
+KAVITA_HEADERS="$ROOT_DIR/kavita-session.headers"
+write_kavita_environment \
+    "$KAVITA_ENV" "$KAVITA_PORT" \
+    "$KAVITA_STATE" "$KAVITA_DATA" "$KAVITA_BACKUP"
+
+./btctl plan --env "$KAVITA_ENV" --json >/dev/null
+./btctl install --env "$KAVITA_ENV" --yes --json >/dev/null
+assert_doctor "$KAVITA_ENV"
+assert_doctor "$FRESH_ENV"
+test "$(docker inspect "${KAVITA_INSTALL}-api" --format '{{.Config.User}}')" = "101:102"
+test -z "$(docker port "${KAVITA_INSTALL}-api")"
+curl -fsS "http://127.0.0.1:${KAVITA_PORT}/library/7/series/42/book/99" \
+    | grep -q '<div class="book-content">'
+curl -fsS -D "$KAVITA_HEADERS" -o /dev/null -X POST \
+    -H 'Authorization: Bearer container-smoke-kavita-access' \
+    -H 'User-Agent: Lifecycle-Smoke-Browser/1.0' \
+    -H "Origin: http://127.0.0.1:${KAVITA_PORT}" \
+    "http://127.0.0.1:${KAVITA_PORT}/bt-api/session"
+KAVITA_SESSION_COOKIE="$(awk 'BEGIN{IGNORECASE=1} /^set-cookie:/ {sub(/^[^:]*:[[:space:]]*/, ""); split($0, parts, ";"); if (parts[1] ~ /^bt-session=/) print parts[1]}' "$KAVITA_HEADERS" | tail -n 1 | tr -d '\r')"
+if [[ ! "$KAVITA_SESSION_COOKIE" =~ ^bt-session=[A-Za-z0-9_-]{32,128}$ ]]; then
+    echo "Kavita lifecycle smoke did not receive an opaque session" >&2
+    exit 1
+fi
+curl -fsS \
+    -H "Cookie: ${KAVITA_SESSION_COOKIE}" \
+    -H 'User-Agent: Lifecycle-Smoke-Browser/1.0' \
+    "http://127.0.0.1:${KAVITA_PORT}/bt-api/metrics" \
+    | grep -q '"total_requests"'
+test -e "$FRESH_DATA/reader_session_key"
+test -e "$KAVITA_DATA/reader_session_key"
+./btctl uninstall --env "$KAVITA_ENV" --yes --json | python3 -c \
+    'import json,sys; assert json.load(sys.stdin)["status"] == "uninstalled"'
+test ! -e "$KAVITA_DATA/reader_session_key"
+test -e "$KAVITA_DATA/translations.db"
+test "$(docker inspect "$KAVITA_CONTAINER" --format '{{.State.Running}}')" = "true"
+test "$(docker inspect "$CWA_CONTAINER" --format '{{.State.Running}}')" = "true"
+assert_doctor "$FRESH_ENV"
 
 rm -- "$FRESH_STATE/state.json"
 ./btctl adopt --env "$FRESH_ENV" --json | python3 -c \
@@ -268,4 +372,4 @@ assert journal["status"] == "upgraded", journal
 assert journal["attempt"] == 2, journal
 PY
 
-echo "btctl install, adopt, uninstall, reinstall, migration, rollback, and reupgrade: OK"
+echo "btctl CWA/Kavita isolation, adopt, uninstall, reinstall, migration, rollback, and reupgrade: OK"

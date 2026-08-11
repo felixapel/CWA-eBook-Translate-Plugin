@@ -39,7 +39,7 @@ NODE_VERSION = "24.18.0"
 APK_PACKAGES = {
     "libgomp": "15.2.0-r5",
     "libxml2": "2.13.9-r2",
-    "nginx": "1.30.3-r0",
+    "nginx": "1.30.4-r1",
     "pcre2": "10.47-r1",
 }
 
@@ -95,9 +95,9 @@ class SupplyChainContractTests(unittest.TestCase):
     def test_supply_chain_contract_is_a_required_backend_gate(self):
         for workflow in WORKFLOWS:
             self.assertIn(
-                "test_supply_chain_contract",
+                "-m unittest discover -v tests/python",
                 workflow.read_text(),
-                f"{workflow}: supply-chain assertions must run in CI",
+                f"{workflow}: every discovered contract must run in CI",
             )
 
     def test_container_base_and_operating_system_packages_are_immutable(self):

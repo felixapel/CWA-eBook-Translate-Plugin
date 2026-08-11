@@ -17,6 +17,8 @@ SMOKE_NETWORK="${SMOKE_PREFIX}-net"
 DATA_DIR=""
 COOKIE_JAR=""
 RESPONSE_FILE=""
+PROVIDER_POLICY=""
+PROVIDER_GENERATION=""
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 
@@ -223,12 +225,34 @@ BROWSER_UA='CA-Smoke-Browser/1.0'
 curl -sf -c "$COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
     "http://127.0.0.1:${APP_PORT}/fixture/login" | grep -q '"authenticated":true'
 
+load_provider_policy() {
+    PROVIDER_POLICY="$(curl -sf -b "$COOKIE_JAR" \
+        -H "User-Agent: ${BROWSER_UA}" \
+        "http://127.0.0.1:${APP_PORT}/bt-api/provider-policy")"
+    PROVIDER_GENERATION="$(sed -n \
+        's/.*"generation":"\([^"]*\)".*/\1/p' <<<"$PROVIDER_POLICY")"
+    test -n "$PROVIDER_GENERATION"
+}
+
+load_provider_policy
+
 request_translation() {
-    curl -sf -b "$COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
+    local status
+    local payload
+    payload='{"paragraphs":["first smoke paragraph","second smoke paragraph"],'
+    payload+='"source_lang":"English","target_lang":"Spanish",'
+    payload+='"book_id":"ca-smoke-book","chapter_id":"chapter-1",'
+    payload+="\"provider_policy\":${PROVIDER_POLICY}}"
+    status="$(curl -sS -b "$COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
         -H 'Content-Type: application/json' \
-        --data '{"paragraphs":["first smoke paragraph","second smoke paragraph"],"source_lang":"English","target_lang":"Spanish","book_id":"ca-smoke-book","chapter_id":"chapter-1"}' \
+        --data "$payload" \
         "http://127.0.0.1:${APP_PORT}/bt-api/translate/batch" \
-        >"$RESPONSE_FILE"
+        --output "$RESPONSE_FILE" --write-out '%{http_code}')"
+    if [ "$status" != 200 ]; then
+        echo "combined profile translation returned HTTP ${status}" >&2
+        sed -n '1,10p' "$RESPONSE_FILE" >&2
+        return 1
+    fi
 }
 
 request_translation
@@ -247,6 +271,7 @@ for _ in $(seq 1 30); do
     fi
     sleep 1
 done
+load_provider_policy
 request_translation
 grep -Eq '"cached":\[true,true\]' "$RESPONSE_FILE"
 

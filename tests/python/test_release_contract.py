@@ -292,7 +292,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         changelog = (ROOT / "CHANGELOG.md").read_text()
         self.assertEqual(changelog.count("\n## [Unreleased]\n"), 1)
         unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-        self.assertRegex(unreleased, r"(?m)^### (?:Added|Changed|Deprecated|Removed|Fixed|Security)$")
+        if unreleased.strip():
+            self.assertRegex(
+                unreleased,
+                r"(?m)^### (?:Added|Changed|Deprecated|Removed|Fixed|Security)$",
+            )
 
     def test_v214_compose_upgrade_is_offline_external_and_reversible(self):
         lifecycle = (ROOT / "docs" / "operations" / "lifecycle.md").read_text()
@@ -366,12 +370,13 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_release_reuses_every_required_ci_contract(self):
         workflow = GITEA_RELEASE.read_text()
         for command in (
-            "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py",
+            "git ls-files -z -- '*.py' | xargs -0 -r python3 -m py_compile",
             "python3 -m tests.python.test_translation",
             "python3 -m tests.python.test_hardening",
-            "tests.python.test_btctl_auth tests.python.test_btctl_lifecycle",
-            "tests.python.test_singleflight tests.python.test_auth tests.python.test_ci_contract tests.python.test_docs_contract",
-            "tests.python.test_release_contract",
+            "python3 -m coverage erase",
+            "python3 -m coverage run --branch --source=. --omit='.venv/*,tests/*,tools/*' -m unittest discover -v tests/python",
+            "python3 -m coverage report --precision=1 --show-missing --fail-under=\"$BT_COVERAGE_FAIL_UNDER\"",
+            "bash -n btctl install_unraid.sh scripts/*.sh",
             "npm ci",
             "npm audit --audit-level=high",
             "npm test",
@@ -381,8 +386,10 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             './scripts/btctl-lifecycle-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX"',
             './scripts/btctl-bootstrap-smoke.sh "$SMOKE_PREFIX"',
             './scripts/ca-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-ca"',
+            './scripts/hub-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-hub"',
         ):
             self.assertIn(command, workflow)
+        self.assertIn("BT_COVERAGE_FAIL_UNDER: \"60\"", workflow)
 
     def test_release_docker_smoke_uses_the_host_runner_and_scoped_names(self):
         workflow = GITEA_RELEASE.read_text()

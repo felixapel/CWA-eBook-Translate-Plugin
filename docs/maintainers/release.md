@@ -41,19 +41,12 @@ git diff --check
 python3 scripts/check_docs.py
 python3 -m tests.python.test_translation
 python3 -m tests.python.test_hardening
-python3 -m unittest -v \
-  tests.python.test_btctl tests.python.test_btctl_container \
-  tests.python.test_btctl_compose tests.python.test_btctl_unraid \
-  tests.python.test_btctl_auth tests.python.test_btctl_lifecycle \
-  tests.python.test_work_budget tests.python.test_provider_budget \
-  tests.python.test_cache_v2 tests.python.test_context_cache \
-  tests.python.test_singleflight tests.python.test_auth \
-  tests.python.test_ci_contract tests.python.test_docs_contract \
-  tests.python.test_release_contract tests.python.test_supply_chain_contract \
-  tests.python.test_shell_contract tests.python.test_container_contract \
-  tests.python.test_cleanup_token tests.python.test_api_schema \
-  tests.python.test_error_privacy tests.python.test_observability \
-  tests.python.test_proxy_config tests.python.test_live_scripts
+git ls-files -z -- '*.py' | xargs -0 -r python3 -m py_compile
+bash -n btctl install_unraid.sh scripts/*.sh
+python3 -m coverage erase
+python3 -m coverage run --branch --source=. \
+  --omit='.venv/*,tests/*,tools/*' -m unittest discover -v tests/python
+python3 -m coverage report --precision=1 --show-missing --fail-under=60
 node -c static/translator.js
 node -c static/loader.js
 npm ci
@@ -63,6 +56,7 @@ npm run test:e2e
 docker build -t "cwa-translate:${VERSION}-candidate" .
 ./scripts/container-smoke.sh "cwa-translate:${VERSION}-candidate" release
 ./scripts/btctl-lifecycle-smoke.sh "cwa-translate:${VERSION}-candidate" release
+./scripts/hub-container-smoke.sh "cwa-translate:${VERSION}-candidate" release-hub
 ./scripts/btctl-bootstrap-smoke.sh release
 ./scripts/ca-container-smoke.sh "cwa-translate:${VERSION}-candidate" release-ca
 python3 scripts/release_preflight.py --help
@@ -82,9 +76,43 @@ on the exact merge commit.
 Before tagging a runtime change, run physical stock-Unraid and browser
 acceptance on that exact commit. The source-built path must complete
 `plan -> install -> doctor`; the reader must translate a non-sensitive DRM-free
-EPUB through the public route. Community Applications candidates require the
-additional digest-pinned combined-container checklist. Record host, CWA version,
+EPUB through the public route. Record host, exact reader version and image,
 browser, LLM, commit/digest and result in the release issue without secrets.
+
+Record the physical gate with this complete template:
+
+```text
+Candidate tag:
+Commit and image digest:
+Unraid version and architecture:
+CWA image/tag and immutable image ID:
+Kavita image/tag and immutable image ID:
+Browser and version:
+LLM provider/model:
+plan -> install -> doctor:
+CWA EPUB/auth/navigation/reload:
+Kavita EPUB/auth/navigation/reload:
+Manga/PDF inactivity:
+CWA/Kavita ports, state, data, keys and backups isolated:
+Rollback/fix-forward result:
+Secrets/book content included: no
+```
+
+For Kavita, also prove stock v0.9.0.2, exact EPUB route and `.book-content`,
+native login exchange, chapter navigation, reload, and inactivity on manga/PDF
+routes. When CWA and Kavita coexist, prove their names, ports, state, data,
+backups and lifecycle operations are isolated. Community Applications
+candidates require their separate digest-pinned CWA-only checklist.
+
+## Kavita promotion sequence
+
+Keep audit hardening and a new reader compatibility claim independently
+releasable. Ship the audit corrections in the next unused `2.2.x` patch after
+its normal gates. Introduce Kavita as `2.3.0-rc.1` only after unit, Chromium,
+container and lifecycle gates pass on the exact candidate. Promote `2.3.0`
+only after the physical Kavita checklist above is recorded on that exact code;
+otherwise issue a new release candidate and keep Kavita labeled candidate.
+Do not add Kavita to Community Applications as part of this sequence.
 
 ## Publish source and mirror
 

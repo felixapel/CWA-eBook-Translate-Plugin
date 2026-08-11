@@ -1,4 +1,4 @@
-# Contributing to CWA eBook Translate
+# Contributing to eBook Translate
 
 Thanks for helping improve the project. Keep changes narrow, explain the user
 problem, and include a regression test for behavior changes.
@@ -14,6 +14,8 @@ problem, and include a regression test for behavior changes.
    . .venv/bin/activate
    python -m pip install --require-hashes --only-binary=:all: \
      -r requirements/requirements.txt
+   python -m pip install --require-hashes --only-binary=:all: \
+     -r requirements/requirements-audit.txt
    npm ci
    ```
 
@@ -29,19 +31,12 @@ before opening a pull request:
 ```bash
 python3 -m tests.python.test_translation
 python3 -m tests.python.test_hardening
-python3 -m unittest -v \
-  tests.python.test_btctl tests.python.test_btctl_container \
-  tests.python.test_btctl_compose tests.python.test_btctl_unraid \
-  tests.python.test_btctl_auth tests.python.test_btctl_lifecycle \
-  tests.python.test_work_budget tests.python.test_provider_budget \
-  tests.python.test_cache_v2 tests.python.test_context_cache \
-  tests.python.test_singleflight tests.python.test_auth \
-  tests.python.test_ci_contract tests.python.test_docs_contract \
-  tests.python.test_release_contract tests.python.test_supply_chain_contract \
-  tests.python.test_shell_contract tests.python.test_container_contract \
-  tests.python.test_cleanup_token tests.python.test_api_schema \
-  tests.python.test_error_privacy tests.python.test_observability \
-  tests.python.test_proxy_config tests.python.test_live_scripts
+python3 -m coverage erase
+python3 -m coverage run --branch --source=. \
+  --omit='.venv/*,tests/*,tools/*' -m unittest discover -v tests/python
+python3 -m coverage report --precision=1 --show-missing --fail-under=60
+git ls-files -z -- '*.py' | xargs -0 -r python3 -m py_compile
+bash -n btctl install_unraid.sh scripts/*.sh
 node -c static/translator.js
 node -c static/loader.js
 npm ci

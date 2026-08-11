@@ -5,11 +5,27 @@
 (function () {
     'use strict';
     // ── Version & Telemetry ──────────────────────────────────────────
-    const BT_UI_VERSION = '2.2.2';
+    const BT_UI_VERSION = '2.3.0-rc.1';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
+    const configuredReaderType = cfg.readerType || '';
+    const READER_TYPE = configuredReaderType === 'kavita' ? 'kavita' : 'cwa';
+    const STRICT_READER_ROUTE = configuredReaderType === 'cwa'
+        || configuredReaderType === 'kavita';
+    const validKavitaContract = READER_TYPE === 'kavita'
+        && cfg.readerVersion === '0.9.0.2'
+        && cfg.readerContractVersion === 'kavita-0.9.0.2-epub-v1';
+    if (configuredReaderType && configuredReaderType !== 'cwa'
+            && configuredReaderType !== 'kavita') {
+        console.error('[BookTranslator] disabled: unsupported reader type');
+        return;
+    }
+    if (READER_TYPE === 'kavita' && !validKavitaContract) {
+        console.error('[BookTranslator] disabled: unsupported Kavita reader contract');
+        return;
+    }
     const configuredAuthMode = cfg.authMode || (cfg.apiToken ? 'token' : 'cwa_session');
-    const AUTH_MODE = ['cwa_session', 'token', 'forwarded'].includes(configuredAuthMode)
+    const AUTH_MODE = ['cwa_session', 'reader_session', 'token', 'forwarded'].includes(configuredAuthMode)
         ? configuredAuthMode
         : 'cwa_session';
     const configuredCredentials = ['omit', 'same-origin', 'include'].includes(cfg.credentials)
@@ -43,7 +59,6 @@
     let TARGET_LANG = localStorage.getItem('bt_lang') || cfg.targetLang || defaultLang;
 
     const BT_CLIENT_MAX_INFLIGHT = 1;
-    const BT_CLIENT_MIN_REQUEST_GAP_MS = 500;
     const BT_CLIENT_RATE_LIMIT_BACKOFF_MS = 10000;
     const BT_CLIENT_MAX_RATE_LIMIT_RESPONSES = 3;
     const BT_CLIENT_MAX_RETRY_AFTER_SECONDS = 60;
@@ -55,15 +70,34 @@
     let prefetchQueue = [];
     let isPumpRunning = false;
     let rateLimitUntil = 0;
-    let lastRequestEnd = 0;
+    let firstVisibleBatchCompleted = false;
     let lastFirstVisibleHash = null;
     let pendingFirstVisibleHash = null; // 2-poll debounce for the page-turn detector
 
+    function kavitaRouteParts() {
+        const match = window.location.pathname.match(
+            /^\/library\/([1-9][0-9]*)\/series\/([1-9][0-9]*)\/book\/([1-9][0-9]*)\/?$/
+        );
+        return match ? { libraryId: match[1], seriesId: match[2], chapterId: match[3] } : null;
+    }
+
+    function isSupportedReaderRoute() {
+        if (!STRICT_READER_ROUTE) return true;
+        if (READER_TYPE === 'kavita') return kavitaRouteParts() !== null;
+        return /^\/read\/[^/?#]+(?:\/[^?#]*)?\/?$/.test(window.location.pathname);
+    }
+
+    let readerRouteActive = false;
+
     // UI / status state
-    let prefetchEnabled = localStorage.getItem('bt_prefetch') !== '0'; // translate whole chapter ahead
+    let prefetchEnabled = localStorage.getItem('bt_prefetch') === '1'; // explicit whole-chapter opt-in
     // Privacy decision scoped to this reader tab/book. Never restore it from
     // browser storage: every new book session starts with remote fallback off.
     let allowCloudFallback = false;
+    // Fetched from the authenticated API. Until this is known, translation is
+    // fail-closed so book text cannot leave the browser without an honest UI.
+    let providerPolicyState = null;
+    let providerPolicyPromise = null;
     // Honest chapter progress: `chapterDone` counts paragraphs actually
     // processed this session (visible AND prefetch), `inflightCount` the ones
     // currently at the API. The displayed total is computed live as
@@ -143,6 +177,7 @@
     // fetches immediately instead of blocking the UI until they finish.
     let generation = 0;
     const activeControllers = new Set();
+    let paragraphTextCache = new WeakMap();
 
     function newGeneration() {
         generation++;
@@ -150,12 +185,14 @@
             try { c.abort(); } catch (e) { /* ignore */ }
         }
         activeControllers.clear();
+        paragraphTextCache = new WeakMap();
         visibleQueue = [];
         prefetchQueue = [];
         chapterDone = 0;
         inflightCount = 0;
         isTranslating = false;
         isPrefetching = false;
+        firstVisibleBatchCompleted = false;
         refreshStatus();
         return generation;
     }
@@ -196,6 +233,9 @@
             retryPage: 'Retry current page', debug: 'Debug',
             cloudFallback: 'Allow cloud fallback',
             cloudPrivacy: 'Sends book text to the configured remote provider. This choice is not saved and applies only to this book tab.',
+            cloudActive: 'Cloud translation is active: book text is sent to the configured remote primary provider.',
+            cloudSecondary: 'Allow secondary remote fallback',
+            cloudSecondaryPrivacy: 'The primary provider is already remote. This additionally permits the configured remote fallback for this tab.',
             dbgQueue: 'Queue', dbgGen: 'Generation', dbgTrigger: 'Last trigger',
         },
         es: {
@@ -210,6 +250,9 @@
             retryPage: 'Reintentar página actual', debug: 'Depuración',
             cloudFallback: 'Permitir fallback cloud',
             cloudPrivacy: 'Envía texto del libro al proveedor remoto configurado. Esta elección no se guarda y solo aplica a esta pestaña del libro.',
+            cloudActive: 'La traducción cloud está activa: el texto se envía al proveedor primario remoto configurado.',
+            cloudSecondary: 'Permitir fallback remoto secundario',
+            cloudSecondaryPrivacy: 'El proveedor primario ya es remoto. Esto además permite el fallback remoto configurado durante esta pestaña.',
             dbgQueue: 'Cola', dbgGen: 'Generación', dbgTrigger: 'Último disparo',
         },
         fr: {
@@ -441,6 +484,7 @@
         menu.setAttribute('role', 'dialog');
         menu.setAttribute('aria-label', t.settings);
         menu.setAttribute('aria-hidden', 'true');
+        menu.setAttribute('tabindex', '-1');
         document.body.appendChild(menu);
 
         document.getElementById('bt-toggle').onclick = () => {
@@ -468,7 +512,7 @@
         // Close on outside click (anywhere not on the bar or the menu)...
         document.addEventListener('click', (e) => {
             if (menu.classList.contains('bt-open') && !bar.contains(e.target) && !menu.contains(e.target)) {
-                closeMenu();
+                closeMenu({ restoreFocus: false });
             }
         });
         // ...and on Escape.
@@ -476,12 +520,19 @@
             if (e.key === 'Escape' && menu.classList.contains('bt-open')) closeMenu();
         });
 
-        // Click the error status to retry.
-        document.getElementById('bt-status').onclick = () => {
+        const retryFailed = () => {
             if (bar.dataset.state === 'error') {
                 errorCount = 0;
                 failedParagraphs.clear();
                 if (translationMode !== 'off') translateCurrentPage();
+            }
+        };
+        const status = document.getElementById('bt-status');
+        status.onclick = retryFailed;
+        status.onkeydown = (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                if (bar.dataset.state === 'error') event.preventDefault();
+                retryFailed();
             }
         };
 
@@ -495,6 +546,28 @@
         const entryCount = Object.keys(translatedParagraphs).length;
         const modeLabel = t[translationMode] || translationMode;
         const esc = (s) => String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+        let privacyControls = '';
+        if (providerPolicyState && providerPolicyState.primary === 'remote') {
+            privacyControls +=
+                `<div class="bt-menu-note bt-menu-warning" data-provider-policy="cloud-active">${t.cloudActive || strings.en.cloudActive}</div>`;
+            if (providerPolicyState.fallback === 'remote') {
+                privacyControls +=
+                    `<button type="button" class="bt-menu-item" data-action="cloud-fallback" role="switch" aria-checked="${allowCloudFallback}">` +
+                        `<span>${t.cloudSecondary || strings.en.cloudSecondary}</span>` +
+                        `<span class="bt-switch${allowCloudFallback ? ' bt-on' : ''}" aria-hidden="true"></span>` +
+                    `</button>` +
+                    `<div class="bt-menu-note bt-menu-warning" data-provider-policy="remote-secondary">${t.cloudSecondaryPrivacy || strings.en.cloudSecondaryPrivacy}</div>`;
+            }
+        } else if (providerPolicyState
+                && providerPolicyState.primary === 'local'
+                && providerPolicyState.fallback === 'remote') {
+            privacyControls =
+                `<button type="button" class="bt-menu-item" data-action="cloud-fallback" role="switch" aria-checked="${allowCloudFallback}">` +
+                    `<span>${t.cloudFallback || strings.en.cloudFallback}</span>` +
+                    `<span class="bt-switch${allowCloudFallback ? ' bt-on' : ''}" aria-hidden="true"></span>` +
+                `</button>` +
+                `<div class="bt-menu-note bt-menu-warning" data-provider-policy="remote-fallback">${t.cloudPrivacy || strings.en.cloudPrivacy}</div>`;
+        }
         menu.innerHTML =
             `<div class="bt-menu-header">${t.bookTranslator}<span class="bt-menu-ver">v${BT_UI_VERSION}</span></div>` +
             `<div class="bt-menu-row"><span>${t.modeLabel}</span><span class="bt-menu-val">${modeLabel}</span></div>` +
@@ -507,11 +580,7 @@
                 `<span>${t.prefetchWhole}</span>` +
                 `<span class="bt-switch${prefetchEnabled ? ' bt-on' : ''}" aria-hidden="true"></span>` +
             `</button>` +
-            `<button type="button" class="bt-menu-item" data-action="cloud-fallback" role="switch" aria-checked="${allowCloudFallback}">` +
-                `<span>${t.cloudFallback}</span>` +
-                `<span class="bt-switch${allowCloudFallback ? ' bt-on' : ''}" aria-hidden="true"></span>` +
-            `</button>` +
-            `<div class="bt-menu-note bt-menu-warning">${t.cloudPrivacy}</div>` +
+            privacyControls +
             `<button type="button" class="bt-menu-item" data-action="retry"><span>↻ ${t.retryPage}</span></button>` +
             `<button type="button" class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></button>` +
             `<button type="button" class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></button>` +
@@ -569,14 +638,16 @@
         });
     }
 
-    function closeMenu() {
+    function closeMenu({ restoreFocus = true } = {}) {
         const menu = document.getElementById('bt-menu');
         const gear = document.getElementById('bt-gear');
+        const wasOpen = !!(menu && menu.classList.contains('bt-open'));
         if (menu) {
             menu.classList.remove('bt-open');
             menu.setAttribute('aria-hidden', 'true');
         }
         if (gear) gear.setAttribute('aria-expanded', 'false');
+        if (restoreFocus && wasOpen && gear) gear.focus();
     }
 
     function toggleMenu() {
@@ -588,13 +659,21 @@
         menu.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
         const gear = document.getElementById('bt-gear');
         if (gear) gear.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+        if (isOpen) {
+            const target = menu.querySelector('select, button, [tabindex="0"]') || menu;
+            window.requestAnimationFrame(() => target.focus());
+        } else if (gear) {
+            gear.focus();
+        }
     }
 
     // Single source of truth for the status zone: derives display from state.
     function refreshStatus() {
+        if (typeof document === 'undefined') return;
         const bar = document.getElementById('bt-bar');
         const text = document.getElementById('bt-status-text');
         const progress = document.getElementById('bt-progress');
+        const status = document.getElementById('bt-status');
         const fill = document.getElementById('bt-progress-fill');
         if (!bar || !text) return;
 
@@ -641,12 +720,23 @@
                 text.textContent = t.done;
                 doneHideTimer = setTimeout(() => {
                     chapterDone = 0;
-                    const b = document.getElementById('bt-bar');
-                    if (b && b.dataset.state === 'done') { b.dataset.state = 'idle'; }
+                    doneHideTimer = null;
+                    refreshStatus();
                 }, 2500);
             }
         }
         bar.dataset.state = state;
+        if (status) {
+            if (state === 'error') {
+                status.setAttribute('role', 'button');
+                status.setAttribute('tabindex', '0');
+                status.setAttribute('aria-label', t.retryPage);
+            } else {
+                status.setAttribute('role', 'status');
+                status.removeAttribute('tabindex');
+                status.removeAttribute('aria-label');
+            }
+        }
         if (progress) {
             if (state === 'page') {
                 progress.removeAttribute('aria-valuenow');
@@ -677,12 +767,27 @@
     }
 
     // ── DOM Helpers ────────────────────────────────────────────────────
+    function getReaderIframe() {
+        if (READER_TYPE === 'kavita') return null;
+        return document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+    }
+
     function getReaderDoc() {
-        const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+        if (READER_TYPE === 'kavita') {
+            return document.querySelector('.book-content') ? document : null;
+        }
+        const iframe = getReaderIframe();
         if (iframe) {
             try { return iframe.contentDocument || iframe.contentWindow.document; } catch (e) { return null; }
         }
         return null;
+    }
+
+    function getReaderRoot() {
+        if (READER_TYPE === 'kavita') {
+            return document.querySelector('.book-content');
+        }
+        return getReaderDoc() || document;
     }
 
     const HEADING_CLASS_RE = /title|subtitle|chapter|heading|epigraph/i;
@@ -759,15 +864,27 @@
     }
 
     function getParagraphs() {
-        return getTranslatableElements(getReaderDoc() || document);
+        return getTranslatableElements(getReaderRoot());
     }
 
     function getVisibleParagraphs() {
         // Filter the SAME canonical, de-duplicated set used everywhere else, so
         // visible-first covers headings/lists too and the prefetch complement is
         // exact (no element falls through the cracks between the two selectors).
-        const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+        const iframe = getReaderIframe();
         const all = getParagraphs();
+        if (READER_TYPE === 'kavita') {
+            return all.filter(el => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return false;
+                const right = Number.isFinite(rect.right)
+                    ? rect.right : rect.left + rect.width;
+                const bottom = Number.isFinite(rect.bottom)
+                    ? rect.bottom : rect.top + rect.height;
+                return right >= -100 && rect.left < window.innerWidth - 20
+                    && bottom >= -100 && rect.top < window.innerHeight - 20;
+            });
+        }
         if (!iframe || !iframe.contentDocument) {
             return all.slice(0, 5);
         }
@@ -784,10 +901,17 @@
     }
 
     function getParagraphText(el) {
-        if (el.dataset.originalText) return el.dataset.originalText;
+        if (el.dataset.originalText) {
+            paragraphTextCache.set(el, el.dataset.originalText);
+            return el.dataset.originalText;
+        }
+        const cached = paragraphTextCache.get(el);
+        if (cached !== undefined) return cached;
         const clone = el.cloneNode(true);
         clone.querySelectorAll('.bt-loading, .bt-translation').forEach(n => n.remove());
-        return clone.textContent.trim();
+        const text = clone.textContent.trim();
+        paragraphTextCache.set(el, text);
+        return text;
     }
 
     function hashText(str) {
@@ -812,6 +936,10 @@
     }
 
     function currentBookId() {
+        if (READER_TYPE === 'kavita') {
+            const route = kavitaRouteParts();
+            return route ? `${route.libraryId}:${route.seriesId}` : 'unscoped';
+        }
         if (cfg.bookId !== undefined && cfg.bookId !== null) {
             return boundedScopeValue(cfg.bookId, 'unscoped');
         }
@@ -825,6 +953,10 @@
     }
 
     function currentChapterId() {
+        if (READER_TYPE === 'kavita') {
+            const route = kavitaRouteParts();
+            return route ? route.chapterId : 'unscoped';
+        }
         try {
             const rendition = window.reader && window.reader.rendition;
             const location = rendition && rendition.currentLocation && rendition.currentLocation();
@@ -841,7 +973,7 @@
         } catch (e) { /* reader is not ready yet */ }
 
         try {
-            const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+            const iframe = getReaderIframe();
             if (iframe) {
                 const doc = iframe.contentDocument;
                 const identity = (doc && doc.documentURI) || iframe.getAttribute('src');
@@ -874,20 +1006,93 @@
     function cacheKeyForText(text, elementContext = 'unscoped-element') {
         const scope = translationScope();
         return hashText(JSON.stringify([
-            'cwa-ui-cache/v3', BT_UI_VERSION, SOURCE_LANG, TARGET_LANG,
+            'reader-ui-cache/v4', READER_TYPE, BT_UI_VERSION, SOURCE_LANG, TARGET_LANG,
             scope.book_id, scope.chapter_id, elementContext, text
         ]));
     }
 
     // ── Translation engine ─────────────────────────────────────────────
-    const VISIBLE_CHUNK = 1;       // paragraphs per request for the on-screen page
-    const PREFETCH_CHUNK = 3;      // paragraphs per request for background fill
+    const FIRST_VISIBLE_CHUNK = 1; // minimize time to the first translated paragraph
+    const VISIBLE_CHUNK = 5;       // amortize later visible work without a large burst
+    const PREFETCH_CHUNK = 5;      // bounded background batches
     const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
 
     // Server rejects paragraphs beyond BT_MAX_PARAGRAPH_CHARS (default 8000)
     // with a 413 that would fail the WHOLE batch. Skip oversized elements
     // client-side — they are almost always mis-detected wrappers, not prose.
     const CLIENT_MAX_PARAGRAPH_CHARS = 7500;
+
+    function apiRequestCredentials() {
+        return configuredCredentials || (
+            AUTH_MODE === 'forwarded'
+                ? 'include'
+                : (AUTH_MODE === 'cwa_session' || AUTH_MODE === 'reader_session'
+                    ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
+                    : 'omit')
+        );
+    }
+
+    function apiRequestHeaders({ json = false } = {}) {
+        const headers = {};
+        if (json) headers['Content-Type'] = 'application/json';
+        if (AUTH_MODE === 'token' && cfg.apiToken) {
+            headers['X-BT-Token'] = cfg.apiToken;
+        }
+        return headers;
+    }
+
+    function validProviderPolicy(policy) {
+        if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return false;
+        const keys = Object.keys(policy).sort();
+        return keys.length === 3 && keys[0] === 'fallback'
+            && keys[1] === 'generation' && keys[2] === 'primary'
+            && (policy.primary === 'local' || policy.primary === 'remote')
+            && (policy.fallback === null
+                || policy.fallback === 'local'
+                || policy.fallback === 'remote')
+            && typeof policy.generation === 'string'
+            && /^[a-f0-9]{32}$/.test(policy.generation);
+    }
+
+    async function loadProviderPolicy({ force = false } = {}) {
+        if (!force && providerPolicyState) return true;
+        if (providerPolicyPromise) return providerPolicyPromise;
+        if (!TRANSLATOR_URL) return false;
+        if (force) {
+            providerPolicyState = null;
+            allowCloudFallback = false;
+            buildMenu();
+        }
+        providerPolicyPromise = (async () => {
+            const send = () => fetch(`${TRANSLATOR_URL}/provider-policy`, {
+                method: 'GET',
+                headers: apiRequestHeaders(),
+                credentials: apiRequestCredentials(),
+                cache: 'no-store',
+            });
+            try {
+                let response = await send();
+                if (response.status === 401 && AUTH_MODE === 'reader_session'
+                        && typeof window.__BT_REFRESH_SESSION === 'function') {
+                    await window.__BT_REFRESH_SESSION();
+                    response = await send();
+                }
+                if (!response.ok) return false;
+                const policy = await response.json();
+                if (!validProviderPolicy(policy)) return false;
+                providerPolicyState = policy;
+                if (policy.fallback !== 'remote') allowCloudFallback = false;
+                buildMenu();
+                return true;
+            } catch (e) {
+                console.error('[BookTranslator] provider privacy policy unavailable');
+                return false;
+            } finally {
+                providerPolicyPromise = null;
+            }
+        })();
+        return providerPolicyPromise;
+    }
 
     function collectUncached(elements) {
         const out = [];
@@ -912,6 +1117,9 @@
             console.error('[BookTranslator] HTTPS requires a same-origin or TLS apiUrl');
             return { error: 'configuration' };
         }
+        if (!await loadProviderPolicy()) {
+            return { error: 'configuration' };
+        }
         const controller = new AbortController();
         activeControllers.add(controller);
         // Distinguish OUR safety-net timeout from a deliberate abort
@@ -920,31 +1128,51 @@
         // deliberate abort means the work is stale and can be discarded.
         const timer = setTimeout(() => { controller.btTimedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
         try {
-            const headers = { 'Content-Type': 'application/json' };
-            if (AUTH_MODE === 'token' && cfg.apiToken) headers['X-BT-Token'] = cfg.apiToken;
+            const headers = apiRequestHeaders({ json: true });
             const scope = translationScope();
-            const requestCredentials = configuredCredentials || (
-                AUTH_MODE === 'forwarded'
-                    ? 'include'
-                    : (AUTH_MODE === 'cwa_session'
-                        ? (cfg.sendCredentials === true ? 'include' : 'same-origin')
-                        : 'omit')
-            );
-            const resp = await fetch(`${TRANSLATOR_URL}/translate/batch`, {
+            const requestCredentials = apiRequestCredentials();
+            const requestBody = () => JSON.stringify({
+                paragraphs: texts,
+                source_lang: SOURCE_LANG,
+                target_lang: TARGET_LANG,
+                book_id: scope.book_id,
+                chapter_id: scope.chapter_id,
+                allow_cloud_fallback: allowCloudFallback,
+                provider_policy: providerPolicyState
+            });
+            const send = () => fetch(`${TRANSLATOR_URL}/translate/batch`, {
                 method: 'POST',
                 headers,
                 credentials: requestCredentials,
-                body: JSON.stringify({
-                    paragraphs: texts,
-                    source_lang: SOURCE_LANG,
-                    target_lang: TARGET_LANG,
-                    book_id: scope.book_id,
-                    chapter_id: scope.chapter_id,
-                    allow_cloud_fallback: allowCloudFallback
-                }),
+                body: requestBody(),
                 signal: controller.signal,
             });
+            let resp = await send();
+            // A 401 is rejected before translation admission, so one session
+            // refresh and one replay cannot duplicate provider work. No other
+            // ambiguous failure is retried automatically.
+            if (resp.status === 401 && AUTH_MODE === 'reader_session'
+                    && typeof window.__BT_REFRESH_SESSION === 'function') {
+                try {
+                    await window.__BT_REFRESH_SESSION();
+                } catch (e) {
+                    return null;
+                }
+                if (!await loadProviderPolicy({ force: true })) {
+                    return { error: 'configuration' };
+                }
+                if (controller.signal.aborted) {
+                    return { error: controller.btTimedOut ? 'timeout' : 'aborted' };
+                }
+                resp = await send();
+            }
             if (!resp.ok) {
+                if (resp.status === 409) {
+                    providerPolicyState = null;
+                    allowCloudFallback = false;
+                    await loadProviderPolicy({ force: true });
+                    return { error: 'policy_changed' };
+                }
                 if (resp.status === 429) {
                     let r = {};
                     try { r = await resp.json(); } catch(e) {}
@@ -974,17 +1202,11 @@
         isPumpRunning = true;
         
         try {
-            while (translationMode !== 'off') {
+            while (translationMode !== 'off' && readerRouteActive) {
                 const now = Date.now();
                 if (rateLimitUntil > now) {
                     refreshStatus();
                     await new Promise(r => setTimeout(r, Math.min(1000, rateLimitUntil - now)));
-                    continue;
-                }
-                
-                const gap = BT_CLIENT_MIN_REQUEST_GAP_MS - (now - lastRequestEnd);
-                if (gap > 0) {
-                    await new Promise(r => setTimeout(r, gap));
                     continue;
                 }
                 
@@ -1008,8 +1230,10 @@
                 let isVisible = false;
                 let batch = [];
                 if (visibleQueue.length > 0) {
-                    batch = visibleQueue.slice(0, VISIBLE_CHUNK);
-                    visibleQueue = visibleQueue.slice(VISIBLE_CHUNK);
+                    const chunkSize = firstVisibleBatchCompleted
+                        ? VISIBLE_CHUNK : FIRST_VISIBLE_CHUNK;
+                    batch = visibleQueue.slice(0, chunkSize);
+                    visibleQueue = visibleQueue.slice(chunkSize);
                     isVisible = true;
                 } else {
                     batch = prefetchQueue.slice(0, PREFETCH_CHUNK);
@@ -1054,13 +1278,11 @@
                     console.error("Translation request failed:", e);
                     markBatchFailed(batch);
                     inflightCount = 0;
-                    lastRequestEnd = Date.now();
                     refreshStatus();
                     continue;
                 }
 
                 inflightCount = 0;
-                lastRequestEnd = Date.now();
 
                 if (data && data.error === 'aborted') {
                     // Deliberate cancel (mode/language/page change) — the items
@@ -1098,6 +1320,9 @@
                 // failed paragraph; successful entries remain available.
                 const succeeded = batch.filter(b => translatedParagraphs[b.hash]);
                 chapterDone += succeeded.length;
+                if (isVisible && succeeded.length > 0) {
+                    firstVisibleBatchCompleted = true;
+                }
                 const failed = batch.filter(b => !translatedParagraphs[b.hash]);
                 if (failed.length) markBatchFailed(failed);
                 else if (anyGood) errorCount = 0;
@@ -1119,11 +1344,14 @@
     }
 
     async function translateCurrentPage() {
-        if (translationMode === 'off') return;
+        if (translationMode === 'off' || !readerRouteActive) return;
         
         const myGen = generation;
         const idoc = getReaderDoc();
-        if (idoc) { ensureIframeStyles(idoc); applyIframeTheme(idoc); }
+        if (idoc && READER_TYPE === 'cwa') {
+            ensureIframeStyles(idoc);
+            applyIframeTheme(idoc);
+        }
 
         const visibleEls = getVisibleParagraphs();
         
@@ -1187,18 +1415,18 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     // ── Rendering ──────────────────────────────────────────────────────
-    // Original inner HTML of inline-replaced elements. dataset.originalText
+    // Cloned original children of inline-replaced elements. dataset.originalText
     // (plain text) remains the marker + hash source, but restoring from it
-    // would permanently strip the paragraph's markup (italics, bold, links…) —
-    // so the real markup is kept here and used for restoration.
-    const originalHtml = new WeakMap();
+    // would permanently strip markup. Keeping nodes avoids reparsing EPUB
+    // markup through an innerHTML sink during restoration.
+    const originalContent = new WeakMap();
 
     function restoreOriginal(el) {
         if (el.dataset.originalText === undefined) return;
-        const html = originalHtml.get(el);
-        if (html !== undefined) el.innerHTML = html;
+        const fragment = originalContent.get(el);
+        if (fragment !== undefined) el.replaceChildren(fragment);
         else el.textContent = el.dataset.originalText; // fallback (pre-fix entries)
-        originalHtml.delete(el);
+        originalContent.delete(el);
         delete el.dataset.originalText;
     }
 
@@ -1238,12 +1466,14 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
 
             // Store the CLEAN original so toggling back restores correctly even
             // after bilingual rendering: plain text in dataset (marker + hash
-            // source) and the real markup in the WeakMap (see restoreOriginal).
+            // source) and cloned markup nodes in the WeakMap (see restoreOriginal).
             if (!el.dataset.originalText) {
                 el.dataset.originalText = text;
                 const clone = el.cloneNode(true);
                 clone.querySelectorAll('.bt-translation, .bt-loading').forEach(n => n.remove());
-                originalHtml.set(el, clone.innerHTML);
+                const fragment = el.ownerDocument.createDocumentFragment();
+                while (clone.firstChild) fragment.appendChild(clone.firstChild);
+                originalContent.set(el, fragment);
             }
             // Remove any bilingual/loading spans before replacing the text.
             el.querySelectorAll('.bt-translation, .bt-loading').forEach(n => n.remove());
@@ -1254,7 +1484,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     function removeAllTranslations() {
         document.querySelectorAll('.bt-translation, .bt-loading').forEach(el => el.remove());
 
-        const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
+        const iframe = getReaderIframe();
         if (iframe && iframe.contentDocument) {
             iframe.contentDocument.querySelectorAll('.bt-translation, .bt-loading').forEach(el => el.remove());
         }
@@ -1267,16 +1497,70 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     // ── Observers & Polling ────────────────────────────────────────────
-    const isBtNode = (n) => n.nodeType === 1 && n.classList &&
-        (n.classList.contains('bt-translation') || n.classList.contains('bt-loading'));
+    const isBtNode = (node) => {
+        if (!node || node.nodeType !== 1) return false;
+        return !!(node.closest && node.closest(
+            '#bt-bar, #bt-menu, #bt-toast, .bt-translation, .bt-loading'
+        ));
+    };
+
+    function mutationContainsReaderContent(mutation) {
+        const target = mutation.target && mutation.target.nodeType === 1
+            ? mutation.target
+            : mutation.target && mutation.target.parentElement;
+        if (target && target.closest
+                && target.closest('#bt-bar, #bt-menu, #bt-toast, [data-original-text]')) {
+            return false;
+        }
+        if (mutation.addedNodes.length === 0) return true;
+        return Array.from(mutation.addedNodes).some(node => !isBtNode(node));
+    }
 
     let translateTimeout = null;
-    let lastDocumentIdentity = null;
-    let iframeObserver = null;
+    let lastContentIdentity = null;
+    let readerObserver = null;
     let mainObserver = null;
 
+    function setOverlayHidden(hidden) {
+        ['bt-bar', 'bt-menu', 'bt-toast'].forEach(id => {
+            const element = document.getElementById(id);
+            if (element) {
+                element.hidden = hidden;
+                // Author CSS can override the user-agent [hidden] rule (the
+                // toolbar normally uses display:flex), so enforce route
+                // deactivation at the inline cascade as well.
+                element.style.display = hidden ? 'none' : '';
+            }
+        });
+        if (hidden) closeMenu();
+    }
+
+    function syncReaderRoute({ initial = false } = {}) {
+        const supported = isSupportedReaderRoute();
+        const wasActive = readerRouteActive;
+        if (!supported) {
+            if (wasActive) {
+                readerRouteActive = false;
+                clearTimeout(translateTimeout);
+                newGeneration();
+                removeAllTranslations();
+            }
+            setOverlayHidden(true);
+            return false;
+        }
+
+        readerRouteActive = true;
+        createFloatingUI();
+        setOverlayHidden(false);
+        if (!wasActive && !initial && translationMode !== 'off') {
+            lastContentIdentity = null;
+            scheduleTranslate('reader_route', { immediate: true, forceRediscover: true });
+        }
+        return true;
+    }
+
     function scheduleTranslate(reason, { immediate = false, forceRediscover = false } = {}) {
-        if (translationMode === 'off') return;
+        if (translationMode === 'off' || !readerRouteActive) return;
         lastTriggerReason = reason;
 
         if (forceRediscover) {
@@ -1297,54 +1581,59 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     function setupObservers() {
         if (!mainObserver) {
             mainObserver = new MutationObserver((mutations) => {
-                let shouldTranslate = false;
-                for (const m of mutations) {
-                    for (const n of m.addedNodes) {
-                        if (!isBtNode(n)) { shouldTranslate = true; break; }
-                    }
-                    if (shouldTranslate) break;
+                if (!readerRouteActive) return;
+                const relevant = mutations.some(mutationContainsReaderContent);
+                if (relevant) {
+                    scheduleTranslate('main_mutation', {
+                        forceRediscover: READER_TYPE === 'kavita'
+                    });
                 }
-                if (shouldTranslate) scheduleTranslate('main_mutation');
             });
             mainObserver.observe(document.body, { childList: true, subtree: true });
         }
 
-        // We check for iframe document changes or page turns
+        // Track CWA iframe documents and Kavita's stable .book-content host.
         setInterval(() => {
-            if (translationMode === 'off') return;
+            if (!syncReaderRoute() || translationMode === 'off') return;
 
-            // 1. Iframe discovery and identity tracking
-            const iframe = document.querySelector('#viewer iframe, .epub-container iframe, iframe');
-            if (iframe) {
+            let content = null;
+            if (READER_TYPE === 'kavita') {
+                content = getReaderRoot();
+            } else {
+                const iframe = getReaderIframe();
                 try {
-                    const idoc = iframe.contentDocument || iframe.contentWindow.document;
-                    if (idoc && idoc !== lastDocumentIdentity) {
-                        lastDocumentIdentity = idoc;
-                        
-                        if (iframeObserver) iframeObserver.disconnect();
-                        iframeObserver = new MutationObserver((mutations) => {
-                            let shouldTranslate = false;
-                            for (const m of mutations) {
-                                for (const n of m.addedNodes) {
-                                    if (!isBtNode(n)) { shouldTranslate = true; break; }
-                                }
-                                if (shouldTranslate) break;
-                            }
-                            if (shouldTranslate) scheduleTranslate('iframe_mutation');
-                        });
-                        
-                        if (idoc.body) {
-                            ensureIframeStyles(idoc);   // inject our CSS into the new chapter doc
-                            applyIframeTheme(idoc);
-                            attachIframeShortcut(idoc); // Alt+T works with reader focus too
-                            iframeObserver.observe(idoc.body, { childList: true, subtree: true });
-                            scheduleTranslate('new_document', { immediate: true, forceRediscover: true });
-                        }
-                    }
-                } catch (e) {}
+                    const idoc = iframe && (
+                        iframe.contentDocument || iframe.contentWindow.document
+                    );
+                    content = idoc && idoc.body;
+                } catch (e) { content = null; }
+            }
+            if (content && content !== lastContentIdentity) {
+                lastContentIdentity = content;
+                if (readerObserver) readerObserver.disconnect();
+                readerObserver = new MutationObserver((mutations) => {
+                    if (!readerRouteActive
+                            || !mutations.some(mutationContainsReaderContent)) return;
+                    scheduleTranslate(
+                        READER_TYPE === 'kavita'
+                            ? 'kavita_content_mutation' : 'iframe_mutation',
+                        { forceRediscover: READER_TYPE === 'kavita' }
+                    );
+                });
+                if (READER_TYPE === 'cwa') {
+                    const idoc = content.ownerDocument;
+                    ensureIframeStyles(idoc);
+                    applyIframeTheme(idoc);
+                    attachIframeShortcut(idoc);
+                }
+                readerObserver.observe(content, { childList: true, subtree: true });
+                scheduleTranslate('new_reader_content', {
+                    immediate: true,
+                    forceRediscover: true
+                });
             }
 
-            // 2. Page turn detector.
+            // Position-based page turn detector.
             // BUG (root cause of the status bar flicker): inserting a bilingual
             // translation block under a paragraph increases that paragraph's
             // rendered height, which reflows the layout and can shift WHICH
@@ -1391,6 +1680,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     function attachEpubHooks() {
+        if (READER_TYPE !== 'cwa') return;
         if (window.reader && window.reader.rendition) {
             window.reader.rendition.on('relocated', () => {
                 scheduleTranslate('epub_relocated', { immediate: true, forceRediscover: true });
@@ -1430,10 +1720,12 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     }
 
     function init() {
-        createFloatingUI();
+        if (!syncReaderRoute({ initial: true })) return;
+        void loadProviderPolicy();
         setupObservers();
         attachEpubHooks();
         setupKeyboardShortcut();
+        window.addEventListener('bt:reader-route', () => syncReaderRoute());
         // Persist any pending translations if the user closes/reloads the tab.
         window.addEventListener('beforeunload', persistCacheNow);
         // Brief version toast helps Felix confirm the correct JS is loaded after deploys.

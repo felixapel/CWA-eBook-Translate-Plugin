@@ -85,7 +85,7 @@ class ServerGroupCacheTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(server, "get_cached", side_effect=partial_hit),
-            mock.patch.object(server, "put_cache") as put_cache,
+            mock.patch.object(server, "put_cache_many") as put_cache_many,
             mock.patch.object(server, "translate_batch", return_value=fresh) as translate,
             mock.patch.object(
                 server,
@@ -106,9 +106,11 @@ class ServerGroupCacheTests(unittest.TestCase):
         self.assertEqual(result["fresh_count"], 2)
         translate.assert_called_once()
         self.assertEqual(translate.call_args.kwargs["selected_groups"], [[0, 1]])
-        self.assertEqual(put_cache.call_count, 2)
-        for call in put_cache.call_args_list:
-            cache_scope = call.kwargs["scope"]
+        put_cache_many.assert_called_once()
+        entries = put_cache_many.call_args.args[0]
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            cache_scope = entry[4]
             self.assertEqual(cache_scope.tenant, "subject-42")
             self.assertEqual(cache_scope.book_id, "book-7")
             self.assertEqual(cache_scope.chapter_id, "chapter-3")
@@ -124,7 +126,7 @@ class ServerGroupCacheTests(unittest.TestCase):
         with (
             mock.patch.object(server, "get_cached", side_effect=complete_hit),
             mock.patch.object(server, "translate_batch") as translate,
-            mock.patch.object(server, "put_cache") as put_cache,
+            mock.patch.object(server, "put_cache_many") as put_cache_many,
             mock.patch.object(server, "record_cache_hit") as record_hit,
             mock.patch.object(
                 server,
@@ -144,7 +146,7 @@ class ServerGroupCacheTests(unittest.TestCase):
         self.assertEqual(result["cached_count"], 2)
         self.assertEqual(result["fresh_count"], 0)
         translate.assert_not_called()
-        put_cache.assert_not_called()
+        put_cache_many.assert_not_called()
         self.assertEqual(record_hit.call_count, 2)
 
     def test_individual_recovery_is_not_cached_as_batch_but_siblings_are(self) -> None:
@@ -161,7 +163,7 @@ class ServerGroupCacheTests(unittest.TestCase):
         with (
             mock.patch.object(translator, "BT_BATCH_SIZE", 2),
             mock.patch.object(server, "get_cached", return_value=None),
-            mock.patch.object(server, "put_cache") as put_cache,
+            mock.patch.object(server, "put_cache_many") as put_cache_many,
             mock.patch.object(
                 server, "translate_batch", return_value=fresh
             ) as translate,
@@ -187,7 +189,7 @@ class ServerGroupCacheTests(unittest.TestCase):
             translate.call_args.kwargs["selected_groups"], [[0, 1], [2, 3]]
         )
         self.assertEqual(
-            [call.args[0] for call in put_cache.call_args_list], ["a", "b"]
+            [entry[0] for entry in put_cache_many.call_args.args[0]], ["a", "b"]
         )
 
     def test_mid_recovery_budget_exhaustion_writes_no_partial_cache(self) -> None:
@@ -235,7 +237,7 @@ class ServerGroupCacheTests(unittest.TestCase):
                 ),
                 mock.patch.object(translator, "BT_BATCH_SIZE", 3),
                 mock.patch.object(server, "get_cached", return_value=None),
-                mock.patch.object(server, "put_cache") as put_cache,
+                mock.patch.object(server, "put_cache_many") as put_cache_many,
                 mock.patch.object(
                     server,
                     "cache_lookup_backends",
@@ -255,7 +257,7 @@ class ServerGroupCacheTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.reason, "attempts")
             self.assertEqual(calls, ["batch", "batch", "single:one"])
-            put_cache.assert_not_called()
+            put_cache_many.assert_not_called()
             with server._metrics_lock:
                 recovery = dict(server._metrics["segment_recovery"])
             self.assertEqual(recovery, {

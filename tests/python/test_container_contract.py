@@ -19,7 +19,7 @@ class ContainerContractTests(unittest.TestCase):
         self.assertNotIn("COPY *.py", dockerfile)
         for runtime_module in (
             "auth.py", "cache.py", "server.py", "singleflight.py",
-            "translator.py", "work_budget.py",
+            "translator.py", "work_budget.py", "reader_session.py",
         ):
             self.assertIn(runtime_module, dockerfile)
         for operator_input in (
@@ -34,9 +34,24 @@ class ContainerContractTests(unittest.TestCase):
     def test_operator_image_is_distinct_from_the_production_runtime(self):
         dockerfile = (ROOT / "Dockerfile.btctl").read_text()
         self.assertIn("FROM source-exporter AS operator", dockerfile)
+        self.assertIn("btctl_reconfigure.py", dockerfile)
+        self.assertIn("btctl_hub.py", dockerfile)
         self.assertIn('ENTRYPOINT ["python3", "/opt/btctl/btctl.py"]', dockerfile)
         self.assertNotIn("USER appuser", dockerfile)
         self.assertNotIn("docker-entrypoint.sh", dockerfile)
+
+    def test_bootstrap_smoke_shares_only_its_private_tmpdir_with_sibling_docker(self):
+        smoke = (ROOT / "scripts" / "btctl-bootstrap-smoke.sh").read_text()
+        self.assertIn(
+            '--mount "type=bind,src=$TEMPORARY,dst=$TEMPORARY"',
+            smoke,
+        )
+        self.assertIn('--env "TMPDIR=$TEMPORARY"', smoke)
+        dispatcher = smoke.split("run_without_host_tooling() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertIn("--cap-add DAC_READ_SEARCH", dispatcher)
+        self.assertIn("--cap-add DAC_OVERRIDE", dispatcher)
 
     def test_entrypoint_never_changes_ownership_or_escalates(self):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
@@ -45,9 +60,17 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn('BT_ROLE="${BT_ROLE:-auto}"', entrypoint)
         self.assertIn('exec gunicorn --bind', entrypoint)
         self.assertIn('exec nginx -c /app/proxy/nginx-main.conf', entrypoint)
+        self.assertIn("api|proxy|all|hub", entrypoint)
+        self.assertIn("exec python /app/hub_runtime.py", entrypoint)
         self.assertIn("umask 027", entrypoint)
         self.assertIn('stat -c %a /app/data', entrypoint)
         self.assertNotIn("chmod 700 /app/data", entrypoint)
+
+    def test_image_packages_the_hub_without_publishing_an_api_port(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("hub_runtime.py", dockerfile)
+        self.assertIn("EXPOSE 8390 8080 8081", dockerfile)
+        self.assertIn("hub_runtime.py --healthcheck", dockerfile)
 
     def test_api_roles_initialize_cache_before_serving(self):
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
@@ -74,7 +97,7 @@ class ContainerContractTests(unittest.TestCase):
             "scgi_temp_path /tmp/nginx/scgi_temp;",
             "access_log /dev/stdout bt_privacy;",
             "error_log /dev/stderr warn;",
-            "include /tmp/nginx/proxy.conf;",
+            "include /tmp/nginx/proxy*.conf;",
         ):
             self.assertIn(directive, config)
         self.assertIn("log_format bt_privacy", config)
@@ -106,17 +129,17 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn("absolute_redirect off;", template)
         self.assertNotIn("$http_x_forwarded_proto", template)
         self.assertEqual(
-            template.count("proxy_set_header Host ${BT_PUBLIC_HOST};"), 2
+            template.count("proxy_set_header Host ${BT_PUBLIC_HOST};"), 3
         )
         self.assertEqual(
             template.count("proxy_set_header X-Forwarded-Proto ${BT_PUBLIC_SCHEME};"),
-            2,
+            3,
         )
         self.assertEqual(
-            template.count("proxy_set_header X-Forwarded-For $remote_addr;"), 2
+            template.count("proxy_set_header X-Forwarded-For $remote_addr;"), 3
         )
         self.assertEqual(
-            template.count("proxy_set_header User-Agent $http_user_agent;"), 2
+            template.count("proxy_set_header User-Agent $http_user_agent;"), 3
         )
         self.assertNotIn("$proxy_add_x_forwarded_for", template)
         self.assertNotIn("$http_x_forwarded_for", template)
@@ -160,6 +183,25 @@ class ContainerContractTests(unittest.TestCase):
         self.assertGreaterEqual(compose.count("- ALL"), 2)
         self.assertGreaterEqual(compose.count("/tmp:rw,noexec,nosuid"), 2)
 
+    def test_universal_compose_is_one_hardened_service_with_two_reader_edges(self):
+        compose = (ROOT / "docker-compose.hub.yml").read_text(encoding="utf-8")
+        example = (ROOT / ".env.hub.example").read_text(encoding="utf-8")
+
+        self.assertEqual(compose.count("    build: .\n"), 1)
+        self.assertRegex(compose, r"(?m)^  book-translator-hub:$")
+        self.assertNotRegex(compose, r"(?m)^  book-translator-(?:api|proxy):$")
+        self.assertIn("BT_ROLE: hub", compose)
+        self.assertIn('"${BT_CWA_PUBLISHED_PORT:-8385}:8080"', compose)
+        self.assertIn('"${BT_KAVITA_PUBLISHED_PORT:-8386}:8081"', compose)
+        self.assertIn("read_only: true", compose)
+        self.assertIn("no-new-privileges:true", compose)
+        self.assertIn("cap_drop:", compose)
+        self.assertIn("- ALL", compose)
+        self.assertIn("/tmp:rw,noexec,nosuid", compose)
+        self.assertIn("BT_ENABLE_CWA=true", example)
+        self.assertIn("BT_ENABLE_KAVITA=true", example)
+        self.assertNotRegex(example, r"(?m)^LLM_API_KEY=.+$")
+
     def test_ci_runs_both_roles_with_the_production_sandbox(self):
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         smoke_path = ROOT / "scripts" / "container-smoke.sh"
@@ -183,9 +225,38 @@ class ContainerContractTests(unittest.TestCase):
             "--cap-drop ALL",
             "--security-opt no-new-privileges:true",
             "docker image inspect \"$SMOKE_IMAGE\" --format '{{.Config.User}}'",
+            "BT_AUTH_MODE=reader_session",
+            "BT_READER_TYPE=kavita",
+            "BT_READER_VERSION=0.9.0.2",
+            "test_kavita_auth_fixture.py",
+            "/bt-api/session",
         ):
             self.assertIn(token, smoke)
         self.assertNotIn("gosu", smoke)
+
+    def test_hub_smoke_proves_two_listeners_and_fail_fast_supervision(self):
+        path = ROOT / "scripts" / "hub-container-smoke.sh"
+        source = path.read_text(encoding="utf-8")
+        self.assertTrue(path.stat().st_mode & 0o111)
+        for token in (
+            "BT_ROLE=hub",
+            "BT_ENABLE_CWA=true",
+            "BT_ENABLE_KAVITA=true",
+            "proxy-cwa.conf",
+            "proxy-kavita.conf",
+            "127.0.0.1:8391",
+            "reader_session_key",
+            "State.Status",
+        ):
+            self.assertIn(token, source)
+        self.assertNotRegex(source, r"-p[^\n]*839[12]")
+
+    def test_kavita_container_fixture_is_literal_compilable_python(self):
+        fixture = ROOT / "tests" / "python" / "test_kavita_auth_fixture.py"
+        source = fixture.read_text(encoding="utf-8")
+        compile(source, str(fixture), "exec")
+        self.assertIn('"kavitaVersion": "0.9.0.2"', source)
+        self.assertIn('class="book-content"', source.replace('\\"', '"'))
 
     def test_ca_profile_certifies_the_combined_role_without_publishing_api(self):
         smoke_path = ROOT / "scripts" / "ca-container-smoke.sh"
@@ -204,6 +275,8 @@ class ContainerContractTests(unittest.TestCase):
             "chown 101:102 /data",
             "chmod 0700 /data",
             "wrong ownership or mode",
+            "provider-policy",
+            "provider_policy",
             "docker rm -f",
             "recreate",
             "cached",
@@ -255,6 +328,19 @@ class ContainerContractTests(unittest.TestCase):
             smoke,
         )
 
+    def test_lifecycle_smoke_proves_kavita_isolated_from_cwa(self):
+        smoke = (ROOT / "scripts" / "btctl-lifecycle-smoke.sh").read_text()
+        for token in (
+            "BT_READER_TYPE=kavita",
+            "BT_READER_VERSION=0.9.0.2",
+            "test_kavita_auth_fixture.py",
+            'assert_doctor "$KAVITA_ENV"',
+            'assert_doctor "$FRESH_ENV"',
+            'test ! -e "$KAVITA_DATA/reader_session_key"',
+            'docker inspect "$CWA_CONTAINER"',
+        ):
+            self.assertIn(token, smoke)
+
     def test_image_auth_defaults_fail_closed_and_proxy_forwards_cwa_cookie(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         entrypoint = (ROOT / "docker-entrypoint.sh").read_text()
@@ -264,7 +350,15 @@ class ContainerContractTests(unittest.TestCase):
         self.assertIn("validate_api_auth", entrypoint)
         self.assertIn("BT_API_TOKEN is required", entrypoint)
         self.assertIn("disabled auth requires BT_ALLOW_INSECURE_AUTH=true", entrypoint)
-        self.assertIn("proxy_set_header Cookie $http_cookie;", proxy)
+        self.assertIn("POST $http_cookie;", proxy)
+        self.assertNotIn("default $http_cookie;", proxy)
+        self.assertIn("POST $http_authorization;", proxy)
+        self.assertNotIn("default $http_authorization;", proxy)
+        self.assertIn("DELETE $bt${BT_PROXY_NAMESPACE}_session_cookie;", proxy)
+        self.assertIn(
+            "proxy_set_header Cookie $bt${BT_PROXY_NAMESPACE}_session_route_cookie;",
+            proxy,
+        )
         self.assertIn('proxy_set_header ${BT_CWA_IDENTITY_HEADER} "";', proxy)
         self.assertIn('proxy_set_header X-BT-Subject "";', proxy)
         self.assertIn('proxy_set_header X-BT-Roles "";', proxy)

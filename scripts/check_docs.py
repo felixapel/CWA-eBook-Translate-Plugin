@@ -17,6 +17,8 @@ CANONICAL_GUIDES = {
     "install/authentik.md",
     "install/btctl.md",
     "install/community-applications.md",
+    "install/kavita.md",
+    "install/universal-hub.md",
     "maintainers/development.md",
     "maintainers/release.md",
     "operations/lifecycle.md",
@@ -44,7 +46,11 @@ OBSOLETE_PATHS = {
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 ADR_RE = re.compile(r"ADR-\d{3}-[a-z0-9-]+\.md$")
-VERSION_RE = re.compile(r"(?<![A-Za-z0-9])v(\d+\.\d+\.\d+)(?![A-Za-z0-9])")
+VERSION_RE = re.compile(
+    r"(?<![A-Za-z0-9])v(\d+\.\d+\.\d+"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)"
+    r"(?!(?:[A-Za-z0-9-]|\.[0-9A-Za-z-]))"
+)
 VALID_ADR_STATUSES = {"Accepted", "Deprecated", "Proposed", "Superseded"}
 
 
@@ -192,7 +198,15 @@ def collect_errors(repository: Path = REPOSITORY) -> list[str]:
     version = (repository / "VERSION").read_text(encoding="utf-8").strip()
     readme = (repository / "README.md").read_text(encoding="utf-8")
     expected_checkout = f"git switch --detach v{version}"
-    if expected_checkout not in readme:
+    if "-" in version:
+        candidate_notice = f"Version `{version}` is still an unreleased candidate"
+        if candidate_notice not in readme:
+            errors.append(
+                f"README must identify the current unreleased candidate: {version}"
+            )
+        if expected_checkout in readme:
+            errors.append("README must not claim a tag for an unreleased candidate")
+    elif expected_checkout not in readme:
         errors.append(f"README install must select the current release: {expected_checkout}")
     if len(readme.splitlines()) > 220:
         errors.append("README exceeds the 220-line public-entrypoint budget")

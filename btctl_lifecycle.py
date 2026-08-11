@@ -22,12 +22,17 @@ from btctl_compose import (
     InstallError,
     _completed_uninstall_for_reinstall,
     _container_networks,
-    _has_exact_cwa_version,
+    _has_exact_reader_version,
     _labels,
     _probe_runtime_dependencies,
     _verify_identity_edge_artifact,
     _verify_private_network,
     render_compose,
+    render_schema1_compose,
+    render_schema2_compose,
+    _compose_api_environment,
+    _compose_environment_text,
+    _compose_proxy_environment,
 )
 from btctl_core import (
     ConfigError,
@@ -49,6 +54,9 @@ from btctl_unraid import (
 
 _CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _JOURNAL_SCHEMA = 1
+_HISTORICAL_CA_LATEST_IMAGE = (
+    "ghcr.io/felixapel/cwa-ebook-translate-plugin:latest"
+)
 
 
 class LifecycleDocker(Protocol):
@@ -64,8 +72,10 @@ class LifecycleDocker(Protocol):
     def probe_http(self, container: str, url: str) -> None: ...
     def probe_auth(self, container: str, url: str) -> None: ...
     def probe_sqlite(self, container: str, database_path: str) -> None: ...
+    def probe_providers(self, container: str) -> None: ...
     def probe_image_version(self, image_id: str, expected_version: str) -> None: ...
     def prepare_migration_source(self, image_id: str, path: Path) -> None: ...
+    def remove_data_credential(self, image: str, path: Path, filename: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +97,21 @@ def _state_matches_plan(
         "config_fingerprint": plan.config_fingerprint,
         "install_profile": plan.install_profile,
         "auth_profile": plan.auth_profile,
+        "reader_type": plan.reader_type,
+        "reader_contract_version": plan.reader_contract_version,
     }
     if any(getattr(state, name) != value for name, value in expected.items()):
         raise InstallError("deployment state does not match this checkout and configuration")
+    legacy_resource_names = {"reader": "cwa", "reader_network": "cwa_network"}
     for name, resource in plan.resources.items():
-        state_resource = state.resources.get(name)
+        if state.schema_version == 1 and name == "session_key":
+            continue
+        state_name = (
+            legacy_resource_names.get(name, name)
+            if state.schema_version == 1
+            else name
+        )
+        state_resource = state.resources.get(state_name)
         if not isinstance(state_resource, dict):
             raise InstallError("deployment state resource inventory is incomplete")
         for identity_key in ("name", "path", "role"):
@@ -101,6 +121,35 @@ def _state_matches_plan(
 
 def _mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
+
+
+def _verify_session_key(state: DeploymentState, config: InstallConfig) -> None:
+    if state.schema_version == 1 or not config.uses_reader_session:
+        return
+    resource = state.resources.get("session_key")
+    expected_path = Path(config.data_dir) / "reader_session_key"
+    if (
+        not isinstance(resource, dict)
+        or resource.get("path") != str(expected_path)
+        or resource.get("ownership") != "owned-credential"
+    ):
+        raise InstallError("reader session credential inventory does not match")
+    if resource.get("removed") is True and not expected_path.exists():
+        return
+    try:
+        metadata = expected_path.lstat()
+        data_metadata = Path(config.data_dir).lstat()
+    except OSError as exc:
+        raise InstallError("reader session credential is missing") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != data_metadata.st_uid
+        or metadata.st_uid not in {101, os.geteuid()}
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size != 32
+    ):
+        raise InstallError("reader session credential ownership has drifted")
 
 
 class DeploymentDoctor:
@@ -114,11 +163,17 @@ class DeploymentDoctor:
         config: InstallConfig,
         plan: DeploymentPlan,
         *,
+        deep: bool = False,
         _operation_locked: bool = False,
     ) -> DoctorReport:
         if not _operation_locked:
             with OperationLock(Path(config.state_dir), create=False):
-                return self.run(config, plan, _operation_locked=True)
+                return self.run(
+                    config,
+                    plan,
+                    deep=deep,
+                    _operation_locked=True,
+                )
         checks: list[dict[str, str]] = []
 
         def check(name: str, operation) -> bool:
@@ -146,23 +201,27 @@ class DeploymentDoctor:
         check("configuration", lambda: _state_matches_plan(state, config, plan))
         check("docker", self.docker.require_available)
 
-        def verify_cwa() -> None:
-            cwa = self.docker.inspect_container(config.cwa_container)
+        def verify_reader() -> None:
+            reader = self.docker.inspect_container(config.reader_container)
             if (
-                cwa is None
-                or cwa.get("State", {}).get("Status") != "running"
-                or not _has_exact_cwa_version(cwa, config.cwa_version)
-                or config.cwa_network not in _container_networks(cwa)
+                reader is None
+                or reader.get("State", {}).get("Status") != "running"
+                or not _has_exact_reader_version(
+                    reader, config.reader_version, config.reader_image_id
+                )
+                or config.reader_network not in _container_networks(reader)
             ):
-                raise InstallError("external CWA runtime evidence does not match")
+                raise InstallError("external reader runtime evidence does not match")
 
-        check("external-cwa", verify_cwa)
+        check("external-reader", verify_reader)
         verifier = ComposeInstaller(self.docker)
         image_holder: dict[str, str] = {}
 
         def verify_image() -> None:
             image_holder["id"] = verifier._verify_image(
-                config, self.docker.inspect_image(config.image)
+                config,
+                self.docker.inspect_image(config.image),
+                allow_legacy_labels=state.schema_version == 1,
             )
 
         image_ok = check("image", verify_image)
@@ -170,7 +229,12 @@ class DeploymentDoctor:
             for role in ("api", "proxy"):
                 def verify_role(role=role) -> None:
                     container_id, container = verifier._verify_container(
-                        config, plan, state.install_id, role, image_holder["id"]
+                        config,
+                        plan,
+                        state.install_id,
+                        role,
+                        image_holder["id"],
+                        allow_legacy_labels=state.schema_version == 1,
                     )
                     if state.resources[role].get("id") != container_id:
                         raise InstallError(f"{role} runtime ID does not match state")
@@ -192,6 +256,7 @@ class DeploymentDoctor:
                 state.install_id,
                 network,
                 expected_id=str(state.resources["private_network"].get("id", "")),
+                allow_legacy_labels=state.schema_version == 1,
             )
 
         check("private-network", verify_private_network)
@@ -225,29 +290,108 @@ class DeploymentDoctor:
                 )
 
         check("data-directory", verify_data)
+        check("session-key", lambda: _verify_session_key(state, config))
 
         def verify_artifacts() -> None:
             if config.install_profile == "compose-existing":
                 path = Path(config.state_dir) / "deployment.compose.json"
-                if path.is_symlink() or _mode(path) != 0o600:
-                    raise InstallError("Compose artifact is missing or not private")
-                if json.loads(path.read_text(encoding="utf-8")) != render_compose(
+                expected_compose = {
+                    1: render_schema1_compose,
+                    2: render_schema2_compose,
+                }.get(state.schema_version, render_compose)(
                     config, plan, state.install_id
-                ):
+                )
+                try:
+                    actual_compose = json.loads(
+                        read_private_text(
+                            Path(config.state_dir), path.name,
+                            label="Compose artifact",
+                        )
+                    )
+                except (ConfigError, json.JSONDecodeError) as exc:
+                    raise InstallError("Compose artifact is not trustworthy") from exc
+                if actual_compose != expected_compose:
                     raise InstallError("Compose artifact does not match the plan")
+                if state.schema_version == 3:
+                    expected_env = {
+                        "api": _compose_environment_text(
+                            _compose_api_environment(config, state.install_id)
+                        ),
+                        "proxy": _compose_environment_text(
+                            _compose_proxy_environment(config)
+                        ),
+                    }
+                    for role, expected in expected_env.items():
+                        env_path = Path(config.state_dir) / f"{role}.env"
+                        try:
+                            actual = read_private_text(
+                                Path(config.state_dir), env_path.name,
+                                label=f"{role} Compose environment",
+                            )
+                        except ConfigError as exc:
+                            raise InstallError(
+                                f"{role} Compose environment artifact is not trustworthy"
+                            ) from exc
+                        if actual != expected:
+                            raise InstallError(
+                                f"{role} Compose environment artifact has drifted"
+                            )
             else:
                 expected_templates = render_templates(config, plan)
                 state_dir = Path(config.state_dir)
                 expected_env = {
                     "api": _environment_text(
-                        {**config.api_environment(), "BT_ROLE": "api"}
+                        {
+                            **config.api_environment(),
+                            "BT_ROLE": "api",
+                            **(
+                                {"BT_READER_CONNECTOR_ID": state.install_id}
+                                if config.uses_reader_session
+                                else {}
+                            ),
+                        }
                     ),
                     "proxy": _environment_text({
                         **config.proxy_environment(),
                         "BT_ROLE": "proxy",
-                        "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
+                        "BT_API_UPSTREAM": "http://translator-api:8390",
                     }),
                 }
+                if state.schema_version == 1:
+                    legacy_api = {
+                        **config.api_environment(),
+                        "BT_ROLE": "api",
+                    }
+                    for name in (
+                        "BT_READER_TYPE",
+                        "BT_READER_AUTH_URL",
+                        "BT_READER_VERSION",
+                        "BT_READER_CONTRACT_VERSION",
+                        "BT_PUBLIC_ORIGIN",
+                        "BT_SESSION_KEY_PATH",
+                    ):
+                        legacy_api.pop(name, None)
+                    legacy_api["BT_AUTH_MODE"] = "cwa_session"
+                    legacy_api["BT_CWA_AUTH_URL"] = (
+                        f"{config.reader_upstream}/ajax/emailstat"
+                    )
+                    expected_env["api"] = _environment_text(legacy_api)
+                    legacy_proxy = config.proxy_environment()
+                    for name in (
+                        "BT_READER_TYPE",
+                        "BT_READER_UPSTREAM",
+                        "BT_READER_VERSION",
+                        "BT_READER_CONTRACT_VERSION",
+                    ):
+                        legacy_proxy.pop(name, None)
+                    legacy_proxy["BT_BROWSER_AUTH_MODE"] = "cwa_session"
+                    expected_env["proxy"] = _environment_text({
+                        **legacy_proxy,
+                        "BT_ROLE": "proxy",
+                        "BT_API_UPSTREAM": (
+                            f"http://{plan.resources['api']['name']}:8390"
+                        ),
+                    })
                 for role in ("api", "proxy"):
                     env_path = state_dir / f"{role}.env"
                     if (
@@ -272,6 +416,16 @@ class DeploymentDoctor:
                 raise InstallError("identity-edge artifact digest does not match state")
 
         check("artifacts", verify_artifacts)
+        if deep and all(item["status"] == "ok" for item in checks):
+            def verify_providers() -> None:
+                try:
+                    self.docker.probe_providers(
+                        str(plan.resources["api"]["name"])
+                    )
+                except Exception as exc:
+                    raise InstallError("provider deep probe failed") from exc
+
+            check("providers", verify_providers)
         return DoctorReport(
             all(item["status"] == "ok" for item in checks), checks
         )
@@ -297,13 +451,18 @@ class RuntimeUninstaller:
             if container is None and (resource.get("removed") or tolerate_missing):
                 continue
             labels = container.get("Config", {}).get("Labels", {}) if container else {}
+            prefix = (
+                "io.cwa-translate."
+                if state.schema_version == 1
+                else "io.book-translator."
+            )
             if (
                 container is None
                 or container.get("Id") != resource.get("id")
-                or labels.get("io.cwa-translate.managed-by") != "btctl"
-                or labels.get("io.cwa-translate.install-id") != state.install_id
-                or labels.get("io.cwa-translate.role") != role
-                or labels.get("io.cwa-translate.revision") != config.identity.sha
+                or labels.get(prefix + "managed-by") != "btctl"
+                or labels.get(prefix + "install-id") != state.install_id
+                or labels.get(prefix + "role") != role
+                or labels.get(prefix + "revision") != config.identity.sha
             ):
                 raise InstallError(f"{role} ownership evidence has drifted")
         resource = state.resources["private_network"]
@@ -315,6 +474,7 @@ class RuntimeUninstaller:
             state.install_id,
             network,
             expected_id=str(resource.get("id", "")),
+            allow_legacy_labels=state.schema_version == 1,
         )
 
     def uninstall(
@@ -323,10 +483,16 @@ class RuntimeUninstaller:
         plan: DeploymentPlan,
         *,
         _operation_locked: bool = False,
+        _allow_missing_target_data: bool = False,
     ) -> DeploymentState:
         if not _operation_locked:
             with OperationLock(Path(config.state_dir)):
-                return self.uninstall(config, plan, _operation_locked=True)
+                return self.uninstall(
+                    config,
+                    plan,
+                    _operation_locked=True,
+                    _allow_missing_target_data=_allow_missing_target_data,
+                )
         store = StateStore(Path(config.state_dir))
         state = store.load()
         if state.status in {"uninstalled", "rolled_back"}:
@@ -334,12 +500,20 @@ class RuntimeUninstaller:
         if state.status not in {"installed", "adopted", "uninstalling"}:
             raise InstallError("deployment state cannot be uninstalled")
         _state_matches_plan(state, config, plan)
-        mutable_resources = ["proxy", "api", "private_network"]
+        mutable_resources = {
+            "proxy": "owned",
+            "api": "owned",
+            "private_network": "owned",
+        }
+        if state.schema_version in {2, 3} and config.uses_reader_session:
+            mutable_resources["session_key"] = "owned-credential"
         if config.install_profile == "unraid":
-            mutable_resources.extend(["proxy_template", "api_template"])
+            mutable_resources.update(
+                {"proxy_template": "owned", "api_template": "owned"}
+            )
         if any(
-            state.resources.get(name, {}).get("ownership") != "owned"
-            for name in mutable_resources
+            state.resources.get(name, {}).get("ownership") != ownership
+            for name, ownership in mutable_resources.items()
         ):
             raise InstallError(
                 "lifecycle resource is not classified as owned; refusing removal"
@@ -379,6 +553,21 @@ class RuntimeUninstaller:
                 self.docker.remove_container(name)
             resource["removed"] = True
             store.save(current)
+        if state.schema_version in {2, 3} and config.uses_reader_session:
+            credential = resources["session_key"]
+            if not credential.get("removed"):
+                data_dir = Path(config.data_dir)
+                if _allow_missing_target_data and not data_dir.exists():
+                    pass
+                else:
+                    _verify_session_key(current, config)
+                    self.docker.remove_data_credential(
+                        config.image,
+                        data_dir,
+                        "reader_session_key",
+                    )
+                credential["removed"] = True
+                store.save(current)
         private = resources["private_network"]
         private_name = str(private["name"])
         if self.docker.inspect_network(private_name) is not None:
@@ -652,9 +841,12 @@ class LegacyUpgrade:
         if container is None:
             raise InstallError("exact legacy container is missing")
         image_ref = container.get("Config", {}).get("Image", "")
-        tag = image_ref.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-        if tag not in {"2.1.4", "v2.1.4"}:
-            raise InstallError("legacy container is not pinned to exact v2.1.4")
+        _image_name, tag_separator, tag = image_ref.rsplit("/", 1)[-1].rpartition(":")
+        is_version_tag = bool(tag_separator) and tag in {"2.1.4", "v2.1.4"}
+        if not is_version_tag and image_ref != (
+            _HISTORICAL_CA_LATEST_IMAGE
+        ):
+            raise InstallError("legacy container is not an approved v2.1.4 source")
         mounts = [
             mount
             for mount in container.get("Mounts", [])
@@ -1446,6 +1638,7 @@ class LegacyUpgrade:
                 config,
                 plan,
                 _operation_locked=True,
+                _allow_missing_target_data=True,
             )
             self._restore_legacy_service(
                 plan,

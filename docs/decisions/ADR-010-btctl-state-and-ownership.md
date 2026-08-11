@@ -33,6 +33,20 @@ durable record of what the installer may later change.
   through every newly created parent before runtime mutation, and the containing
   directory is fsynced after each evidence-file publish. State contains
   ownership and immutable identities, never API keys or browser credentials.
+- An existing state directory is accepted only when it is owned by the current
+  operator with exact mode `0700`; installer evidence files must be one-link,
+  operator-owned regular files with mode `0600`. A fresh install refuses
+  unknown entries instead of changing their ownership or permissions.
+- Before the first Docker mutation, install writes and reads back a private,
+  non-secret `install-attempt.json` bound to the install UUID, checkout
+  identity, configuration fingerprint, and declared resources. Successful
+  state commit removes it durably. When startup creates durable translation
+  data but scoped runtime cleanup succeeds, the journal advances to `cleaned`;
+  only the exact same plan may use that evidence to retry against the retained
+  data. A failure before runtime restores prior `cleaned` evidence instead of
+  minting new retry authority. Failed cleanup aggregates every scoped cleanup
+  error and preserves a `cleanup-failed` journal instead of silently discarding
+  failures.
 - Resources are classified as `owned`, `adopted`, or `external`. A later
   lifecycle operation may mutate only an exact allowlist of `owned` resources
   whose live IDs and installation labels still match state.

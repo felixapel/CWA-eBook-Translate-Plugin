@@ -411,12 +411,26 @@ class CacheStore:
         record_hit: bool = True,
     ) -> str | None:
         cache_key = self.compute_key(text, source_lang, target_lang, cache_scope)
-        row = self.connection().execute(
-            """SELECT translated_text FROM translations_v2
-               WHERE cache_key = ? AND created_at >= ?""",
-            (cache_key, self._cutoff()),
+        conn = self.connection()
+        cutoff = self._cutoff()
+        row = conn.execute(
+            """SELECT translated_text, created_at FROM translations_v2
+               WHERE cache_key = ?""",
+            (cache_key,),
         ).fetchone()
         if row is None:
+            return None
+        if row[1] < cutoff:
+            try:
+                conn.execute(
+                    """DELETE FROM translations_v2
+                       WHERE cache_key = ? AND created_at = ?""",
+                    (cache_key, row[1]),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
             return None
         if record_hit:
             self._queue_hit(cache_key)
@@ -490,13 +504,44 @@ class CacheStore:
         translated_text: str,
         cache_scope: CacheScope,
     ) -> None:
-        if not isinstance(translated_text, str) or not translated_text.strip():
-            raise ValueError("translated_text must be a non-empty string")
-        cache_key = self.compute_key(text, source_lang, target_lang, cache_scope)
+        self.put_many([(
+            text, source_lang, target_lang, translated_text, cache_scope
+        )])
+
+    def put_many(
+        self,
+        entries: list[tuple[str, str, str, str, CacheScope]],
+    ) -> None:
+        """Commit one batch of cacheable translations in one transaction."""
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("cache entries must be one non-empty list")
         now = self._utc_now().isoformat()
+        rows = []
+        for text, source_lang, target_lang, translated_text, cache_scope in entries:
+            if not isinstance(translated_text, str) or not translated_text.strip():
+                raise ValueError("translated_text must be a non-empty string")
+            cache_key = self.compute_key(
+                text, source_lang, target_lang, cache_scope
+            )
+            rows.append((
+                cache_key,
+                self._hash_identifier(cache_scope.tenant),
+                self._hash_identifier(cache_scope.book_id),
+                self._hash_identifier(cache_scope.chapter_id),
+                self._hash_identifier(cache_scope.context_hash),
+                source_lang.strip(),
+                target_lang.strip(),
+                translated_text,
+                cache_scope.provider,
+                cache_scope.model,
+                cache_scope.prompt_hash,
+                cache_scope.protocol_version,
+                now,
+                now,
+            ))
         conn = self.connection()
         try:
-            conn.execute(
+            conn.executemany(
                 """INSERT INTO translations_v2 (
                        cache_key, tenant_hash, book_hash, chapter_hash,
                        context_hash, source_lang, target_lang, translated_text,
@@ -511,22 +556,7 @@ class CacheStore:
                        protocol_version = excluded.protocol_version,
                        created_at = excluded.created_at,
                        last_accessed_at = excluded.last_accessed_at""",
-                (
-                    cache_key,
-                    self._hash_identifier(cache_scope.tenant),
-                    self._hash_identifier(cache_scope.book_id),
-                    self._hash_identifier(cache_scope.chapter_id),
-                    self._hash_identifier(cache_scope.context_hash),
-                    source_lang.strip(),
-                    target_lang.strip(),
-                    translated_text,
-                    cache_scope.provider,
-                    cache_scope.model,
-                    cache_scope.prompt_hash,
-                    cache_scope.protocol_version,
-                    now,
-                    now,
-                ),
+                rows,
             )
             self._delete_expired(conn)
             self._enforce_cap(conn)
@@ -755,6 +785,12 @@ def put_cache(
         translated_text,
         _scope_for(model, scope, provider),
     )
+
+
+def put_cache_many(
+    entries: list[tuple[str, str, str, str, CacheScope]],
+) -> None:
+    _store().put_many(entries)
 
 
 def get_cache_stats() -> dict:

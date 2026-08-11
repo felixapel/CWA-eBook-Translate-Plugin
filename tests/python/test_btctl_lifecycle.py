@@ -13,7 +13,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from btctl_compose import ComposeInstaller, InstallError
+from btctl_compose import (
+    ComposeInstaller,
+    InstallError,
+    _write_private_json,
+    render_schema2_compose,
+)
 from btctl_core import DeploymentPlan, InstallConfig, ReleaseIdentity, StateStore
 from btctl_lifecycle import (
     DeploymentDoctor,
@@ -29,6 +34,9 @@ from tests.python.test_btctl_compose import FakeDocker, values
 
 
 class LifecycleDocker(FakeDocker):
+    def probe_providers(self, container):
+        self.calls.append(("probe_providers", container))
+
     def probe_image_version(self, image_id, expected_version):
         self.calls.append(("probe_image_version", image_id, expected_version))
 
@@ -151,6 +159,94 @@ class LifecycleTests(unittest.TestCase):
             })
         MigrationJournalStore(Path(config.state_dir)).save(payload)
         return payload
+
+    def test_historical_ca_latest_reference_requires_exact_image_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _config, _plan, docker, migration_values, _repository = (
+                self.migration_fixture(root)
+            )
+            legacy_name = migration_values["BT_LEGACY_CONTAINER"]
+            legacy = docker.containers[legacy_name]
+            legacy["Config"]["Image"] = (
+                "ghcr.io/felixapel/cwa-ebook-translate-plugin:latest"
+            )
+
+            verified = LegacyUpgrade(docker)._verify_legacy(
+                legacy_name,
+                Path(migration_values["BT_LEGACY_DATA_DIR"]),
+            )
+
+            self.assertIs(verified, legacy)
+            self.assertIn(
+                ("probe_image_version", legacy["Image"], "2.1.4"),
+                docker.calls,
+            )
+
+    def test_legacy_migration_rejects_unrelated_latest_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _config, _plan, docker, migration_values, _repository = (
+                self.migration_fixture(root)
+            )
+            legacy_name = migration_values["BT_LEGACY_CONTAINER"]
+            legacy = docker.containers[legacy_name]
+            legacy["Config"]["Image"] = "example.invalid/translator:latest"
+
+            with self.assertRaisesRegex(InstallError, "approved v2.1.4 source"):
+                LegacyUpgrade(docker)._verify_legacy(
+                    legacy_name,
+                    Path(migration_values["BT_LEGACY_DATA_DIR"]),
+                )
+
+            self.assertNotIn(
+                ("probe_image_version", legacy["Image"], "2.1.4"),
+                docker.calls,
+            )
+
+    def test_legacy_migration_rejects_tagless_version_like_repository(self):
+        for image_ref in ("example.invalid/2.1.4", "example.invalid/v2.1.4"):
+            with self.subTest(image_ref=image_ref), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _config, _plan, docker, migration_values, _repository = (
+                    self.migration_fixture(root)
+                )
+                legacy_name = migration_values["BT_LEGACY_CONTAINER"]
+                legacy = docker.containers[legacy_name]
+                legacy["Config"]["Image"] = image_ref
+
+                with self.assertRaisesRegex(InstallError, "approved v2.1.4 source"):
+                    LegacyUpgrade(docker)._verify_legacy(
+                        legacy_name,
+                        Path(migration_values["BT_LEGACY_DATA_DIR"]),
+                    )
+
+                self.assertNotIn(
+                    ("probe_image_version", legacy["Image"], "2.1.4"),
+                    docker.calls,
+                )
+
+    def test_historical_ca_latest_reference_rejects_wrong_image_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _config, _plan, docker, migration_values, _repository = (
+                self.migration_fixture(root)
+            )
+            legacy_name = migration_values["BT_LEGACY_CONTAINER"]
+            docker.containers[legacy_name]["Config"]["Image"] = (
+                "ghcr.io/felixapel/cwa-ebook-translate-plugin:latest"
+            )
+
+            with mock.patch.object(
+                docker,
+                "probe_image_version",
+                side_effect=InstallError("legacy image version mismatch"),
+            ):
+                with self.assertRaisesRegex(InstallError, "version mismatch"):
+                    LegacyUpgrade(docker)._verify_legacy(
+                        legacy_name,
+                        Path(migration_values["BT_LEGACY_DATA_DIR"]),
+                    )
 
     def test_migration_journal_load_rejects_mutable_local_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -444,6 +540,64 @@ class LifecycleTests(unittest.TestCase):
             drift = DeploymentDoctor(docker).run(config, plan)
             self.assertFalse(drift.ok)
             self.assertIn("runtime", " ".join(str(check) for check in drift.checks))
+
+    def test_legacy_schema_two_compose_remains_doctor_and_uninstall_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, plan, docker, state = self.installed(root)
+            legacy = replace(state, schema_version=2)
+            StateStore(Path(config.state_dir)).save(legacy)
+            _write_private_json(
+                Path(config.state_dir) / "deployment.compose.json",
+                render_schema2_compose(config, plan, state.install_id),
+            )
+            for name in ("api.env", "proxy.env"):
+                (Path(config.state_dir) / name).unlink()
+
+            report = DeploymentDoctor(docker).run(config, plan)
+            self.assertTrue(report.ok, report.to_dict())
+            removed = RuntimeUninstaller(docker).uninstall(config, plan)
+            self.assertEqual(removed.status, "uninstalled")
+
+    def test_doctor_deep_probes_only_after_structural_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, plan, docker, _ = self.installed(Path(directory))
+
+            ordinary = DeploymentDoctor(docker).run(config, plan)
+            self.assertTrue(ordinary.ok, ordinary.to_dict())
+            self.assertFalse(
+                [call for call in docker.calls if call[0] == "probe_providers"]
+            )
+
+            deep = DeploymentDoctor(docker).run(config, plan, deep=True)
+            self.assertTrue(deep.ok, deep.to_dict())
+            self.assertEqual(
+                [call for call in docker.calls if call[0] == "probe_providers"],
+                [("probe_providers", plan.resources["api"]["name"])],
+            )
+
+            docker.containers[config.reader_container]["State"]["Status"] = "exited"
+            failed = DeploymentDoctor(docker).run(config, plan, deep=True)
+            self.assertFalse(failed.ok)
+            self.assertEqual(
+                [call for call in docker.calls if call[0] == "probe_providers"],
+                [("probe_providers", plan.resources["api"]["name"])],
+            )
+
+    def test_doctor_deep_sanitizes_provider_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config, plan, docker, _ = self.installed(Path(directory))
+
+            def fail(_container):
+                raise RuntimeError("private-key-value model-name endpoint")
+
+            docker.probe_providers = fail
+            report = DeploymentDoctor(docker).run(config, plan, deep=True)
+
+            self.assertFalse(report.ok)
+            provider = report.checks[-1]
+            self.assertEqual(provider["name"], "providers")
+            self.assertEqual(provider["detail"], "provider deep probe failed")
 
     def test_doctor_accepts_exact_compose_operator_group_mode(self):
         with tempfile.TemporaryDirectory() as directory:

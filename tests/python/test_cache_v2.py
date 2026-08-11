@@ -125,7 +125,10 @@ class CacheV2Tests(unittest.TestCase):
         self.assertIsNone(
             self.store.get("hello", "English", "Spanish", scope())
         )
-        self.assertEqual(self.store.stats()["total_entries"], 0)
+        remaining = self.store.connection().execute(
+            "SELECT COUNT(*) FROM translations_v2"
+        ).fetchone()[0]
+        self.assertEqual(remaining, 0)
 
     def test_hard_cap_is_never_exceeded(self) -> None:
         for index in range(6):
@@ -150,6 +153,29 @@ class CacheV2Tests(unittest.TestCase):
                 "source-5", "English", "Spanish", scope(context_hash="ctx-5")
             ),
             "target-5",
+        )
+
+    def test_put_many_uses_one_transaction_for_one_translation_batch(self) -> None:
+        statements: list[str] = []
+        connection = self.store.connection()
+        connection.set_trace_callback(statements.append)
+        try:
+            self.store.put_many([
+                (
+                    f"source-{index}", "English", "Spanish",
+                    f"target-{index}", scope(context_hash=f"ctx-{index}"),
+                )
+                for index in range(5)
+            ])
+        finally:
+            connection.set_trace_callback(None)
+
+        self.assertEqual(
+            sum(statement == "COMMIT" for statement in statements), 1
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM translations_v2").fetchone()[0],
+            self.store.max_entries,
         )
 
     def test_cache_hit_does_not_write_until_counters_are_flushed(self) -> None:

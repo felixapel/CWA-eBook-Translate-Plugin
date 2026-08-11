@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ["LLM_PROVIDER"] = "local"
 os.environ["LLM_MODEL"] = "fake-model"
@@ -35,6 +36,7 @@ class ProviderBudgetTests(unittest.TestCase):
         self.original_response_limit = translator.BT_MAX_UPSTREAM_RESPONSE_BYTES
         self.original_provider_config = (
             translator.LLM_PROVIDER,
+            translator.LLM_API_KEY,
             translator.LLM_MODEL,
             translator.LLM_FALLBACK_PROVIDER,
             translator.LLM_FALLBACK_MODEL,
@@ -43,6 +45,7 @@ class ProviderBudgetTests(unittest.TestCase):
         # Keep this module deterministic even when another test imported the
         # translator before the environment variables above were applied.
         translator.LLM_PROVIDER = "local"
+        translator.LLM_API_KEY = ""
         translator.LLM_MODEL = "fake-model"
         translator.LLM_FALLBACK_PROVIDER = "minimax"
         translator.LLM_FALLBACK_MODEL = "fake-fallback"
@@ -63,6 +66,7 @@ class ProviderBudgetTests(unittest.TestCase):
         translator.BT_MAX_UPSTREAM_RESPONSE_BYTES = self.original_response_limit
         (
             translator.LLM_PROVIDER,
+            translator.LLM_API_KEY,
             translator.LLM_MODEL,
             translator.LLM_FALLBACK_PROVIDER,
             translator.LLM_FALLBACK_MODEL,
@@ -81,6 +85,116 @@ class ProviderBudgetTests(unittest.TestCase):
     def test_default_global_upstream_limit_is_not_unbounded(self):
         self.assertGreater(translator.BT_MAX_UPSTREAM_INFLIGHT, 0)
         self.assertIsNotNone(translator._UPSTREAM_SEM)
+
+    def test_provider_transport_ignores_proxy_environment_and_redirects(self):
+        class Response:
+            pass
+
+        class Session:
+            def __init__(self):
+                self.trust_env = True
+                self.calls = []
+
+            def mount(self, *_args):
+                return None
+
+            def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return Response()
+
+            def close(self):
+                return None
+
+        session = Session()
+        with mock.patch.object(translator.requests, "Session", return_value=session):
+            response = translator._deadline_provider_post(
+                "https://provider.example.test/v1/chat/completions",
+                headers={"Authorization": "Bearer test"},
+                json={"messages": []},
+                timeout=1,
+                stream=True,
+                budget=self.budget(max_attempts=1),
+            )
+
+        self.assertIs(response._bt_deadline_session, session)
+        self.assertFalse(session.trust_env)
+        self.assertFalse(session.calls[0][1]["allow_redirects"])
+
+    def test_named_provider_transport_reuses_one_thread_local_session(self):
+        class Response:
+            pass
+
+        class Session:
+            def __init__(self):
+                self.trust_env = True
+                self.mount_calls = []
+
+            def mount(self, *args):
+                self.mount_calls.append(args)
+
+            def post(self, *_args, **_kwargs):
+                return Response()
+
+            def close(self):
+                raise AssertionError("pooled provider session must stay open")
+
+        if hasattr(translator._PROVIDER_HTTP_SESSIONS, "session"):
+            del translator._PROVIDER_HTTP_SESSIONS.session
+        with mock.patch.object(
+            translator.requests, "Session", side_effect=Session
+        ) as session_factory:
+            first = translator._deadline_provider_post(
+                "https://provider.example.test/v1/chat/completions",
+                headers={}, json={}, timeout=1, stream=True,
+                budget=self.budget(max_attempts=2), reuse_connection=True,
+            )
+            second = translator._deadline_provider_post(
+                "https://provider.example.test/v1/chat/completions",
+                headers={}, json={}, timeout=1, stream=True,
+                budget=self.budget(max_attempts=2), reuse_connection=True,
+            )
+        self.assertEqual(session_factory.call_count, 1)
+        self.assertEqual(
+            len(translator._PROVIDER_HTTP_SESSIONS.session.mount_calls), 2
+        )
+        self.assertFalse(hasattr(first, "_bt_deadline_session"))
+        self.assertFalse(hasattr(second, "_bt_deadline_session"))
+        del translator._PROVIDER_HTTP_SESSIONS.session
+
+    def test_custom_transport_never_reuses_a_session(self):
+        class Response:
+            pass
+
+        class Session:
+            def __init__(self):
+                self.trust_env = True
+
+            def mount(self, *_args):
+                return None
+
+            def post(self, *_args, **_kwargs):
+                return Response()
+
+            def close(self):
+                return None
+
+        with mock.patch.object(
+            translator.requests, "Session", side_effect=Session
+        ) as session_factory:
+            responses = [
+                translator._deadline_provider_post(
+                    "https://custom.example.test/v1/chat/completions",
+                    headers={}, json={}, timeout=1, stream=True,
+                    budget=self.budget(max_attempts=1),
+                    reuse_connection=False,
+                )
+                for _ in range(2)
+            ]
+        self.assertEqual(session_factory.call_count, 2)
+        self.assertIsNot(
+            responses[0]._bt_deadline_session,
+            responses[1]._bt_deadline_session,
+        )
 
     def test_remote_fallback_requires_explicit_consent(self):
         calls = {"primary": 0, "fallback": 0}
@@ -139,8 +253,10 @@ class ProviderBudgetTests(unittest.TestCase):
 
     def test_local_fallback_remains_available_without_cloud_consent(self):
         translator.LLM_PROVIDER = "openai"
+        translator.LLM_API_KEY = "primary-key"
         translator.LLM_MODEL = "remote-primary"
         translator.LLM_FALLBACK_PROVIDER = "local"
+        translator.LLM_FALLBACK_API_KEY = ""
         translator.LLM_FALLBACK_MODEL = "private-fallback"
         translator._primary_provider = None
         translator._fallback_provider = "unset"
@@ -374,8 +490,19 @@ class ProviderBudgetTests(unittest.TestCase):
 
         server_thread = threading.Thread(target=drip_headers, daemon=True)
         server_thread.start()
-        provider = translator._Provider("local", "fake-model", "")
-        provider.url = f"http://127.0.0.1:{port}/v1/chat/completions"
+        endpoint = f"http://127.0.0.1:{port}/v1/chat/completions"
+        provider = translator._Provider(
+            "local",
+            "fake-model",
+            "",
+            spec=translator.ProviderSpec(
+                provider_id="local",
+                endpoint=endpoint,
+                protocol="openai",
+                locality="local",
+                cache_namespace="local",
+            ),
+        )
         translator._primary_provider = provider
         translator._fallback_provider = None
         translator._provider_post = translator._deadline_provider_post

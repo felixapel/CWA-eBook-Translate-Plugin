@@ -90,6 +90,7 @@ jobs:
         run: |
           ./scripts/container-smoke.sh "$IMAGE:scan-$RELEASE_SHA" "ghcr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           ./scripts/ca-container-smoke.sh "$IMAGE:scan-$RELEASE_SHA" "ghcr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ca"
+          ./scripts/hub-container-smoke.sh "$IMAGE:scan-$RELEASE_SHA" "ghcr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-hub"
 
       - name: Reject high and critical image vulnerabilities
         run: |
@@ -233,3 +234,4 @@ jobs:
             "$GHCR_DIGEST"
           ./scripts/container-smoke.sh "$GHCR_DIGEST" "ghcr-pull-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           ./scripts/ca-container-smoke.sh "$GHCR_DIGEST" "ghcr-pull-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-ca"
+          ./scripts/hub-container-smoke.sh "$GHCR_DIGEST" "ghcr-pull-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-hub"

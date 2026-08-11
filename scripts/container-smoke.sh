@@ -12,6 +12,7 @@ fi
 API_CONTAINER="${SMOKE_PREFIX}-api"
 PROXY_CONTAINER="${SMOKE_PREFIX}-proxy"
 CWA_CONTAINER="${SMOKE_PREFIX}-cwa-strong"
+KAVITA_CONTAINER="${SMOKE_PREFIX}-kavita"
 EDGE_CONTAINER="${SMOKE_PREFIX}-edge"
 OUTPOST_CONTAINER="${SMOKE_PREFIX}-outpost"
 SMOKE_NETWORK="${SMOKE_PREFIX}-net"
@@ -19,11 +20,13 @@ SMOKE_VOLUME="${SMOKE_PREFIX}-data"
 SMOKE_TOKEN="container-smoke-only-secret"
 EDGE_DIR=""
 CWA_COOKIE_JAR=""
+SESSION_HEADERS=""
 
 cleanup() {
     docker rm -f -v \
         "$EDGE_CONTAINER" "$OUTPOST_CONTAINER" \
         "$PROXY_CONTAINER" "$API_CONTAINER" "$CWA_CONTAINER" \
+        "$KAVITA_CONTAINER" \
         >/dev/null 2>&1 || true
     docker volume rm -f "$SMOKE_VOLUME" >/dev/null 2>&1 || true
     docker network rm "$SMOKE_NETWORK" >/dev/null 2>&1 || true
@@ -32,6 +35,9 @@ cleanup() {
     fi
     if [ -n "$CWA_COOKIE_JAR" ]; then
         rm -f "$CWA_COOKIE_JAR"
+    fi
+    if [ -n "$SESSION_HEADERS" ]; then
+        rm -f "$SESSION_HEADERS"
     fi
 }
 trap cleanup EXIT
@@ -130,13 +136,13 @@ curl -sf -H 'Host: attacker.example' -H 'X-Forwarded-Proto: javascript' \
 # The generated configuration, not client-controlled forwarding headers, owns
 # the public authority and the immediate client hop.
 test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
-    'proxy_set_header Host books.example.test:8443;' /tmp/nginx/proxy.conf)" = "2"
+    'proxy_set_header Host books.example.test:8443;' /tmp/nginx/proxy.conf)" = "3"
 test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
-    'proxy_set_header X-Forwarded-Proto https;' /tmp/nginx/proxy.conf)" = "2"
+    'proxy_set_header X-Forwarded-Proto https;' /tmp/nginx/proxy.conf)" = "3"
 test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
-    'proxy_set_header X-Forwarded-For $remote_addr;' /tmp/nginx/proxy.conf)" = "2"
+    'proxy_set_header X-Forwarded-For $remote_addr;' /tmp/nginx/proxy.conf)" = "3"
 test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
-    'proxy_set_header User-Agent $http_user_agent;' /tmp/nginx/proxy.conf)" = "2"
+    'proxy_set_header User-Agent $http_user_agent;' /tmp/nginx/proxy.conf)" = "3"
 test "$(docker exec "$PROXY_CONTAINER" grep -Fc \
     'proxy_set_header Remote-User "";' /tmp/nginx/proxy.conf)" = "1"
 docker exec "$PROXY_CONTAINER" grep -Fq \
@@ -190,6 +196,151 @@ curl -sf -b "$CWA_COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
 test "$(curl -sS -o /dev/null -w '%{http_code}' \
     -b "$CWA_COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
     "http://127.0.0.1:${API_PORT}/metrics")" = "401"
+
+# Exercise the managed opaque-session boundary. Raw CWA credentials may reach
+# only the exact exchange endpoint; ordinary API routes receive only the
+# five-minute plugin cookie, bound to the proxy-observed address and User-Agent.
+docker rm -f "$API_CONTAINER" >/dev/null
+docker run -d --name "$API_CONTAINER" --network "$SMOKE_NETWORK" \
+    "${sandbox[@]}" \
+    --mount "type=volume,source=${SMOKE_VOLUME},target=/app/data" \
+    -e BT_ROLE=api \
+    -e BT_AUTH_MODE=reader_session \
+    -e BT_READER_TYPE=cwa \
+    -e "BT_READER_AUTH_URL=http://${CWA_CONTAINER}:8083/ajax/emailstat" \
+    -e BT_READER_VERSION=4.0.6 \
+    -e BT_READER_CONTRACT_VERSION=cwa-epub-v1 \
+    -e BT_READER_CONNECTOR_ID=00000000-0000-4000-8000-000000000001 \
+    -e BT_PUBLIC_ORIGIN=https://books.example.test:8443 \
+    -e BT_SESSION_KEY_PATH=/app/data/reader_session_key \
+    -e "BT_TRUSTED_PROXY_HOST=${PROXY_CONTAINER}" \
+    -p 127.0.0.1::8390 \
+    "$SMOKE_IMAGE" >/dev/null
+API_PORT="$(docker port "$API_CONTAINER" 8390/tcp | sed 's/.*://')"
+for _ in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:${API_PORT}/ping" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+SESSION_HEADERS="$(mktemp "${TMPDIR:-/tmp}/reader-session-headers.XXXXXX")"
+curl -sf -D "$SESSION_HEADERS" -o /dev/null -X POST \
+    -b "$CWA_COOKIE_JAR" \
+    -H "User-Agent: ${BROWSER_UA}" \
+    -H 'Origin: https://books.example.test:8443' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/session"
+PLUGIN_COOKIE="$(awk 'BEGIN{IGNORECASE=1} /^set-cookie:/ {sub(/^[^:]*:[[:space:]]*/, ""); split($0, parts, ";"); if (parts[1] ~ /^__Host-bt-session=/) print parts[1]}' "$SESSION_HEADERS" | tail -n 1 | tr -d '\r')"
+if [[ ! "$PLUGIN_COOKIE" =~ ^__Host-bt-session=[A-Za-z0-9_-]{32,128}$ ]]; then
+    echo "opaque CWA session cookie was not issued" >&2
+    exit 1
+fi
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -b "$CWA_COOKIE_JAR" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
+curl -sf -H "Cookie: ${PLUGIN_COOKIE}" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics" \
+    | grep -q '"total_requests"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Cookie: ${PLUGIN_COOKIE}" -H 'User-Agent: Wrong-Browser/1.0' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
+curl -sf -X DELETE \
+    -H "Cookie: ${PLUGIN_COOKIE}; session=cwa-cookie-must-not-reach-api" \
+    -H "User-Agent: ${BROWSER_UA}" \
+    -H 'Origin: https://books.example.test:8443' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/session" \
+    | grep -q '"status":"revoked"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Cookie: ${PLUGIN_COOKIE}" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
+
+# A pinned Kavita fixture proves both stock HTML proxying and native bearer
+# exchange. Its account DTO includes unrelated auth-key data; the broker uses
+# only the bounded user id and exact v0.9.0.2 version fields.
+KAVITA_FIXTURE_SOURCE="$(pwd)/tests/python/test_kavita_auth_fixture.py"
+test -r "$KAVITA_FIXTURE_SOURCE"
+docker run -d --name "$KAVITA_CONTAINER" --network "$SMOKE_NETWORK" \
+    "${sandbox[@]}" \
+    --mount "type=bind,src=${KAVITA_FIXTURE_SOURCE},dst=/fixture/test_kavita_auth_fixture.py,readonly" \
+    --entrypoint python "$SMOKE_IMAGE" \
+    /fixture/test_kavita_auth_fixture.py >/dev/null
+for _ in $(seq 1 30); do
+    if docker exec "$KAVITA_CONTAINER" python -c \
+        'import socket; socket.create_connection(("127.0.0.1", 5000), 1).close()' \
+        >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+
+docker rm -f "$API_CONTAINER" "$PROXY_CONTAINER" >/dev/null
+docker run -d --name "$API_CONTAINER" --network "$SMOKE_NETWORK" \
+    "${sandbox[@]}" \
+    --mount "type=volume,source=${SMOKE_VOLUME},target=/app/data" \
+    -e BT_ROLE=api \
+    -e BT_AUTH_MODE=reader_session \
+    -e BT_READER_TYPE=kavita \
+    -e "BT_READER_AUTH_URL=http://${KAVITA_CONTAINER}:5000/api/Account" \
+    -e BT_READER_VERSION=0.9.0.2 \
+    -e BT_READER_CONTRACT_VERSION=kavita-0.9.0.2-epub-v1 \
+    -e BT_READER_CONNECTOR_ID=00000000-0000-4000-8000-000000000002 \
+    -e BT_PUBLIC_ORIGIN=https://books.example.test:8443 \
+    -e BT_SESSION_KEY_PATH=/app/data/reader_session_key \
+    -e "BT_TRUSTED_PROXY_HOST=${PROXY_CONTAINER}" \
+    -p 127.0.0.1::8390 \
+    "$SMOKE_IMAGE" >/dev/null
+docker run -d --name "$PROXY_CONTAINER" --network "$SMOKE_NETWORK" \
+    "${sandbox[@]}" \
+    -e BT_ROLE=proxy \
+    -e BT_READER_TYPE=kavita \
+    -e "BT_READER_UPSTREAM=http://${KAVITA_CONTAINER}:5000" \
+    -e "BT_API_UPSTREAM=http://${API_CONTAINER}:8390" \
+    -e BT_PUBLIC_ORIGIN=https://books.example.test:8443 \
+    -e BT_READER_VERSION=0.9.0.2 \
+    -e BT_READER_CONTRACT_VERSION=kavita-0.9.0.2-epub-v1 \
+    -e BT_BROWSER_AUTH_MODE=reader_session \
+    -e BT_BROWSER_CREDENTIALS=same-origin \
+    -p 127.0.0.1::8080 \
+    "$SMOKE_IMAGE" >/dev/null
+API_PORT="$(docker port "$API_CONTAINER" 8390/tcp | sed 's/.*://')"
+PROXY_PORT="$(docker port "$PROXY_CONTAINER" 8080/tcp | sed 's/.*://')"
+for _ in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:${PROXY_PORT}/bt-api/ping" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+curl -sf "http://127.0.0.1:${PROXY_PORT}/library/7/series/42/book/99" \
+    | grep -q '<div class="book-content">'
+curl -sf "http://127.0.0.1:${PROXY_PORT}/library/7/series/42/book/99" \
+    | grep -q '/bt-static/loader.js'
+
+: >"$SESSION_HEADERS"
+curl -sf -D "$SESSION_HEADERS" -o /dev/null -X POST \
+    -H 'Authorization: Bearer container-smoke-kavita-access' \
+    -H "User-Agent: ${BROWSER_UA}" \
+    -H 'Origin: https://books.example.test:8443' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/session"
+PLUGIN_COOKIE="$(awk 'BEGIN{IGNORECASE=1} /^set-cookie:/ {sub(/^[^:]*:[[:space:]]*/, ""); split($0, parts, ";"); if (parts[1] ~ /^__Host-bt-session=/) print parts[1]}' "$SESSION_HEADERS" | tail -n 1 | tr -d '\r')"
+if [[ ! "$PLUGIN_COOKIE" =~ ^__Host-bt-session=[A-Za-z0-9_-]{32,128}$ ]]; then
+    echo "opaque Kavita session cookie was not issued" >&2
+    exit 1
+fi
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H 'Authorization: Bearer container-smoke-kavita-access' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
+curl -sf -H "Cookie: ${PLUGIN_COOKIE}" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics" \
+    | grep -q '"total_requests"'
+curl -sf -X DELETE \
+    -H "Cookie: ${PLUGIN_COOKIE}; .AspNetCore.Cookies=oidc-cookie-must-not-reach-api" \
+    -H "User-Agent: ${BROWSER_UA}" \
+    -H 'Origin: https://books.example.test:8443' \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/session" \
+    | grep -q '"status":"revoked"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Cookie: ${PLUGIN_COOKIE}" -H "User-Agent: ${BROWSER_UA}" \
+    "http://127.0.0.1:${PROXY_PORT}/bt-api/metrics")" = "401"
 
 # Render the managed Authentik/Nginx edge fragment, validate it with the nginx
 # binary shipped in the candidate, and exercise a successful auth subrequest.

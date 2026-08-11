@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import stat
@@ -9,13 +10,14 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from btctl import _docker_for
+from btctl import _docker_for, _load_values, _parser
 
 from btctl_core import (
     ConfigError,
     DeploymentPlan,
     DeploymentState,
     InstallConfig,
+    InstallAttemptStore,
     OperationLock,
     ReleaseIdentity,
     StateStore,
@@ -28,6 +30,18 @@ from btctl_core import (
 
 ROOT = Path(__file__).resolve().parents[2]
 BTCTL = ROOT / "btctl.py"
+
+
+class ParserTests(unittest.TestCase):
+    def test_doctor_deep_is_explicit_and_defaults_off(self):
+        parser = _parser()
+        ordinary = parser.parse_args(["doctor", "--env", "install.env"])
+        deep = parser.parse_args(
+            ["doctor", "--env", "install.env", "--deep"]
+        )
+
+        self.assertFalse(ordinary.deep)
+        self.assertTrue(deep.deep)
 
 
 class ReleaseIdentityTests(unittest.TestCase):
@@ -132,6 +146,62 @@ class DockerEnvironmentTests(unittest.TestCase):
                 self.assertNotIn("DOCKER_CERT_PATH", os.environ)
 
 
+class EnvironmentSnapshotTests(unittest.TestCase):
+    def test_container_operator_rejects_environment_snapshot_digest_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / "install.env"
+            environment.write_text("BT_INSTALL_NAME=first\n", encoding="utf-8")
+            environment.chmod(0o600)
+            metadata = environment.stat()
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"BTCTL_EXPECTED_ENV_SHA256": "0" * 64},
+                    clear=False,
+                ),
+                mock.patch(
+                    "btctl.os.fstat",
+                    return_value=mock.Mock(
+                        st_mode=metadata.st_mode,
+                        st_nlink=1,
+                        st_size=metadata.st_size,
+                        st_uid=0,
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(ConfigError, "snapshot changed"):
+                    _load_values(environment)
+
+    def test_container_operator_accepts_the_bound_root_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = Path(directory) / "install.env"
+            payload = b"BT_INSTALL_NAME=first\n"
+            environment.write_bytes(payload)
+            environment.chmod(0o600)
+            metadata = environment.stat()
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"BTCTL_EXPECTED_ENV_SHA256": hashlib.sha256(payload).hexdigest()},
+                    clear=False,
+                ),
+                mock.patch(
+                    "btctl.os.fstat",
+                    return_value=mock.Mock(
+                        st_mode=metadata.st_mode,
+                        st_nlink=1,
+                        st_size=metadata.st_size,
+                        st_uid=0,
+                    ),
+                ),
+            ):
+                values = _load_values(environment)
+
+            self.assertEqual(values["BT_INSTALL_NAME"], "first")
+
+
 class OperationLockTests(unittest.TestCase):
     def test_same_state_directory_allows_only_one_lifecycle_operation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -204,12 +274,12 @@ class InstallConfigTests(unittest.TestCase):
         api = config.api_environment()
         proxy = config.proxy_environment()
 
-        self.assertEqual(api["BT_AUTH_MODE"], "cwa_session")
+        self.assertEqual(api["BT_AUTH_MODE"], "reader_session")
         self.assertEqual(api["BT_CACHE_OPERATOR_GROUP_ACCESS"], "true")
-        self.assertEqual(proxy["BT_BROWSER_AUTH_MODE"], "cwa_session")
+        self.assertEqual(proxy["BT_BROWSER_AUTH_MODE"], "reader_session")
         self.assertEqual(proxy["BT_BROWSER_CREDENTIALS"], "same-origin")
         self.assertEqual(
-            api["BT_CWA_AUTH_URL"],
+            api["BT_READER_AUTH_URL"],
             "http://calibre-web-automated:8083/ajax/emailstat",
         )
         self.assertEqual(api["BT_TRUSTED_PROXY_HOST"], "translator-proxy")
@@ -220,6 +290,138 @@ class InstallConfigTests(unittest.TestCase):
         self.assertNotIn("BT_INSTALL_PROFILE", api)
         self.assertNotIn("BT_IMAGE", api)
         self.assertNotIn("BT_ALLOW_INSECURE_AUTH", api)
+
+    def test_legacy_and_generic_cwa_reader_inputs_normalize_identically(self):
+        legacy = InstallConfig.from_mapping(self.base, self.identity)
+        generic_values = {
+            **self.base,
+            "BT_READER_TYPE": "cwa",
+            "BT_READER_UPSTREAM": self.base["CWA_UPSTREAM"],
+            "BT_READER_CONTAINER": self.base["BT_CWA_CONTAINER"],
+            "BT_READER_NETWORK": self.base["BT_CWA_NETWORK"],
+            "BT_READER_VERSION": self.base["BT_CWA_VERSION"],
+        }
+        generic = InstallConfig.from_mapping(generic_values, self.identity)
+
+        self.assertEqual(generic.reader_type, "cwa")
+        self.assertEqual(generic.reader_contract_version, "cwa-epub-v1")
+        self.assertEqual(generic.public_contract(), legacy.public_contract())
+        self.assertEqual(
+            DeploymentPlan.from_config(generic).config_fingerprint,
+            DeploymentPlan.from_config(legacy).config_fingerprint,
+        )
+
+    def test_conflicting_generic_and_legacy_cwa_inputs_are_rejected(self):
+        aliases = {
+            "BT_READER_UPSTREAM": "http://other:8083",
+            "BT_READER_CONTAINER": "other",
+            "BT_READER_NETWORK": "other_default",
+            "BT_READER_VERSION": "4.0.7",
+        }
+        for name, value in aliases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ConfigError, name):
+                InstallConfig.from_mapping(
+                    {**self.base, "BT_READER_TYPE": "cwa", name: value},
+                    self.identity,
+                )
+
+    def test_exact_certified_kavita_reader_contract(self):
+        values = {
+            **self.base,
+            "BT_INSTALL_NAME": "kavita-translate",
+            "BT_AUTH_PROFILE": "reader-session",
+            "BT_READER_TYPE": "kavita",
+            "BT_READER_UPSTREAM": "http://kavita:5000",
+            "BT_READER_CONTAINER": "kavita",
+            "BT_READER_NETWORK": "kavita_default",
+            "BT_READER_VERSION": "0.9.0.2",
+            "BT_STATE_DIR": "/srv/kavita-translate/state",
+            "BT_DATA_DIR": "/srv/kavita-translate/data",
+            "BT_BACKUP_DIR": "/srv/kavita-translate/backups",
+        }
+        for legacy_name in (
+            "CWA_UPSTREAM",
+            "BT_CWA_CONTAINER",
+            "BT_CWA_NETWORK",
+            "BT_CWA_VERSION",
+        ):
+            values.pop(legacy_name)
+
+        config = InstallConfig.from_mapping(values, self.identity)
+
+        self.assertEqual(config.reader_type, "kavita")
+        self.assertEqual(config.reader_version, "0.9.0.2")
+        self.assertEqual(config.reader_image_id, "")
+        self.assertEqual(config.compatibility_tier, "certified")
+        self.assertEqual(config.reader_contract_version, "kavita-0.9.0.2-epub-v1")
+        self.assertEqual(
+            config.image,
+            "local/kavita-translate:2.2.0-bbbbbbbbbbbb",
+        )
+        self.assertNotEqual(config.image, self.identity.image)
+        self.assertEqual(config.api_environment()["BT_AUTH_MODE"], "reader_session")
+        self.assertEqual(
+            config.api_environment()["BT_READER_AUTH_URL"],
+            "http://kavita:5000/api/Account",
+        )
+        self.assertEqual(config.proxy_environment()["BT_READER_TYPE"], "kavita")
+        self.assertEqual(
+            config.proxy_environment()["BT_READER_UPSTREAM"],
+            "http://kavita:5000",
+        )
+
+        for version in ("0.9.0.1", "v0.9.0.2", "0.9.1.0", "latest"):
+            with self.subTest(version=version), self.assertRaisesRegex(
+                ConfigError, "certified Kavita"
+            ):
+                InstallConfig.from_mapping(
+                    {**values, "BT_READER_VERSION": version}, self.identity
+                )
+
+        exact_image_id = "sha256:" + "1" * 64
+        pinned = InstallConfig.from_mapping(
+            {**values, "BT_READER_IMAGE_ID": exact_image_id}, self.identity
+        )
+        self.assertEqual(pinned.reader_image_id, exact_image_id)
+        self.assertEqual(
+            DeploymentPlan.from_config(pinned).resources["reader"]["image_id"],
+            exact_image_id,
+        )
+        for image_id in ("latest", "sha256:1234", "sha256:" + "A" * 64):
+            with self.subTest(image_id=image_id), self.assertRaisesRegex(
+                ConfigError, "BT_READER_IMAGE_ID"
+            ):
+                InstallConfig.from_mapping(
+                    {**values, "BT_READER_IMAGE_ID": image_id}, self.identity
+                )
+
+    def test_kavita_forbids_cwa_only_inputs_and_non_reader_auth(self):
+        base = {
+            **self.base,
+            "BT_READER_TYPE": "kavita",
+            "BT_READER_UPSTREAM": "http://kavita:5000",
+            "BT_READER_CONTAINER": "kavita",
+            "BT_READER_NETWORK": "kavita_default",
+            "BT_READER_VERSION": "0.9.0.2",
+        }
+        for legacy_name in (
+            "CWA_UPSTREAM",
+            "BT_CWA_CONTAINER",
+            "BT_CWA_NETWORK",
+            "BT_CWA_VERSION",
+        ):
+            base.pop(legacy_name)
+        for name, value in (
+            ("BT_CWA_IDENTITY_HEADER", "Remote-User"),
+            ("CWA_UPSTREAM", "http://calibre-web-automated:8083"),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(ConfigError, name):
+                InstallConfig.from_mapping(
+                    {**base, "BT_AUTH_PROFILE": "reader-session", name: value},
+                    self.identity,
+                )
+        with self.assertRaisesRegex(ConfigError, "reader-session"):
+            InstallConfig.from_mapping(base, self.identity)
 
     def test_nginx_facing_origins_reject_variable_or_ambiguous_authorities(self):
         malicious = (
@@ -472,6 +674,76 @@ class InstallConfigTests(unittest.TestCase):
                     {**self.base, "BT_LOCAL_URL": endpoint}, self.identity
                 )
 
+    def test_managed_provider_contract_supports_fallback_and_custom_endpoint(self):
+        gemini_primary = InstallConfig.from_mapping(
+            {
+                **self.base,
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.5-flash-lite",
+                "LLM_API_KEY": "gemini-private-key",
+                "LLM_FALLBACK_PROVIDER": "local",
+                "LLM_FALLBACK_MODEL": "gemma4-12b",
+            },
+            self.identity,
+        )
+        primary_env = gemini_primary.api_environment()
+        self.assertEqual(primary_env["LLM_FALLBACK_PROVIDER"], "local")
+        self.assertEqual(primary_env["LLM_FALLBACK_MODEL"], "gemma4-12b")
+        self.assertEqual(primary_env["LLM_FALLBACK_API_KEY"], "")
+        self.assertEqual(
+            primary_env["BT_LOCAL_URL"],
+            "http://host.docker.internal:2819/v1/chat/completions",
+        )
+
+        custom = InstallConfig.from_mapping(
+            {
+                **self.base,
+                "LLM_PROVIDER": "openai-compatible",
+                "LLM_MODEL": "translation-model",
+                "BT_LOCAL_URL": "",
+                "LLM_CUSTOM_ENDPOINT": "https://llm.example.test/v1/chat/completions",
+                "LLM_CUSTOM_API_KEY": "custom-private-key",
+            },
+            self.identity,
+        )
+        custom_env = custom.api_environment()
+        self.assertEqual(
+            custom_env["LLM_CUSTOM_ENDPOINT"],
+            "https://llm.example.test/v1/chat/completions",
+        )
+        self.assertEqual(custom_env["LLM_CUSTOM_API_KEY"], "custom-private-key")
+        self.assertEqual(custom_env["LLM_API_KEY"], "")
+        self.assertNotIn("custom-private-key", repr(custom.public_contract()))
+
+    def test_managed_provider_contract_rejects_ambiguous_or_unsafe_fallbacks(self):
+        invalid_cases = (
+            {
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.5-flash-lite",
+                "LLM_API_KEY": "primary-key",
+                "LLM_FALLBACK_PROVIDER": "gemini",
+                "LLM_FALLBACK_MODEL": "gemini-3.5-flash-lite",
+                "BT_LOCAL_URL": "",
+            },
+            {
+                "LLM_PROVIDER": "openai-compatible",
+                "LLM_MODEL": "translation-model",
+                "LLM_CUSTOM_ENDPOINT": "http://llm.example.test/v1/chat/completions",
+                "LLM_CUSTOM_API_KEY": "custom-key",
+                "BT_LOCAL_URL": "",
+            },
+            {
+                "LLM_PROVIDER": "openai-compatible",
+                "LLM_MODEL": "translation-model",
+                "LLM_CUSTOM_ENDPOINT": "https://llm.example.test/v1/chat/completions/",
+                "LLM_CUSTOM_API_KEY": "custom-key",
+                "BT_LOCAL_URL": "",
+            },
+        )
+        for values in invalid_cases:
+            with self.subTest(values=values), self.assertRaises(ConfigError):
+                InstallConfig.from_mapping({**self.base, **values}, self.identity)
+
     def test_redaction_never_returns_secret_values(self):
         values = {
             "LLM_API_KEY": "cloud-secret",
@@ -525,11 +797,35 @@ class PlanAndStateTests(unittest.TestCase):
         self.assertNotIn("never-print-this", encoded)
         self.assertEqual(first["image"], self.identity.image)
         self.assertEqual(first["compatibility_tier"], "tier1")
-        self.assertEqual(first["resources"]["cwa"]["ownership"], "external")
+        self.assertEqual(first["schema_version"], 3)
+        self.assertEqual(first["reader_type"], "cwa")
+        self.assertEqual(first["reader_contract_version"], "cwa-epub-v1")
+        self.assertEqual(first["resources"]["reader"]["ownership"], "external")
         self.assertEqual(first["resources"]["api"]["ownership"], "owned")
         self.assertEqual(first["resources"]["proxy"]["ownership"], "owned")
         self.assertEqual(first["resources"]["api"]["published_ports"], [])
         self.assertEqual(first["resources"]["proxy"]["published_ports"], [8385])
+
+    def test_schema_one_state_loads_without_implicit_rewrite(self):
+        payload = {
+            "schema_version": 1,
+            "install_id": "01234567-89ab-4cde-8123-0123456789ab",
+            "status": "installed",
+            "version": "2.2.0",
+            "revision": "c" * 40,
+            "image": "local/cwa-translate:2.2.0-cccccccccccc",
+            "config_fingerprint": "d" * 64,
+            "install_profile": "compose-existing",
+            "auth_profile": "cwa-session",
+            "resources": {"cwa": {"name": "calibre-web-automated"}},
+        }
+
+        state = DeploymentState.from_dict(payload)
+
+        self.assertEqual(state.schema_version, 1)
+        self.assertEqual(state.reader_type, "cwa")
+        self.assertEqual(state.reader_contract_version, "cwa-epub-v1")
+        self.assertEqual(state.to_dict(), payload)
 
     def test_state_is_private_atomic_schema_versioned_and_secret_free(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -548,6 +844,25 @@ class PlanAndStateTests(unittest.TestCase):
             self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
             self.assertNotIn("never-print-this", payload)
             self.assertEqual(store.load(), state)
+
+    def test_cleaned_install_attempt_cannot_report_cleanup_errors(self):
+        plan = DeploymentPlan.from_config(
+            InstallConfig.from_mapping(self.values, self.identity)
+        )
+        payload = {
+            "install_id": "01234567-89ab-4cde-8123-0123456789ab",
+            "status": "cleaned",
+            "version": plan.version,
+            "revision": plan.revision,
+            "image": plan.image,
+            "config_fingerprint": plan.config_fingerprint,
+            "install_profile": plan.install_profile,
+            "resources": plan.resources,
+            "cleanup_errors": ["compose: cleanup failed"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ConfigError, "cannot contain cleanup errors"):
+                InstallAttemptStore(Path(directory)).save(payload)
 
     def test_fresh_state_directory_entry_is_durable_before_state_publish(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -600,6 +915,27 @@ class PlanAndStateTests(unittest.TestCase):
                         ),
                     )
                 )
+
+    def test_state_save_refuses_to_take_over_an_existing_mutable_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "state"
+            root.mkdir(mode=0o755)
+            marker = root / "belongs-to-another-tool"
+            marker.write_text("preserve", encoding="utf-8")
+            store = StateStore(root)
+            state = DeploymentState.new(
+                install_id="01234567-89ab-4cde-8123-0123456789ab",
+                plan=DeploymentPlan.from_config(
+                    InstallConfig.from_mapping(self.values, self.identity)
+                ),
+            )
+
+            with self.assertRaisesRegex(ConfigError, "owned.*mode 0700"):
+                store.save(state)
+
+            self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+            self.assertFalse(store.path.exists())
 
     def test_state_load_rejects_mutable_or_linked_ownership_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

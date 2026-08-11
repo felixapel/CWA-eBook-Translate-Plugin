@@ -10,7 +10,7 @@ BT_UI_VERSION="$(cat /app/VERSION 2>/dev/null || echo dev)"
 export PORT BT_PROXY_PORT BT_ROLE BT_UI_VERSION
 
 if [ "$BT_ROLE" = "auto" ]; then
-    if [ -n "${CWA_UPSTREAM:-}" ]; then
+    if [ -n "${BT_READER_UPSTREAM:-${CWA_UPSTREAM:-}}" ]; then
         BT_ROLE="all"
     else
         BT_ROLE="api"
@@ -19,12 +19,16 @@ if [ "$BT_ROLE" = "auto" ]; then
 fi
 
 case "$BT_ROLE" in
-    api|proxy|all) ;;
+    api|proxy|all|hub) ;;
     *)
-        echo "[entrypoint] ERROR: BT_ROLE must be api, proxy, all, or auto" >&2
+        echo "[entrypoint] ERROR: BT_ROLE must be api, proxy, all, hub, or auto" >&2
         exit 64
         ;;
 esac
+
+if [ "$BT_ROLE" = "hub" ]; then
+    exec python /app/hub_runtime.py
+fi
 
 if [ "$BT_ROLE" = "all" ]; then
     export BT_TRUSTED_PROXIES="${BT_TRUSTED_PROXIES:-127.0.0.1/32}"
@@ -66,6 +70,17 @@ validate_api_auth() {
                 exit 78
             fi
             ;;
+        reader_session)
+            if [ -z "${BT_READER_TYPE:-}" ] \
+                || [ -z "${BT_READER_AUTH_URL:-}" ] \
+                || [ -z "${BT_READER_VERSION:-}" ] \
+                || [ -z "${BT_READER_CONNECTOR_ID:-}" ] \
+                || [ -z "${BT_PUBLIC_ORIGIN:-}" ] \
+                || [ -z "${BT_SESSION_KEY_PATH:-}" ]; then
+                echo "[entrypoint] ERROR: reader_session configuration is incomplete" >&2
+                exit 78
+            fi
+            ;;
         forwarded)
             if [ -z "${BT_IDENTITY_TRUSTED_PROXIES:-}" ]; then
                 echo "[entrypoint] ERROR: BT_IDENTITY_TRUSTED_PROXIES is required when BT_AUTH_MODE=forwarded" >&2
@@ -94,8 +109,10 @@ initialize_cache() {
 }
 
 configure_proxy() {
-    if [ -z "${CWA_UPSTREAM:-}" ]; then
-        echo "[entrypoint] ERROR: CWA_UPSTREAM is required for the proxy role" >&2
+    BT_READER_UPSTREAM="${BT_READER_UPSTREAM:-${CWA_UPSTREAM:-}}"
+    BT_READER_TYPE="${BT_READER_TYPE:-cwa}"
+    if [ -z "$BT_READER_UPSTREAM" ]; then
+        echo "[entrypoint] ERROR: BT_READER_UPSTREAM is required for the proxy role" >&2
         exit 64
     fi
     BT_API_UPSTREAM="${BT_API_UPSTREAM:-http://127.0.0.1:${PORT}}"
@@ -104,7 +121,8 @@ configure_proxy() {
     # credential. The injection proxy is not an identity authority, so it
     # always removes that client-supplied header before forwarding to CWA.
     BT_CWA_IDENTITY_HEADER="${BT_CWA_IDENTITY_HEADER:-Remote-User}"
-    export BT_API_UPSTREAM BT_CWA_MAX_BODY_SIZE BT_CWA_IDENTITY_HEADER
+    export BT_API_UPSTREAM BT_CWA_MAX_BODY_SIZE BT_CWA_IDENTITY_HEADER \
+        BT_READER_UPSTREAM BT_READER_TYPE
 
     mkdir -p \
         /tmp/nginx/client_temp \
@@ -138,7 +156,7 @@ case "$BT_ROLE" in
         ;;
     proxy)
         configure_proxy
-        echo "[entrypoint] proxy role on :${BT_PROXY_PORT} -> ${CWA_UPSTREAM}"
+        echo "[entrypoint] proxy role on :${BT_PROXY_PORT} -> ${BT_READER_UPSTREAM}"
         exec nginx -c /app/proxy/nginx-main.conf -e /dev/stderr -g 'daemon off;'
         ;;
 esac

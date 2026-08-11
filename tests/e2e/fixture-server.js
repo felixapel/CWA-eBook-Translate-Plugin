@@ -46,6 +46,18 @@ const server = http.createServer((request, response) => {
         }));
         return;
     }
+    if (url.pathname === '/bt-api/provider-policy') {
+        response.writeHead(200, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+        });
+        response.end(JSON.stringify({
+            primary: 'local',
+            fallback: 'remote',
+            generation: '0123456789abcdef0123456789abcdef',
+        }));
+        return;
+    }
     if (url.pathname === '/chapter/1') {
         response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         response.end(`<!doctype html><html><body>
@@ -65,6 +77,28 @@ const server = http.createServer((request, response) => {
         </head><body>
           <main><div id="viewer"><iframe title="Book chapter" src="/chapter/1"></iframe></div></main>
         </body></html>`);
+        return;
+    }
+    if (url.pathname === '/library/7/series/42/book/99') {
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        response.end(`<!doctype html><html lang="en"><head>
+          <meta charset="utf-8">
+          <title>Kavita EPUB reader fixture</title>
+          <script src="/bt-static/loader.js?v=e2e"></script>
+        </head><body>
+          <main class="book-container">
+            <div class="book-content"><p id="kavita-paragraph">A Kavita EPUB paragraph.</p></div>
+          </main>
+        </body></html>`);
+        return;
+    }
+    if (url.pathname === '/library/7/series/42/manga/99') {
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        response.end(`<!doctype html><html lang="en"><head>
+          <meta charset="utf-8">
+          <title>Kavita manga fixture</title>
+          <script src="/bt-static/loader.js?v=e2e"></script>
+        </head><body><main><canvas aria-label="manga page"></canvas></main></body></html>`);
         return;
     }
     if (url.pathname === '/library') {

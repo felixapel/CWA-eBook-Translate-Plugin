@@ -263,6 +263,7 @@ chmod 0600 "$ENV_FILE"
 
 outer_mounts=(
     --mount "type=bind,src=$ROOT_DIR,dst=$ROOT_DIR,readonly"
+    --mount "type=bind,src=$TEMPORARY,dst=$TEMPORARY"
     --mount "type=bind,src=$ENV_FILE,dst=$ENV_FILE,readonly"
     --mount type=bind,src=/mnt,dst=/mnt,readonly
     --mount type=bind,src=/boot,dst=/boot,readonly
@@ -274,10 +275,12 @@ run_without_host_tooling() {
     docker run --rm --user 0:0 --network none \
         --read-only --pids-limit 128 --cap-drop ALL \
         --cap-add DAC_READ_SEARCH \
+        --cap-add DAC_OVERRIDE \
         --security-opt no-new-privileges:true \
         --env HOME=/tmp/home \
         --env DOCKER_CONFIG=/tmp/docker \
         --env XDG_CONFIG_HOME=/tmp/config \
+        --env "TMPDIR=$TEMPORARY" \
         --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m \
         "${outer_mounts[@]}" \
         --entrypoint /bin/bash "$DISPATCHER_IMAGE" \

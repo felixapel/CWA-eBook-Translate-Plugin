@@ -18,6 +18,8 @@ assert(/authMode:\s*managed\.authMode/.test(loaderCode)
         && /apiToken:\s*''/.test(loaderCode)
         && !/authMode:\s*existing\.authMode/.test(loaderCode),
     'Managed authentication settings must not be overridden by page JavaScript');
+assert(!/\.refreshToken\b/.test(loaderCode),
+    'The Kavita bootstrap must never access the native refresh token');
 assert(/AUTH_MODE\s*===\s*'token'\s*&&\s*cfg\.apiToken/.test(code),
     'The browser must send X-BT-Token only in explicit token mode');
 assert(/AUTH_MODE\s*===\s*'forwarded'[\s\S]{0,80}?['"]include['"]/.test(code),
@@ -26,6 +28,22 @@ assert(/id="bt-source-lang"/.test(code)
         && /localStorage\.setItem\(['"]bt_source_lang['"]/.test(code)
         && /source_lang:\s*SOURCE_LANG/.test(code),
     'The reader must expose and persist a bounded source-language selector');
+assert(/const FIRST_VISIBLE_CHUNK = 1;/.test(code)
+        && /const VISIBLE_CHUNK = 5;/.test(code)
+        && /const PREFETCH_CHUNK = 5;/.test(code),
+    'The queue must optimize first-paint latency while bounding later batches');
+assert(!/BT_CLIENT_MIN_REQUEST_GAP_MS/.test(code),
+    'Successful requests must not pay an unconditional client-side delay');
+assert(/paragraphTextCache = new WeakMap\(\)/.test(code)
+        && /paragraphTextCache\.get\(el\)/.test(code),
+    'Paragraph extraction must be cached within one DOM generation');
+assert(/status\.onkeydown/.test(code)
+        && /event\.key === 'Enter' \|\| event\.key === ' '/.test(code)
+        && /status\.setAttribute\('tabindex', '0'\)/.test(code),
+    'The visible retry control must be keyboard operable');
+assert(/window\.requestAnimationFrame\(\(\) => target\.focus\(\)\)/.test(code)
+        && /gear\.focus\(\)/.test(code),
+    'The settings dialog must move and restore keyboard focus');
 
 let fetchCalls = [];
 let fetchResponses = [];
@@ -33,6 +51,14 @@ let activeFetches = 0;
 let maxActiveFetches = 0;
 
 global.fetch = async (url, options) => {
+    if (String(url).endsWith('/provider-policy')) {
+        return {
+            ok: true,
+            status: 200,
+            json: async () => ({ primary: 'local', fallback: 'remote', generation: '0123456789abcdef0123456789abcdef' }),
+            headers: { get: () => null }
+        };
+    }
     activeFetches++;
     if (activeFetches > maxActiveFetches) {
         maxActiveFetches = activeFetches;
@@ -133,6 +159,14 @@ async function captureAuthTransport(config, enableCloudFallback = false) {
 
     let captured = null;
     authDom.window.fetch = async (url, options) => {
+        if (String(url).endsWith('/provider-policy')) {
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ primary: 'local', fallback: 'remote', generation: '0123456789abcdef0123456789abcdef' }),
+                headers: { get: () => null }
+            };
+        }
         captured = captured || { url, options };
         const count = JSON.parse(options.body).paragraphs.length;
         return {
@@ -160,9 +194,145 @@ async function captureAuthTransport(config, enableCloudFallback = false) {
     }
     const deadline = Date.now() + 2000;
     while (!captured && Date.now() < deadline) await wait(20);
-    authDom.window.close();
     assert(captured, `Expected a request for auth mode ${config.authMode}`);
+    // Let the successful response finish rendering before closing jsdom;
+    // otherwise an intentionally detached Window can race the queue's final
+    // cache paint and obscure the transport assertion below.
+    await wait(30);
+    authDom.window.close();
     return captured.options;
+}
+
+async function assertProviderPolicyControls() {
+    const cases = [
+        {
+            policy: { primary: 'remote', fallback: 'local', generation: '0123456789abcdef0123456789abcdef' },
+            control: false,
+            markers: ['cloud-active']
+        },
+        {
+            policy: { primary: 'local', fallback: 'remote', generation: '0123456789abcdef0123456789abcdef' },
+            control: true,
+            markers: ['remote-fallback']
+        },
+        {
+            policy: { primary: 'remote', fallback: 'remote', generation: '0123456789abcdef0123456789abcdef' },
+            control: true,
+            markers: ['cloud-active', 'remote-secondary']
+        },
+        {
+            policy: { primary: 'local', fallback: 'local', generation: '0123456789abcdef0123456789abcdef' },
+            control: false,
+            markers: []
+        },
+        {
+            policy: { primary: 'local', fallback: null, generation: '0123456789abcdef0123456789abcdef' },
+            control: false,
+            markers: []
+        }
+    ];
+    for (const scenario of cases) {
+        const policyDom = new JSDOM(
+            '<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>',
+            { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' }
+        );
+        policyDom.window.BOOK_TRANSLATOR = { apiUrl: '/bt-api', authMode: 'cwa_session' };
+        policyDom.window.localStorage.setItem('bt_mode', 'off');
+        policyDom.window.fetch = async (url) => {
+            assert(String(url).endsWith('/provider-policy'));
+            return {
+                ok: true,
+                status: 200,
+                json: async () => scenario.policy,
+                headers: { get: () => null }
+            };
+        };
+        const policyScript = policyDom.window.document.createElement('script');
+        policyScript.textContent = code;
+        policyDom.window.document.body.appendChild(policyScript);
+        const deadline = Date.now() + 2000;
+        while (!policyDom.window.document.querySelector('#bt-menu')
+                && Date.now() < deadline) await wait(10);
+        await wait(20);
+        const control = policyDom.window.document.querySelector(
+            '[data-action="cloud-fallback"]');
+        assert.strictEqual(Boolean(control), scenario.control,
+            `Unexpected remote fallback control for ${JSON.stringify(scenario.policy)}`);
+        const markers = Array.from(policyDom.window.document.querySelectorAll(
+            '[data-provider-policy]')).map(element => element.dataset.providerPolicy);
+        assert.deepStrictEqual(markers, scenario.markers,
+            `Unexpected privacy marker for ${JSON.stringify(scenario.policy)}`);
+        policyDom.window.close();
+    }
+}
+
+async function assertStalePolicyIsRefetchedWithoutTranslationReplay() {
+    const staleDom = new JSDOM(
+        '<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>',
+        { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' }
+    );
+    staleDom.window.BOOK_TRANSLATOR = {
+        apiUrl: '/bt-api',
+        authMode: 'cwa_session',
+    };
+    staleDom.window.localStorage.setItem('bt_mode', 'translated');
+    staleDom.window.localStorage.setItem('bt_prefetch', '0');
+    staleDom.window.localStorage.setItem('bt_lang', 'Spanish');
+    staleDom.window.requestAnimationFrame = cb => setTimeout(cb, 0);
+    const paragraph = staleDom.window.document.querySelector('iframe')
+        .contentDocument.body.appendChild(
+            staleDom.window.document.querySelector('iframe')
+                .contentDocument.createElement('p')
+        );
+    paragraph.textContent = 'policy generation probe';
+    paragraph.getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+
+    let policyCalls = 0;
+    let translationCalls = 0;
+    let submittedPolicy = null;
+    staleDom.window.fetch = async (url, options) => {
+        if (String(url).endsWith('/provider-policy')) {
+            policyCalls++;
+            return {
+                ok: true,
+                status: 200,
+                json: async () => policyCalls === 1
+                    ? { primary: 'local', fallback: null, generation: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }
+                    : { primary: 'remote', fallback: 'local', generation: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },
+                headers: { get: () => null },
+            };
+        }
+        translationCalls++;
+        submittedPolicy = JSON.parse(options.body).provider_policy;
+        return {
+            ok: false,
+            status: 409,
+            json: async () => ({ error: 'provider_policy_changed' }),
+            headers: { get: () => null },
+        };
+    };
+
+    const script = staleDom.window.document.createElement('script');
+    script.textContent = code;
+    staleDom.window.document.body.appendChild(script);
+    const deadline = Date.now() + 2000;
+    while ((policyCalls < 2 || translationCalls < 1)
+            && Date.now() < deadline) await wait(20);
+    await wait(40);
+
+    assert.strictEqual(translationCalls, 1,
+        'A policy-generation 409 must not replay book text automatically');
+    assert.deepStrictEqual(submittedPolicy, {
+        primary: 'local',
+        fallback: null,
+        generation: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    });
+    assert(staleDom.window.document.querySelector(
+        '[data-provider-policy="cloud-active"]'),
+    'A stale reader must refetch and render the new remote-primary warning');
+    staleDom.window.close();
 }
 
 async function assertManagedLoaderContract() {
@@ -203,6 +373,172 @@ async function assertManagedLoaderContract() {
     loaderDom.window.close();
 }
 
+async function assertKavitaSessionLoaderContract() {
+    const loaderDom = new JSDOM(
+        '<!DOCTYPE html><html><head></head><body><main>Library</main></body></html>',
+        {
+            url: 'https://kavita.example.test/library',
+            runScripts: 'dangerously'
+        }
+    );
+    loaderDom.window.localStorage.setItem('kavita-user', JSON.stringify({
+        token: 'native-access-token',
+        refreshToken: 'must-never-be-forwarded'
+    }));
+    const requests = [];
+    loaderDom.window.fetch = async (url, options) => {
+        requests.push({ url, options });
+        if (url === '/bt-config.json') {
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({
+                    apiUrl: '/bt-api',
+                    authMode: 'reader_session',
+                    credentials: 'same-origin',
+                    readerType: 'kavita',
+                    readerVersion: '0.9.0.2',
+                    readerContractVersion: 'kavita-0.9.0.2-epub-v1'
+                })
+            };
+        }
+        assert.strictEqual(url, '/bt-api/session');
+        return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+                status: 'ok', expires_in: 300,
+                reader_type: 'kavita', reader_version: '0.9.0.2'
+            })
+        };
+    };
+
+    const element = loaderDom.window.document.createElement('script');
+    element.textContent = loaderCode;
+    loaderDom.window.document.head.appendChild(element);
+    await wait(30);
+    assert.strictEqual(
+        loaderDom.window.document.querySelectorAll('script[src*="translator.js"]').length,
+        0,
+        'Kavita assets must stay inert outside the exact EPUB reader route'
+    );
+
+    loaderDom.window.history.pushState(
+        {}, '', '/library/7/series/42/book/99'
+    );
+    const deadline = Date.now() + 1000;
+    while (!loaderDom.window.document.querySelector('script[src*="translator.js"]')
+            && Date.now() < deadline) await wait(10);
+
+    assert.strictEqual(requests.length, 2,
+        'SPA activation must perform one config fetch and one session exchange');
+    const exchange = requests[1];
+    assert.strictEqual(exchange.options.method, 'POST');
+    assert.strictEqual(exchange.options.credentials, 'same-origin');
+    assert.strictEqual(exchange.options.cache, 'no-store');
+    assert.strictEqual(exchange.options.redirect, 'error');
+    assert.strictEqual(exchange.options.headers.Authorization,
+        'Bearer native-access-token');
+    assert.strictEqual(exchange.options.body, undefined,
+        'The credential exchange must have an empty body');
+    assert(!JSON.stringify(exchange).includes('must-never-be-forwarded'),
+        'The Kavita refresh token must never leave localStorage');
+    assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.readerType, 'kavita');
+    assert.strictEqual(loaderDom.window.BOOK_TRANSLATOR.readerVersion, '0.9.0.2');
+    assert.strictEqual(
+        loaderDom.window.BOOK_TRANSLATOR.readerContractVersion,
+        'kavita-0.9.0.2-epub-v1'
+    );
+    assert.strictEqual(typeof loaderDom.window.__BT_REFRESH_SESSION, 'function');
+    loaderDom.window.close();
+}
+
+async function assertKavitaReaderAdapterContract() {
+    const kavitaDom = new JSDOM(`<!DOCTYPE html><html><body>
+      <main class="book-container">
+        <div class="book-content"><p id="kavita-one">Kavita paragraph one.</p></div>
+      </main>
+    </body></html>`, {
+        url: 'https://kavita.example.test/library/7/series/42/book/99',
+        runScripts: 'dangerously'
+    });
+    kavitaDom.window.BOOK_TRANSLATOR = {
+        apiUrl: '/bt-api',
+        authMode: 'reader_session',
+        credentials: 'same-origin',
+        readerType: 'kavita',
+        readerVersion: '0.9.0.2',
+        readerContractVersion: 'kavita-0.9.0.2-epub-v1'
+    };
+    kavitaDom.window.localStorage.setItem('bt_mode', 'bilingual');
+    kavitaDom.window.localStorage.setItem('bt_prefetch', '0');
+    kavitaDom.window.localStorage.setItem('bt_lang', 'Spanish');
+    kavitaDom.window.requestAnimationFrame = cb => setTimeout(cb, 0);
+    const payloads = [];
+    kavitaDom.window.fetch = async (url, options) => {
+        if (String(url).endsWith('/provider-policy')) {
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ primary: 'local', fallback: null, generation: '0123456789abcdef0123456789abcdef' }),
+                headers: { get: () => null }
+            };
+        }
+        const payload = JSON.parse(options.body);
+        payloads.push(payload);
+        return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+                translations: payload.paragraphs.map(text => `ES: ${text}`)
+            }),
+            headers: { get: () => null }
+        };
+    };
+    const first = kavitaDom.window.document.getElementById('kavita-one');
+    first.getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+
+    const script = kavitaDom.window.document.createElement('script');
+    script.textContent = code;
+    kavitaDom.window.document.body.appendChild(script);
+    let deadline = Date.now() + 2000;
+    while (payloads.length === 0 && Date.now() < deadline) await wait(20);
+
+    assert.strictEqual(payloads[0].book_id, '7:42');
+    assert.strictEqual(payloads[0].chapter_id, '99');
+    assert.strictEqual(payloads[0].paragraphs[0], 'Kavita paragraph one.');
+    assert.strictEqual(
+        first.querySelector('.bt-translation').textContent,
+        'ES: Kavita paragraph one.'
+    );
+
+    const root = kavitaDom.window.document.querySelector('.book-content');
+    root.innerHTML = '<p id="kavita-two">Kavita paragraph two.</p>';
+    const second = kavitaDom.window.document.getElementById('kavita-two');
+    second.getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+    deadline = Date.now() + 2000;
+    while (!payloads.some(payload => payload.paragraphs.includes('Kavita paragraph two.'))
+            && Date.now() < deadline) await wait(20);
+    assert(payloads.some(payload => payload.paragraphs.includes('Kavita paragraph two.')),
+        'Angular innerHtml replacement must trigger bounded rediscovery');
+
+    const callsBeforeManga = payloads.length;
+    kavitaDom.window.history.pushState({}, '', '/library/7/series/42/manga/99');
+    kavitaDom.window.dispatchEvent(new kavitaDom.window.CustomEvent('bt:reader-route'));
+    await wait(50);
+    assert.strictEqual(kavitaDom.window.document.getElementById('bt-bar').hidden, true,
+        'The overlay must deactivate outside Kavita EPUB routes');
+    root.innerHTML = '<p>Manga route text must stay local.</p>';
+    await wait(400);
+    assert.strictEqual(payloads.length, callsBeforeManga,
+        'Kavita manga/PDF routes must never send content for translation');
+    kavitaDom.window.close();
+}
+
 async function runTest() {
     console.log("Starting frontend assertions test...");
     await assertManagedLoaderContract();
@@ -239,14 +575,13 @@ async function runTest() {
         body: { translations: ["Translated visible 2"] }
     });
     
-    // Provide responses for the remaining prefetch blocks
+    // Provide one bounded response for the remaining prefetch block
     fetchResponses.push({
         status: 200,
-        body: { translations: ["Translated prefetch 1", "Translated prefetch 2", "Translated prefetch 3"] }
-    });
-    fetchResponses.push({
-        status: 200,
-        body: { translations: ["Translated prefetch 4"] }
+        body: { translations: [
+            "Translated prefetch 1", "Translated prefetch 2",
+            "Translated prefetch 3", "Translated prefetch 4"
+        ] }
     });
     
     const timeBeforeResume = Date.now();
@@ -337,13 +672,20 @@ async function runTest() {
     // Regression guard: "Translated" mode used to store only PLAIN TEXT of the
     // original and restore via textContent, permanently stripping the
     // paragraph's markup (italics/bold/links) when toggling back. The fix
-    // keeps the original innerHTML in a WeakMap and restores from it.
+    // keeps cloned DOM nodes in a WeakMap and restores them without reparsing
+    // serialized EPUB markup through innerHTML.
     assert(
-        /const originalHtml = new WeakMap\(\)/.test(code)
+        /const originalContent = new WeakMap\(\)/.test(code)
             && /function restoreOriginal\(el\)/.test(code)
-            && /originalHtml\.set\(el,\s*clone\.innerHTML\)/.test(code)
-            && /el\.innerHTML = html/.test(code),
-        'Inline mode must preserve and restore the original markup (regression: italics/links lost)'
+            && /originalContent\.set\(el,\s*fragment\)/.test(code)
+            && /el\.replaceChildren\(/.test(code)
+            && !/el\.innerHTML\s*=/.test(code),
+        'Inline mode must restore cloned markup without an innerHTML parser sink'
+    );
+
+    assert(
+        /let prefetchEnabled = localStorage\.getItem\(['"]bt_prefetch['"]\) === ['"]1['"]/.test(code),
+        'Whole-chapter prefetch must be explicit opt-in, not the default'
     );
 
     // Regression guard: ambiguous timeouts/network failures must never spawn a
@@ -375,6 +717,9 @@ async function runTest() {
         'Persistent browser caching must be opt-in and keys must be context-scoped'
     );
 
+    await assertProviderPolicyControls();
+    await assertStalePolicyIsRefetchedWithoutTranslationReplay();
+
     const [tokenTransport, forwardedTransport, cwaTransport, consentedTransport] = await Promise.all([
         captureAuthTransport({ authMode: 'token', apiToken: 'browser-token' }),
         captureAuthTransport({ authMode: 'forwarded', apiToken: 'must-not-leak' }),
@@ -395,10 +740,18 @@ async function runTest() {
         'CWA-session mode must not send a compatibility token');
     assert.strictEqual(JSON.parse(tokenTransport.body).allow_cloud_fallback, false,
         'A fresh reader must not consent to cloud fallback');
+    assert.deepStrictEqual(JSON.parse(tokenTransport.body).provider_policy, {
+        primary: 'local',
+        fallback: 'remote',
+        generation: '0123456789abcdef0123456789abcdef'
+    }, 'Every official-reader translation must bind the current provider policy');
     assert.strictEqual(JSON.parse(consentedTransport.body).allow_cloud_fallback, true,
         'The explicit privacy control must consent only subsequent requests');
     assert(!/localStorage\.(?:getItem|setItem)\([^)]*cloud/i.test(code),
         'Cloud fallback consent must never persist across reader sessions');
+
+    await assertKavitaSessionLoaderContract();
+    await assertKavitaReaderAdapterContract();
 
     console.log("All assertions passed.");
     process.exit(0);

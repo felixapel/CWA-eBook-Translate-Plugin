@@ -38,15 +38,24 @@ than becoming an administration container.
 - The archive builds a separate, revision-labeled operator image containing
   only the installer modules, Python, Git, and Docker CLI. The dispatcher
   verifies the resulting immutable image ID and revision label before use.
-- A containerized planner validates the private environment and emits a
-  versioned mount protocol. The dispatcher accepts only the documented command
+- Before planning, the root dispatcher copies the validated one-link private
+  environment into its mode `0700` bootstrap directory, makes the snapshot
+  root-owned mode `0600`, and binds its SHA-256 into mount protocol version 2.
+  Both planning and execution receive only that snapshot. The operator checks
+  the digest again, so changes to the original environment cannot alter an
+  approved operation.
+- A containerized planner validates the snapshot and emits a versioned mount
+  protocol containing the device, inode, type/mode, owner, permissions, and
+  link count of every bind source. The dispatcher accepts only the documented command
   matrix, existing `/mnt/user/<share>/...` or `/mnt/<pool>/...` roots, and the
   exact DockerMan template directory. One empty root-owned mode `0700`
   directory at `/run/cwa-translate-btctl-locks` supplies a stable global lock
   inode to both native and containerized Unraid commands. It is bound read-only
   at `/run/btctl-lock`, so serialization exposes no sibling appdata. Broader ancestor
   binds needed to create state or stage an upgrade are narrowed by nested
-  read-only guards. `plan` and `auth-snippet` receive no Docker socket; other
+  read-only guards. Immediately before execution the dispatcher regenerates
+  the complete plan, compares it byte-for-byte, and revalidates every recorded
+  source identity. `plan` and `auth-snippet` receive no Docker socket; other
   commands receive the local `/var/run/docker.sock` and only their required
   read-only or read-write paths.
 - Temporary containers run without network access, with a read-only root,

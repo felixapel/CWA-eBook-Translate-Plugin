@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-12
 - Amended by: [ADR-012](ADR-012-community-applications-image.md)
+- Amended by: [ADR-015](ADR-015-universal-reader-hub.md)
 
 ## Context
 
@@ -22,7 +23,7 @@ backwards-compatible `BT_ROLE=all` modes. Its declared user is the existing
 stable `appuser` identity (`101:102`). No role performs ownership repair or
 privilege changes at runtime.
 
-The recommended Compose topology runs that image twice:
+The original recommended Compose topology runs that image twice:
 
 - the API role owns the SQLite volume and provider access;
 - the proxy role owns browser-facing nginx and connects to CWA and the API;
@@ -52,6 +53,9 @@ existing one-container deployments while Compose users migrate.
 - The combined role remains supported for compatibility. ADR-012 additionally
   certifies one narrow Community Applications production profile; it does not
   replace the split recommendation for managed lifecycle or advanced installs.
+- ADR-015 makes the namespaced universal hub the default for ordinary CWA,
+  Kavita, or dual-reader installs. This split topology remains supported for
+  independent restart/security boundaries and CWA Authentik-forwarded mode.
 - nginx and the standard-library-only validated config renderer remain present
   in the shared image even for the API role; this is the accepted cost of
   keeping one auditable release artifact. gettext/envsubst was removed.

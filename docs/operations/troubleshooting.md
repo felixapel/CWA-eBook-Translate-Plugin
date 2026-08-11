@@ -1,27 +1,27 @@
 # Troubleshooting
 
-These checks apply to the managed split deployment and the certified
-Community Applications profile. Do not expose the
-API, add a browser token, broaden a trusted proxy range, or disable
-authentication to make an error disappear.
+These checks apply to the recommended universal hub, the managed split
+deployment and, where stated, the CWA-only certified Community Applications
+profile. Do not expose the API, add a browser token, broaden a trusted proxy
+range, or disable authentication to make an error disappear.
 
 ## Start with the deployment evidence
 
-For a managed `btctl` split deployment, run the read-only doctor from the same
-clean checkout and private environment file used to install:
+For any managed `btctl` hub or split deployment, run the read-only doctor from
+the same clean checkout and private environment file used to install:
 
 ```bash
-./btctl doctor --env /absolute/private/path/cwa-translate.env
+./btctl doctor --env /absolute/private/path/deployment.env
 ```
 
 For structured output that is easier to share after removing private paths:
 
 ```bash
-./btctl doctor --env /absolute/private/path/cwa-translate.env --json
+./btctl doctor --env /absolute/private/path/deployment.env --json
 ```
 
 Every check must be `ok`. Doctor validates the saved plan, version+commit image,
-owned containers/network, exact CWA evidence, health, runtime environment,
+owned containers/network, exact reader evidence, health, runtime environment,
 authentication profile, published ports, and generated artifacts. Fix its first
 failed check before debugging the browser.
 
@@ -32,8 +32,7 @@ published ports, appdata bind, network, and environment after removing provider
 secrets. First confirm user `101:102`, a bind to `/app/data`, only container port
 8080 published, and no mapping for 8390. Then work from the first startup or
 request error in the container log. The remaining checks in this guide apply to
-both profiles unless a paragraph explicitly refers to `btctl` or managed split
-roles.
+all topologies unless a paragraph explicitly limits its scope.
 
 ## Application is missing from Community Applications
 
@@ -72,16 +71,20 @@ confirming no other `btctl` operation is running; do not bypass the lock.
 
 ## Toolbar is missing
 
-1. Open the reader through `BT_PUBLIC_ORIGIN`, not CWA's direct port. Stock CWA
-   intentionally has no overlay.
+1. Open the reader through `BT_PUBLIC_ORIGIN`, not the reader's direct port. A
+   stock reader reached directly intentionally has no overlay.
 2. Hard-refresh once (`Ctrl+Shift+R` or `Cmd+Shift+R`).
 3. In Browser DevTools, confirm `GET /bt-config.json` returns `200`, a JSON
    object, and `Cache-Control: no-store`. A missing or invalid managed config
    makes the loader fail closed; page variables cannot override it.
 4. Confirm the reader page loads `/bt-static/loader.js` and that the Console
    has no `[BookTranslator]` error.
-5. If a reverse proxy is present, confirm its main CWA route points to the
-   managed injection proxy. Keep OPDS/Kobo routes pointed directly at CWA.
+5. For CWA, confirm the path begins `/read/`. For Kavita, the only accepted
+   path is `/library/<positive-id>/series/<positive-id>/book/<positive-id>`.
+   Manga, PDF and library pages intentionally do not mount the toolbar.
+6. If a reverse proxy is present, confirm its browser-reader route points to the
+   managed injection proxy. Keep non-browser OPDS/Kobo/mobile routes pointed
+   directly at the stock reader.
 
 ## Translation requests return 401 with `cwa-session`
 
@@ -115,12 +118,38 @@ If Authentik authenticates the browser but CWA never creates a session that its
 anonymous mode and do not put a shared secret in browser storage.
 
 A `503` instead of `401` means the API could not safely evaluate CWA as the
-authority. Check that the CWA container is running, `CWA_UPSTREAM` and
-`BT_CWA_NETWORK` are exact, and the selected auth endpoint is reachable from
+authority. Check that the CWA container is running, `BT_READER_UPSTREAM` and
+`BT_READER_NETWORK` are exact, and the selected auth endpoint is reachable from
 the API container. On a managed split install, `doctor` catches topology and
 runtime drift. On Community Applications, verify the CWA network and auth URL in
 the Unraid Edit screen. In both profiles, API logs contain the bounded authority
 failure without session-cookie contents.
+
+## Translation requests return 401 with Kavita
+
+Kavita requires `BT_AUTH_PROFILE=reader-session`, stock version `0.9.0.2`, and
+an HTTPS public origin outside loopback. Sign out and back in through that
+origin, open the exact EPUB route, and inspect `POST /bt-api/session` first.
+
+- Native login requires a bounded access token in Kavita's own `kavita-user`
+  local-storage object. The connector reads its `token` field only; it never
+  reads or sends a refresh token.
+- Stock OIDC login requires the exact `.AspNetCore.Cookies` cookie, including
+  contiguous `C1`, `C2`, ... chunks when ASP.NET split it. Unrelated cookies
+  are not forwarded to the account probe.
+- The exchange must return `200` with `reader_type: "kavita"`, exact version
+  `0.9.0.2`, and `expires_in` no greater than 300. The cookie itself is HttpOnly
+  and therefore correctly absent from JavaScript storage.
+- A `401` means the native proof, version, origin, observed address or
+  User-Agent did not match. A `503` means `/api/Account` was unreachable or
+  returned a malformed/oversized response. `doctor` catches container,
+  network, version and generated-environment drift.
+
+Do not copy a token into translator configuration or relax the proxy. Ordinary
+`/bt-api/*` routes intentionally strip Kavita Authorization and cookies and
+accept only the opaque plugin session. The frontend performs one fresh exchange
+and one replay after an expired-session `401`; repeated failures require a new
+Kavita login or topology repair.
 
 ## Translation requests return 401 with `authentik-forwarded`
 
@@ -163,6 +192,16 @@ reviewed fragment with:
   non-sensitive translation through the authenticated public route to prove a
   real provider before translating a book. `/health/deep` is also authenticated
   and spends provider capacity.
+
+For Gemini, set `LLM_PROVIDER=gemini`, use a currently supported model ID such
+as `gemini-3.5-flash-lite`, provide a Google AI Studio or project API key, and
+leave `BT_LOCAL_URL` empty unless a separate local role actually uses it. The
+endpoint is fixed by the adapter. A `400` usually means an invalid model/request
+contract, `401` or `403` means the key is invalid, blocked or not permitted for
+the Gemini API, `404` means the model is unavailable to that API/project, and
+`429` means quota or rate limiting. Check the key in Google AI Studio without
+printing it, and do not replace it with a Gemini or Antigravity browser-session
+credential.
 
 After changing the managed environment, do not recreate a role with an ad-hoc
 `docker run`; use the documented lifecycle so state and ownership remain
@@ -207,16 +246,17 @@ envelopes at the cost of one provider call per paragraph. Keep
 `BT_REQUEST_MAX_ATTEMPTS`, output limits, and the request deadline finite; do
 not hide a systematic provider problem by making them unlimited.
 
-## 502 or 504 after CWA was recreated
+## 502 or 504 after the reader was recreated
 
-The injection proxy resolves `CWA_UPSTREAM` when its Nginx process starts. If
-CWA was recreated with a new address, restart only the translator proxy role,
-or the single translator container for Community Applications. On a managed
-split install, rerun `doctor`. Do not recreate CWA or the translator API role
-for this symptom.
+The injection proxy resolves `BT_READER_UPSTREAM` when its Nginx process starts.
+If CWA or Kavita was recreated with a new address, restart the complete universal
+hub, only the proxy role in a managed split install, or the single Community
+Applications container. Rerun `doctor` for every managed topology. Do not
+recreate the stock reader or split API role for this symptom.
 
-Also confirm CWA still joins the exact `BT_CWA_NETWORK` and that its running
-image supplies the exact `BT_CWA_VERSION` tag/label expected by the plan.
+Also confirm the reader still joins the exact `BT_READER_NETWORK` and that its
+running image supplies the exact `BT_READER_VERSION` tag/label expected by the
+plan.
 
 ## Rate-limited or slow translation
 
@@ -227,8 +267,9 @@ bounded setting at a time.
 
 Useful controls include `BT_RATE_LIMIT_PER_MINUTE`,
 client request pacing, `BT_MAX_UPSTREAM_INFLIGHT`, request deadline,
-and output-token limits. Never set an unlimited production value. Local model,
-context size, target language, and GPU memory normally dominate latency.
+and output-token limits. Never set an unlimited production value. For cloud
+providers, project quota and provider latency matter; for local providers,
+model size, context, target language and GPU memory normally dominate latency.
 
 ## Translation formatting, duplicates, or stale behavior
 
@@ -260,8 +301,13 @@ DRM-free EPUB.
   without Python, the temporary bootstrap may still warm Docker build cache.
   Correct the named field and rerun it.
 - A failed fresh install removes only newly created translator runtime
-  resources and writes no successful `state.json`; CWA and user data stay
-  external.
+  resources and the newly created session key, and writes no successful
+  `state.json`; the stock reader and translation database stay external. If
+  cleanup completes, `install-attempt.json` records `status=cleaned` and the
+  unchanged install command may retry against that exact retained data. Do not
+  edit the journal: a different checkout, configuration, profile or resource
+  plan is rejected. `status=cleanup-failed` requires inspection and repair of
+  every recorded cleanup error before another install.
 - If `state.json` alone was lost while the complete labeled split runtime is
   healthy, use `./btctl adopt --env ...`. It rejects partial or unlabeled
   resources and never converts a v2.1.4 combined container.
@@ -291,9 +337,10 @@ DRM-free EPUB.
 
 ## Collecting a useful issue report
 
-Include the exact source commit or image digest, `VERSION`, host/profile, CWA
-image tag, reverse-proxy type, browser, and the smallest relevant log window.
-For managed split installs, also include the redacted first failed doctor
+Include the exact source commit or image digest, `VERSION`, host/profile, reader
+type and exact image tag, reverse-proxy type, browser, and the smallest relevant
+log window.
+For managed hub or split installs, also include the redacted first failed doctor
 check; for Community Applications, include the first container startup or
 request error instead. Remove cookies, Authentik headers, public IPs, private
 filesystem paths, book text, and all LLM credentials before sharing.

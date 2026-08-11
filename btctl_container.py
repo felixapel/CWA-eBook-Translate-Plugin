@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import re
 import stat
 import sys
 from dataclasses import dataclass
@@ -14,6 +16,7 @@ from typing import Mapping
 from btctl import _load_values, _release_identity
 from btctl_compose import InstallError
 from btctl_core import ConfigError, InstallConfig
+from btctl_hub import HubInstallConfig, is_hub_configuration
 from btctl_lifecycle import MigrationJournalStore
 from btctl_paths import (
     paths_overlap as _paths_overlap,
@@ -27,13 +30,18 @@ from btctl_paths import (
 EX_USAGE = 64
 LOCK_DESTINATION = Path("/run/btctl-lock")
 HOST_LOCK_SOURCE = Path("/run/cwa-translate-btctl-locks")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MOUNT_IDENTITY_RE = re.compile(
+    r"^[0-9]+:[0-9]+:[0-9a-f]+:[0-9]+:[0-7]+:[0-9]+$"
+)
 _COMMAND_ACCESS: dict[str, tuple[tuple[str, str], ...]] = {
     "plan": (),
     "auth-snippet": (),
     "doctor": (("state", "ro"), ("data", "ro"), ("template", "ro")),
     "adopt": (("state", "rw"), ("data", "ro"), ("template", "ro")),
     "install": (("state", "rw"), ("data", "rw"), ("template", "rw")),
-    "uninstall": (("state", "rw"), ("template", "rw")),
+    "reconfigure": (("state", "rw"), ("data", "ro"), ("template", "ro")),
+    "uninstall": (("state", "rw"), ("data", "ro"), ("template", "rw")),
     "upgrade": (
         ("state", "rw"),
         ("data", "rw"),
@@ -55,30 +63,110 @@ _COMMAND_ACCESS: dict[str, tuple[tuple[str, str], ...]] = {
 class MountSpec:
     path: Path
     mode: str
+    identity: str
 
     def __post_init__(self) -> None:
         if self.mode not in {"ro", "rw"}:
             raise ConfigError("mount mode must be ro or rw")
         _validate_mount_text(self.path, "mount path")
+        if not _MOUNT_IDENTITY_RE.fullmatch(self.identity):
+            raise ConfigError("mount source identity is invalid")
+
+    @classmethod
+    def capture(cls, path: Path, mode: str) -> "MountSpec":
+        return cls(path=path, mode=mode, identity=_path_identity(path))
+
+
+def _path_identity(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ConfigError("mount source identity could not be inspected") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not (
+        stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+    ):
+        raise ConfigError("mount source must be one real file or directory")
+    return ":".join(
+        (
+            str(metadata.st_dev),
+            str(metadata.st_ino),
+            f"{metadata.st_mode:x}",
+            str(metadata.st_uid),
+            f"{stat.S_IMODE(metadata.st_mode):o}",
+            str(metadata.st_nlink),
+        )
+    )
+
+
+def _environment_digest(path: Path) -> str:
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            raise ConfigError("environment snapshot must be one private regular file")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            payload = handle.read((1024 * 1024) + 1)
+        if len(payload) > 1024 * 1024:
+            raise ConfigError("environment snapshot exceeds the 1 MiB safety limit")
+        return hashlib.sha256(payload).hexdigest()
+    except ConfigError:
+        raise
+    except OSError as exc:
+        raise ConfigError("environment snapshot could not be hashed") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)
 class MountPlan:
     command: str
     socket: bool
+    environment_sha256: str
     mounts: tuple[MountSpec, ...]
     lock_source: Path | None = None
+    lock_identity: str | None = None
 
     def __post_init__(self) -> None:
+        if not _SHA256_RE.fullmatch(self.environment_sha256):
+            raise ConfigError("environment snapshot digest is invalid")
         if self.lock_source is not None:
             _validate_mount_text(self.lock_source, "lock mount source")
+            captured = self.lock_identity or _path_identity(self.lock_source)
+            if not _MOUNT_IDENTITY_RE.fullmatch(captured):
+                raise ConfigError("lock mount source identity is invalid")
+            object.__setattr__(self, "lock_identity", captured)
+        elif self.lock_identity is not None:
+            raise ConfigError("lock identity requires a lock mount source")
 
     def render(self) -> str:
-        lines = [f"BTCTL_MOUNT_PLAN\t1\t{self.command}\tunraid"]
-        lines.extend(f"mount\t{mount.mode}\t{mount.path}" for mount in self.mounts)
+        lines = [
+            "\t".join(
+                (
+                    "BTCTL_MOUNT_PLAN",
+                    "2",
+                    self.command,
+                    "unraid",
+                    self.environment_sha256,
+                )
+            )
+        ]
+        lines.extend(
+            f"mount\t{mount.mode}\t{mount.path}\t{mount.identity}"
+            for mount in self.mounts
+        )
         if self.lock_source is not None:
             lines.append(
                 f"lock\tro\t{self.lock_source}\t{LOCK_DESTINATION}"
+                f"\t{self.lock_identity}"
             )
         lines.append(f"socket\t{'yes' if self.socket else 'no'}")
         return "\n".join(lines) + "\n"
@@ -157,11 +245,19 @@ def _config_for_command(
     repository: Path,
     env_file: Path,
     expected_revision: str,
-) -> tuple[InstallConfig, Mapping[str, str]]:
+) -> tuple[InstallConfig | HubInstallConfig, Mapping[str, str]]:
     identity = _release_identity(repository)
     if identity.sha != expected_revision:
         raise ConfigError("mount plan revision does not match the verified checkout")
     values = _load_values(env_file)
+    if is_hub_configuration(values):
+        config = HubInstallConfig.from_mapping(values, identity)
+        if config.install_profile != "unraid":
+            raise ConfigError(
+                "the containerized fallback supports only BT_INSTALL_PROFILE=unraid; "
+                "compose-existing requires host Python 3.11+"
+            )
+        return config, values
     legacy_plan = bool(
         values.get("BT_LEGACY_CONTAINER") and values.get("BT_LEGACY_DATA_DIR")
     )
@@ -187,22 +283,35 @@ def create_mount_plan(
     env_file: Path,
     expected_revision: str,
 ) -> MountPlan:
-    access = command_path_access(command)
+    requested_access = command_path_access(command)
     checkout = _validate_repository(repository)
     environment = _validate_mount_text(env_file, "environment file")
     if environment.is_symlink() or not environment.is_file():
         raise ConfigError("environment file must be one real regular file")
+    environment_sha256 = _environment_digest(environment)
     config, values = _config_for_command(
         command, checkout, environment, expected_revision
     )
+    access = tuple(
+        item
+        for item in requested_access
+        if not isinstance(config, HubInstallConfig) or item[0] not in {"template", "legacy"}
+    )
+    final_environment_sha256 = _environment_digest(environment)
+    if final_environment_sha256 != environment_sha256:
+        raise ConfigError("environment snapshot changed during mount planning")
 
     paths: dict[str, Path] = {
         "state": validate_storage_path(Path(config.state_dir), "BT_STATE_DIR"),
         "data": validate_storage_path(Path(config.data_dir), "BT_DATA_DIR"),
         "backup": validate_storage_path(Path(config.backup_dir), "BT_BACKUP_DIR"),
-        "template": _validate_template_path(Path(config.unraid_template_dir)),
     }
-    legacy_text = legacy_data_path(command, config, values)
+    if not isinstance(config, HubInstallConfig):
+        paths["template"] = _validate_template_path(Path(config.unraid_template_dir))
+    legacy_text = (
+        "" if isinstance(config, HubInstallConfig)
+        else legacy_data_path(command, config, values)
+    )
     if legacy_text:
         paths["legacy"] = validate_storage_path(
             Path(legacy_text), "BT_LEGACY_DATA_DIR"
@@ -262,7 +371,7 @@ def create_mount_plan(
             add_mount(managed, "ro")
 
     ordered = tuple(
-        MountSpec(path, mode)
+        MountSpec.capture(path, mode)
         for path, mode in sorted(
             mounts.items(), key=lambda item: (len(item[0].parts), str(item[0]))
         )
@@ -270,6 +379,7 @@ def create_mount_plan(
     return MountPlan(
         command=command,
         socket=command_requires_socket(command),
+        environment_sha256=environment_sha256,
         mounts=ordered,
         lock_source=lock_source,
     )

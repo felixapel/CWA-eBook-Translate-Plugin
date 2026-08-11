@@ -50,6 +50,7 @@ class ShellContractTests(unittest.TestCase):
             "no-new-privileges:true",
             "/var/run/docker.sock",
             "BTCTL_EXPECTED_REVISION",
+            "BTCTL_EXPECTED_ENV_SHA256",
             "core.fsmonitor",
             "GIT_NO_REPLACE_OBJECTS=1",
             "source_exporter_dockerfile",
@@ -59,7 +60,11 @@ class ShellContractTests(unittest.TestCase):
             "DOCKER_HOST=unix:///var/run/docker.sock",
             "[ -S /var/run/docker.sock ]",
             "/run/cwa-translate-btctl-locks",
+            'type=bind,src=$HOST_LOCK_DIRECTORY,dst=$HOST_LOCK_DIRECTORY,readonly',
             '[ "$second" = "$HOST_LOCK_DIRECTORY" ]',
+            'environment_snapshot="$temporary/install.env.snapshot"',
+            'cmp --silent -- "$temporary/mount-plan" "$temporary/final-mount-plan"',
+            'final_operator_arguments+=(--env "$environment_snapshot")',
         ):
             self.assertIn(contract, source)
         self.assertNotRegex(source, r"(?m)^\s*(?:source|eval)\s")
@@ -68,6 +73,15 @@ class ShellContractTests(unittest.TestCase):
             'cp -- "$SCRIPT_DIR/Dockerfile.btctl"',
             source,
         )
+        self.assertIn('cp -P -- \\\n            "$env_file" "$environment_snapshot"', source)
+        self.assertNotIn("--no-preserve=all", source)
+        self.assertEqual(
+            source.count('sha256sum -- "$environment_snapshot"'),
+            2,
+        )
+        self.assertNotIn("sha256sum --binary", source)
+        self.assertIn('chown 0:0 -- "$environment_snapshot"', source)
+        self.assertIn('chmod 0600 -- "$environment_snapshot"', source)
 
     def test_python_without_git_selects_the_container_fallback(self):
         with tempfile.TemporaryDirectory() as directory:

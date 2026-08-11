@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Documented the universal one-container hub as the default CWA/Kavita install,
+  with explicit reader switches, topology-specific provider cutover and rollback,
+  and split deployment retained as an advanced isolation option.
+- Made Gemini a complete server-side backend in quick-start examples using the
+  stable `gemini-3.5-flash-lite` model; local vLLM and fallback providers are now
+  described as optional instead of implied deployment requirements.
+- Expanded lifecycle, troubleshooting, compatibility and security guidance for
+  hub operation, Gemini API errors, private key handling, regenerated browser
+  sessions and per-reader isolation.
+- Moved generated Compose credentials into mode-`0600` raw environment files,
+  introduced split state schema 3, retained read-only doctor/uninstall support
+  for former inline-environment schema 2, and required Docker Compose 2.30 or
+  newer for new Compose installations.
+- Reduced reader latency with a one-paragraph first visible request followed by
+  bounded five-paragraph batches, removed the unconditional client delay,
+  reused fixed-provider HTTP connections per worker, and committed each cache
+  batch in one SQLite transaction.
+- Added keyboard retry and settings-dialog focus management, bounded custom DNS
+  resolver capacity, full discovered backend coverage, universal hub smoke and
+  opt-in deep provider diagnosis.
+
+### Fixed
+
+- Updated Gemini/OpenAI-compatible request contracts for current Gemini models,
+  including omission of deprecated sampling fields and invalid prefilled model
+  turns.
+
+## [2.3.0-rc.1] - Unreleased candidate
+
+### Security
+
+- Added a reader-neutral, five-minute maximum session broker. Raw CWA cookies,
+  Kavita access tokens and exact Kavita OIDC cookie chunks are accepted only by
+  the same-origin exchange route, validated against the pinned reader account
+  endpoint, never persisted, and replaced with an opaque HttpOnly cookie bound
+  to the connector, public origin, observed address and User-Agent.
+- Ordinary translation routes now strip bearer credentials and, in managed
+  reader-session mode, every reader cookie. Provider HTTP clients ignore
+  inherited proxy variables, expired cache rows are deleted on lookup, DOM
+  restoration uses pristine clones, and uninstall removes the connector secret
+  without removing translations.
+- Lifecycle mutation now binds execution to immutable plan inputs and journals
+  recoverable install attempts before the first owned runtime mutation.
+- The managed v2.1.4 migration path now recognizes the exact historical
+  Community Applications `ghcr.io/felixapel/cwa-ebook-translate-plugin:latest`
+  reference only after the container's immutable image ID is probed in a
+  network-disabled sandbox and reports version 2.1.4. Other mutable `latest`
+  references remain rejected.
+
+### Changed
+
+- Managed reader preflight can now bind a mutable container tag to an explicit
+  immutable Docker image ID; the install and doctor fail closed if that exact
+  runtime image changes.
+- Generalized schema-2 lifecycle state, generated resources and browser
+  contracts from CWA-specific fields to explicit stock-reader connectors while
+  retaining schema-1 CWA compatibility.
+- Updated the pinned Alpine runtime closure to the exact packages still
+  available for the immutable base image, including nginx `1.30.4-r1`.
 - Replaced the accumulated, overlapping documentation set with one indexed
   guide hierarchy for installation, operations, reference material,
   maintainers, and durable architecture decisions.
@@ -21,6 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layout.
 - Pinned the lock compiler's build frontend to a reviewed non-yanked release
   instead of retaining a withdrawn transitive candidate.
+
+### Added
+
+- Added a stock Kavita v0.9.0.2 EPUB connector for the exact
+  `/library/:libraryId/series/:seriesId/book/:chapterId` route and
+  `.book-content` DOM, including SPA teardown, route-derived cache scopes and
+  one bounded session refresh/replay after `401`.
+- Added unit, real-Chromium and real-container coverage for separate CWA/Kavita
+  connectors, Kavita native authentication, unsupported manga/PDF isolation,
+  credential stripping and reader-neutral lifecycle artifacts.
 
 ## [2.2.2] - 2026-07-17
 

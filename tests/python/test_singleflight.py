@@ -125,7 +125,12 @@ class SingleFlightTests(unittest.TestCase):
 
 class TranslatorSingleFlightTests(unittest.TestCase):
     def test_cloud_consent_is_part_of_singleflight_identity(self) -> None:
-        with mock.patch.object(translator, "LLM_FALLBACK_PROVIDER", "minimax"):
+        with (
+            mock.patch.object(translator, "LLM_FALLBACK_PROVIDER", "minimax"),
+            mock.patch.object(translator, "LLM_FALLBACK_MODEL", "fake-model"),
+            mock.patch.object(translator, "LLM_FALLBACK_API_KEY", "fake-key"),
+            mock.patch.object(translator, "_fallback_provider", None),
+        ):
             without_consent = translator._single_operation_key(
                 "private text",
                 "English",
@@ -157,7 +162,6 @@ class TranslatorSingleFlightTests(unittest.TestCase):
             for _ in range(2):
                 translator.translate_text(
                     "hello",
-                    budget=budget(),
                     operation_namespace="same-namespace",
                 )
         self.assertEqual(complete.call_count, 2)
@@ -181,7 +185,6 @@ class TranslatorSingleFlightTests(unittest.TestCase):
             try:
                 results.append(translator.translate_text(
                     "hello",
-                    budget=budget(),
                     operation_namespace="tenant-book-chapter",
                 ))
             except Exception as exc:  # pragma: no cover - assertion evidence
@@ -207,17 +210,82 @@ class TranslatorSingleFlightTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(results, [("hola", "local"), ("hola", "local")])
 
-    def test_identical_batch_groups_share_one_provider_operation(self) -> None:
+    def test_request_budgets_do_not_share_mutable_translation_flights(self) -> None:
         flights = SingleFlight(max_entries=16, result_ttl_seconds=0)
         entered = threading.Event()
         release = threading.Event()
+        leader_budget = budget()
+        follower_budget = budget()
+        calls = []
+        leader_errors = []
+        follower_results = []
+        follower_errors = []
+
+        def complete(*_args, **kwargs):
+            operation_budget = kwargs.get("budget")
+            if operation_budget is None:
+                operation_budget = _args[5]
+            calls.append(operation_budget)
+            if operation_budget is leader_budget:
+                entered.set()
+                self.assertTrue(release.wait(1))
+            operation_budget.ensure_active()
+            return "hola", "local"
+
+        def invoke(target, errors, request_budget):
+            try:
+                target.append(translator.translate_text(
+                    "hello",
+                    budget=request_budget,
+                    operation_namespace="tenant-book-chapter",
+                ))
+            except Exception as exc:  # pragma: no cover - assertion evidence
+                errors.append(exc)
+
+        with (
+            mock.patch.object(translator, "_TRANSLATION_SINGLEFLIGHT", flights),
+            mock.patch.object(translator, "_complete", side_effect=complete),
+        ):
+            leader = threading.Thread(
+                target=invoke, args=([], leader_errors, leader_budget)
+            )
+            follower = threading.Thread(
+                target=invoke,
+                args=(follower_results, follower_errors, follower_budget),
+            )
+            leader.start()
+            self.assertTrue(entered.wait(1))
+            follower.start()
+            follower.join(1)
+            self.assertFalse(follower.is_alive())
+            leader_budget.cancel("cancelled")
+            release.set()
+            leader.join(1)
+
+        self.assertEqual(len(leader_errors), 1)
+        self.assertIsInstance(leader_errors[0], translator.WorkBudgetExceeded)
+        self.assertEqual(follower_errors, [])
+        self.assertEqual(follower_results, [("hola", "local")])
+        self.assertEqual(calls, [leader_budget, follower_budget])
+        self.assertEqual(flights.stats()["leaders"], 0)
+        follower_budget.ensure_active()
+
+    def test_identical_request_budgets_keep_batch_work_isolated(self) -> None:
+        flights = SingleFlight(max_entries=16, result_ttl_seconds=0)
+        entered = threading.Event()
+        both_entered = threading.Event()
+        release = threading.Event()
         calls = 0
+        calls_lock = threading.Lock()
         results = []
         errors = []
 
         def group_operation(*_args, **_kwargs):
             nonlocal calls
-            calls += 1
+            with calls_lock:
+                calls += 1
+                if calls == 2:
+                    both_entered.set()
             entered.set()
             self.assertTrue(release.wait(1))
             return [
@@ -251,23 +319,19 @@ class TranslatorSingleFlightTests(unittest.TestCase):
             leader.start()
             self.assertTrue(entered.wait(1))
             follower.start()
-            deadline = time.monotonic() + 1
-            while flights.stats()["followers_waiting"] < 1 and time.monotonic() < deadline:
-                time.sleep(0.001)
+            self.assertTrue(both_entered.wait(1))
             release.set()
             leader.join(1)
             follower.join(1)
 
         self.assertEqual(errors, [])
-        self.assertEqual(calls, 1)
+        self.assertEqual(calls, 2)
         self.assertEqual(results, [
             [("uno", "local"), ("dos", "local")],
             [("uno", "local"), ("dos", "local")],
         ])
 
-    def test_identical_recovery_batches_share_the_bounded_provider_work(self) -> None:
-        # The outer batch flight must be sufficient to coalesce recovery. A
-        # nested single-paragraph flight would deadlock admission at capacity 1.
+    def test_identical_recovery_batches_keep_request_budgets_isolated(self) -> None:
         flights = SingleFlight(max_entries=1, result_ttl_seconds=0)
         entered = threading.Event()
         release = threading.Event()
@@ -343,32 +407,26 @@ class TranslatorSingleFlightTests(unittest.TestCase):
             leader.start()
             self.assertTrue(entered.wait(1))
             follower.start()
-            deadline = time.monotonic() + 1
-            while (
-                flights.stats()["followers_waiting"] < 1
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.001)
-            self.assertEqual(flights.stats()["followers_waiting"], 1)
+            follower.join(1)
+            self.assertFalse(follower.is_alive())
             release.set()
             leader.join(1)
-            follower.join(1)
 
         self.assertFalse(leader.is_alive())
         self.assertFalse(follower.is_alive())
         self.assertEqual(errors, [])
-        self.assertEqual(calls, [
-            "batch", "batch", "single:one", "single:two",
-        ])
+        self.assertEqual(calls.count("batch"), 4)
+        self.assertEqual(calls.count("single:one"), 2)
+        self.assertEqual(calls.count("single:two"), 2)
         self.assertEqual(results, [
             [("translated:one", "local"), ("translated:two", "local")],
             [("translated:one", "local"), ("translated:two", "local")],
         ])
         self.assertEqual(
-            sum(item.snapshot()["attempts"] for item in budgets), 4
+            [item.snapshot()["attempts"] for item in budgets], [4, 4]
         )
-        self.assertEqual(flights.stats()["leaders"], 1)
-        self.assertEqual(flights.stats()["shared_results"], 1)
+        self.assertEqual(flights.stats()["leaders"], 0)
+        self.assertEqual(flights.stats()["shared_results"], 0)
         self.assertEqual(flights.stats()["capacity_rejections"], 0)
         recovery_totals = {
             name: sum(
@@ -377,10 +435,10 @@ class TranslatorSingleFlightTests(unittest.TestCase):
             for name in translator.RECOVERY_METRIC_NAMES
         }
         self.assertEqual(recovery_totals, {
-            "envelope_retry_groups": 1,
+            "envelope_retry_groups": 2,
             "envelope_retry_recovered_groups": 0,
-            "paragraph_fallback_groups": 1,
-            "paragraph_fallback_recovered_segments": 2,
+            "paragraph_fallback_groups": 2,
+            "paragraph_fallback_recovered_segments": 4,
             "paragraph_fallback_failed_segments": 0,
         })
 
@@ -393,10 +451,10 @@ class TranslatorSingleFlightTests(unittest.TestCase):
             ) as complete,
         ):
             translator.translate_text(
-                "hello", budget=budget(), operation_namespace="tenant-a"
+                "hello", operation_namespace="tenant-a"
             )
             translator.translate_text(
-                "hello", budget=budget(), operation_namespace="tenant-b"
+                "hello", operation_namespace="tenant-b"
             )
         self.assertEqual(complete.call_count, 2)
 

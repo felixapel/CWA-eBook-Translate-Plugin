@@ -4,8 +4,8 @@ WORKDIR /app
 
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=unknown
-LABEL org.opencontainers.image.title="CWA eBook Translate Plugin" \
-      org.opencontainers.image.description="Bilingual LLM translation overlay for Calibre-Web-Automated" \
+LABEL org.opencontainers.image.title="eBook Translate Plugin" \
+      org.opencontainers.image.description="Bilingual LLM translation overlay for CWA and Kavita" \
       org.opencontainers.image.source="https://github.com/felixapel/CWA-eBook-Translate-Plugin" \
       org.opencontainers.image.url="https://github.com/felixapel/CWA-eBook-Translate-Plugin" \
       org.opencontainers.image.documentation="https://github.com/felixapel/CWA-eBook-Translate-Plugin#readme" \
@@ -18,7 +18,7 @@ LABEL org.opencontainers.image.title="CWA eBook Translate Plugin" \
 RUN apk add --no-cache \
     libgomp=15.2.0-r5 \
     libxml2=2.13.9-r2 \
-    nginx=1.30.3-r0 \
+    nginx=1.30.4-r1 \
     pcre2=10.47-r1
 
 # Copy requirements and install. Then strip packaging tooling that is only needed
@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requireme
 
 # Copy only runtime modules; tests, benchmarks, and operator helpers do not
 # belong in the published execution artifact.
-COPY auth.py cache.py server.py singleflight.py translator.py work_budget.py ./
+COPY auth.py cache.py hub_runtime.py reader_session.py server.py singleflight.py translator.py work_budget.py ./
 COPY VERSION ./
 COPY static/loader.js static/translator.css static/translator.js ./static/
 COPY proxy/nginx-main.conf proxy/nginx.conf.template proxy/render_config.py ./proxy/
@@ -72,12 +72,12 @@ ENV BT_BATCH_SIZE="5"
 
 # 8390 = translation API. 8080 = injection proxy. BT_ROLE selects api, proxy,
 # or the backwards-compatible combined mode. EXPOSE is documentation only.
-EXPOSE 8390 8080
+EXPOSE 8390 8080 8081
 
 # Probe the process selected by BT_ROLE. Combined/auto mode checks the API; its
 # unprivileged monitor exits if nginx dies.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import os,urllib.request,sys; proxy=os.environ.get('BT_ROLE')=='proxy'; p=os.environ.get('BT_PROXY_PORT','8080') if proxy else os.environ.get('PORT','8390'); path='/bt-api/ping' if proxy else '/ping'; sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}{path}', timeout=4).status==200 else 1)"
+    CMD if [ "${BT_ROLE:-auto}" = hub ]; then python /app/hub_runtime.py --healthcheck; else python -c "import os,urllib.request,sys; proxy=os.environ.get('BT_ROLE')=='proxy'; p=os.environ.get('BT_PROXY_PORT','8080') if proxy else os.environ.get('PORT','8390'); path='/bt-api/ping' if proxy else '/ping'; sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}{path}', timeout=4).status==200 else 1)"; fi
 
 # Both roles use unprivileged ports and write only to /app/data or /tmp.
 USER appuser

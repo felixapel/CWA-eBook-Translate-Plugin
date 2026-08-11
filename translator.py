@@ -14,6 +14,7 @@ fatal.
 """
 import json
 import hashlib
+import ipaddress
 import math
 import os
 import re
@@ -27,9 +28,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from requests.adapters import HTTPAdapter
 from typing import Callable, Literal, Optional
+from urllib.parse import urlsplit
 from urllib3 import PoolManager, ProxyManager
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
+from urllib3.util import connection as _urllib3_connection
 from singleflight import (
     SingleFlight, SingleFlightCapacityError, SingleFlightTimeout,
 )
@@ -42,12 +46,18 @@ log = logging.getLogger("book-translator.translator")
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "local").lower()
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemma4-12b")
+LLM_CUSTOM_ENDPOINT = os.environ.get("LLM_CUSTOM_ENDPOINT", "")
+LLM_CUSTOM_API_KEY = os.environ.get("LLM_CUSTOM_API_KEY", "")
 
 # Optional fallback provider. A local fallback may be used automatically; a
 # remote/cloud fallback requires explicit consent on the current request.
 LLM_FALLBACK_PROVIDER = os.environ.get("LLM_FALLBACK_PROVIDER", "").lower()
 LLM_FALLBACK_API_KEY = os.environ.get("LLM_FALLBACK_API_KEY", "")
 LLM_FALLBACK_MODEL = os.environ.get("LLM_FALLBACK_MODEL", "")
+LLM_FALLBACK_CUSTOM_ENDPOINT = os.environ.get(
+    "LLM_FALLBACK_CUSTOM_ENDPOINT", "")
+LLM_FALLBACK_CUSTOM_API_KEY = os.environ.get(
+    "LLM_FALLBACK_CUSTOM_API_KEY", "")
 
 # Tunables.
 #   BT_TIMEOUT        seconds before a single request is abandoned
@@ -112,6 +122,7 @@ PROVIDER_ENDPOINTS = {
     "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "openai"),
     "local": (LOCAL_BACKEND_URL, "openai"),
 }
+CUSTOM_PROVIDER_ID = "openai-compatible"
 
 # ── API key loading (primary) ────────────────────────────────────────────────
 
@@ -127,18 +138,243 @@ def _load_primary_api_key() -> str:
 
 # ── Provider model ───────────────────────────────────────────────────────────
 
+@dataclass(frozen=True, slots=True)
+class ProviderSpec:
+    """Immutable non-secret identity for one resolved provider endpoint."""
+
+    provider_id: str
+    endpoint: str
+    protocol: Literal["openai", "anthropic"]
+    locality: Literal["local", "remote"]
+    cache_namespace: str
+
+
+class _CustomEndpointConfigurationError(ValueError):
+    """A custom endpoint violates the immutable public-network contract."""
+
+
+class _CustomEndpointDNSFailure(RuntimeError):
+    """A custom endpoint hostname could not be resolved within its budget."""
+
+
+_DNS_RESOLVER_SLOTS = _threading.BoundedSemaphore(2)
+
+
+def _bounded_getaddrinfo(
+    hostname: str,
+    port: int,
+    *,
+    budget: Optional[WorkBudget] = None,
+) -> list[tuple]:
+    """Resolve without allowing libc DNS latency to escape the request clock."""
+    timeout = 5.0
+    if budget is not None:
+        budget.ensure_active()
+        timeout = min(timeout, budget.remaining_seconds())
+    resolver_slots = _DNS_RESOLVER_SLOTS
+    if not resolver_slots.acquire(blocking=False):
+        raise _CustomEndpointDNSFailure("custom endpoint DNS capacity exhausted")
+    outcome: dict[str, object] = {}
+    completed = _threading.Event()
+
+    def resolve() -> None:
+        try:
+            outcome["addresses"] = _socket.getaddrinfo(
+                hostname, port, type=_socket.SOCK_STREAM
+            )
+        except Exception as exc:
+            outcome["error"] = exc
+        finally:
+            completed.set()
+            resolver_slots.release()
+
+    try:
+        worker = _threading.Thread(target=resolve, daemon=True)
+        worker.start()
+    except BaseException:
+        resolver_slots.release()
+        raise
+    if timeout <= 0 or not completed.wait(timeout):
+        if budget is not None and budget.remaining_seconds() <= 0:
+            raise WorkBudgetExceeded("deadline")
+        raise _CustomEndpointDNSFailure("custom endpoint DNS timed out")
+    if budget is not None:
+        budget.ensure_active()
+    error = outcome.get("error")
+    if error is not None:
+        raise _CustomEndpointDNSFailure("custom endpoint DNS failed") from error
+    resolved = outcome.get("addresses")
+    if not isinstance(resolved, list):
+        raise _CustomEndpointDNSFailure("custom endpoint DNS failed")
+    return resolved
+
+
+def _resolve_custom_endpoint(
+    endpoint: str,
+    *,
+    budget: Optional[WorkBudget] = None,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Resolve one public HTTPS endpoint to addresses safe to pin."""
+    if not isinstance(endpoint, str) or endpoint != endpoint.strip():
+        raise _CustomEndpointConfigurationError(
+            "LLM custom endpoint must be one clean URL"
+        )
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError as exc:
+        raise _CustomEndpointConfigurationError(
+            "LLM custom endpoint must be one valid URL"
+        ) from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/v1/chat/completions"
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise _CustomEndpointConfigurationError(
+            "LLM custom endpoint must be public HTTPS with exact "
+            "/v1/chat/completions path"
+        )
+
+    hostname = parsed.hostname
+    try:
+        addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        resolved = _bounded_getaddrinfo(
+            hostname, port or 443, budget=budget
+        )
+        try:
+            addresses = [ipaddress.ip_address(item[4][0]) for item in resolved]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise _CustomEndpointDNSFailure(
+                "custom endpoint DNS returned invalid addresses"
+            ) from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise _CustomEndpointConfigurationError(
+            "LLM custom endpoint must resolve only to public addresses"
+        )
+    canonical = tuple(dict.fromkeys(str(address) for address in addresses))
+    return endpoint, hostname, canonical
+
+
+def _validate_custom_endpoint(endpoint: str) -> str:
+    """Validate one public HTTPS OpenAI-compatible endpoint fail-closed."""
+    _resolve_custom_endpoint(endpoint)
+    return endpoint
+
+
+def _provider_spec(name: str, custom_endpoint: str = "") -> ProviderSpec:
+    endpoint = PROVIDER_ENDPOINTS.get(name)
+    if endpoint is not None:
+        url, protocol = endpoint
+        if name == "local":
+            try:
+                parsed = urlsplit(url)
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError("BT_LOCAL_URL must be one valid URL") from exc
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or parsed.path != "/v1/chat/completions"
+                or (port is not None and not 1 <= port <= 65535)
+            ):
+                raise ValueError(
+                    "BT_LOCAL_URL must target exact /v1/chat/completions"
+                )
+        return ProviderSpec(
+            provider_id=name,
+            endpoint=url,
+            protocol=protocol,
+            locality="local" if name == "local" else "remote",
+            cache_namespace=name,
+        )
+    if name == CUSTOM_PROVIDER_ID:
+        url = _validate_custom_endpoint(custom_endpoint)
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+        return ProviderSpec(
+            provider_id=name,
+            endpoint=url,
+            protocol="openai",
+            locality="remote",
+            cache_namespace=f"{CUSTOM_PROVIDER_ID}:{digest}",
+        )
+    raise ValueError(f"Unknown LLM provider: {name}")
+
+
 class _Provider:
     """Resolved configuration for one translation backend."""
-    __slots__ = ("name", "url", "api_type", "model", "api_key")
+    __slots__ = ("spec", "model", "api_key")
 
-    def __init__(self, name: str, model: str, api_key: str):
-        endpoint = PROVIDER_ENDPOINTS.get(name)
-        if not endpoint:
-            raise ValueError(f"Unknown LLM provider: {name}")
-        self.name = name
-        self.url, self.api_type = endpoint
+    def __init__(
+        self,
+        name: str,
+        model: str,
+        api_key: str,
+        *,
+        spec: Optional[ProviderSpec] = None,
+    ):
+        self.spec = spec or _provider_spec(name)
         self.model = model
         self.api_key = api_key
+
+    @property
+    def name(self) -> str:
+        return self.spec.provider_id
+
+    @property
+    def url(self) -> str:
+        return self.spec.endpoint
+
+    @property
+    def api_type(self) -> str:
+        return self.spec.protocol
+
+    @property
+    def locality(self) -> str:
+        return self.spec.locality
+
+    @property
+    def cache_namespace(self) -> str:
+        return self.spec.cache_namespace
+
+
+def _provider_from_config(
+    *,
+    name: str,
+    model: str,
+    api_key: str,
+    custom_endpoint: str,
+    custom_api_key: str,
+) -> _Provider:
+    """Validate one role's environment values and return a resolved backend."""
+    if not isinstance(model, str) or not model.strip() or model != model.strip():
+        raise ValueError("LLM model must be a non-empty clean value")
+    if name == CUSTOM_PROVIDER_ID:
+        if api_key or not custom_api_key:
+            raise ValueError(
+                "openai-compatible requires its dedicated custom API key"
+            )
+        spec = _provider_spec(name, custom_endpoint)
+        return _Provider(name, model, custom_api_key, spec=spec)
+    if custom_endpoint or custom_api_key:
+        raise ValueError("custom endpoint values require openai-compatible")
+    spec = _provider_spec(name)
+    if spec.locality == "local":
+        if api_key:
+            raise ValueError("local provider forbids an API key")
+    elif not api_key:
+        raise ValueError(f"{name} requires an API key")
+    return _Provider(name, model, api_key, spec=spec)
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -148,10 +384,23 @@ class ProviderUnavailableError(RuntimeError):
 class _ProviderCallError(RuntimeError):
     """Sanitized provider failure retained only for retry decisions/logging."""
 
-    def __init__(self, provider: str, status_code: int, error_type: str):
+    def __init__(
+        self,
+        provider: str,
+        status_code: int,
+        error_type: str,
+        *,
+        retryable: Optional[bool] = None,
+        fallback_eligible: Optional[bool] = None,
+    ):
         self.provider = provider
         self.status_code = status_code
         self.error_type = error_type
+        transient = status_code in {408, 429, 500, 502, 503, 504}
+        self.retryable = transient if retryable is None else retryable
+        self.fallback_eligible = (
+            transient if fallback_eligible is None else fallback_eligible
+        )
         super().__init__("provider call failed")
 
 
@@ -160,6 +409,7 @@ class _ProviderResponseTooLarge(RuntimeError):
 
 
 _HTTP_CALL_CONTEXT = _threading.local()
+_PROVIDER_HTTP_SESSIONS = _threading.local()
 
 
 class _DeadlineSocket:
@@ -223,6 +473,39 @@ class _DeadlineSocket:
 
 class _DeadlineConnectionMixin:
     """Install the deadline socket before urllib3 reads response headers."""
+
+    def _new_conn(self):
+        """Connect custom hosts only through the addresses vetted this attempt."""
+        pinned_host = getattr(_HTTP_CALL_CONTEXT, "pinned_host", None)
+        pinned_addresses = getattr(
+            _HTTP_CALL_CONTEXT, "pinned_addresses", None
+        )
+        if pinned_host is None or pinned_addresses is None:
+            return super()._new_conn()
+        if self._dns_host.casefold() != pinned_host.casefold():
+            raise NewConnectionError(
+                self, "custom endpoint host differs from pinned resolution"
+            )
+
+        last_error: OSError | None = None
+        for address in pinned_addresses:
+            try:
+                return _urllib3_connection.create_connection(
+                    (address, self.port),
+                    self.timeout,
+                    source_address=self.source_address,
+                    socket_options=self.socket_options,
+                )
+            except _socket.timeout as exc:
+                raise ConnectTimeoutError(
+                    self,
+                    f"Connection timed out. (connect timeout={self.timeout})",
+                ) from exc
+            except OSError as exc:
+                last_error = exc
+        raise NewConnectionError(
+            self, "failed to connect to a vetted custom endpoint address"
+        ) from last_error
 
     def _apply_call_budget(self) -> None:
         budget = getattr(_HTTP_CALL_CONTEXT, "budget", None)
@@ -328,13 +611,26 @@ def _deadline_provider_post(
     timeout: float,
     stream: bool,
     budget: WorkBudget,
+    reuse_connection: Optional[bool] = None,
 ):
     """Start one HTTP operation with inactivity and absolute time bounds."""
     budget.ensure_active()
-    session = requests.Session()
-    adapter = _DeadlineHTTPAdapter()
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
+    if reuse_connection is None:
+        reuse_connection = bool(getattr(
+            _HTTP_CALL_CONTEXT, "reuse_connection", False
+        ))
+    session = getattr(_PROVIDER_HTTP_SESSIONS, "session", None)
+    session_is_new = session is None or not reuse_connection
+    if session_is_new:
+        session = requests.Session()
+        if reuse_connection:
+            _PROVIDER_HTTP_SESSIONS.session = session
+        # Provider credentials and book text must never be redirected to
+        # another authority or routed through ambient host proxy settings.
+        session.trust_env = False
+        adapter = _DeadlineHTTPAdapter()
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
     _HTTP_CALL_CONTEXT.budget = budget
     _HTTP_CALL_CONTEXT.inactivity_timeout = float(timeout)
     try:
@@ -344,14 +640,24 @@ def _deadline_provider_post(
             json=json,
             timeout=timeout,
             stream=stream,
+            allow_redirects=False,
         )
-        response._bt_deadline_session = session
+        if not reuse_connection:
+            response._bt_deadline_session = session
         return response
     except WorkBudgetExceeded:
         session.close()
+        if reuse_connection and getattr(
+            _PROVIDER_HTTP_SESSIONS, "session", None
+        ) is session:
+            del _PROVIDER_HTTP_SESSIONS.session
         raise
     except Exception:
         session.close()
+        if reuse_connection and getattr(
+            _PROVIDER_HTTP_SESSIONS, "session", None
+        ) is session:
+            del _PROVIDER_HTTP_SESSIONS.session
         # Convert a socket/read error caused by the absolute deadline while
         # preserving ordinary provider errors for the retry policy.
         budget.ensure_active()
@@ -371,14 +677,20 @@ _fallback_provider = "unset"  # sentinel distinct from None (= "no fallback")
 def _get_primary() -> _Provider:
     global _primary_provider
     if _primary_provider is None:
-        _primary_provider = _Provider(LLM_PROVIDER, LLM_MODEL, _load_primary_api_key())
+        _primary_provider = _provider_from_config(
+            name=LLM_PROVIDER,
+            model=LLM_MODEL,
+            api_key=_load_primary_api_key(),
+            custom_endpoint=LLM_CUSTOM_ENDPOINT,
+            custom_api_key=LLM_CUSTOM_API_KEY,
+        )
     return _primary_provider
 
 
 def _get_fallback() -> Optional[_Provider]:
     global _fallback_provider
     if _fallback_provider == "unset":
-        if LLM_FALLBACK_PROVIDER and LLM_FALLBACK_PROVIDER in PROVIDER_ENDPOINTS:
+        if LLM_FALLBACK_PROVIDER:
             model = LLM_FALLBACK_MODEL or LLM_MODEL
             if not LLM_FALLBACK_MODEL:
                 log.warning(
@@ -386,16 +698,49 @@ def _get_fallback() -> Optional[_Provider]:
                     "provider '%s' (this may be invalid for that provider).",
                     LLM_MODEL, LLM_FALLBACK_PROVIDER,
                 )
-            _fallback_provider = _Provider(LLM_FALLBACK_PROVIDER, model, LLM_FALLBACK_API_KEY)
+            _fallback_provider = _provider_from_config(
+                name=LLM_FALLBACK_PROVIDER,
+                model=model,
+                api_key=LLM_FALLBACK_API_KEY,
+                custom_endpoint=LLM_FALLBACK_CUSTOM_ENDPOINT,
+                custom_api_key=LLM_FALLBACK_CUSTOM_API_KEY,
+            )
+            primary = _get_primary()
+            if (
+                primary.cache_namespace == _fallback_provider.cache_namespace
+                and primary.model == _fallback_provider.model
+            ):
+                raise ValueError("primary and fallback providers must be distinct")
             log.info("Fallback provider configured: %s (%s)", LLM_FALLBACK_PROVIDER, model)
         else:
             _fallback_provider = None
     return _fallback_provider
 
 
-def _is_cloud_provider(provider_name: str) -> bool:
-    """Return whether the named provider sends content outside local mode."""
-    return provider_name != "local"
+def provider_policy() -> dict[str, Optional[str]]:
+    """Expose only the browser privacy facts needed for consent controls."""
+    primary = _get_primary()
+    fallback = _get_fallback()
+    return {
+        "primary": primary.locality,
+        "fallback": fallback.locality if fallback is not None else None,
+    }
+
+
+def initialize_provider_configuration() -> None:
+    """Resolve both provider roles during service startup, before requests."""
+    _get_primary()
+    _get_fallback()
+
+
+def _eligible_providers(*, allow_cloud_fallback: bool) -> list[_Provider]:
+    providers = [_get_primary()]
+    fallback = _get_fallback()
+    if fallback is not None and (
+        fallback.locality == "local" or allow_cloud_fallback
+    ):
+        providers.append(fallback)
+    return providers
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -466,8 +811,8 @@ class BatchRecoveryTracker:
     """Thread-safe, fixed-cardinality recovery counters for one request.
 
     The tracker deliberately contains no paragraph content, provider value,
-    segment ID, or other caller-controlled dimension. It is passed only to the
-    singleflight leader, so coalesced followers do not double-count provider
+    segment ID, or other caller-controlled dimension. Batch work is never
+    shared across requests, so each request publishes only its own recovery
     work.
     """
 
@@ -668,13 +1013,16 @@ def _translate_openai(
 
     payload = {
         "model": p.model,
-        "temperature": 0.3,
         "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
     }
+    # Gemini 3.5+ deprecates OpenAI sampling parameters and may reject them in
+    # future model generations. Source: https://ai.google.dev/gemini-api/docs/latest-model
+    if p.name != "gemini":
+        payload["temperature"] = 0.3
 
     resp = _provider_post(
         p.url,
@@ -823,20 +1171,76 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
             _acquire_upstream_slot(budget)
             try:
                 budget.reserve_attempt(user_content + system_prompt, max_tokens)
-                call_timeout = min(float(timeout), budget.remaining_seconds())
-                if call_timeout <= 0:
-                    raise WorkBudgetExceeded("deadline")
-                if p.api_type == "openai":
-                    return _translate_openai(
-                        p, user_content, system_prompt, call_timeout, max_tokens,
-                        budget)
-                return _translate_anthropic(
-                    p, user_content, system_prompt, call_timeout, max_tokens,
-                    budget)
+                if p.name == CUSTOM_PROVIDER_ID:
+                    _endpoint, pinned_host, pinned_addresses = (
+                        _resolve_custom_endpoint(p.url, budget=budget)
+                    )
+                    _HTTP_CALL_CONTEXT.pinned_host = pinned_host
+                    _HTTP_CALL_CONTEXT.pinned_addresses = pinned_addresses
+                try:
+                    call_timeout = min(float(timeout), budget.remaining_seconds())
+                    if call_timeout <= 0:
+                        raise WorkBudgetExceeded("deadline")
+                    _HTTP_CALL_CONTEXT.reuse_connection = (
+                        p.name != CUSTOM_PROVIDER_ID
+                    )
+                    if p.api_type == "openai":
+                        return _translate_openai(
+                            p, user_content, system_prompt, call_timeout,
+                            max_tokens, budget)
+                    return _translate_anthropic(
+                        p, user_content, system_prompt, call_timeout,
+                        max_tokens, budget)
+                finally:
+                    _HTTP_CALL_CONTEXT.__dict__.pop(
+                        "reuse_connection", None
+                    )
+                    _HTTP_CALL_CONTEXT.__dict__.pop("pinned_host", None)
+                    _HTTP_CALL_CONTEXT.__dict__.pop("pinned_addresses", None)
             finally:
                 _UPSTREAM_SEM.release()
         except WorkBudgetExceeded:
             raise
+        except _CustomEndpointConfigurationError as e:
+            error_type = type(e).__name__
+            log.warning(
+                "provider=%s status=0 attempt=%d/%d error_type=%s",
+                p.name, attempt + 1, max_retries, error_type,
+            )
+            raise _ProviderCallError(
+                p.name,
+                0,
+                error_type,
+                retryable=False,
+                fallback_eligible=False,
+            ) from None
+        except _CustomEndpointDNSFailure as e:
+            error_type = type(e).__name__
+            log.warning(
+                "provider=%s status=0 attempt=%d/%d error_type=%s",
+                p.name, attempt + 1, max_retries, error_type,
+            )
+            last_error = _ProviderCallError(
+                p.name,
+                0,
+                error_type,
+                retryable=True,
+                fallback_eligible=True,
+            )
+            _sleep_before_retry(budget, 0.5, attempt, max_retries)
+        except requests.exceptions.SSLError as e:
+            error_type = type(e).__name__
+            log.warning(
+                "provider=%s status=0 attempt=%d/%d error_type=%s",
+                p.name, attempt + 1, max_retries, error_type,
+            )
+            raise _ProviderCallError(
+                p.name,
+                0,
+                error_type,
+                retryable=False,
+                fallback_eligible=False,
+            ) from None
         except requests.exceptions.RequestException as e:
             response = getattr(e, "response", None)
             status_code = getattr(response, "status_code", 0) or 0
@@ -845,27 +1249,45 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                 "provider=%s status=%s attempt=%d/%d error_type=%s",
                 p.name, status_code, attempt + 1, max_retries, error_type,
             )
+            transient_transport = status_code == 0 and isinstance(
+                e,
+                (requests.exceptions.ConnectionError, requests.exceptions.Timeout),
+            )
+            retryable = (
+                status_code in {408, 429, 500, 502, 503, 504}
+                or transient_transport
+            )
             last_error = _ProviderCallError(
-                p.name, status_code, error_type)
+                p.name,
+                status_code,
+                error_type,
+                retryable=retryable,
+                fallback_eligible=retryable,
+            )
+            if not retryable:
+                break
             if status_code == 429:
                 _sleep_before_retry(budget, 2 ** attempt, attempt, max_retries)
-            elif status_code and status_code >= 500:
+            elif status_code:
                 _sleep_before_retry(budget, 1, attempt, max_retries)
-            elif status_code == 0:
+            else:
                 # No HTTP response at all (timeout / connection refused): often a
                 # transient blip on a busy local LLM — retry with a short pause
                 # instead of burning the provider on the first hiccup.
                 _sleep_before_retry(budget, 0.5, attempt, max_retries)
-            else:
-                break  # 4xx (other than 429): retrying won't help, bail to fallback
-        except Exception as e:
+        except (_ProviderResponseTooLarge, ValueError, KeyError, TypeError) as e:
             error_type = type(e).__name__
             log.warning(
                 "provider=%s status=0 attempt=%d/%d error_type=%s",
                 p.name, attempt + 1, max_retries, error_type,
             )
-            last_error = _ProviderCallError(p.name, 0, error_type)
-            _sleep_before_retry(budget, 0.5, attempt, max_retries)
+            raise _ProviderCallError(
+                p.name,
+                0,
+                error_type,
+                retryable=False,
+                fallback_eligible=True,
+            ) from None
     raise last_error or _ProviderCallError(p.name, 0, "UnknownError")
 
 
@@ -879,27 +1301,29 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
     if budget is None:
         budget = create_work_budget()
 
-    providers = [_get_primary()]
-    fb = _get_fallback()
-    if fb is not None and (
-        not _is_cloud_provider(fb.name) or allow_cloud_fallback
-    ):
-        providers.append(fb)
+    providers = _eligible_providers(
+        allow_cloud_fallback=allow_cloud_fallback)
 
     for p in providers:
         try:
             out = _call_provider(
                 p, user_content, system_prompt, max_retries, timeout, max_tokens, budget)
-            return out, p.name
+            return out, p.cache_namespace
         except WorkBudgetExceeded:
             raise
-        except Exception as e:
-            status_code = getattr(e, "status_code", 0)
-            error_type = getattr(e, "error_type", type(e).__name__)
+        except _ProviderCallError as e:
             log.warning(
                 "provider=%s exhausted status=%s error_type=%s",
-                p.name, status_code, error_type,
+                p.name, e.status_code, e.error_type,
             )
+            if not e.fallback_eligible:
+                break
+        except Exception as e:
+            log.warning(
+                "provider=%s terminal error_type=%s",
+                p.name, type(e).__name__,
+            )
+            break
 
     raise ProviderUnavailableError(
         "No configured provider completed the translation")
@@ -914,31 +1338,24 @@ def model_for_provider(provider_name: str) -> str:
     primary model would be exactly the cross-provider poisoning B4 eliminates,
     just via the fallback path.
     """
-    if provider_name and provider_name == LLM_FALLBACK_PROVIDER:
-        return LLM_FALLBACK_MODEL or LLM_MODEL
-    return LLM_MODEL
+    primary = _get_primary()
+    if provider_name == primary.cache_namespace:
+        return primary.model
+    fallback = _get_fallback()
+    if fallback is not None and provider_name == fallback.cache_namespace:
+        return fallback.model
+    return primary.model
 
 
 def cache_lookup_backends(
     *, allow_cloud_fallback: bool = False
 ) -> list[tuple[str, str]]:
     """Provider/model cache identities allowed by this request's policy."""
-    backends = [(LLM_PROVIDER, LLM_MODEL)]
-    if (
-        LLM_FALLBACK_PROVIDER
-        and LLM_FALLBACK_PROVIDER in PROVIDER_ENDPOINTS
-        and (
-            not _is_cloud_provider(LLM_FALLBACK_PROVIDER)
-            or allow_cloud_fallback
-        )
-    ):
-        fallback = (
-            LLM_FALLBACK_PROVIDER,
-            LLM_FALLBACK_MODEL or LLM_MODEL,
-        )
-        if fallback not in backends:
-            backends.append(fallback)
-    return backends
+    return [
+        (provider.cache_namespace, provider.model)
+        for provider in _eligible_providers(
+            allow_cloud_fallback=allow_cloud_fallback)
+    ]
 
 
 def cache_lookup_models(*, allow_cloud_fallback: bool = False) -> list[str]:
@@ -986,13 +1403,16 @@ def _validate_operation_namespace(value: str) -> str:
 def _backend_operation_identity(
     *, allow_cloud_fallback: bool
 ) -> list[tuple[str, str, str, str]]:
-    identities = []
-    for provider, model in cache_lookup_backends(
-        allow_cloud_fallback=allow_cloud_fallback
-    ):
-        url, api_type = PROVIDER_ENDPOINTS[provider]
-        identities.append((provider, model, url, api_type))
-    return identities
+    return [
+        (
+            provider.cache_namespace,
+            provider.model,
+            hashlib.sha256(provider.url.encode("utf-8")).hexdigest(),
+            provider.api_type,
+        )
+        for provider in _eligible_providers(
+            allow_cloud_fallback=allow_cloud_fallback)
+    ]
 
 
 def _single_operation_key(
@@ -1062,10 +1482,21 @@ def translate_text(
     allow_cloud_fallback: bool = False,
 ) -> tuple[str, str]:
     """Translate a single text. Returns (translated_text, provider_name)."""
-    if budget is None:
-        budget = create_work_budget()
-    budget.ensure_active()
     resolved_timeout = BT_TIMEOUT if timeout is None else timeout
+    _validate_operation_namespace(operation_namespace)
+    if budget is not None:
+        budget.ensure_active()
+        return _translate_text_operation(
+            text,
+            source_lang,
+            target_lang,
+            max_retries,
+            resolved_timeout,
+            budget,
+            allow_cloud_fallback,
+        )
+
+    wait_budget = create_work_budget()
     key = _single_operation_key(
         text,
         source_lang,
@@ -1084,10 +1515,10 @@ def translate_text(
                 target_lang,
                 max_retries,
                 resolved_timeout,
-                budget,
+                create_work_budget(),
                 allow_cloud_fallback,
             ),
-            timeout=budget.remaining_seconds(),
+            timeout=wait_budget.remaining_seconds(),
         )
     except SingleFlightTimeout as exc:
         raise WorkBudgetExceeded("deadline") from exc
@@ -1366,81 +1797,38 @@ def _translate_group_operation(
     return recovered
 
 
-def _batch_operation_key(
-    all_texts: list[str],
-    idxs: list[int],
-    source_lang: str,
-    target_lang: str,
-    operation_namespace: str,
-    allow_cloud_fallback: bool,
-) -> str:
-    contract = batch_cache_contract(
-        all_texts, idxs, source_lang, target_lang
-    )
-    return _contract_hash([
-        TRANSLATION_CONTRACT_VERSION,
-        "singleflight-batch",
-        _validate_operation_namespace(operation_namespace),
-        _backend_operation_identity(
-            allow_cloud_fallback=allow_cloud_fallback
-        ),
-        allow_cloud_fallback,
-        contract.prompt_hash,
-        contract.protocol_version,
-        contract.context_hash,
-        BT_BATCH_MAX_TOKENS,
-        BT_OUTPUT_TOKEN_FACTOR,
-        BT_OUTPUT_TOKEN_FLOOR,
-    ])
-
-
 def _translate_group(
     all_texts: list[str],
     idxs: list[int],
     source_lang: str,
     target_lang: str,
     budget: WorkBudget,
-    operation_namespace: str,
     allow_cloud_fallback: bool,
     recovery_tracker: Optional[BatchRecoveryTracker],
 ) -> list[BatchTranslationItem]:
     if len(idxs) == 1 and BT_CONTEXT_WINDOW == 0:
-        translated, provider = translate_text(
+        translated, provider = _translate_text_operation(
             all_texts[idxs[0]],
             source_lang,
             target_lang,
-            max_retries=1,
-            budget=budget,
-            operation_namespace=operation_namespace,
-            allow_cloud_fallback=allow_cloud_fallback,
+            1,
+            BT_TIMEOUT,
+            budget,
+            allow_cloud_fallback,
         )
         return [BatchTranslationItem(
             translated, provider, True, "direct")]
 
     budget.ensure_active()
-    key = _batch_operation_key(
-        all_texts, idxs, source_lang, target_lang, operation_namespace,
+    return _translate_group_operation(
+        all_texts,
+        idxs,
+        source_lang,
+        target_lang,
+        budget,
         allow_cloud_fallback,
+        recovery_tracker,
     )
-    try:
-        flight = _TRANSLATION_SINGLEFLIGHT.run(
-            key,
-            lambda: _translate_group_operation(
-                all_texts,
-                idxs,
-                source_lang,
-                target_lang,
-                budget,
-                allow_cloud_fallback,
-                recovery_tracker,
-            ),
-            timeout=budget.remaining_seconds(),
-        )
-    except SingleFlightTimeout as exc:
-        raise WorkBudgetExceeded("deadline") from exc
-    except SingleFlightCapacityError as exc:
-        raise WorkBudgetExceeded("queue") from exc
-    return flight.value
 
 
 
@@ -1464,6 +1852,7 @@ def translate_batch_detailed(
     ``translate_batch``; the server uses this detailed result to avoid caching
     individual recovery output under a batch prompt contract.
     """
+    _validate_operation_namespace(operation_namespace)
     if max_concurrent is None:
         max_concurrent = BT_MAX_CONCURRENT
     if budget is None:
@@ -1509,7 +1898,6 @@ def translate_batch_detailed(
                 source_lang,
                 target_lang,
                 budget,
-                operation_namespace,
                 allow_cloud_fallback,
                 recovery_tracker,
             )

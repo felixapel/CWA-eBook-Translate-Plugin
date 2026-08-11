@@ -26,7 +26,8 @@ native_tools_are_compatible() {
 }
 
 if [ "${BTCTL_FORCE_CONTAINER:-0}" != "1" ] && native_tools_are_compatible; then
-    unset BTCTL_EXPECTED_REVISION BTCTL_OPERATOR_REVISION BTCTL_LOCK_DIRECTORY
+    unset BTCTL_EXPECTED_REVISION BTCTL_OPERATOR_REVISION \
+        BTCTL_EXPECTED_ENV_SHA256 BTCTL_LOCK_DIRECTORY
     exec python3 "$SCRIPT_DIR/btctl.py" "$@"
 fi
 
@@ -34,6 +35,13 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     fail "$EX_NOPERM" \
         "the containerized Unraid path must run as root (compatible host Python 3.11+ and Git were not both available)"
 fi
+
+case " ${*} " in
+    *" migrate-topology "*|*" rollback-topology "*)
+        fail "$EX_USAGE" \
+            "topology migration requires host Python 3.11+ and Git so every source state can be mounted exactly"
+        ;;
+esac
 command -v "$DOCKER_BIN" >/dev/null 2>&1 \
     || fail 1 "Docker is required for the stock-Unraid bootstrap"
 [ -S /var/run/docker.sock ] \
@@ -73,7 +81,7 @@ for ((index = 0; index < ${#arguments[@]}; index += 1)); do
         --env=*)
             env_file="${argument#--env=}"
             ;;
-        plan|install|adopt|auth-snippet|doctor|uninstall|upgrade|rollback)
+        plan|install|adopt|auth-snippet|doctor|uninstall|upgrade|rollback|reconfigure|migrate-topology|rollback-topology)
             if [ -z "$command" ]; then
                 command="$argument"
             fi
@@ -158,7 +166,7 @@ if [ -n "$env_file" ]; then
 fi
 
 case "$command" in
-    install|adopt|doctor|uninstall|upgrade|rollback)
+    install|adopt|doctor|uninstall|upgrade|rollback|reconfigure)
         prepare_host_lock_directory
         ;;
 esac
@@ -166,6 +174,8 @@ esac
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/btctl-bootstrap.XXXXXX")" \
     || fail 1 "could not create a private bootstrap directory"
 chmod 700 "$temporary"
+[ "$(stat -c '%u:%a' -- "$temporary")" = "0:700" ] \
+    || fail 1 "bootstrap directory is not root-owned mode 0700"
 exporter_image=""
 operator_image=""
 bootstrap_tag="${temporary##*.}"
@@ -187,6 +197,38 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
+
+environment_snapshot="$temporary/install.env.snapshot"
+environment_sha256=""
+if [ -n "$env_file" ]; then
+    env_metadata="$(stat -c '%d:%i:%f:%u:%a:%h' -- "$env_file")" \
+        || fail "$EX_USAGE" "environment file metadata could not be read"
+    IFS=: read -r _ _ _ _ env_mode env_links <<<"$env_metadata"
+    [ "$env_links" = "1" ] \
+        || fail "$EX_USAGE" "environment file must have exactly one link"
+    (( (8#$env_mode & 8#077) == 0 )) \
+        || fail "$EX_USAGE" "environment file must use private mode 0600 or stricter"
+    (
+        umask 077
+        cp -P -- \
+            "$env_file" "$environment_snapshot"
+    ) || fail 1 "environment snapshot could not be created"
+    [ -f "$environment_snapshot" ] && [ ! -L "$environment_snapshot" ] \
+        || fail 1 "environment snapshot must be one real regular file"
+    [ "$(stat -c '%d:%i:%f:%u:%a:%h' -- "$env_file")" = "$env_metadata" ] \
+        || fail 1 "environment file identity changed while it was captured"
+    chown 0:0 -- "$environment_snapshot" \
+        || fail 1 "environment snapshot ownership could not be secured"
+    chmod 0600 -- "$environment_snapshot" \
+        || fail 1 "environment snapshot permissions could not be secured"
+    [ "$(stat -c '%u:%a:%h' -- "$environment_snapshot")" = "0:600:1" ] \
+        || fail 1 "environment snapshot is not root-owned mode 0600"
+    read -r environment_sha256 _ < <(
+        sha256sum -- "$environment_snapshot"
+    ) || fail 1 "environment snapshot could not be hashed"
+    [[ "$environment_sha256" =~ ^[0-9a-f]{64}$ ]] \
+        || fail 1 "environment snapshot digest is invalid"
+fi
 
 printf 'btctl: preparing the local stock-Unraid operator image\n' >&2
 source_exporter_dockerfile | "$DOCKER_BIN" build \
@@ -303,6 +345,7 @@ operator_environment=(
     --env DOCKER_CONFIG=/tmp/docker
     --env PYTHONDONTWRITEBYTECODE=1
     --env "BTCTL_EXPECTED_REVISION=$revision"
+    --env "BTCTL_EXPECTED_ENV_SHA256=$environment_sha256"
     "${git_environment[@]}"
 )
 
@@ -321,28 +364,44 @@ if [ "$help_requested" -eq 1 ] || [ -z "$command" ] || [ -z "$env_file" ]; then
 fi
 
 planner_mounts=("${repository_mount[@]}")
-planner_mounts+=(--mount "type=bind,src=$env_file,dst=$env_file,readonly")
+planner_mounts+=(
+    --mount "type=bind,src=$environment_snapshot,dst=$environment_snapshot,readonly"
+)
 if [ -d /mnt ]; then
     planner_mounts+=(--mount type=bind,src=/mnt,dst=/mnt,readonly)
 fi
 if [ -d /boot ]; then
     planner_mounts+=(--mount type=bind,src=/boot,dst=/boot,readonly)
 fi
+case "$command" in
+    install|adopt|doctor|uninstall|upgrade|rollback|reconfigure)
+        planner_mounts+=(
+            --mount "type=bind,src=$HOST_LOCK_DIRECTORY,dst=$HOST_LOCK_DIRECTORY,readonly"
+        )
+        ;;
+esac
 
-"$DOCKER_BIN" run \
-    "${readonly_runtime[@]}" \
-    "${operator_environment[@]}" \
-    "${planner_mounts[@]}" \
-    --entrypoint python3 \
-    "$operator_image" \
-    /opt/btctl/btctl_container.py \
-    --repository "$SCRIPT_DIR" \
-    --env "$env_file" \
-    --command "$command" \
-    --expected-revision "$revision" >"$temporary/mount-plan" \
+render_mount_plan() {
+    local destination="$1"
+    "$DOCKER_BIN" run \
+        "${readonly_runtime[@]}" \
+        "${operator_environment[@]}" \
+        "${planner_mounts[@]}" \
+        --entrypoint python3 \
+        "$operator_image" \
+        /opt/btctl/btctl_container.py \
+        --repository "$SCRIPT_DIR" \
+        --env "$environment_snapshot" \
+        --command "$command" \
+        --expected-revision "$revision" >"$destination"
+}
+
+render_mount_plan "$temporary/mount-plan" \
     || fail "$EX_USAGE" "the Unraid mount plan was rejected"
 
 final_mounts=()
+planned_sources=()
+planned_identities=()
 socket_required=0
 socket_records=0
 lock_records=0
@@ -356,28 +415,63 @@ validate_planned_path() {
             fail 1 "mount planner emitted an unsafe Docker mount path"
             ;;
     esac
+    [ -e "$candidate" ] && [ ! -L "$candidate" ] \
+        || fail 1 "mount planner emitted a missing or linked source"
+    if [ -d "$candidate" ]; then
+        [ "$(CDPATH= cd -P -- "$candidate" && pwd -P)" = "$candidate" ] \
+            || fail 1 "mount planner emitted a non-canonical directory"
+    else
+        local parent base canonical
+        parent="$(CDPATH= cd -P -- "$(dirname -- "$candidate")" && pwd -P)" \
+            || fail 1 "mount planner source parent could not be resolved"
+        base="$(basename -- "$candidate")"
+        canonical="$parent/$base"
+        [ "$canonical" = "$candidate" ] \
+            || fail 1 "mount planner emitted a non-canonical file"
+    fi
 }
-while IFS=$'\t' read -r record first second fourth; do
+validate_planned_identity() {
+    local candidate="$1"
+    local expected="$2"
+    local current
+    [[ "$expected" =~ ^[0-9]+:[0-9]+:[0-9a-f]+:[0-9]+:[0-7]+:[0-9]+$ ]] \
+        || fail 1 "mount planner emitted an invalid source identity"
+    current="$(stat -c '%d:%i:%f:%u:%a:%h' -- "$candidate")" \
+        || fail 1 "mount planner source identity could not be inspected"
+    [ "$current" = "$expected" ] \
+        || fail 1 "mount planner source identity changed before execution"
+}
+while IFS=$'\t' read -r record first second fourth fifth extra; do
     ((line_number += 1))
     if [ "$line_number" -eq 1 ]; then
         [ "$record" = "BTCTL_MOUNT_PLAN" ] \
-            && [ "$first" = "1" ] \
+            && [ "$first" = "2" ] \
             && [ "$second" = "$command" ] \
             && [ "$fourth" = "unraid" ] \
+            && [ "$fifth" = "$environment_sha256" ] \
+            && [ -z "$extra" ] \
             || fail 1 "mount planner emitted an invalid header"
         continue
     fi
     case "$record:$first" in
         mount:ro)
-            [ -z "$fourth" ] || fail 1 "mount planner emitted an invalid mount record"
             [ -n "$second" ] || fail 1 "mount planner emitted an empty path"
+            [ -n "$fourth" ] && [ -z "$fifth" ] && [ -z "$extra" ] \
+                || fail 1 "mount planner emitted an invalid mount record"
             validate_planned_path "$second"
+            validate_planned_identity "$second" "$fourth"
+            planned_sources+=("$second")
+            planned_identities+=("$fourth")
             final_mounts+=(--mount "type=bind,src=$second,dst=$second,readonly")
             ;;
         mount:rw)
-            [ -z "$fourth" ] || fail 1 "mount planner emitted an invalid mount record"
             [ -n "$second" ] || fail 1 "mount planner emitted an empty path"
+            [ -n "$fourth" ] && [ -z "$fifth" ] && [ -z "$extra" ] \
+                || fail 1 "mount planner emitted an invalid mount record"
             validate_planned_path "$second"
+            validate_planned_identity "$second" "$fourth"
+            planned_sources+=("$second")
+            planned_identities+=("$fourth")
             final_mounts+=(--mount "type=bind,src=$second,dst=$second")
             ;;
         lock:ro)
@@ -387,6 +481,11 @@ while IFS=$'\t' read -r record first second fourth; do
                 || fail 1 "mount planner emitted an invalid lock source"
             [ "$fourth" = "/run/btctl-lock" ] \
                 || fail 1 "mount planner emitted an invalid lock destination"
+            [ -n "$fifth" ] && [ -z "$extra" ] \
+                || fail 1 "mount planner emitted an invalid lock record"
+            validate_planned_identity "$second" "$fifth"
+            planned_sources+=("$second")
+            planned_identities+=("$fifth")
             final_mounts+=(
                 --mount "type=bind,src=$second,dst=$fourth,readonly"
             )
@@ -420,6 +519,43 @@ case "$command:$lock_records" in
     *) fail 1 "mount planner emitted an invalid lifecycle lock policy" ;;
 esac
 
+[ "$(stat -c '%u:%a:%h' -- "$environment_snapshot")" = "0:600:1" ] \
+    || fail 1 "environment snapshot metadata changed after planning"
+read -r final_environment_sha256 _ < <(
+    sha256sum -- "$environment_snapshot"
+) || fail 1 "environment snapshot could not be revalidated"
+[ "$final_environment_sha256" = "$environment_sha256" ] \
+    || fail 1 "environment snapshot changed after planning"
+render_mount_plan "$temporary/final-mount-plan" \
+    || fail 1 "the Unraid mount plan could not be revalidated"
+cmp --silent -- "$temporary/mount-plan" "$temporary/final-mount-plan" \
+    || fail 1 "the Unraid mount plan changed before execution"
+for ((index = 0; index < ${#planned_sources[@]}; index += 1)); do
+    validate_planned_path "${planned_sources[$index]}"
+    validate_planned_identity \
+        "${planned_sources[$index]}" "${planned_identities[$index]}"
+done
+
+final_operator_arguments=()
+skip_environment_value=0
+for argument in "${operator_arguments[@]}"; do
+    if [ "$skip_environment_value" -eq 1 ]; then
+        skip_environment_value=0
+        continue
+    fi
+    case "$argument" in
+        --env)
+            skip_environment_value=1
+            ;;
+        --env=*)
+            ;;
+        *)
+            final_operator_arguments+=("$argument")
+            ;;
+    esac
+done
+final_operator_arguments+=(--env "$environment_snapshot")
+
 final_runtime=(
     --rm
     --user 0:0
@@ -446,4 +582,4 @@ fi
     "${operator_environment[@]}" \
     "${final_mounts[@]}" \
     "$operator_image" \
-    "${operator_arguments[@]}"
+    "${final_operator_arguments[@]}"

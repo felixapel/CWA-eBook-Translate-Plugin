@@ -2,14 +2,35 @@
 # Rendered only after proxy/render_config.py validates every ${...} value.
 # nginx's own $variables remain runtime variables.
 #
-# Browser ──► :${BT_PROXY_PORT} (this nginx) ──► ${CWA_UPSTREAM} (stock CWA)
+# Browser ──► :${BT_PROXY_PORT} (this nginx) ──► ${BT_READER_UPSTREAM} (stock reader)
 #   /bt-api/*     → the local translation API (same-origin: no CORS needed)
 #   /bt-static/*  → overlay JS/CSS served from this container
 #   everything    → proxied to CWA; HTML gets ONE <script> tag injected
 
-map $http_upgrade $connection_upgrade {
+map $http_upgrade $bt${BT_PROXY_NAMESPACE}_connection_upgrade {
     default upgrade;
     ''      close;
+}
+
+# Ordinary translation calls receive only the plugin's short-lived session.
+# Raw reader cookies are confined to the exact exchange endpoint below.
+map $http_cookie $bt${BT_PROXY_NAMESPACE}_session_cookie {
+    default "";
+    "~*(?:^|;[[:space:]]*)(${BT_SESSION_COOKIE_NAME}=[^;]{1,128})(?:;|$)" $1;
+}
+
+# Only POST session creation needs the one-time reader proof. Revocation is
+# authenticated by the plugin cookie; every other method must forward neither
+# reader cookies nor bearer credentials, even when the API rejects that method.
+map $request_method $bt${BT_PROXY_NAMESPACE}_session_route_cookie {
+    default "";
+    POST $http_cookie;
+    DELETE $bt${BT_PROXY_NAMESPACE}_session_cookie;
+}
+
+map $request_method $bt${BT_PROXY_NAMESPACE}_session_route_authorization {
+    default "";
+    POST $http_authorization;
 }
 
 server {
@@ -27,6 +48,30 @@ server {
     gzip on;
     gzip_types text/css application/javascript application/json;
 
+    location = /bt-api/session {
+        client_max_body_size 1k;
+        proxy_pass ${BT_API_UPSTREAM}/session;
+        proxy_ssl_server_name on;
+        proxy_set_header Host ${BT_PUBLIC_HOST};
+        # This is the only API route allowed to receive raw reader proof. The
+        # broker applies an exact cookie/JWT allowlist and never persists it.
+        proxy_set_header Cookie $bt${BT_PROXY_NAMESPACE}_session_route_cookie;
+        proxy_set_header Authorization $bt${BT_PROXY_NAMESPACE}_session_route_authorization;
+        proxy_set_header X-BT-Subject "";
+        proxy_set_header X-BT-Roles "";
+        proxy_set_header X-authentik-uid "";
+        proxy_set_header X-authentik-groups "";
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header User-Agent $http_user_agent;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Host ${BT_PUBLIC_HOST};
+        proxy_set_header X-Forwarded-Port "";
+        proxy_set_header X-Forwarded-Proto ${BT_PUBLIC_SCHEME};
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 10s;
+    }
+
     location /bt-api/ {
         # The API's own WSGI cap is 2 MB (BT_MAX_CONTENT_LENGTH); 3 MB here
         # lets Flask return its structured JSON 413 while nginx still stops
@@ -36,9 +81,8 @@ server {
         proxy_pass ${BT_API_UPSTREAM}/;
         proxy_ssl_server_name on;
         proxy_set_header Host ${BT_PUBLIC_HOST};
-        # Forward the browser's HttpOnly CWA session to the API. The API sends
-        # only configured cookie names to CWA's authenticated JSON probe.
-        proxy_set_header Cookie $http_cookie;
+        proxy_set_header Cookie ${BT_API_COOKIE_SOURCE};
+        proxy_set_header Authorization "";
         # This injection proxy is not an identity authority. Always discard
         # client-supplied forwarded identity; forwarded auth deployments must
         # route /bt-api through their allowlisted identity-aware proxy instead.
@@ -61,7 +105,7 @@ server {
     }
 
     location = /bt-config.json {
-        alias /tmp/nginx/browser-config.json;
+        alias ${BT_BROWSER_CONFIG_PATH};
         default_type application/json;
         add_header Cache-Control "no-store" always;
         add_header Pragma "no-cache" always;
@@ -73,7 +117,7 @@ server {
     }
 
     location / {
-        proxy_pass ${CWA_UPSTREAM};
+        proxy_pass ${BT_READER_UPSTREAM};
         proxy_http_version 1.1;
         proxy_ssl_server_name on;
         proxy_set_header Host ${BT_PUBLIC_HOST};
@@ -90,13 +134,12 @@ server {
         proxy_set_header X-authentik-uid "";
         proxy_set_header X-authentik-groups "";
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Connection $bt${BT_PROXY_NAMESPACE}_connection_upgrade;
         proxy_connect_timeout 2s;
         proxy_read_timeout 300s;
 
         # The whole plugin injection: one tag before </head> on HTML responses.
-        # loader.js self-guards to /read/ pages, so injecting site-wide is safe
-        # and keeps this config free of assumptions about CWA's routes.
+        # loader.js self-guards to supported CWA or Kavita EPUB routes.
         proxy_set_header Accept-Encoding "";
         sub_filter '</head>' '<script src="/bt-static/loader.js?v=${BT_UI_VERSION}"></script></head>';
         sub_filter_once on;

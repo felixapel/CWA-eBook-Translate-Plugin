@@ -1,4 +1,4 @@
-"""Unraid adapter using local Docker only; no SSH, registry, or CWA overlay."""
+"""Unraid adapter using local Docker only; no SSH, registry, or reader fork."""
 
 from __future__ import annotations
 
@@ -19,10 +19,15 @@ from btctl_compose import (
     ComposeInstaller,
     InstallError,
     _container_networks,
+    _cleaned_attempt_matches,
     _completed_uninstall_for_reinstall,
-    _has_exact_cwa_version,
+    _has_exact_reader_version,
+    _install_attempt_payload,
     _labels,
+    _bounded_error,
+    _managed_credential_present,
     _probe_runtime_dependencies,
+    _remove_new_session_key,
     _validate_data_destination,
     _verify_identity_edge_artifact,
     _verify_private_network,
@@ -32,6 +37,7 @@ from btctl_core import (
     ConfigError,
     DeploymentPlan,
     DeploymentState,
+    InstallAttemptStore,
     InstallConfig,
     OperationLock,
     StateStore,
@@ -62,6 +68,7 @@ class UnraidDocker(Protocol):
     def inspect_network(self, name: str) -> dict | None: ...
     def inspect_image(self, name: str) -> dict | None: ...
     def build_image(self, repository: Path, image: str, labels: dict[str, str]) -> None: ...
+    def remove_data_credential(self, image: str, path: Path, filename: str) -> None: ...
     def create_network(self, name: str, labels: dict[str, str], *, internal: bool) -> None: ...
     def create_container(self, spec: ContainerSpec) -> None: ...
     def connect_network(self, network: str, container: str) -> None: ...
@@ -252,15 +259,17 @@ class UnraidInstaller:
             plan,
             allow_rolled_back=allow_rolled_back_state,
         )
-        cwa = self.docker.inspect_container(config.cwa_container)
-        if cwa is None or cwa.get("State", {}).get("Status") != "running":
-            raise InstallError("configured CWA container is missing or stopped")
-        if not _has_exact_cwa_version(cwa, config.cwa_version):
-            raise InstallError("configured CWA version lacks exact runtime evidence")
-        if config.cwa_network not in _container_networks(cwa):
-            raise InstallError("configured CWA is not on BT_CWA_NETWORK")
-        if self.docker.inspect_network(config.cwa_network) is None:
-            raise InstallError("BT_CWA_NETWORK does not exist")
+        reader = self.docker.inspect_container(config.reader_container)
+        if reader is None or reader.get("State", {}).get("Status") != "running":
+            raise InstallError("configured reader container is missing or stopped")
+        if not _has_exact_reader_version(
+            reader, config.reader_version, config.reader_image_id
+        ):
+            raise InstallError("configured reader version lacks exact runtime evidence")
+        if config.reader_network not in _container_networks(reader):
+            raise InstallError("configured reader is not on BT_READER_NETWORK")
+        if self.docker.inspect_network(config.reader_network) is None:
+            raise InstallError("BT_READER_NETWORK does not exist")
         if config.edge_network and self.docker.inspect_network(config.edge_network) is None:
             raise InstallError("BT_EDGE_NETWORK does not exist")
         for role in ("api", "proxy"):
@@ -274,9 +283,24 @@ class UnraidInstaller:
             target = Path(plan.resources[f"{role}_template"]["path"])
             if target.exists() or target.is_symlink():
                 raise InstallError(f"Unraid {role} template already exists")
+        cleaned_retry = False
+        try:
+            StateStore(Path(config.state_dir))._validate_destination()
+            attempt_store = InstallAttemptStore(Path(config.state_dir))
+            if attempt_store.path.exists():
+                attempt = attempt_store.load()
+                if not _cleaned_attempt_matches(attempt, plan):
+                    raise InstallError(
+                        "unfinished install attempt exists; inspect recovery evidence"
+                    )
+                cleaned_retry = True
+        except ConfigError as exc:
+            raise InstallError(f"state directory is unsafe: {exc}") from exc
         _validate_data_destination(
             Path(config.data_dir),
-            allow_nonempty=allow_existing_data or previous_state is not None,
+            allow_nonempty=(
+                allow_existing_data or previous_state is not None or cleaned_retry
+            ),
         )
         return previous_state
 
@@ -306,46 +330,117 @@ class UnraidInstaller:
             allow_existing_data=_allow_existing_data,
             allow_rolled_back_state=_allow_rolled_back_state,
         )
-        image_labels = {
-            "io.cwa-translate.version": config.identity.version,
-            "io.cwa-translate.revision": config.identity.sha,
-            "io.cwa-translate.source": "local-checkout",
-        }
-        self.docker.build_image(Path(repository), config.image, image_labels)
-        verifier = ComposeInstaller(self.docker)
-        image_id = verifier._verify_image(config, self.docker.inspect_image(config.image))
-        self.prepare_data(Path(config.data_dir))
-
+        install_id = str(uuid.uuid4())
         state_dir = Path(config.state_dir)
+        attempt_store = InstallAttemptStore(state_dir)
+        retry_evidence: dict[str, object] | None = None
+        if attempt_store.path.exists():
+            try:
+                retry_evidence = attempt_store.load()
+            except ConfigError as exc:
+                raise InstallError(
+                    "cleaned retry evidence could not be reloaded"
+                ) from exc
+        attempt = _install_attempt_payload(plan, install_id)
+        try:
+            attempt_store.save(attempt)
+        except ConfigError as exc:
+            raise InstallError("install attempt could not be committed") from exc
         api_env = state_dir / "api.env"
         proxy_env = state_dir / "proxy.env"
-        _write_private(api_env, _environment_text({**config.api_environment(), "BT_ROLE": "api"}))
-        _write_private(
-            proxy_env,
-            _environment_text(
-                {
-                    **config.proxy_environment(),
-                    "BT_ROLE": "proxy",
-                    "BT_API_UPSTREAM": f"http://{plan.resources['api']['name']}:8390",
+        session_key_preexisting = False
+        try:
+            image_labels = {
+                "io.book-translator.version": config.identity.version,
+                "io.book-translator.revision": config.identity.sha,
+                "io.book-translator.source": "local-checkout",
+                "io.cwa-translate.version": config.identity.version,
+                "io.cwa-translate.revision": config.identity.sha,
+                "io.cwa-translate.source": "local-checkout",
+            }
+            if config.reader_type != "cwa":
+                image_labels = {
+                    key: value
+                    for key, value in image_labels.items()
+                    if not key.startswith("io.cwa-translate.")
                 }
-            ),
-        )
-        templates = render_templates(config, plan)
-        for role, source in templates.items():
-            _write_private(state_dir / f"{role}.template.xml", source)
-        if config.auth_profile == "authentik-forwarded":
-            artifact = render_authentik_edge(config, plan)
-            artifact_path = Path(str(plan.resources["identity_edge_config"]["path"]))
-            if artifact_path.name != artifact.filename:
-                raise InstallError("identity-edge artifact name does not match the plan")
-            _write_private(artifact_path, artifact.content)
+            self.docker.build_image(Path(repository), config.image, image_labels)
+            verifier = ComposeInstaller(self.docker)
+            image_id = verifier._verify_image(
+                config, self.docker.inspect_image(config.image)
+            )
+            self.prepare_data(Path(config.data_dir))
+            if config.uses_reader_session:
+                session_key_preexisting = _managed_credential_present(
+                    Path(config.data_dir) / "reader_session_key"
+                )
 
-        install_id = str(uuid.uuid4())
+            _write_private(
+                api_env,
+                _environment_text(
+                    {
+                        **config.api_environment(),
+                        "BT_ROLE": "api",
+                        **(
+                            {"BT_READER_CONNECTOR_ID": install_id}
+                            if config.uses_reader_session
+                            else {}
+                        ),
+                    }
+                ),
+            )
+            _write_private(
+                proxy_env,
+                _environment_text(
+                    {
+                        **config.proxy_environment(),
+                        "BT_ROLE": "proxy",
+                        "BT_API_UPSTREAM": "http://translator-api:8390",
+                    }
+                ),
+            )
+            templates = render_templates(config, plan)
+            for role, source in templates.items():
+                _write_private(state_dir / f"{role}.template.xml", source)
+            if config.auth_profile == "authentik-forwarded":
+                artifact = render_authentik_edge(config, plan)
+                artifact_path = Path(
+                    str(plan.resources["identity_edge_config"]["path"])
+                )
+                if artifact_path.name != artifact.filename:
+                    raise InstallError(
+                        "identity-edge artifact name does not match the plan"
+                    )
+                _write_private(artifact_path, artifact.content)
+        except BaseException as exc:
+            cleanup_errors: list[str] = []
+            try:
+                if retry_evidence is None:
+                    attempt_store.remove()
+                else:
+                    attempt_store.save(retry_evidence)
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(_bounded_error("journal", cleanup_exc))
+            if cleanup_errors:
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
+                except BaseException:
+                    pass
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
+            raise
+
         private_name = str(plan.resources["private_network"]["name"])
         network_attempted = False
         attempted_roles: list[tuple[str, str]] = []
         copied_templates: list[Path] = []
+        state_committed = False
         try:
+            attempt["status"] = "starting"
+            attempt_store.save(attempt)
             network_attempted = True
             self.docker.create_network(
                 private_name,
@@ -368,8 +463,8 @@ class UnraidInstaller:
                 )
             )
             api_external = (
-                config.cwa_network
-                if config.auth_profile == "cwa-session"
+                config.reader_network
+                if config.uses_reader_session
                 else config.edge_network
             )
             self.docker.connect_network(api_external, api_name)
@@ -391,7 +486,7 @@ class UnraidInstaller:
                     publish_port=config.proxy_port,
                 )
             )
-            self.docker.connect_network(config.cwa_network, proxy_name)
+            self.docker.connect_network(config.reader_network, proxy_name)
             if config.edge_network:
                 self.docker.connect_network(config.edge_network, proxy_name)
             self.docker.start_container(proxy_name)
@@ -425,13 +520,23 @@ class UnraidInstaller:
             if previous_state is not None:
                 state_store.archive(previous_state)
             state_store.save(state)
+            state_committed = True
+            attempt_store.remove()
             return state
-        except BaseException:
+        except BaseException as exc:
+            if state_committed:
+                raise InstallError(
+                    "runtime state committed but install-attempt cleanup failed; "
+                    "run doctor before further lifecycle operations"
+                ) from exc
+            cleanup_errors: list[str] = []
             for target in reversed(copied_templates):
                 try:
                     target.unlink()
-                except OSError:
-                    pass
+                except OSError as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error(f"template {target.name}", cleanup_exc)
+                    )
             for role, name in reversed(attempted_roles):
                 try:
                     container = self.docker.inspect_container(name)
@@ -447,16 +552,56 @@ class UnraidInstaller:
                         and all(labels.get(key) == value for key, value in expected.items())
                     ):
                         self.docker.remove_container(name)
-                except BaseException:
-                    pass
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error(f"{role} container", cleanup_exc)
+                    )
             if network_attempted:
                 try:
                     network = self.docker.inspect_network(private_name)
                     if network is not None:
                         _verify_private_network(config, install_id, network)
                         self.docker.remove_network(private_name)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error("private network", cleanup_exc)
+                    )
+            if not cleanup_errors:
+                try:
+                    _remove_new_session_key(
+                        self.docker,
+                        config,
+                        preexisting=session_key_preexisting,
+                    )
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error("reader session credential", cleanup_exc)
+                    )
+            if cleanup_errors:
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
+                except BaseException as journal_exc:
+                    cleanup_errors.append(_bounded_error("journal", journal_exc))
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
+            attempt["status"] = "cleaned"
+            attempt["cleanup_errors"] = []
+            try:
+                attempt_store.save(attempt)
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(_bounded_error("journal", cleanup_exc))
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
                 except BaseException:
                     pass
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
             raise
 
 
@@ -482,34 +627,40 @@ class UnraidAdopter:
         store = StateStore(Path(config.state_dir))
         if store.path.exists():
             raise InstallError("deployment state already exists; use doctor")
-        cwa = self.docker.inspect_container(config.cwa_container)
+        reader = self.docker.inspect_container(config.reader_container)
         if (
-            cwa is None
-            or cwa.get("State", {}).get("Status") != "running"
-            or not _has_exact_cwa_version(cwa, config.cwa_version)
-            or config.cwa_network not in _container_networks(cwa)
+            reader is None
+            or reader.get("State", {}).get("Status") != "running"
+            or not _has_exact_reader_version(
+                reader, config.reader_version, config.reader_image_id
+            )
+            or config.reader_network not in _container_networks(reader)
         ):
-            raise InstallError("configured CWA evidence does not match")
+            raise InstallError("configured reader evidence does not match")
         containers = {
             role: self.docker.inspect_container(str(plan.resources[role]["name"]))
             for role in ("api", "proxy")
         }
         for role, container in containers.items():
             labels = container.get("Config", {}).get("Labels", {}) if container else {}
+            neutral = "io.book-translator."
+            legacy = "io.cwa-translate." if config.reader_type == "cwa" else neutral
             if (
                 not container
-                or labels.get("io.cwa-translate.managed-by") != "btctl"
-                or labels.get("io.cwa-translate.role") != role
-                or labels.get("io.cwa-translate.version") != config.identity.version
-                or labels.get("io.cwa-translate.revision") != config.identity.sha
-                or not labels.get("io.cwa-translate.install-id")
+                or labels.get(neutral + "managed-by") != "btctl"
+                or labels.get(neutral + "role") != role
+                or labels.get(neutral + "version") != config.identity.version
+                or labels.get(neutral + "revision") != config.identity.sha
+                or not labels.get(neutral + "install-id")
+                or labels.get(legacy + "install-id")
+                != labels.get(neutral + "install-id")
             ):
                 raise InstallError(f"{role} ownership labels are missing or incompatible")
         install_id = containers["api"]["Config"]["Labels"][
-            "io.cwa-translate.install-id"
+            "io.book-translator.install-id"
         ]
         if containers["proxy"]["Config"]["Labels"].get(
-            "io.cwa-translate.install-id"
+            "io.book-translator.install-id"
         ) != install_id:
             raise InstallError("split runtime install-id labels do not match")
         verifier = ComposeInstaller(self.docker)

@@ -33,10 +33,12 @@ from translator import (
     cache_lookup_backends, translation_groups, batch_cache_contract,
     single_cache_contract, singleflight_stats, BatchRecoveryTracker,
     RECOVERY_METRIC_NAMES,
+    provider_policy,
+    initialize_provider_configuration,
 )
 from work_budget import WorkBudget, WorkBudgetExceeded
 from cache import (
-    CacheScope, get_cached, put_cache, record_cache_hit,
+    CacheScope, get_cached, put_cache, put_cache_many, record_cache_hit,
     get_cache_stats, cleanup_old_entries,
 )
 
@@ -180,6 +182,11 @@ log = logging.getLogger("book-translator.server")
 # BT_AUTH_MODE=disabled remains available only as an explicit development/test
 # choice; it is never the default.
 AUTHENTICATOR = RequestAuthenticator.from_environment()
+initialize_provider_configuration()
+# Non-secret process generation. A managed provider reconfigure replaces the
+# API process, so an open reader can prove it learned policy from this exact
+# provider generation without exposing provider/model/endpoint identity.
+PROVIDER_POLICY_GENERATION = uuid.uuid4().hex
 
 app = Flask(__name__)
 
@@ -222,6 +229,32 @@ def _cloud_fallback_consent(data: dict) -> bool:
     if type(consent) is not bool:
         raise ValueError("'allow_cloud_fallback' must be a boolean")
     return consent
+
+
+def _stale_provider_policy(data: dict) -> bool:
+    """Reject official-reader requests bound to an obsolete locality policy."""
+    if "provider_policy" not in data:
+        # Token-mode API clients retain the pre-existing optional contract.
+        # Managed browser modes fail closed so an already-open old reader
+        # cannot bypass the generation boundary after an API replacement.
+        return AUTHENTICATOR.mode in {
+            "cwa_session", "reader_session", "forwarded"
+        }
+    policy = data["provider_policy"]
+    if (
+        not isinstance(policy, dict)
+        or set(policy) != {"primary", "fallback", "generation"}
+        or policy.get("primary") not in {"local", "remote"}
+        or policy.get("fallback") not in {None, "local", "remote"}
+        or not isinstance(policy.get("generation"), str)
+        or len(policy.get("generation")) != 32
+    ):
+        raise ValueError("'provider_policy' must be an exact locality policy")
+    current = {
+        **provider_policy(),
+        "generation": PROVIDER_POLICY_GENERATION,
+    }
+    return policy != current
 
 # ── Language validation (H7) ────────────────────────────────────────────────
 # The selectable set mirrors Gemma 4's pre-training coverage (top-10 most
@@ -334,7 +367,7 @@ def _is_origin_allowed(origin: str | None) -> str | None:
     # Credentialed CWA-session requests may never combine cookies with a
     # subnet-wide origin policy. Cross-origin operators must enumerate the
     # exact reader origin; same-origin proxy mode needs no CORS at all.
-    if AUTHENTICATOR.mode == "cwa_session":
+    if AUTHENTICATOR.mode in {"cwa_session", "reader_session"}:
         return None
     if BT_ALLOW_PRIVATE_LAN and _PRIVATE_ORIGIN_RE.match(origin):
         return origin
@@ -872,6 +905,7 @@ def _translate_paragraphs(
             )
         finally:
             _flush_segment_recovery(recovery_tracker)
+        cache_writes: list[tuple[str, str, str, str, CacheScope]] = []
         for group in missing_groups:
             contract = contracts[tuple(group)]
             for index in group:
@@ -885,29 +919,28 @@ def _translate_paragraphs(
                 fresh_count += 1
                 if not item.server_cacheable:
                     continue
-                try:
-                    scope = _cache_scope(
-                        tenant=tenant,
-                        book_id=book_id,
-                        chapter_id=chapter_id,
-                        context_hash=contract.context_hash,
-                        provider=backend,
-                        model=model_for_provider(backend),
-                        prompt_hash=contract.prompt_hash,
-                        protocol_version=contract.protocol_version,
-                    )
-                    put_cache(
-                        paragraphs[index],
-                        source_lang,
-                        target_lang,
-                        translated,
-                        scope=scope,
-                    )
-                except Exception as exc:
-                    log.error(
-                        "Cache write failed (non-fatal) error_type=%s",
-                        type(exc).__name__,
-                    )
+                scope = _cache_scope(
+                    tenant=tenant,
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    context_hash=contract.context_hash,
+                    provider=backend,
+                    model=model_for_provider(backend),
+                    prompt_hash=contract.prompt_hash,
+                    protocol_version=contract.protocol_version,
+                )
+                cache_writes.append((
+                    paragraphs[index], source_lang, target_lang,
+                    translated, scope,
+                ))
+        if cache_writes:
+            try:
+                put_cache_many(cache_writes)
+            except Exception as exc:
+                log.error(
+                    "Cache write failed (non-fatal) error_type=%s",
+                    type(exc).__name__,
+                )
 
     total_elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -932,9 +965,15 @@ def before_request_hook():
     # Liveness/readiness and preflight stay independent of external auth so
     # orchestration can diagnose an auth-authority outage. Everything else,
     # including metrics and stats, receives a server-owned opaque subject.
+    session_exchange = (
+        AUTHENTICATOR.mode == "reader_session"
+        and request.path == "/session"
+        and request.method == "POST"
+    )
     protected = (
         request.method != "OPTIONS"
         and request.path not in ("/health", "/ready", "/ping")
+        and not session_exchange
     )
     if protected:
         auth_client_key = _client_ip()
@@ -962,7 +1001,7 @@ def before_request_hook():
         try:
             try:
                 auth_kwargs = {}
-                if AUTHENTICATOR.mode == "cwa_session":
+                if AUTHENTICATOR.mode in {"cwa_session", "reader_session"}:
                     auth_kwargs["cwa_binding"] = _cwa_session_binding()
                 identity = AUTHENTICATOR.authenticate(
                     request.headers,
@@ -1041,13 +1080,95 @@ def after_request_hook(response):
         # Let cross-origin JS read the request ID and 429 Retry-After header.
         response.headers["Access-Control-Expose-Headers"] = "X-Request-ID, Retry-After"
         response.vary.add("Origin")
-        if AUTHENTICATOR.mode == "cwa_session":
+        if AUTHENTICATOR.mode in {"cwa_session", "reader_session"}:
             response.headers["Access-Control-Allow-Credentials"] = "true"
 
     return response
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
+
+
+@app.route("/session", methods=["POST", "DELETE"])
+def reader_session():
+    """Exchange reader credentials for, or revoke, one short-lived BT session."""
+    broker = getattr(AUTHENTICATOR, "reader_session_broker", None)
+    if AUTHENTICATOR.mode != "reader_session" or broker is None:
+        return jsonify({
+            "error": "not_found",
+            "request_id": getattr(request, "request_id", None),
+        }), 404
+
+    try:
+        binding = _cwa_session_binding()
+    except AuthRejected:
+        return jsonify({
+            "error": "unauthorized",
+            "request_id": request.request_id,
+        }), 401
+    if request.method == "DELETE":
+        try:
+            broker.revoke(request.headers, binding)
+        except Exception as exc:
+            from reader_session import BrokerRejected
+
+            if isinstance(exc, BrokerRejected):
+                return jsonify({
+                    "error": "unauthorized",
+                    "request_id": request.request_id,
+                }), 401
+            raise
+        response = jsonify({"status": "revoked", "request_id": request.request_id})
+        response.headers["Set-Cookie"] = broker.clear_cookie
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    # The credential travels in Authorization or Cookie. A request body is
+    # unnecessary and would expand the sensitive parser surface.
+    if request.content_length not in (None, 0) or request.get_data(cache=False):
+        return jsonify({
+            "error": "bad_request",
+            "request_id": request.request_id,
+        }), 400
+    client_key = _client_ip()
+    if not _check_auth_rate_limit(client_key) or not _acquire_auth_inflight(client_key):
+        response = jsonify({
+            "error": "rate_limited",
+            "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+            "request_id": request.request_id,
+        })
+        response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
+        return response, 429
+    try:
+        try:
+            issue = broker.exchange(request.headers, binding)
+        except Exception as exc:
+            from reader_session import BrokerRejected, BrokerUnavailable
+
+            if isinstance(exc, BrokerRejected):
+                return jsonify({
+                    "error": "unauthorized",
+                    "request_id": request.request_id,
+                }), 401
+            if isinstance(exc, BrokerUnavailable):
+                return jsonify({
+                    "error": "authentication_unavailable",
+                    "request_id": request.request_id,
+                }), 503
+            raise
+    finally:
+        _release_auth_inflight(client_key)
+    response = jsonify({
+        "status": "ok",
+        "expires_in": issue.expires_in,
+        "reader_type": broker.reader_type,
+        "reader_version": broker.reader_version,
+        "request_id": request.request_id,
+    })
+    response.headers["Set-Cookie"] = issue.set_cookie
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.errorhandler(HTTPException)
@@ -1122,6 +1243,17 @@ def health():
     })
 
 
+@app.route("/provider-policy")
+def get_provider_policy():
+    """Return backend locality plus an opaque generation for consent binding."""
+    response = jsonify({
+        **provider_policy(),
+        "generation": PROVIDER_POLICY_GENERATION,
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/health/deep")
 def deep_health():
     """Operator-only provider probe using normal work and concurrency caps."""
@@ -1147,7 +1279,7 @@ def deep_health():
         backend_health = check_backend_health(create_work_budget())
     except WorkBudgetExceeded as exc:
         return _work_budget_response(exc)
-    overall = "ok" if any(
+    overall = "ok" if backend_health and all(
         b.get("status") == "ok" for b in backend_health.values()
     ) else "degraded"
     return jsonify({
@@ -1240,8 +1372,14 @@ def translate():
 
     try:
         allow_cloud_fallback = _cloud_fallback_consent(data)
+        stale_provider_policy = _stale_provider_policy(data)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    if stale_provider_policy:
+        return jsonify({
+            "error": "provider_policy_changed",
+            "request_id": getattr(request, "request_id", None),
+        }), 409
 
     try:
         tenant, book_id, chapter_id = _request_cache_namespace(data)
@@ -1428,8 +1566,14 @@ def translate_batch_endpoint():
 
     try:
         allow_cloud_fallback = _cloud_fallback_consent(data)
+        stale_provider_policy = _stale_provider_policy(data)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    if stale_provider_policy:
+        return jsonify({
+            "error": "provider_policy_changed",
+            "request_id": getattr(request, "request_id", None),
+        }), 409
 
     try:
         tenant, book_id, chapter_id = _request_cache_namespace(data)

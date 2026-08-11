@@ -9,7 +9,7 @@ Only the latest release (and `main`) receives security fixes.
 Please report vulnerabilities privately via **GitHub Security Advisories**
 ("Report a vulnerability" on the repository's Security tab) rather than a
 public issue. If that form is unavailable, email
-`felixguillermoapel@gmail.com` with the subject `CWA Translate security report`.
+`felixguillermoapel@gmail.com` with the subject `eBook Translate security report`.
 Do not include credentials, session cookies, book text, or provider keys unless
 we explicitly arrange a safe transfer. You should get a first response within
 7 days.
@@ -17,9 +17,10 @@ we explicitly arrange a safe transfer. You should get a first response within
 ## Scope notes for self-hosters
 
 - The API fails startup by default unless an authentication authority is
-  configured. Use `cwa_session` in the recommended same-origin proxy topology,
-  or `forwarded` behind an identity proxy whose CIDR is allowlisted. `token` is
-  a shared-tenant compatibility mode; `disabled` is development-only.
+  configured. The universal hub uses reader-session exchange for CWA and
+  Kavita. Managed split installs also support native CWA sessions or `forwarded`
+  behind an identity proxy whose exact peer is allowlisted. `token` is a shared-
+  tenant compatibility mode; `disabled` is development-only.
 - In `forwarded` mode the identity proxy must strip incoming `X-BT-Subject` and
   `X-BT-Roles` before setting trusted values. Never publish a bypass route to
   the API. The bundled injection proxy strips these headers and cannot serve as
@@ -29,8 +30,11 @@ we explicitly arrange a safe transfer. You should get a first response within
   probe must target the exact authenticated `/ajax/emailstat` path and return a
   bounded JSON task list. Browser requests omit cookies entirely in `token` and
   `forwarded` modes.
-- The API never stores your provider API keys anywhere except the container
-  environment you configure. Cache schema v2 stores translated results and
-  one-way source/scope hashes, not source paragraphs, raw identities, or CWA
-  cookies. Provider prompts still leave the host when a cloud provider is
+- Provider API keys remain in the private server-side environment supplied to
+  the container and are never sent to reader configuration or browser storage.
+  Protect environment files as secrets, restrict cloud keys to the required API
+  and never use a consumer subscription/browser session as an API credential.
+  Cache schema v2 stores translated results and
+  one-way source/scope hashes, not source paragraphs, raw identities, or reader
+  credentials. Provider prompts still leave the host when a cloud provider is
   configured; see the fallback/privacy warning in the configuration guide.

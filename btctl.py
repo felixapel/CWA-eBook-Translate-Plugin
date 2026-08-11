@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -21,17 +23,28 @@ from btctl_core import (
 )
 from btctl_compose import ComposeAdopter, ComposeInstaller, InstallError
 from btctl_docker import DockerCLI, DockerCommandError
+from btctl_hub import (
+    HubDoctor,
+    HubInstallConfig,
+    HubInstaller,
+    HubPlan,
+    HubTopologyMigration,
+    HubUninstaller,
+    is_hub_configuration,
+)
 from btctl_lifecycle import (
     DeploymentDoctor,
     LegacyUpgrade,
     RuntimeUninstaller,
 )
-from btctl_paths import validate_unraid_config_paths
+from btctl_paths import paths_overlap, validate_storage_path, validate_unraid_config_paths
+from btctl_reconfigure import ProviderReconfigurer
 from btctl_unraid import UnraidAdopter, UnraidInstaller
 
 
 EX_USAGE = 64
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UNRAID_LOCK_DIRECTORY = Path("/run/cwa-translate-btctl-locks")
 _CONTAINER_LOCK_DIRECTORY = Path("/run/btctl-lock")
 
@@ -73,6 +86,11 @@ def _parser() -> argparse.ArgumentParser:
         "doctor", help="read-only verification of state, ownership, auth, and runtime"
     )
     doctor.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
+    doctor.add_argument(
+        "--deep",
+        action="store_true",
+        help="after structural checks, make one bounded probe of each provider",
+    )
     doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     uninstall = commands.add_parser(
         "uninstall", help="remove only owned runtime while preserving data and backups"
@@ -92,6 +110,44 @@ def _parser() -> argparse.ArgumentParser:
     rollback.add_argument("--env", required=True, type=Path, help="strict KEY=value file")
     rollback.add_argument("--yes", action="store_true", help="confirm rollback")
     rollback.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    reconfigure = commands.add_parser(
+        "reconfigure",
+        help="transactionally replace only the API role's provider configuration",
+    )
+    reconfigure.add_argument(
+        "--env", required=True, type=Path, help="strict replacement KEY=value file"
+    )
+    reconfigure.add_argument(
+        "--yes", action="store_true", help="confirm the redacted provider cutover"
+    )
+    reconfigure.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    migrate_topology = commands.add_parser(
+        "migrate-topology",
+        help="stop exact split deployments and cut over to one universal hub",
+    )
+    migrate_topology.add_argument(
+        "--env", required=True, type=Path, help="strict hub KEY=value file"
+    )
+    migrate_topology.add_argument(
+        "--from-state",
+        required=True,
+        action="append",
+        type=Path,
+        help="source split state directory or state.json; repeat per enabled reader",
+    )
+    migrate_topology.add_argument("--yes", action="store_true")
+    migrate_topology.add_argument("--json", action="store_true")
+    rollback_topology = commands.add_parser(
+        "rollback-topology",
+        help="remove the migrated hub and restore the exact split runtimes",
+    )
+    rollback_topology.add_argument(
+        "--env", required=True, type=Path, help="strict hub KEY=value file"
+    )
+    rollback_topology.add_argument("--yes", action="store_true")
+    rollback_topology.add_argument("--json", action="store_true")
     return parser
 
 
@@ -112,9 +168,24 @@ def _load_values(env_file: Path) -> dict[str, str]:
             )
         if metadata.st_size > 1024 * 1024:
             raise ConfigError("environment file exceeds the 1 MiB safety limit")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        expected_digest = os.environ.get("BTCTL_EXPECTED_ENV_SHA256", "")
+        if expected_digest:
+            if not _SHA256_RE.fullmatch(expected_digest):
+                raise ConfigError("expected environment snapshot digest is invalid")
+            if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+                raise ConfigError(
+                    "container environment snapshot must be root-owned mode 0600"
+                )
+        with os.fdopen(descriptor, "rb") as handle:
             descriptor = None
-            source = handle.read()
+            source_bytes = handle.read((1024 * 1024) + 1)
+        if len(source_bytes) > 1024 * 1024:
+            raise ConfigError("environment file exceeds the 1 MiB safety limit")
+        if expected_digest and not hmac.compare_digest(
+            hashlib.sha256(source_bytes).hexdigest(), expected_digest
+        ):
+            raise ConfigError("environment snapshot changed after planning")
+        source = source_bytes.decode("utf-8")
     except ConfigError:
         raise
     except (OSError, UnicodeError) as exc:
@@ -144,6 +215,8 @@ def _release_identity(repository: Path):
 def _load_plan(repository: Path, env_file: Path) -> DeploymentPlan:
     identity = _release_identity(repository)
     values = _load_values(env_file)
+    if is_hub_configuration(values):
+        return HubPlan.from_config(HubInstallConfig.from_mapping(values, identity))
     legacy_upgrade_plan = bool(
         values.get("BT_LEGACY_CONTAINER") and values.get("BT_LEGACY_DATA_DIR")
     )
@@ -164,6 +237,20 @@ def _load_config(
 ) -> tuple[InstallConfig, DeploymentPlan, dict[str, str]]:
     values = _load_values(env_file)
     identity = _release_identity(repository)
+    if is_hub_configuration(values):
+        config = HubInstallConfig.from_mapping(values, identity)
+        if config.install_profile == "unraid" and not os.environ.get(
+            "BTCTL_EXPECTED_REVISION"
+        ):
+            for label, value in (
+                ("BT_STATE_DIR", config.state_dir),
+                ("BT_DATA_DIR", config.data_dir),
+                ("BT_BACKUP_DIR", config.backup_dir),
+            ):
+                managed = validate_storage_path(Path(value), label)
+                if paths_overlap(repository.resolve(), managed.resolve()):
+                    raise ConfigError(f"{label} must not overlap the Git checkout")
+        return config, HubPlan.from_config(config), values
     config = InstallConfig.from_mapping(
         values, identity, allow_legacy_cwa=allow_legacy_cwa
     )
@@ -259,7 +346,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
                 raise ConfigError("install requires --yes after reviewing the plan")
             docker = _docker_for(config)
-            if config.install_profile == "compose-existing":
+            if isinstance(config, HubInstallConfig):
+                state = HubInstaller(docker).install(config, plan, args.repository)
+            elif config.install_profile == "compose-existing":
                 state = ComposeInstaller(docker).install(config, plan, args.repository)
             else:
                 state = UnraidInstaller(docker).install(config, plan, args.repository)
@@ -268,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "adopt":
             config, plan, _ = _load_config(args.repository, args.env)
+            if isinstance(config, HubInstallConfig):
+                raise ConfigError("hub adoption is not supported; use install or migrate-topology")
             docker = _docker_for(config)
             if config.install_profile == "compose-existing":
                 state = ComposeAdopter(docker).adopt(config, plan)
@@ -277,13 +368,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "auth-snippet":
             config, plan, _ = _load_config(args.repository, args.env)
+            if isinstance(config, HubInstallConfig):
+                raise ConfigError("the hub topology does not support Authentik forwarded auth")
             print(render_authentik_edge(config, plan).content, end="")
             return 0
         if args.command == "doctor":
             config, plan, _ = _load_config(
                 args.repository, args.env, allow_legacy_cwa=True
             )
-            report = DeploymentDoctor(_docker_for(config)).run(config, plan)
+            if isinstance(config, HubInstallConfig):
+                report = HubDoctor(_docker_for(config)).run(
+                    config, plan, deep=args.deep
+                )
+            else:
+                report = DeploymentDoctor(_docker_for(config)).run(
+                    config, plan, deep=args.deep
+                )
             _print_payload(report.to_dict(), compact=args.json)
             return 0 if report.ok else 1
         if args.command == "uninstall":
@@ -293,13 +393,18 @@ def main(argv: list[str] | None = None) -> int:
             if not args.yes:
                 print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
                 raise ConfigError("uninstall requires --yes after reviewing ownership")
-            state = RuntimeUninstaller(_docker_for(config)).uninstall(config, plan)
+            if isinstance(config, HubInstallConfig):
+                state = HubUninstaller(_docker_for(config)).uninstall(config, plan)
+            else:
+                state = RuntimeUninstaller(_docker_for(config)).uninstall(config, plan)
             _print_payload(state.to_dict(), compact=args.json)
             return 0
         if args.command == "upgrade":
             config, plan, values = _load_config(
                 args.repository, args.env, allow_legacy_cwa=True
             )
+            if isinstance(config, HubInstallConfig):
+                raise ConfigError("hub topology uses migrate-topology, not upgrade")
             if not args.yes:
                 print(json.dumps(plan.to_dict(), sort_keys=True, indent=2))
                 raise ConfigError("upgrade requires --yes after reviewing the plan")
@@ -318,9 +423,51 @@ def main(argv: list[str] | None = None) -> int:
                 allow_legacy_cwa=True,
                 validate_legacy_data=False,
             )
+            if isinstance(config, HubInstallConfig):
+                raise ConfigError("hub topology uses rollback-topology")
             if not args.yes:
                 raise ConfigError("rollback requires --yes")
             state = LegacyUpgrade(_docker_for(config)).rollback(config, plan)
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "reconfigure":
+            config, plan, _ = _load_config(args.repository, args.env)
+            if isinstance(config, HubInstallConfig):
+                raise ConfigError("hub provider changes require a reviewed reinstall in this release")
+            reconfigurer = ProviderReconfigurer(_docker_for(config))
+            if not args.yes:
+                preview = reconfigurer.preview(config, plan)
+                _print_payload(preview, compact=args.json)
+                raise ConfigError(
+                    "reconfigure requires --yes after reviewing the redacted plan"
+                )
+            state = reconfigurer.reconfigure(config, plan)
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "migrate-topology":
+            config, plan, _ = _load_config(args.repository, args.env)
+            if not isinstance(config, HubInstallConfig):
+                raise ConfigError("migrate-topology requires BT_TOPOLOGY=hub")
+            if not args.yes:
+                _print_payload(plan.to_dict(), compact=args.json)
+                raise ConfigError(
+                    "migrate-topology requires --yes after reviewing all source states"
+                )
+            state = HubTopologyMigration(_docker_for(config)).migrate(
+                config,
+                plan,
+                args.repository,
+                args.from_state,
+            )
+            _print_payload(state.to_dict(), compact=args.json)
+            return 0
+        if args.command == "rollback-topology":
+            config, plan, _ = _load_config(args.repository, args.env)
+            if not isinstance(config, HubInstallConfig):
+                raise ConfigError("rollback-topology requires BT_TOPOLOGY=hub")
+            if not args.yes:
+                raise ConfigError("rollback-topology requires --yes")
+            state = HubTopologyMigration(_docker_for(config)).rollback(config, plan)
             _print_payload(state.to_dict(), compact=args.json)
             return 0
         raise ConfigError("unsupported command")

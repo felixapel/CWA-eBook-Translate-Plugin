@@ -13,7 +13,7 @@ import stat
 import subprocess
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
@@ -32,14 +32,17 @@ _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _HOSTNAME_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$"
 )
-_SECRET_NAME_RE = re.compile(r"(?:KEY|PASSWORD|SECRET|TOKEN)$")
+_SECRET_NAME_RE = re.compile(r"(?:KEY|PASSWORD|SECRET|TOKEN|CUSTOM_ENDPOINT)$")
 _INSTALL_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 
 _INSTALL_PROFILES = frozenset({"unraid", "compose-existing"})
 _INGRESS_MODES = frozenset({"published", "docker-edge"})
-_AUTH_PROFILES = frozenset({"cwa-session", "authentik-forwarded"})
+_AUTH_PROFILES = frozenset(
+    {"cwa-session", "reader-session", "authentik-forwarded"}
+)
+_READER_TYPES = frozenset({"cwa", "kavita"})
 _REVERSE_PROXIES = frozenset({"nginx", "traefik", "caddy"})
 _LLM_PROVIDERS = frozenset(
     {
@@ -52,9 +55,14 @@ _LLM_PROVIDERS = frozenset(
         "minimax",
         "deepseek",
         "openrouter",
+        "openai-compatible",
     }
 )
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 3
+INSTALL_ATTEMPT_SCHEMA_VERSION = 1
+
+KAVITA_CERTIFIED_VERSION = "0.9.0.2"
+KAVITA_CERTIFIED_COMMIT = "6bcd5689385d0e96824982d843c54f15ce784ddc"
 
 _MANAGED_PROXY_HEADERS = frozenset(
     {
@@ -334,6 +342,29 @@ def _http_url(value: object, name: str) -> str:
     return f"{normalized}{parsed.path}"
 
 
+def _custom_llm_endpoint(value: object, name: str) -> str:
+    """Validate the managed public OpenAI-compatible endpoint contract."""
+    parsed, normalized = _validated_http_parts(value, name)
+    hostname = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or parsed.path != "/v1/chat/completions"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigError(
+            f"{name} must be public HTTPS with exact /v1/chat/completions path"
+        )
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        if not address.is_global:
+            raise ConfigError(f"{name} must not target a non-public IP address")
+    return f"{normalized}{parsed.path}"
+
+
 def _exact_peer(value: object) -> str:
     cleaned = _clean_value(value, "BT_IDENTITY_PROXY_IP")
     try:
@@ -523,10 +554,13 @@ class InstallConfig:
     ingress_mode: str
     auth_profile: str
     public_origin: str
-    cwa_upstream: str
-    cwa_container: str
-    cwa_network: str
-    cwa_version: str
+    reader_type: str
+    reader_upstream: str
+    reader_container: str
+    reader_network: str
+    reader_version: str
+    reader_image_id: str
+    reader_contract_version: str
     compatibility_tier: str
     cwa_identity_header: str
     edge_network: str
@@ -542,7 +576,14 @@ class InstallConfig:
     llm_provider: str
     llm_model: str
     local_url: str
-    llm_api_key: str
+    llm_api_key: str = field(repr=False)
+    llm_custom_endpoint: str
+    llm_custom_api_key: str = field(repr=False)
+    llm_fallback_provider: str
+    llm_fallback_model: str
+    llm_fallback_api_key: str = field(repr=False)
+    llm_fallback_custom_endpoint: str
+    llm_fallback_custom_api_key: str = field(repr=False)
 
     @classmethod
     def from_mapping(
@@ -563,40 +604,115 @@ class InstallConfig:
         ingress_mode = _choice(values, "BT_INGRESS_MODE", _INGRESS_MODES)
         auth_profile = _choice(values, "BT_AUTH_PROFILE", _AUTH_PROFILES)
         public_origin = _exact_origin(values.get("BT_PUBLIC_ORIGIN", ""), "BT_PUBLIC_ORIGIN")
-        cwa_upstream = _exact_origin(values.get("CWA_UPSTREAM", ""), "CWA_UPSTREAM")
-
-        cwa_container = _clean_value(
-            values.get("BT_CWA_CONTAINER", ""), "BT_CWA_CONTAINER"
+        reader_type = _clean_value(
+            values.get("BT_READER_TYPE", "cwa"), "BT_READER_TYPE"
         )
-        if not _CONTAINER_RE.fullmatch(cwa_container):
-            raise ConfigError("BT_CWA_CONTAINER must be one exact Docker container name")
-        parsed_cwa_upstream = urlsplit(cwa_upstream)
-        if (
-            parsed_cwa_upstream.scheme != "http"
-            or parsed_cwa_upstream.hostname is None
-            or parsed_cwa_upstream.hostname.casefold() != cwa_container.casefold()
-            or parsed_cwa_upstream.port != 8083
+        if reader_type not in _READER_TYPES:
+            raise ConfigError(f"BT_READER_TYPE must be one of {sorted(_READER_TYPES)}")
+
+        def reader_value(generic_name: str, legacy_name: str) -> str:
+            generic = _clean_value(
+                values.get(generic_name, ""), generic_name, allow_empty=True
+            )
+            legacy = _clean_value(
+                values.get(legacy_name, ""), legacy_name, allow_empty=True
+            )
+            if reader_type == "kavita" and legacy:
+                raise ConfigError(f"{legacy_name} is CWA-only and forbidden for Kavita")
+            if generic and legacy and generic != legacy:
+                raise ConfigError(
+                    f"{generic_name} conflicts with the legacy {legacy_name} value"
+                )
+            return _clean_value(generic or legacy, generic_name)
+
+        reader_upstream = _exact_origin(
+            reader_value("BT_READER_UPSTREAM", "CWA_UPSTREAM"),
+            "BT_READER_UPSTREAM" if reader_type == "kavita" else "CWA_UPSTREAM",
+        )
+        reader_container = reader_value("BT_READER_CONTAINER", "BT_CWA_CONTAINER")
+        if not _CONTAINER_RE.fullmatch(reader_container):
+            raise ConfigError(
+                "BT_READER_CONTAINER must be one exact Docker container name"
+            )
+        reader_network = reader_value("BT_READER_NETWORK", "BT_CWA_NETWORK")
+        if not _NETWORK_RE.fullmatch(reader_network):
+            raise ConfigError("BT_READER_NETWORK must be one exact Docker network name")
+        reader_version = reader_value("BT_READER_VERSION", "BT_CWA_VERSION")
+        reader_image_id = _clean_value(
+            values.get("BT_READER_IMAGE_ID", ""),
+            "BT_READER_IMAGE_ID",
+            allow_empty=True,
+        )
+        if reader_image_id and not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", reader_image_id
         ):
             raise ConfigError(
-                "CWA_UPSTREAM must be exactly http://<BT_CWA_CONTAINER>:8083"
+                "BT_READER_IMAGE_ID must be an exact lowercase sha256 image ID"
             )
-        cwa_upstream = f"http://{cwa_container}:8083"
-        cwa_network = _clean_value(
-            values.get("BT_CWA_NETWORK", ""), "BT_CWA_NETWORK"
-        )
-        if not _NETWORK_RE.fullmatch(cwa_network):
-            raise ConfigError("BT_CWA_NETWORK must be one exact Docker network name")
-        cwa_version = _clean_value(
-            values.get("BT_CWA_VERSION", ""), "BT_CWA_VERSION"
-        )
-        cwa_tier = compatibility_tier(cwa_version)
-        if cwa_tier == "legacy" and not allow_legacy_cwa:
+
+        parsed_reader_upstream = urlsplit(reader_upstream)
+        expected_port = 8083 if reader_type == "cwa" else 5000
+        if (
+            parsed_reader_upstream.scheme != "http"
+            or parsed_reader_upstream.hostname is None
+            or parsed_reader_upstream.hostname.casefold()
+            != reader_container.casefold()
+            or parsed_reader_upstream.port != expected_port
+        ):
+            if reader_type == "cwa":
+                raise ConfigError(
+                    "CWA_UPSTREAM must be exactly http://<BT_CWA_CONTAINER>:8083"
+                )
             raise ConfigError(
-                "CWA 3.1.4 is migration-only; use the explicit btctl upgrade workflow"
+                "BT_READER_UPSTREAM must be exactly "
+                "http://<BT_READER_CONTAINER>:5000 for Kavita"
             )
-        cwa_identity_header = _cwa_identity_header(
-            values.get("BT_CWA_IDENTITY_HEADER", "Remote-User")
-        )
+        reader_upstream = f"http://{reader_container}:{expected_port}"
+
+        if reader_type == "cwa":
+            compatibility = compatibility_tier(reader_version)
+            if compatibility == "legacy" and not allow_legacy_cwa:
+                raise ConfigError(
+                    "CWA 3.1.4 is migration-only; use the explicit btctl upgrade workflow"
+                )
+            reader_contract_version = "cwa-epub-v1"
+            cwa_identity_header = _cwa_identity_header(
+                values.get("BT_CWA_IDENTITY_HEADER", "Remote-User")
+            )
+            if auth_profile not in {
+                "cwa-session",
+                "reader-session",
+                "authentik-forwarded",
+            }:
+                raise ConfigError("CWA requires a supported reader authentication profile")
+        else:
+            if reader_version != KAVITA_CERTIFIED_VERSION:
+                raise ConfigError(
+                    "the only certified Kavita version is exactly 0.9.0.2"
+                )
+            compatibility = "certified"
+            reader_contract_version = "kavita-0.9.0.2-epub-v1"
+            if _clean_value(
+                values.get("BT_CWA_IDENTITY_HEADER", ""),
+                "BT_CWA_IDENTITY_HEADER",
+                allow_empty=True,
+            ):
+                raise ConfigError("BT_CWA_IDENTITY_HEADER is CWA-only and forbidden for Kavita")
+            cwa_identity_header = ""
+            if auth_profile != "reader-session":
+                raise ConfigError("Kavita requires BT_AUTH_PROFILE=reader-session")
+        if auth_profile in {"cwa-session", "reader-session"}:
+            parsed_public_origin = urlsplit(public_origin)
+            hostname = parsed_public_origin.hostname or ""
+            loopback = hostname.casefold() == "localhost"
+            try:
+                loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                pass
+            if parsed_public_origin.scheme != "https" and not loopback:
+                raise ConfigError(
+                    "reader-session BT_PUBLIC_ORIGIN requires HTTPS outside loopback development"
+                )
         state_dir = _absolute_dir(values.get("BT_STATE_DIR", ""), "BT_STATE_DIR")
         data_dir = _absolute_dir(values.get("BT_DATA_DIR", ""), "BT_DATA_DIR")
         backup_dir = _absolute_dir(values.get("BT_BACKUP_DIR", ""), "BT_BACKUP_DIR")
@@ -652,8 +768,8 @@ class InstallConfig:
                 raise ConfigError(
                     "BT_EDGE_NETWORK must be one exact Docker network name for docker-edge ingress"
                 )
-        if edge_network and edge_network == cwa_network:
-            raise ConfigError("BT_EDGE_NETWORK and BT_CWA_NETWORK must be separate")
+        if edge_network and edge_network == reader_network:
+            raise ConfigError("BT_EDGE_NETWORK and BT_READER_NETWORK must be separate")
 
         llm_provider = _choice(values, "LLM_PROVIDER", _LLM_PROVIDERS)
         llm_model = _clean_value(values.get("LLM_MODEL", ""), "LLM_MODEL")
@@ -665,26 +781,142 @@ class InstallConfig:
         llm_api_key = _clean_value(
             values.get("LLM_API_KEY", ""), "LLM_API_KEY", allow_empty=True
         )
-        if llm_provider == "local":
-            if not local_url or llm_api_key:
-                raise ConfigError(
-                    "local provider requires BT_LOCAL_URL and forbids LLM_API_KEY"
-                )
+        llm_custom_endpoint = _clean_value(
+            values.get("LLM_CUSTOM_ENDPOINT", ""),
+            "LLM_CUSTOM_ENDPOINT",
+            allow_empty=True,
+        )
+        llm_custom_api_key = _clean_value(
+            values.get("LLM_CUSTOM_API_KEY", ""),
+            "LLM_CUSTOM_API_KEY",
+            allow_empty=True,
+        )
+        llm_fallback_provider = _clean_value(
+            values.get("LLM_FALLBACK_PROVIDER", ""),
+            "LLM_FALLBACK_PROVIDER",
+            allow_empty=True,
+        )
+        llm_fallback_model = _clean_value(
+            values.get("LLM_FALLBACK_MODEL", ""),
+            "LLM_FALLBACK_MODEL",
+            allow_empty=True,
+        )
+        llm_fallback_api_key = _clean_value(
+            values.get("LLM_FALLBACK_API_KEY", ""),
+            "LLM_FALLBACK_API_KEY",
+            allow_empty=True,
+        )
+        llm_fallback_custom_endpoint = _clean_value(
+            values.get("LLM_FALLBACK_CUSTOM_ENDPOINT", ""),
+            "LLM_FALLBACK_CUSTOM_ENDPOINT",
+            allow_empty=True,
+        )
+        llm_fallback_custom_api_key = _clean_value(
+            values.get("LLM_FALLBACK_CUSTOM_API_KEY", ""),
+            "LLM_FALLBACK_CUSTOM_API_KEY",
+            allow_empty=True,
+        )
+
+        if llm_fallback_provider and llm_fallback_provider not in _LLM_PROVIDERS:
+            raise ConfigError(
+                f"LLM_FALLBACK_PROVIDER must be empty or one of {sorted(_LLM_PROVIDERS)}"
+            )
+        if llm_fallback_model and not _TOKEN_RE.fullmatch(llm_fallback_model):
+            raise ConfigError("LLM_FALLBACK_MODEL contains unsupported characters")
+        if bool(llm_fallback_provider) != bool(llm_fallback_model):
+            raise ConfigError(
+                "LLM_FALLBACK_PROVIDER and LLM_FALLBACK_MODEL must be set together"
+            )
+        if (
+            llm_fallback_provider == llm_provider
+            and llm_fallback_model == llm_model
+        ):
+            raise ConfigError("primary and fallback providers must be distinct")
+
+        uses_local = "local" in {llm_provider, llm_fallback_provider}
+        if uses_local:
+            if not local_url:
+                raise ConfigError("a local provider requires BT_LOCAL_URL")
             local_url = _http_url(local_url, "BT_LOCAL_URL")
             if urlsplit(local_url).path != "/v1/chat/completions":
                 raise ConfigError(
                     "BT_LOCAL_URL must target the exact /v1/chat/completions endpoint"
                 )
-        elif not llm_api_key or local_url:
-            raise ConfigError(
-                "cloud providers require LLM_API_KEY and forbid BT_LOCAL_URL"
-            )
+        elif local_url:
+            raise ConfigError("BT_LOCAL_URL requires a local primary or fallback")
+
+        def validate_provider_role(
+            *,
+            role: str,
+            provider: str,
+            api_key: str,
+            custom_endpoint: str,
+            custom_api_key: str,
+        ) -> str:
+            if not provider:
+                if api_key or custom_endpoint or custom_api_key:
+                    raise ConfigError(
+                        f"{role} provider values require {role} provider selection"
+                    )
+                return custom_endpoint
+            if provider == "local":
+                if api_key or custom_endpoint or custom_api_key:
+                    raise ConfigError(
+                        f"{role} local provider forbids API key and custom endpoint values"
+                    )
+                return custom_endpoint
+            if provider == "openai-compatible":
+                if api_key or not custom_endpoint or not custom_api_key:
+                    endpoint_name = (
+                        "LLM_CUSTOM_ENDPOINT/LLM_CUSTOM_API_KEY"
+                        if role == "primary"
+                        else "LLM_FALLBACK_CUSTOM_ENDPOINT/"
+                        "LLM_FALLBACK_CUSTOM_API_KEY"
+                    )
+                    raise ConfigError(
+                        f"{role} openai-compatible requires {endpoint_name} "
+                        "and forbids the generic API key"
+                    )
+                endpoint_name = (
+                    "LLM_CUSTOM_ENDPOINT"
+                    if role == "primary"
+                    else "LLM_FALLBACK_CUSTOM_ENDPOINT"
+                )
+                return _custom_llm_endpoint(custom_endpoint, endpoint_name)
+            if not api_key or custom_endpoint or custom_api_key:
+                api_key_name = (
+                    "LLM_API_KEY"
+                    if role == "primary"
+                    else "LLM_FALLBACK_API_KEY"
+                )
+                raise ConfigError(
+                    f"{role} named remote provider requires {api_key_name} "
+                    "and forbids custom endpoint values"
+                )
+            return custom_endpoint
+
+        llm_custom_endpoint = validate_provider_role(
+            role="primary",
+            provider=llm_provider,
+            api_key=llm_api_key,
+            custom_endpoint=llm_custom_endpoint,
+            custom_api_key=llm_custom_api_key,
+        )
+        llm_fallback_custom_endpoint = validate_provider_role(
+            role="fallback",
+            provider=llm_fallback_provider,
+            api_key=llm_fallback_api_key,
+            custom_endpoint=llm_fallback_custom_endpoint,
+            custom_api_key=llm_fallback_custom_api_key,
+        )
 
         identity_proxy_peer = ""
         authentik_version = ""
         authentik_outpost_url = ""
         reverse_proxy = ""
         if auth_profile == "authentik-forwarded":
+            if reader_type != "cwa":
+                raise ConfigError("authentik-forwarded is supported only for CWA")
             if ingress_mode != "docker-edge":
                 raise ConfigError(
                     "authentik-forwarded requires BT_INGRESS_MODE=docker-edge"
@@ -716,11 +948,14 @@ class InstallConfig:
             ingress_mode=ingress_mode,
             auth_profile=auth_profile,
             public_origin=public_origin,
-            cwa_upstream=cwa_upstream,
-            cwa_container=cwa_container,
-            cwa_network=cwa_network,
-            cwa_version=cwa_version,
-            compatibility_tier=cwa_tier,
+            reader_type=reader_type,
+            reader_upstream=reader_upstream,
+            reader_container=reader_container,
+            reader_network=reader_network,
+            reader_version=reader_version,
+            reader_image_id=reader_image_id,
+            reader_contract_version=reader_contract_version,
+            compatibility_tier=compatibility,
             cwa_identity_header=cwa_identity_header,
             edge_network=edge_network,
             state_dir=state_dir,
@@ -736,29 +971,78 @@ class InstallConfig:
             llm_model=llm_model,
             local_url=local_url,
             llm_api_key=llm_api_key,
+            llm_custom_endpoint=llm_custom_endpoint,
+            llm_custom_api_key=llm_custom_api_key,
+            llm_fallback_provider=llm_fallback_provider,
+            llm_fallback_model=llm_fallback_model,
+            llm_fallback_api_key=llm_fallback_api_key,
+            llm_fallback_custom_endpoint=llm_fallback_custom_endpoint,
+            llm_fallback_custom_api_key=llm_fallback_custom_api_key,
         )
 
     @property
     def image(self) -> str:
-        return self.identity.image
+        return (
+            f"local/{self.reader_type}-translate:"
+            f"{self.identity.version}-{self.identity.sha[:12]}"
+        )
+
+    @property
+    def cwa_upstream(self) -> str:
+        """Compatibility accessor for lifecycle code while schema 1 remains readable."""
+        return self.reader_upstream
+
+    @property
+    def cwa_container(self) -> str:
+        return self.reader_container
+
+    @property
+    def cwa_network(self) -> str:
+        return self.reader_network
+
+    @property
+    def cwa_version(self) -> str:
+        return self.reader_version
+
+    @property
+    def uses_reader_session(self) -> bool:
+        return self.auth_profile in {"cwa-session", "reader-session"}
 
     def api_environment(self) -> dict[str, str]:
         values = {
             "BT_AUTH_MODE": (
-                "cwa_session"
-                if self.auth_profile == "cwa-session"
-                else "forwarded"
+                "reader_session" if self.uses_reader_session else "forwarded"
             ),
             "LLM_PROVIDER": self.llm_provider,
             "LLM_MODEL": self.llm_model,
             "BT_LOCAL_URL": self.local_url,
             "LLM_API_KEY": self.llm_api_key,
+            "LLM_CUSTOM_ENDPOINT": self.llm_custom_endpoint,
+            "LLM_CUSTOM_API_KEY": self.llm_custom_api_key,
+            "LLM_FALLBACK_PROVIDER": self.llm_fallback_provider,
+            "LLM_FALLBACK_MODEL": self.llm_fallback_model,
+            "LLM_FALLBACK_API_KEY": self.llm_fallback_api_key,
+            "LLM_FALLBACK_CUSTOM_ENDPOINT": self.llm_fallback_custom_endpoint,
+            "LLM_FALLBACK_CUSTOM_API_KEY": self.llm_fallback_custom_api_key,
         }
         if self.install_profile == "compose-existing":
             values["BT_CACHE_OPERATOR_GROUP_ACCESS"] = "true"
-        if self.auth_profile == "cwa-session":
-            values["BT_CWA_AUTH_URL"] = f"{self.cwa_upstream}/ajax/emailstat"
-            values["BT_TRUSTED_PROXY_HOST"] = "translator-proxy"
+        if self.uses_reader_session:
+            values.update(
+                {
+                    "BT_READER_TYPE": self.reader_type,
+                    "BT_READER_AUTH_URL": (
+                        f"{self.reader_upstream}/api/Account"
+                        if self.reader_type == "kavita"
+                        else f"{self.reader_upstream}/ajax/emailstat"
+                    ),
+                    "BT_READER_VERSION": self.reader_version,
+                    "BT_READER_CONTRACT_VERSION": self.reader_contract_version,
+                    "BT_PUBLIC_ORIGIN": self.public_origin,
+                    "BT_TRUSTED_PROXY_HOST": "translator-proxy",
+                    "BT_SESSION_KEY_PATH": "/app/data/reader_session_key",
+                }
+            )
         else:
             values.update(
                 {
@@ -771,32 +1055,34 @@ class InstallConfig:
         return values
 
     def proxy_environment(self) -> dict[str, str]:
-        return {
+        values = {
             "BT_PUBLIC_ORIGIN": self.public_origin,
-            "CWA_UPSTREAM": self.cwa_upstream,
-            "BT_CWA_IDENTITY_HEADER": self.cwa_identity_header,
+            "BT_READER_TYPE": self.reader_type,
+            "BT_READER_UPSTREAM": self.reader_upstream,
+            "BT_CWA_IDENTITY_HEADER": self.cwa_identity_header or "Remote-User",
             "BT_BROWSER_AUTH_MODE": (
-                "cwa_session"
-                if self.auth_profile == "cwa-session"
+                "reader_session"
+                if self.uses_reader_session
                 else "forwarded"
             ),
+            "BT_READER_VERSION": self.reader_version,
+            "BT_READER_CONTRACT_VERSION": self.reader_contract_version,
             "BT_BROWSER_CREDENTIALS": (
-                "same-origin" if self.auth_profile == "cwa-session" else "include"
+                "same-origin" if self.uses_reader_session else "include"
             ),
         }
+        if self.reader_type == "cwa":
+            values["CWA_UPSTREAM"] = self.reader_upstream
+        return values
 
     def public_contract(self) -> dict[str, object]:
         """Return stable non-secret settings suitable for plans and audit logs."""
-        return {
+        common = {
             "install_profile": self.install_profile,
             "install_name": self.install_name,
             "ingress_mode": self.ingress_mode,
             "auth_profile": self.auth_profile,
             "public_origin": self.public_origin,
-            "cwa_upstream": self.cwa_upstream,
-            "cwa_container": self.cwa_container,
-            "cwa_network": self.cwa_network,
-            "cwa_version": self.cwa_version,
             "compatibility_tier": self.compatibility_tier,
             "cwa_identity_header": self.cwa_identity_header,
             "edge_network": self.edge_network,
@@ -814,6 +1100,60 @@ class InstallConfig:
             "local_url": self.local_url,
             "has_api_key": bool(self.llm_api_key),
         }
+        if self.llm_custom_endpoint:
+            common.update(
+                {
+                    "custom_endpoint_sha256": hashlib.sha256(
+                        self.llm_custom_endpoint.encode("utf-8")
+                    ).hexdigest(),
+                    "has_custom_api_key": bool(self.llm_custom_api_key),
+                }
+            )
+        if self.llm_fallback_provider:
+            common.update(
+                {
+                    "llm_fallback_provider": self.llm_fallback_provider,
+                    "llm_fallback_model": self.llm_fallback_model,
+                    "has_fallback_api_key": bool(self.llm_fallback_api_key),
+                }
+            )
+        if self.llm_fallback_custom_endpoint:
+            common.update(
+                {
+                    "fallback_custom_endpoint_sha256": hashlib.sha256(
+                        self.llm_fallback_custom_endpoint.encode("utf-8")
+                    ).hexdigest(),
+                    "has_fallback_custom_api_key": bool(
+                        self.llm_fallback_custom_api_key
+                    ),
+                }
+            )
+        if self.reader_image_id:
+            common["reader_image_id"] = self.reader_image_id
+        if self.reader_type == "cwa":
+            # This projection deliberately remains byte-for-byte compatible
+            # with schema-1 CWA fingerprints.
+            common.update(
+                {
+                    "cwa_upstream": self.reader_upstream,
+                    "cwa_container": self.reader_container,
+                    "cwa_network": self.reader_network,
+                    "cwa_version": self.reader_version,
+                    "cwa_identity_header": self.cwa_identity_header,
+                }
+            )
+        else:
+            common.update(
+                {
+                    "reader_type": self.reader_type,
+                    "reader_upstream": self.reader_upstream,
+                    "reader_container": self.reader_container,
+                    "reader_network": self.reader_network,
+                    "reader_version": self.reader_version,
+                    "reader_contract_version": self.reader_contract_version,
+                }
+            )
+        return common
 
 
 @dataclass(frozen=True, slots=True)
@@ -825,7 +1165,9 @@ class DeploymentPlan:
     install_profile: str
     ingress_mode: str
     auth_profile: str
-    cwa_version: str
+    reader_type: str
+    reader_version: str
+    reader_contract_version: str
     compatibility_tier: str
     state_dir: str
     data_dir: str
@@ -841,12 +1183,14 @@ class DeploymentPlan:
         fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         proxy_ports = [config.proxy_port] if config.proxy_port is not None else []
         resources: dict[str, dict[str, object]] = {
-            "cwa": {
-                "name": config.cwa_container,
+            "reader": {
+                "name": config.reader_container,
+                "type": config.reader_type,
+                "version": config.reader_version,
                 "ownership": "external",
             },
-            "cwa_network": {
-                "name": config.cwa_network,
+            "reader_network": {
+                "name": config.reader_network,
                 "ownership": "external",
             },
             "private_network": {
@@ -871,6 +1215,14 @@ class DeploymentPlan:
                 "published_ports": proxy_ports,
             },
         }
+        if config.reader_image_id:
+            resources["reader"]["image_id"] = config.reader_image_id
+        if config.uses_reader_session:
+            resources["session_key"] = {
+                "path": str(Path(config.data_dir) / "reader_session_key"),
+                "ownership": "owned-credential",
+                "retention": "remove-on-uninstall",
+            }
         if config.edge_network:
             resources["edge_network"] = {
                 "name": config.edge_network,
@@ -887,15 +1239,20 @@ class DeploymentPlan:
                 "ownership": "owned",
             }
         if config.install_profile == "unraid":
+            template_prefix = (
+                "my-cwa-translate"
+                if config.reader_type == "cwa"
+                else "my-kavita-translate"
+            )
             resources["api_template"] = {
                 "path": str(
-                    Path(config.unraid_template_dir) / "my-cwa-translate-api.xml"
+                    Path(config.unraid_template_dir) / f"{template_prefix}-api.xml"
                 ),
                 "ownership": "owned",
             }
             resources["proxy_template"] = {
                 "path": str(
-                    Path(config.unraid_template_dir) / "my-cwa-translate-proxy.xml"
+                    Path(config.unraid_template_dir) / f"{template_prefix}-proxy.xml"
                 ),
                 "ownership": "owned",
             }
@@ -907,7 +1264,9 @@ class DeploymentPlan:
             install_profile=config.install_profile,
             ingress_mode=config.ingress_mode,
             auth_profile=config.auth_profile,
-            cwa_version=config.cwa_version,
+            reader_type=config.reader_type,
+            reader_version=config.reader_version,
+            reader_contract_version=config.reader_contract_version,
             compatibility_tier=config.compatibility_tier,
             state_dir=config.state_dir,
             data_dir=config.data_dir,
@@ -927,7 +1286,9 @@ class DeploymentPlan:
             "install_profile": self.install_profile,
             "ingress_mode": self.ingress_mode,
             "auth_profile": self.auth_profile,
-            "cwa_version": self.cwa_version,
+            "reader_type": self.reader_type,
+            "reader_version": self.reader_version,
+            "reader_contract_version": self.reader_contract_version,
             "compatibility_tier": self.compatibility_tier,
             "state_dir": self.state_dir,
             "data_dir": self.data_dir,
@@ -949,6 +1310,8 @@ class DeploymentState:
     config_fingerprint: str
     install_profile: str
     auth_profile: str
+    reader_type: str
+    reader_contract_version: str
     resources: dict[str, dict[str, object]]
 
     @classmethod
@@ -969,11 +1332,13 @@ class DeploymentState:
             config_fingerprint=plan.config_fingerprint,
             install_profile=plan.install_profile,
             auth_profile=plan.auth_profile,
+            reader_type=plan.reader_type,
+            reader_contract_version=plan.reader_contract_version,
             resources=plan.resources,
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        document = {
             "schema_version": self.schema_version,
             "install_id": self.install_id,
             "status": self.status,
@@ -983,14 +1348,23 @@ class DeploymentState:
             "config_fingerprint": self.config_fingerprint,
             "install_profile": self.install_profile,
             "auth_profile": self.auth_profile,
-            "resources": self.resources,
         }
+        if self.schema_version in {2, 3}:
+            document.update(
+                {
+                    "reader_type": self.reader_type,
+                    "reader_contract_version": self.reader_contract_version,
+                }
+            )
+        document["resources"] = self.resources
+        return document
 
     @classmethod
     def from_dict(cls, payload: object) -> "DeploymentState":
         if not isinstance(payload, dict):
             raise ConfigError("state must be one JSON object")
-        if payload.get("schema_version") != STATE_SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if schema_version not in {1, 2, STATE_SCHEMA_VERSION}:
             raise ConfigError("unsupported state schema version")
         expected = {
             "schema_version",
@@ -1004,9 +1378,19 @@ class DeploymentState:
             "auth_profile",
             "resources",
         }
+        if schema_version in {2, 3}:
+            expected.update({"reader_type", "reader_contract_version"})
         if set(payload) != expected:
             raise ConfigError("state fields do not match the supported schema")
-        state = cls(**payload)
+        normalized = dict(payload)
+        if schema_version == 1:
+            normalized.update(
+                {
+                    "reader_type": "cwa",
+                    "reader_contract_version": "cwa-epub-v1",
+                }
+            )
+        state = cls(**normalized)
         if not _INSTALL_ID_RE.fullmatch(str(state.install_id)):
             raise ConfigError("state contains an invalid install_id")
         if state.status not in {
@@ -1019,6 +1403,14 @@ class DeploymentState:
             raise ConfigError("state contains an invalid status")
         if not isinstance(state.resources, dict):
             raise ConfigError("state resources must be an object")
+        if state.reader_type not in _READER_TYPES:
+            raise ConfigError("state contains an invalid reader_type")
+        expected_contracts = {
+            "cwa": "cwa-epub-v1",
+            "kavita": "kavita-0.9.0.2-epub-v1",
+        }
+        if state.reader_contract_version != expected_contracts[state.reader_type]:
+            raise ConfigError("state contains an invalid reader contract version")
         return state
 
 
@@ -1034,6 +1426,75 @@ class StateStore:
             raise ConfigError("state destination must not be a symbolic link")
         if self.state_dir.exists() and not self.state_dir.is_dir():
             raise ConfigError("state destination must be a directory")
+        if not self.state_dir.exists():
+            return
+        try:
+            directory_metadata = self.state_dir.lstat()
+        except OSError as exc:
+            raise ConfigError("state destination could not be inspected") from exc
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            raise ConfigError(
+                "state destination must be owned by the current user with mode 0700"
+            )
+        if self.path.exists():
+            try:
+                state_metadata = self.path.lstat()
+            except OSError as exc:
+                raise ConfigError("state destination could not be inspected") from exc
+            if (
+                not stat.S_ISREG(state_metadata.st_mode)
+                or state_metadata.st_nlink != 1
+                or state_metadata.st_uid != directory_metadata.st_uid
+                or stat.S_IMODE(state_metadata.st_mode) != 0o600
+            ):
+                raise ConfigError(
+                    "deployment state must be one private regular file owned by "
+                    "the current user with mode 0600"
+                )
+            return
+
+        allowed_files = {
+            "api.env",
+            "api.template.xml",
+            "authentik-edge.caddy",
+            "authentik-edge.nginx.conf",
+            "authentik-edge.traefik.yml",
+            "deployment.compose.json",
+            "install-attempt.json",
+            "migration-v214.json",
+            "proxy.env",
+            "proxy.template.xml",
+        }
+        try:
+            entries = list(self.state_dir.iterdir())
+        except OSError as exc:
+            raise ConfigError("state destination could not be inspected") from exc
+        for entry in entries:
+            if entry.name == "history":
+                metadata = entry.lstat()
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != directory_metadata.st_uid
+                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                ):
+                    raise ConfigError("state history must be a private owned directory")
+                continue
+            if entry.name not in allowed_files:
+                raise ConfigError(
+                    "state directory is not empty and contains unknown entries"
+                )
+            metadata = entry.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != directory_metadata.st_uid
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ConfigError("managed state artifact must be a private owned file")
 
     def save(self, state: DeploymentState) -> None:
         self._validate_destination()
@@ -1056,6 +1517,8 @@ class StateStore:
             except FileNotFoundError:
                 pass
             raise
+        if self.load() != state:
+            raise ConfigError("deployment state readback did not match the committed state")
 
     def load(self) -> DeploymentState:
         try:
@@ -1131,6 +1594,128 @@ class StateStore:
             except FileNotFoundError:
                 pass
         return target
+
+
+class InstallAttemptStore:
+    """Durable, non-secret evidence for one not-yet-committed install."""
+
+    _STATUSES = frozenset({"prepared", "starting", "cleaned", "cleanup-failed"})
+    _EXPECTED_FIELDS = frozenset(
+        {
+            "schema_version",
+            "install_id",
+            "status",
+            "version",
+            "revision",
+            "image",
+            "config_fingerprint",
+            "install_profile",
+            "resources",
+            "cleanup_errors",
+        }
+    )
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        self.path = self.state_dir / "install-attempt.json"
+
+    @classmethod
+    def _validate(cls, payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict) or set(payload) != cls._EXPECTED_FIELDS:
+            raise ConfigError("install attempt fields do not match the supported schema")
+        if payload.get("schema_version") != INSTALL_ATTEMPT_SCHEMA_VERSION:
+            raise ConfigError("unsupported install attempt schema version")
+        try:
+            install_id = str(uuid.UUID(str(payload.get("install_id", ""))))
+        except (ValueError, AttributeError) as exc:
+            raise ConfigError("install attempt contains an invalid install_id") from exc
+        if install_id != payload.get("install_id") or not _INSTALL_ID_RE.fullmatch(
+            install_id
+        ):
+            raise ConfigError("install attempt contains an invalid install_id")
+        if payload.get("status") not in cls._STATUSES:
+            raise ConfigError("install attempt contains an invalid status")
+        if payload.get("install_profile") not in _INSTALL_PROFILES:
+            raise ConfigError("install attempt contains an invalid install profile")
+        if not isinstance(payload.get("version"), str) or not _SEMVER_RE.fullmatch(
+            str(payload["version"])
+        ):
+            raise ConfigError("install attempt contains an invalid version")
+        if not isinstance(payload.get("revision"), str) or not _SHA_RE.fullmatch(
+            str(payload["revision"])
+        ):
+            raise ConfigError("install attempt contains an invalid revision")
+        if not isinstance(payload.get("image"), str) or not payload["image"]:
+            raise ConfigError("install attempt contains an invalid image")
+        fingerprint = payload.get("config_fingerprint")
+        if not isinstance(fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", fingerprint
+        ):
+            raise ConfigError("install attempt contains an invalid fingerprint")
+        if not isinstance(payload.get("resources"), dict):
+            raise ConfigError("install attempt resources must be an object")
+        cleanup_errors = payload.get("cleanup_errors")
+        if (
+            not isinstance(cleanup_errors, list)
+            or len(cleanup_errors) > 32
+            or any(
+                not isinstance(error, str)
+                or not error
+                or len(error) > 512
+                or any(character in error for character in "\r\n\0")
+                for error in cleanup_errors
+            )
+        ):
+            raise ConfigError("install attempt cleanup errors are invalid")
+        if payload.get("status") == "cleaned" and cleanup_errors:
+            raise ConfigError("cleaned install attempt cannot contain cleanup errors")
+        return dict(payload)
+
+    def save(self, payload: Mapping[str, object]) -> None:
+        document = dict(payload)
+        document["schema_version"] = INSTALL_ATTEMPT_SCHEMA_VERSION
+        validated = self._validate(document)
+        StateStore(self.state_dir)._validate_destination()
+        ensure_directory_durable(self.state_dir)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".install-attempt.json.", dir=self.state_dir
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(validated, handle, sort_keys=True, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary_name, 0o600)
+            os.replace(temporary_name, self.path)
+            _fsync_directory(self.state_dir)
+        except BaseException:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+            raise
+        if self.load() != validated:
+            raise ConfigError("install attempt readback did not match committed evidence")
+
+    def load(self) -> dict[str, object]:
+        try:
+            payload = json.loads(
+                read_private_text(
+                    self.state_dir, self.path.name, label="install attempt"
+                )
+            )
+        except json.JSONDecodeError as exc:
+            raise ConfigError("install attempt is not valid JSON") from exc
+        return self._validate(payload)
+
+    def remove(self) -> None:
+        self.load()
+        try:
+            self.path.unlink()
+            _fsync_directory(self.state_dir)
+        except OSError as exc:
+            raise ConfigError("install attempt could not be removed durably") from exc
 
 
 def redact_mapping(values: Mapping[str, str]) -> dict[str, str]:

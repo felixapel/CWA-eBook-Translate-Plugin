@@ -17,32 +17,18 @@ FRONTEND_WORKFLOWS = (
     GITEA_CI,
     ROOT / ".gitea" / "workflows" / "release.yml",
 )
-BACKEND_UNIT_COMMAND = "python3 -m unittest -v " + " ".join((
-    "tests.python.test_btctl",
-    "tests.python.test_btctl_container",
-    "tests.python.test_btctl_compose",
-    "tests.python.test_btctl_unraid",
-    "tests.python.test_btctl_auth",
-    "tests.python.test_btctl_lifecycle",
-    "tests.python.test_work_budget",
-    "tests.python.test_provider_budget",
-    "tests.python.test_cache_v2",
-    "tests.python.test_context_cache",
-    "tests.python.test_singleflight",
-    "tests.python.test_auth",
-    "tests.python.test_ci_contract",
-    "tests.python.test_docs_contract",
-    "tests.python.test_release_contract",
-    "tests.python.test_supply_chain_contract",
-    "tests.python.test_shell_contract",
-    "tests.python.test_container_contract",
-    "tests.python.test_cleanup_token",
-    "tests.python.test_api_schema",
-    "tests.python.test_error_privacy",
-    "tests.python.test_observability",
-    "tests.python.test_proxy_config",
-    "tests.python.test_live_scripts",
-))
+BACKEND_WORKFLOWS = (GITHUB_CI, GITEA_CI, RELEASE)
+PY_COMPILE_COMMAND = (
+    "git ls-files -z -- '*.py' | xargs -0 -r python3 -m py_compile"
+)
+BACKEND_DISCOVERY_COMMAND = (
+    "python3 -m coverage run --branch --source=. "
+    "--omit='.venv/*,tests/*,tools/*' -m unittest discover -v tests/python"
+)
+COVERAGE_COMMAND = (
+    "python3 -m coverage report --precision=1 --show-missing "
+    "--fail-under=\"$BT_COVERAGE_FAIL_UNDER\""
+)
 
 
 class CIContractTests(unittest.TestCase):
@@ -54,22 +40,26 @@ class CIContractTests(unittest.TestCase):
         for command in (
             "python3 -m tests.python.test_translation",
             "python3 -m tests.python.test_hardening",
-            BACKEND_UNIT_COMMAND,
-            "python3 -m py_compile btctl.py btctl_container.py btctl_core.py btctl_compose.py btctl_docker.py btctl_paths.py btctl_unraid.py btctl_auth.py btctl_lifecycle.py auth.py server.py translator.py cache.py singleflight.py work_budget.py proxy/render_config.py",
-            "bash -n btctl install_unraid.sh scripts/btctl-bootstrap-smoke.sh",
+            "python3 -m coverage erase",
+            BACKEND_DISCOVERY_COMMAND,
+            COVERAGE_COMMAND,
+            PY_COMPILE_COMMAND,
+            "bash -n btctl install_unraid.sh scripts/*.sh",
         ):
             self.assertIn(command, self.workflow)
+        self.assertIn("BT_COVERAGE_FAIL_UNDER: \"60\"", self.workflow)
 
     def test_release_repeats_the_install_and_lifecycle_gates(self):
         workflow = RELEASE.read_text()
-        for module in ("btctl_auth.py", "btctl_lifecycle.py"):
-            self.assertIn(module, workflow)
-        for suite in (
-            "tests.python.test_btctl_auth",
-            "tests.python.test_btctl_lifecycle",
-            "tests.python.test_docs_contract",
-        ):
-            self.assertIn(suite, workflow)
+        self.assertIn(PY_COMPILE_COMMAND, workflow)
+        self.assertIn(BACKEND_DISCOVERY_COMMAND, workflow)
+
+    def test_reader_session_boundary_is_required_everywhere(self):
+        for workflow in BACKEND_WORKFLOWS:
+            source = workflow.read_text()
+            with self.subTest(workflow=workflow):
+                self.assertIn(PY_COMPILE_COMMAND, source)
+                self.assertIn(BACKEND_DISCOVERY_COMMAND, source)
 
     def test_node_install_and_audit_include_locked_dev_tree(self):
         self.assertRegex(self.workflow, r"(?m)^\s*- run: npm ci\s*$")
@@ -125,6 +115,10 @@ class CIContractTests(unittest.TestCase):
         )
         self.assertIn(
             './scripts/ca-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-ca"',
+            self.workflow,
+        )
+        self.assertIn(
+            './scripts/hub-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-hub"',
             self.workflow,
         )
         self.assertNotIn("docker build -t bt-audit:ci", self.workflow)
@@ -226,6 +220,7 @@ class CIContractTests(unittest.TestCase):
         self.assertNotIn('"$IMAGE:latest"', workflow)
         self.assertNotIn("RepoDigests", workflow)
         self.assertGreaterEqual(workflow.count("--severity HIGH,CRITICAL"), 2)
+        self.assertGreaterEqual(workflow.count("hub-container-smoke.sh"), 2)
         self.assertIn('manifest_output="$(docker manifest inspect', workflow)
         self.assertRegex(workflow, r"(?m)^  validate:\n    runs-on: ubuntu-latest$")
         self.assertRegex(
