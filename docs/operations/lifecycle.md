@@ -133,11 +133,12 @@ a completed uninstall is supported; a successful reinstall creates a fresh key
 and moves the prior final record into `BT_STATE_DIR/history/`. Active, partial
 or mismatched state is never overwritten.
 
-Split CWA and Kavita installations have independent schema-2 state and
+New split CWA and Kavita installations have independent schema-3 state and
 connector UUIDs. The universal hub records one schema-3 topology while retaining
 separate reader data, keys and cookies below its owned root. Never reuse one
-split install's state/data paths for the other. Schema-1 CWA state remains
-readable for lifecycle compatibility, but it cannot be relabeled as Kavita.
+split install's state/data paths for the other. Schema-1 CWA and former
+inline-Compose schema-2 state remain readable for lifecycle compatibility, but
+cannot be relabeled or provider-reconfigured in place.
 Changing reader type is a separate install/uninstall operation, not an in-place
 upgrade.
 

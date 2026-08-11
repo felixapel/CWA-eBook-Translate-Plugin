@@ -17,6 +17,7 @@ from btctl_compose import (
     _probe_runtime_dependencies,
     _verify_data_bind,
     _verify_runtime_sandbox,
+    _compose_environment_text,
     render_compose,
 )
 from btctl_core import (
@@ -65,16 +66,13 @@ class ProviderReconfigurer:
     @staticmethod
     def _artifact_paths(config: InstallConfig) -> dict[str, Path]:
         state_dir = Path(config.state_dir)
-        active_name = (
-            "api.env"
-            if config.install_profile == "unraid"
-            else "deployment.compose.json"
-        )
+        active_name = "api.env"
         return {
             "active": state_dir / active_name,
             "old": state_dir / f"{active_name}.reconfigure-old",
             "new": state_dir / f"{active_name}.reconfigure-new",
             "journal": state_dir / "reconfigure.json",
+            "compose": state_dir / "deployment.compose.json",
         }
 
     @staticmethod
@@ -108,6 +106,11 @@ class ProviderReconfigurer:
         state = StateStore(Path(config.state_dir)).load()
         if state.status not in {"installed", "adopted"}:
             raise ConfigError("provider-only reconfigure requires an installed runtime")
+        if config.install_profile == "compose-existing" and state.schema_version < 3:
+            raise ConfigError(
+                "provider-only reconfigure requires uninstalling and reinstalling "
+                "the legacy Compose deployment first"
+            )
         immutable = (
             state.version == plan.version
             and state.revision == plan.revision
@@ -136,29 +139,32 @@ class ProviderReconfigurer:
             or proxy.get("State", {}).get("Status") != "running"
         ):
             raise InstallError("live container identity does not match deployment state")
-        if config.install_profile == "unraid":
+        if config.install_profile != "unraid":
             try:
-                current_environment = parse_env_text(
+                document = json.loads(
                     read_private_text(
                         Path(config.state_dir),
-                        paths["active"].name,
-                        label="active API environment",
-                    )
-                )
-            except ConfigError as exc:
-                raise InstallError("active API environment is not trustworthy") from exc
-        else:
-            try:
-                json.loads(
-                    read_private_text(
-                        Path(config.state_dir),
-                        paths["active"].name,
+                        paths["compose"].name,
                         label="active Compose document",
                     )
                 )
             except (ConfigError, json.JSONDecodeError) as exc:
                 raise InstallError("active Compose document is not trustworthy") from exc
-            current_environment = _container_environment(api)
+            expected_document = render_compose(
+                config, plan, state.install_id
+            )
+            if document != expected_document:
+                raise InstallError("active Compose document does not match the plan")
+        try:
+            current_environment = parse_env_text(
+                read_private_text(
+                    Path(config.state_dir),
+                    paths["active"].name,
+                    label="active API environment",
+                )
+            )
+        except ConfigError as exc:
+            raise InstallError("active API environment is not trustworthy") from exc
         self._verify_api(config, plan, state, api, current_environment)
 
         desired = config.api_environment()
@@ -294,9 +300,10 @@ class ProviderReconfigurer:
             self.docker.connect_network(external_name, api_name)
             self.docker.start_container(api_name)
         else:
-            self.docker.compose_validate(environment_path, config.install_name)
+            document_path = Path(config.state_dir) / "deployment.compose.json"
+            self.docker.compose_validate(document_path, config.install_name)
             self.docker.compose_recreate_service(
-                environment_path, config.install_name, "api"
+                document_path, config.install_name, "api"
             )
         self.docker.wait_healthy([api_name], self.health_timeout_seconds)
         self.docker.probe_providers(api_name)
@@ -384,6 +391,18 @@ class ProviderReconfigurer:
             raise InstallError(
                 "provider reconfiguration recovery evidence does not match runtime state"
             )
+        if config.install_profile != "unraid":
+            try:
+                document = json.loads(read_private_text(
+                    Path(config.state_dir), paths["compose"].name,
+                    label="active Compose document",
+                ))
+            except (ConfigError, json.JSONDecodeError) as exc:
+                raise InstallError(
+                    "active Compose document is not trustworthy"
+                ) from exc
+            if document != render_compose(config, plan, state.install_id):
+                raise InstallError("active Compose document does not match the plan")
         snapshots: dict[str, str] = {}
         for key in ("old", "new"):
             try:
@@ -439,11 +458,7 @@ class ProviderReconfigurer:
             self._remove_owned_api(config, state, api_name)
         _write_private(paths["active"], snapshots["old"])
         restored = self._start_api(config, plan, state, paths["active"])
-        old_environment = (
-            parse_env_text(snapshots["old"])
-            if config.install_profile == "unraid"
-            else _container_environment(restored)
-        )
+        old_environment = parse_env_text(snapshots["old"])
         self._verify_api(config, plan, state, restored, old_environment)
         resources = copy.deepcopy(state.resources)
         resources["api"]["id"] = restored["Id"]
@@ -488,20 +503,13 @@ class ProviderReconfigurer:
         ) = self._load_current(config, plan)
         old_text = read_private_text(
             Path(config.state_dir), paths["active"].name,
-            label=(
-                "active API environment"
-                if config.install_profile == "unraid"
-                else "active Compose document"
-            ),
+            label="active API environment",
         )
-        if config.install_profile == "unraid":
-            new_text = _environment_text(target_environment)
-        else:
-            new_text = json.dumps(
-                render_compose(config, plan, state.install_id),
-                sort_keys=True,
-                indent=2,
-            ) + "\n"
+        new_text = (
+            _environment_text(target_environment)
+            if config.install_profile == "unraid"
+            else _compose_environment_text(target_environment)
+        )
         credentials_changed = any(
             current_environment.get(key, "") != target_environment.get(key, "")
             for key in PROVIDER_ENVIRONMENT

@@ -35,7 +35,9 @@ for a disabled reader are ignored by the runtime.
 For Unraid, use `BT_INSTALL_PROFILE=unraid` and real paths below an existing
 `/mnt/user/<share>/` or `/mnt/<pool>/` boundary. `btctl` creates one raw Docker
 container and does not depend on the Compose plugin. For Linux Compose, keep
-`compose-existing`.
+`compose-existing` and use Docker Compose 2.30.0 or newer. The generated
+Compose JSON contains no environment values; `hub.env` is a separate raw,
+mode-`0600` artifact below `BT_STATE_DIR`.
 
 Select a provider with a normal server-side API contract. A Gemini example is:
 
@@ -68,7 +70,12 @@ credentials.
 ./btctl plan --env /absolute/private/path/book-translator-hub.env
 ./btctl install --env /absolute/private/path/book-translator-hub.env --yes
 ./btctl doctor --env /absolute/private/path/book-translator-hub.env
+./btctl doctor --env /absolute/private/path/book-translator-hub.env --deep
 ```
+
+The ordinary doctor is quota-free and verifies local structure only. Add
+`--deep` deliberately when every configured provider may receive one bounded
+health probe.
 
 On stock Unraid without compatible host Python/Git, the existing containerized
 launcher supports plan, install, doctor and uninstall. It validates exact

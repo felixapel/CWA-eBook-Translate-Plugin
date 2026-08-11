@@ -26,7 +26,7 @@ browser / reverse proxy -> <install>-proxy -> stock CWA or Kavita
 | Profile | Operator | Requirements |
 |---|---|---|
 | `unraid` | root | Stock Unraid, Bash, local Docker socket, full Git checkout; host Python, host Git and NerdTools are not required to run `./btctl`. |
-| `compose-existing` | trusted Docker-capable account | Linux, Docker Engine plus Compose plugin, and the same private primary group/account for every lifecycle command. |
+| `compose-existing` | trusted Docker-capable account | Linux, Docker Engine plus Compose 2.30.0 or newer, and the same private primary group/account for every lifecycle command. |
 
 Both profiles require a supported stock reader on a named Docker network, its
 exact version, private state/data/backup paths outside this checkout and an LLM
@@ -78,6 +78,12 @@ through the trusted operator's private group. For Unraid, use existing
 `/mnt/user/<share>` or `/mnt/<pool>` roots and set
 `BT_UNRAID_TEMPLATE_DIR=/boot/config/plugins/dockerMan/templates-user`.
 `btctl` refuses misspelled share/pool roots.
+
+New Compose installs record split state schema 3. Their generated JSON contains
+only paths to raw mode-`0600` `api.env` and `proxy.env` files, never provider
+credentials. Former schema-2 inline-environment deployments remain available
+to `doctor` and `uninstall`, but must be uninstalled and reinstalled before
+provider-only reconfiguration can use the new artifact boundary.
 
 For CWA, `BT_READER_UPSTREAM` must be exactly
 `http://<BT_READER_CONTAINER>:8083`. The legacy `CWA_UPSTREAM`,

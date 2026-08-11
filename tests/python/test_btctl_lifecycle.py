@@ -13,7 +13,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from btctl_compose import ComposeInstaller, InstallError
+from btctl_compose import (
+    ComposeInstaller,
+    InstallError,
+    _write_private_json,
+    render_schema2_compose,
+)
 from btctl_core import DeploymentPlan, InstallConfig, ReleaseIdentity, StateStore
 from btctl_lifecycle import (
     DeploymentDoctor,
@@ -535,6 +540,24 @@ class LifecycleTests(unittest.TestCase):
             drift = DeploymentDoctor(docker).run(config, plan)
             self.assertFalse(drift.ok)
             self.assertIn("runtime", " ".join(str(check) for check in drift.checks))
+
+    def test_legacy_schema_two_compose_remains_doctor_and_uninstall_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config, plan, docker, state = self.installed(root)
+            legacy = replace(state, schema_version=2)
+            StateStore(Path(config.state_dir)).save(legacy)
+            _write_private_json(
+                Path(config.state_dir) / "deployment.compose.json",
+                render_schema2_compose(config, plan, state.install_id),
+            )
+            for name in ("api.env", "proxy.env"):
+                (Path(config.state_dir) / name).unlink()
+
+            report = DeploymentDoctor(docker).run(config, plan)
+            self.assertTrue(report.ok, report.to_dict())
+            removed = RuntimeUninstaller(docker).uninstall(config, plan)
+            self.assertEqual(removed.status, "uninstalled")
 
     def test_doctor_deep_probes_only_after_structural_success(self):
         with tempfile.TemporaryDirectory() as directory:

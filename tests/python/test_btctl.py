@@ -797,7 +797,7 @@ class PlanAndStateTests(unittest.TestCase):
         self.assertNotIn("never-print-this", encoded)
         self.assertEqual(first["image"], self.identity.image)
         self.assertEqual(first["compatibility_tier"], "tier1")
-        self.assertEqual(first["schema_version"], 2)
+        self.assertEqual(first["schema_version"], 3)
         self.assertEqual(first["reader_type"], "cwa")
         self.assertEqual(first["reader_contract_version"], "cwa-epub-v1")
         self.assertEqual(first["resources"]["reader"]["ownership"], "external")

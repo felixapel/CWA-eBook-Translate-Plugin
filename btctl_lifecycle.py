@@ -29,6 +29,10 @@ from btctl_compose import (
     _verify_private_network,
     render_compose,
     render_schema1_compose,
+    render_schema2_compose,
+    _compose_api_environment,
+    _compose_environment_text,
+    _compose_proxy_environment,
 )
 from btctl_core import (
     ConfigError,
@@ -291,15 +295,47 @@ class DeploymentDoctor:
         def verify_artifacts() -> None:
             if config.install_profile == "compose-existing":
                 path = Path(config.state_dir) / "deployment.compose.json"
-                if path.is_symlink() or _mode(path) != 0o600:
-                    raise InstallError("Compose artifact is missing or not private")
-                expected_compose = (
-                    render_schema1_compose(config, plan, state.install_id)
-                    if state.schema_version == 1
-                    else render_compose(config, plan, state.install_id)
+                expected_compose = {
+                    1: render_schema1_compose,
+                    2: render_schema2_compose,
+                }.get(state.schema_version, render_compose)(
+                    config, plan, state.install_id
                 )
-                if json.loads(path.read_text(encoding="utf-8")) != expected_compose:
+                try:
+                    actual_compose = json.loads(
+                        read_private_text(
+                            Path(config.state_dir), path.name,
+                            label="Compose artifact",
+                        )
+                    )
+                except (ConfigError, json.JSONDecodeError) as exc:
+                    raise InstallError("Compose artifact is not trustworthy") from exc
+                if actual_compose != expected_compose:
                     raise InstallError("Compose artifact does not match the plan")
+                if state.schema_version == 3:
+                    expected_env = {
+                        "api": _compose_environment_text(
+                            _compose_api_environment(config, state.install_id)
+                        ),
+                        "proxy": _compose_environment_text(
+                            _compose_proxy_environment(config)
+                        ),
+                    }
+                    for role, expected in expected_env.items():
+                        env_path = Path(config.state_dir) / f"{role}.env"
+                        try:
+                            actual = read_private_text(
+                                Path(config.state_dir), env_path.name,
+                                label=f"{role} Compose environment",
+                            )
+                        except ConfigError as exc:
+                            raise InstallError(
+                                f"{role} Compose environment artifact is not trustworthy"
+                            ) from exc
+                        if actual != expected:
+                            raise InstallError(
+                                f"{role} Compose environment artifact has drifted"
+                            )
             else:
                 expected_templates = render_templates(config, plan)
                 state_dir = Path(config.state_dir)
@@ -469,7 +505,7 @@ class RuntimeUninstaller:
             "api": "owned",
             "private_network": "owned",
         }
-        if state.schema_version == 2 and config.uses_reader_session:
+        if state.schema_version in {2, 3} and config.uses_reader_session:
             mutable_resources["session_key"] = "owned-credential"
         if config.install_profile == "unraid":
             mutable_resources.update(
@@ -517,7 +553,7 @@ class RuntimeUninstaller:
                 self.docker.remove_container(name)
             resource["removed"] = True
             store.save(current)
-        if state.schema_version == 2 and config.uses_reader_session:
+        if state.schema_version in {2, 3} and config.uses_reader_session:
             credential = resources["session_key"]
             if not credential.get("removed"):
                 data_dir = Path(config.data_dir)

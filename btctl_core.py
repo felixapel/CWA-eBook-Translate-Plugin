@@ -58,7 +58,7 @@ _LLM_PROVIDERS = frozenset(
         "openai-compatible",
     }
 )
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 INSTALL_ATTEMPT_SCHEMA_VERSION = 1
 
 KAVITA_CERTIFIED_VERSION = "0.9.0.2"
@@ -1349,7 +1349,7 @@ class DeploymentState:
             "install_profile": self.install_profile,
             "auth_profile": self.auth_profile,
         }
-        if self.schema_version == 2:
+        if self.schema_version in {2, 3}:
             document.update(
                 {
                     "reader_type": self.reader_type,
@@ -1364,7 +1364,7 @@ class DeploymentState:
         if not isinstance(payload, dict):
             raise ConfigError("state must be one JSON object")
         schema_version = payload.get("schema_version")
-        if schema_version not in {1, STATE_SCHEMA_VERSION}:
+        if schema_version not in {1, 2, STATE_SCHEMA_VERSION}:
             raise ConfigError("unsupported state schema version")
         expected = {
             "schema_version",
@@ -1378,7 +1378,7 @@ class DeploymentState:
             "auth_profile",
             "resources",
         }
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             expected.update({"reader_type", "reader_contract_version"})
         if set(payload) != expected:
             raise ConfigError("state fields do not match the supported schema")

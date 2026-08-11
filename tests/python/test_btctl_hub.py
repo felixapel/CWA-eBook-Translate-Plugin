@@ -32,6 +32,8 @@ from btctl_hub import (
     HubStateStore,
     HubTopologyMigration,
     HubUninstaller,
+    _write_private_environment,
+    _write_private_json,
     render_hub_compose,
 )
 from tests.python.test_btctl_compose import values as split_values
@@ -183,7 +185,16 @@ class HubBtctlTests(unittest.TestCase):
 
         self.assertEqual(set(document["services"]), {"hub"})
         service = document["services"]["hub"]
-        self.assertEqual(service["environment"]["BT_ROLE"], "hub")
+        self.assertNotIn("environment", service)
+        self.assertEqual(
+            service["env_file"],
+            [{
+                "path": str(Path(config.state_dir) / "hub.env"),
+                "required": True,
+                "format": "raw",
+            }],
+        )
+        self.assertNotIn("fake-test-secret", json.dumps(document))
         self.assertEqual(
             service["ports"],
             [
@@ -267,6 +278,11 @@ class HubBtctlTests(unittest.TestCase):
             def compose_up(self, _document, _project):
                 self.calls.append("up")
                 service = self.document["services"]["hub"]
+                environment = {}
+                env_path = Path(service["env_file"][0]["path"])
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    key, value = line.split("=", 1)
+                    environment[key] = value
                 self.hub = {
                     "Id": "hub-container-id",
                     "Image": self.image["Id"],
@@ -276,7 +292,7 @@ class HubBtctlTests(unittest.TestCase):
                         "User": "101:102",
                         "Env": [
                             f"{key}={value}"
-                            for key, value in service["environment"].items()
+                            for key, value in environment.items()
                         ],
                     },
                     "HostConfig": {
@@ -331,6 +347,18 @@ class HubBtctlTests(unittest.TestCase):
             self.assertEqual(state.status, "installed")
             self.assertEqual(state.resources["hub"]["id"], "hub-container-id")
             self.assertEqual(HubStateStore(Path(config.state_dir)).load(), state)
+            compose_path = Path(config.state_dir) / "deployment.hub.compose.json"
+            environment_path = Path(config.state_dir) / "hub.env"
+            self.assertEqual(compose_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(environment_path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn(
+                "fake-test-secret",
+                compose_path.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "fake-test-secret",
+                environment_path.read_text(encoding="utf-8"),
+            )
             self.assertEqual(
                 docker.calls[:5],
                 [
@@ -400,6 +428,20 @@ class HubBtctlTests(unittest.TestCase):
             state = HubState.new(
                 install_id="21234567-89ab-4cde-8123-0123456789ab",
                 plan=plan,
+            )
+            state_dir = Path(config.state_dir)
+            state_dir.mkdir(parents=True)
+            state_dir.chmod(0o700)
+            _write_private_environment(
+                state_dir / "hub.env",
+                {
+                    key: value
+                    for key, value in config.environment.items()
+                },
+            )
+            _write_private_json(
+                state_dir / "deployment.hub.compose.json",
+                render_hub_compose(config, plan, state.install_id),
             )
             docker = Docker()
             doctor = HubDoctor(docker)

@@ -273,20 +273,22 @@ def _service_security() -> dict[str, object]:
     }
 
 
-def render_compose(
-    config: InstallConfig, plan: DeploymentPlan, install_id: str
-) -> dict[str, object]:
-    """Return a JSON-compatible model that never claims reader ownership."""
-    # Compose treats `$NAME` as interpolation in every string field, including
-    # environment values and bind sources. Doubling each dollar preserves the
-    # exact validated runtime value.
-    def compose_literal(value: str) -> str:
-        return value.replace("$", "$$")
+def _compose_literal(value: str) -> str:
+    """Preserve one validated value across Compose interpolation."""
+    return value.replace("$", "$$")
 
-    def compose_environment(values: dict[str, str]) -> dict[str, str]:
-        return {key: compose_literal(value) for key, value in values.items()}
 
-    api_environment = compose_environment({
+def _compose_environment_text(values: dict[str, str]) -> str:
+    """Render a raw private Compose env-file without altering validated values."""
+    if any("\n" in key or "\n" in value for key, value in values.items()):
+        raise InstallError("Compose environment contains an unsupported newline")
+    return "".join(
+        f"{key}={value}\n" for key, value in sorted(values.items())
+    )
+
+
+def _compose_api_environment(config: InstallConfig, install_id: str) -> dict[str, str]:
+    return {
         **config.api_environment(),
         "BT_ROLE": "api",
         **(
@@ -294,12 +296,28 @@ def render_compose(
             if config.uses_reader_session
             else {}
         ),
-    })
-    proxy_environment = compose_environment({
+    }
+
+
+def _compose_proxy_environment(config: InstallConfig) -> dict[str, str]:
+    return {
         **config.proxy_environment(),
         "BT_ROLE": "proxy",
         "BT_API_UPSTREAM": "http://translator-api:8390",
-    })
+    }
+
+
+def render_compose(
+    config: InstallConfig,
+    plan: DeploymentPlan,
+    install_id: str,
+    *,
+    _inline_environment: bool = False,
+) -> dict[str, object]:
+    """Return a JSON-compatible model that never claims reader ownership."""
+    api_environment = _compose_api_environment(config, install_id)
+    proxy_environment = _compose_proxy_environment(config)
+    state_dir = Path(config.state_dir)
     api_networks: dict[str, object] = {"private": {"aliases": ["translator-api"]}}
     if config.uses_reader_session:
         api_networks["reader"] = {}
@@ -316,12 +334,27 @@ def render_compose(
         "image": config.image,
         "pull_policy": "never",
         "container_name": plan.resources["api"]["name"],
-        "environment": api_environment,
+        **(
+            {
+                "environment": {
+                    key: _compose_literal(value)
+                    for key, value in api_environment.items()
+                }
+            }
+            if _inline_environment
+            else {
+                "env_file": [{
+                    "path": _compose_literal(str(state_dir / "api.env")),
+                    "required": True,
+                    "format": "raw",
+                }]
+            }
+        ),
         "labels": _labels(config, "api", install_id),
         "volumes": [
             {
                 "type": "bind",
-                "source": compose_literal(config.data_dir),
+                "source": _compose_literal(config.data_dir),
                 "target": "/app/data",
             }
         ],
@@ -337,7 +370,22 @@ def render_compose(
         "image": config.image,
         "pull_policy": "never",
         "container_name": plan.resources["proxy"]["name"],
-        "environment": proxy_environment,
+        **(
+            {
+                "environment": {
+                    key: _compose_literal(value)
+                    for key, value in proxy_environment.items()
+                }
+            }
+            if _inline_environment
+            else {
+                "env_file": [{
+                    "path": _compose_literal(str(state_dir / "proxy.env")),
+                    "required": True,
+                    "format": "raw",
+                }]
+            }
+        ),
         "labels": _labels(config, "proxy", install_id),
         "tmpfs": ["/tmp:rw,noexec,nosuid,size=67108864,uid=101,gid=102,mode=700"],
         "pids_limit": 64,
@@ -375,7 +423,9 @@ def render_schema1_compose(
     """Reconstruct the frozen schema-1 CWA artifact for doctor only."""
     if config.reader_type != "cwa":
         raise InstallError("schema-1 artifacts can only describe CWA")
-    document = render_compose(config, plan, install_id)
+    document = render_compose(
+        config, plan, install_id, _inline_environment=True
+    )
     networks = document["networks"]
     assert isinstance(networks, dict)
     networks["cwa"] = networks.pop("reader")
@@ -430,6 +480,15 @@ def render_schema1_compose(
         f"{config.reader_upstream}/ajax/emailstat"
     )
     return document
+
+
+def render_schema2_compose(
+    config: InstallConfig, plan: DeploymentPlan, install_id: str
+) -> dict[str, object]:
+    """Reconstruct the frozen inline-environment schema-2 Compose artifact."""
+    return render_compose(
+        config, plan, install_id, _inline_environment=True
+    )
 
 
 def _write_private_json(path: Path, payload: object) -> None:
@@ -878,6 +937,8 @@ class ComposeInstaller:
         except ConfigError as exc:
             raise InstallError("install attempt could not be committed") from exc
         document_path = Path(config.state_dir) / "deployment.compose.json"
+        api_environment_path = Path(config.state_dir) / "api.env"
+        proxy_environment_path = Path(config.state_dir) / "proxy.env"
         start_attempted = False
         state_committed = False
         session_key_preexisting = False
@@ -919,6 +980,16 @@ class ComposeInstaller:
                     "BT_DATA_DIR metadata could not be made durable"
                 ) from exc
 
+            _write_private_text(
+                api_environment_path,
+                _compose_environment_text(
+                    _compose_api_environment(config, install_id)
+                ),
+            )
+            _write_private_text(
+                proxy_environment_path,
+                _compose_environment_text(_compose_proxy_environment(config)),
+            )
             _write_private_json(
                 document_path, render_compose(config, plan, install_id)
             )

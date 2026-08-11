@@ -112,6 +112,8 @@ class DockerCommandError(RuntimeError):
 
 
 class DockerCLI:
+    _MIN_RAW_ENV_COMPOSE = (2, 30, 0)
+
     def _run(
         self,
         arguments: list[str],
@@ -535,6 +537,18 @@ class DockerCLI:
         )
 
     def compose_validate(self, document: Path, project: str) -> None:
+        version = self._run(
+            ["compose", "version", "--short"], timeout=20
+        ).stdout.strip()
+        match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", version)
+        if (
+            match is None
+            or tuple(int(part) for part in match.groups())
+            < self._MIN_RAW_ENV_COMPOSE
+        ):
+            raise DockerCommandError(
+                "Docker Compose 2.30.0 or newer is required for raw private env files"
+            )
         self._run(
             ["compose", "--project-name", project, "--file", str(document), "config", "--quiet"],
             timeout=60,

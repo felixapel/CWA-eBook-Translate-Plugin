@@ -291,6 +291,21 @@ class UnraidTemplateTests(unittest.TestCase):
 
 
 class DockerCLIContractTests(unittest.TestCase):
+    def test_compose_raw_env_requires_version_230_before_validation(self):
+        old = mock.Mock(returncode=0, stdout="2.29.9\n", stderr="")
+        with mock.patch("subprocess.run", return_value=old) as run:
+            with self.assertRaisesRegex(DockerCommandError, "2.30.0"):
+                DockerCLI().compose_validate(Path("/private/compose.json"), "project")
+        self.assertEqual(run.call_count, 1)
+
+    def test_supported_compose_version_runs_validation_without_shell(self):
+        version = mock.Mock(returncode=0, stdout="v2.30.0\n", stderr="")
+        validated = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch("subprocess.run", side_effect=[version, validated]) as run:
+            DockerCLI().compose_validate(Path("/private/compose.json"), "project")
+        self.assertEqual(run.call_count, 2)
+        self.assertIsInstance(run.call_args.args[0], list)
+
     def test_inspect_distinguishes_verified_absence_from_docker_failure(self):
         missing = mock.Mock(
             returncode=1,

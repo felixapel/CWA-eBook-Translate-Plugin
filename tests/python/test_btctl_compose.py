@@ -1,13 +1,25 @@
 import json
 import os
+import re
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-from btctl_compose import ComposeAdopter, ComposeInstaller, InstallError, render_compose
+from btctl_compose import (
+    ComposeAdopter,
+    ComposeInstaller,
+    InstallError,
+    _compose_api_environment,
+    _compose_environment_text,
+    _write_private_json,
+    _write_private_text,
+    render_compose,
+)
 from btctl_core import (
     ConfigError,
     DeploymentPlan,
@@ -23,6 +35,22 @@ def _compose_interpolate(value: str) -> str:
     """Model Compose's dollar expansion for generated string values."""
     sentinel = "\0COMPOSE_LITERAL_DOLLAR\0"
     return os.path.expandvars(value.replace("$$", sentinel)).replace(sentinel, "$")
+
+
+def _service_environment(service: dict) -> dict[str, str]:
+    if "environment" in service:
+        return {
+            key: _compose_interpolate(value)
+            for key, value in service["environment"].items()
+        }
+    env_entry = service["env_file"][0]
+    assert env_entry["format"] == "raw" and env_entry["required"] is True
+    env_path = Path(_compose_interpolate(env_entry["path"]))
+    result = {}
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        key, value = line.split("=", 1)
+        result[key] = value
+    return result
 
 
 class FakeDocker:
@@ -91,7 +119,8 @@ class FakeDocker:
             raise InstallError("compose up failed after creating the private network")
         for service in payload["services"].values():
             name = service["container_name"]
-            role = service["environment"]["BT_ROLE"]
+            environment = _service_environment(service)
+            role = environment["BT_ROLE"]
             ports = {}
             if service.get("ports"):
                 ports["8080/tcp"] = [
@@ -111,7 +140,7 @@ class FakeDocker:
                 }
                 for volume in service.get("volumes", [])
             ]
-            if role == "api" and service["environment"].get("BT_AUTH_MODE") == "reader_session":
+            if role == "api" and environment.get("BT_AUTH_MODE") == "reader_session":
                 data_source = Path(_compose_interpolate(service["volumes"][0]["source"]))
                 session_key = data_source / "reader_session_key"
                 session_key.write_bytes(b"s" * 32)
@@ -132,8 +161,8 @@ class FakeDocker:
                     "Image": service["image"],
                     "Labels": service["labels"],
                     "Env": [
-                        f"{key}={_compose_interpolate(value)}"
-                        for key, value in service["environment"].items()
+                        f"{key}={value}"
+                        for key, value in environment.items()
                     ],
                     "User": service["user"],
                 },
@@ -280,9 +309,15 @@ class ComposeRenderTests(unittest.TestCase):
             self.assertEqual(set(api["networks"]), {"private", "reader"})
             self.assertEqual(set(proxy["networks"]), {"private", "reader"})
             self.assertEqual(
-                proxy["environment"]["BT_API_UPSTREAM"],
-                "http://translator-api:8390",
+                proxy["env_file"],
+                [{
+                    "path": str(Path(config.state_dir) / "proxy.env"),
+                    "required": True,
+                    "format": "raw",
+                }],
             )
+            self.assertNotIn("environment", api)
+            self.assertNotIn("environment", proxy)
             self.assertEqual(
                 api["networks"]["private"]["aliases"],
                 ["translator-api"],
@@ -314,13 +349,15 @@ class ComposeRenderTests(unittest.TestCase):
                     any(key.startswith("io.cwa-translate.") for key in service["labels"])
                 )
             self.assertEqual(
-                document["services"]["api"]["environment"]["BT_AUTH_MODE"],
-                "reader_session",
+                document["services"]["api"]["env_file"],
+                [{
+                    "path": str(Path(config.state_dir) / "api.env"),
+                    "required": True,
+                    "format": "raw",
+                }],
             )
-            self.assertEqual(
-                document["services"]["proxy"]["environment"]["BT_API_UPSTREAM"],
-                "http://translator-api:8390",
-            )
+            self.assertNotIn("environment", document["services"]["api"])
+            self.assertNotIn("environment", document["services"]["proxy"])
 
     def test_forwarded_profile_joins_identity_edge_without_publishing_ports(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -357,10 +394,7 @@ class ComposeRenderTests(unittest.TestCase):
             plan = DeploymentPlan.from_config(config)
             document = render_compose(config, plan, "install-id")
 
-            self.assertEqual(
-                document["services"]["api"]["environment"]["LLM_API_KEY"],
-                "secret$$HOME$$$$literal",
-            )
+            self.assertNotIn("secret$HOME$$literal", json.dumps(document))
             self.assertEqual(
                 document["services"]["api"]["volumes"][0]["source"],
                 str(Path(directory) / "$$HOME-data"),
@@ -369,9 +403,76 @@ class ComposeRenderTests(unittest.TestCase):
             docker = FakeDocker()
             state = ComposeInstaller(docker).install(config, plan, Path(directory))
             self.assertEqual(state.status, "installed")
+            self.assertIn(
+                "LLM_API_KEY=secret$HOME$$literal",
+                (Path(config.state_dir) / "api.env").read_text(encoding="utf-8"),
+            )
             api = docker.containers[str(plan.resources["api"]["name"])]
             self.assertIn("LLM_API_KEY=secret$HOME$$literal", api["Config"]["Env"])
             self.assertEqual(api["Mounts"][0]["Source"], config.data_dir)
+
+    def test_raw_env_file_round_trips_compose_metacharacters(self):
+        if shutil.which("docker") is None:
+            self.skipTest("Docker Compose CLI is unavailable")
+        version = subprocess.run(
+            ["docker", "compose", "version", "--short"],
+            check=False, capture_output=True, text=True,
+        )
+        match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", version.stdout.strip())
+        if version.returncode != 0 or match is None:
+            self.skipTest("Docker Compose plugin is unavailable")
+        self.assertGreaterEqual(
+            tuple(int(part) for part in match.groups()), (2, 30, 0),
+            "Docker Compose must support raw env files",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            configured = values(root)
+            sentinel = "dollar=$HOME $$ hash=# quotes='\" slash=\\ equals=a=b spaces=x y"
+            configured.update({
+                "LLM_PROVIDER": "openai",
+                "BT_LOCAL_URL": "",
+                "LLM_API_KEY": sentinel,
+            })
+            config = InstallConfig.from_mapping(configured, self.identity)
+            plan = DeploymentPlan.from_config(config)
+            state_dir = Path(config.state_dir)
+            state_dir.mkdir(parents=True)
+            state_dir.chmod(0o700)
+            _write_private_text(
+                state_dir / "api.env",
+                _compose_environment_text(
+                    _compose_api_environment(config, "install-id")
+                ),
+            )
+            _write_private_text(state_dir / "proxy.env", "BT_ROLE=proxy\n")
+            document = render_compose(config, plan, "install-id")
+            # Config expansion reads both env files; make proxy complete enough
+            # for this parser-only contract without exposing any output.
+            proxy_values = config.proxy_environment()
+            proxy_values.update({
+                "BT_ROLE": "proxy",
+                "BT_API_UPSTREAM": "http://translator-api:8390",
+            })
+            _write_private_text(
+                state_dir / "proxy.env",
+                _compose_environment_text(proxy_values),
+            )
+            compose_path = state_dir / "deployment.compose.json"
+            _write_private_json(compose_path, document)
+            parsed = subprocess.run(
+                ["docker", "compose", "--file", str(compose_path),
+                 "config", "--format", "json"],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(parsed.returncode, 0, "Compose rejected raw env syntax")
+            actual = json.loads(parsed.stdout)["services"]["api"]["environment"][
+                "LLM_API_KEY"
+            ]
+            self.assertTrue(
+                actual.replace("$$", "$") == sentinel,
+                "raw env sentinel did not round-trip",
+            )
 
 
 class ComposeInstallTests(unittest.TestCase):
@@ -410,6 +511,12 @@ class ComposeInstallTests(unittest.TestCase):
             self.assertEqual(state.resources["api"]["id"], "cwa-translate-test-api-id")
             self.assertEqual(state.resources["proxy"]["id"], "cwa-translate-test-proxy-id")
             self.assertEqual(os.stat(root / "state" / "deployment.compose.json").st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(root / "state" / "api.env").st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(root / "state" / "proxy.env").st_mode & 0o777, 0o600)
+            document_text = (root / "state" / "deployment.compose.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("fake-test-secret", document_text)
 
     def test_concurrent_lifecycle_operation_stops_before_docker_access(self):
         with tempfile.TemporaryDirectory() as directory:

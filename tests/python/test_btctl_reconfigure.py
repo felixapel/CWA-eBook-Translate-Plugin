@@ -15,6 +15,7 @@ from btctl_unraid import InstallError, UnraidInstaller
 from btctl_unraid import _environment_text, _write_private
 from tests.python.test_btctl_unraid import FakeDocker, values
 from btctl_compose import ComposeInstaller
+from btctl_compose import _write_private_json
 from tests.python.test_btctl_compose import FakeDocker as ComposeFakeDocker
 from tests.python.test_btctl_compose import values as compose_values
 
@@ -371,6 +372,12 @@ class ProviderReconfigureTests(unittest.TestCase):
             self.assertEqual(docker.containers[proxy_name]["Id"], proxy_id)
             self.assertIn(
                 "compose-gemini-secret",
+                (Path(config.state_dir) / "api.env").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertNotIn(
+                "compose-gemini-secret",
                 (Path(config.state_dir) / "deployment.compose.json").read_text(
                     encoding="utf-8"
                 ),
@@ -379,6 +386,41 @@ class ProviderReconfigureTests(unittest.TestCase):
                 ("probe_providers", str(plan.resources["api"]["name"])),
                 docker.calls,
             )
+
+    def test_compose_reconfigure_rejects_tampered_document_before_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_values = compose_values(root, reader="kavita")
+            old_config = InstallConfig.from_mapping(old_values, self.identity)
+            old_plan = DeploymentPlan.from_config(old_config)
+            docker = ReconfigureComposeDocker()
+            ComposeInstaller(docker).install(old_config, old_plan, root)
+            new_values = {
+                **old_values,
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.5-flash-lite",
+                "LLM_API_KEY": "new-private-value",
+                "BT_LOCAL_URL": "",
+            }
+            config = InstallConfig.from_mapping(new_values, self.identity)
+            plan = DeploymentPlan.from_config(config)
+            state_dir = Path(config.state_dir)
+            compose_path = state_dir / "deployment.compose.json"
+            document = json.loads(compose_path.read_text(encoding="utf-8"))
+            document["services"]["api"]["read_only"] = False
+            _write_private_json(compose_path, document)
+            old_environment = (state_dir / "api.env").read_bytes()
+            calls_before = len(docker.calls)
+
+            with self.assertRaisesRegex(InstallError, "does not match the plan"):
+                ProviderReconfigurer(docker).reconfigure(config, plan)
+
+            new_calls = docker.calls[calls_before:]
+            self.assertFalse(
+                [call for call in new_calls if call[0].startswith("compose_")]
+            )
+            self.assertEqual((state_dir / "api.env").read_bytes(), old_environment)
+            self.assertFalse((state_dir / "reconfigure.json").exists())
 
 
 if __name__ == "__main__":

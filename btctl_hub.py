@@ -443,7 +443,11 @@ def render_hub_compose(
         "image": config.image,
         "pull_policy": "never",
         "container_name": config.install_name,
-        "environment": {key: literal(value) for key, value in config.environment.items()},
+        "env_file": [{
+            "path": literal(str(Path(config.state_dir) / "hub.env")),
+            "required": True,
+            "format": "raw",
+        }],
         "labels": _labels(config, install_id),
         "volumes": [
             {"type": "bind", "source": literal(config.data_dir), "target": "/app/data"}
@@ -754,6 +758,10 @@ class HubInstaller:
         environment_path = state_dir / "hub.env"
         try:
             if config.install_profile == "compose-existing":
+                _write_private_environment(
+                    environment_path,
+                    config.environment,
+                )
                 _write_private_json(
                     compose_path, render_hub_compose(config, plan, install_id)
                 )
@@ -899,6 +907,45 @@ class HubDoctor:
             ),
         )
         check("runtime-dependencies", lambda: installer._probe(config))
+
+        def verify_artifacts() -> None:
+            state_dir = Path(config.state_dir)
+            environment_path = state_dir / "hub.env"
+            expected_environment = (
+                config.environment
+            )
+            expected_text = "".join(
+                f"{key}={value}\n"
+                for key, value in sorted(expected_environment.items())
+            )
+            try:
+                actual_environment = read_private_text(
+                    state_dir, environment_path.name,
+                    label="hub environment artifact",
+                )
+            except ConfigError as exc:
+                raise InstallError(
+                    "hub environment artifact is not trustworthy"
+                ) from exc
+            if actual_environment != expected_text:
+                raise InstallError("hub environment artifact has drifted")
+            if config.install_profile == "compose-existing":
+                compose_path = state_dir / "deployment.hub.compose.json"
+                try:
+                    actual_compose = json.loads(read_private_text(
+                        state_dir, compose_path.name,
+                        label="hub Compose artifact",
+                    ))
+                except (ConfigError, json.JSONDecodeError) as exc:
+                    raise InstallError(
+                        "hub Compose artifact is not trustworthy"
+                    ) from exc
+                if actual_compose != render_hub_compose(
+                    config, plan, holder["state"].install_id
+                ):
+                    raise InstallError("hub Compose artifact has drifted")
+
+        check("artifacts", verify_artifacts)
 
         check("data-isolation", lambda: self._verify_data(config))
         if deep and all(item["status"] == "ok" for item in checks):

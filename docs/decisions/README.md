@@ -19,6 +19,7 @@ discussion.
 - [ADR-013: Stock reader connector contract](ADR-013-stock-reader-connectors.md)
 - [ADR-014: Configurable provider backends](ADR-014-configurable-provider-backends.md)
 - [ADR-015: Universal one-container reader hub](ADR-015-universal-reader-hub.md)
+- [ADR-016: Private raw Compose environments](ADR-016-private-compose-environments.md)
 
 New ADRs use the next number and include a single `Status` value (`Proposed`,
 `Accepted`, `Deprecated` or `Superseded`) plus an ISO date. Amendments and
