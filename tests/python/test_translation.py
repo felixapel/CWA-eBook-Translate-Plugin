@@ -335,6 +335,8 @@ def run():
           d.get("skipped") == "source==target"
           and d.get("backends") == ["skipped", "skipped"]
           and d.get("cached") == [False, False]
+          and d.get("error_codes") == [None, None]
+          and d.get("retry_after_seconds") == [None, None]
           and d.get("translations") == ["same lang a", "same lang b"])
 
     # Loader inherits its version from its own ?v= param (no hardcoded version).
@@ -450,6 +452,10 @@ def run():
     check("rate limit: returns status 429", resp.status_code == 429)
     check("rate limit: response has Retry-After header", "Retry-After" in resp.headers)
     check("rate limit: response JSON has retry_after", resp.get_json().get("retry_after") is not None)
+    check("rate limit: response explicitly marks replay as safe",
+          resp.get_json().get("retry_safe") is True)
+    check("rate limit: response identifies pre-provider admission",
+          resp.get_json().get("scope") == "api_admission")
     # CORS preflights must NOT burn rate-limit budget: a 429 on an OPTIONS
     # surfaces as a cryptic CORS error in the browser, and every real request
     # would cost 2x. Even while fully rate-limited, OPTIONS sails through.

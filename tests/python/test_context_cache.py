@@ -168,6 +168,43 @@ class ServerGroupCacheTests(unittest.TestCase):
             self.assertEqual(cache_scope.book_id, "book-7")
             self.assertEqual(cache_scope.chapter_id, "chapter-3")
 
+    def test_batch_result_exposes_aligned_sanitized_error_metadata(self) -> None:
+        fresh = [
+            translator.BatchTranslationItem(
+                "translated-a", "gemini", True, "direct"
+            ),
+            translator.BatchTranslationItem(
+                "[TRANSLATION ERROR: provider_rate_limited]",
+                "",
+                False,
+                "failed",
+                error_code="provider_rate_limited",
+                retry_after_seconds=7,
+            ),
+        ]
+        with (
+            mock.patch.object(server, "get_cached", return_value=None),
+            mock.patch.object(server, "put_cache_many"),
+            mock.patch.object(server, "translate_batch", return_value=fresh),
+            mock.patch.object(
+                server,
+                "cache_lookup_backends",
+                return_value=[("gemini", "gemini-test")],
+            ),
+        ):
+            result = server._translate_paragraphs(
+                ["a", "b"],
+                "English",
+                "Spanish",
+                budget(),
+                **self.namespace,
+            )
+
+        self.assertEqual(
+            result["error_codes"], [None, "provider_rate_limited"]
+        )
+        self.assertEqual(result["retry_after_seconds"], [None, 7])
+
     def test_complete_group_hit_avoids_provider_work(self) -> None:
         hits = {"a": "cached-a", "b": "cached-b"}
 

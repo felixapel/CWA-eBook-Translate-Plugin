@@ -41,6 +41,41 @@ from work_budget import WorkBudget, WorkBudgetExceeded
 
 log = logging.getLogger("book-translator.translator")
 
+_PROVIDER_CALL_METRIC_NAMES = (
+    "attempts", "successes", "rate_limited", "failures"
+)
+_provider_call_metrics_lock = _threading.Lock()
+_provider_call_metrics = {
+    name: 0 for name in _PROVIDER_CALL_METRIC_NAMES
+}
+
+
+def _record_provider_call(outcome: str) -> None:
+    """Record one fixed-cardinality provider transport event."""
+    metric_name = {
+        "attempt": "attempts",
+        "success": "successes",
+        "rate_limited": "rate_limited",
+        "failure": "failures",
+    }.get(outcome)
+    if metric_name is None:
+        raise ValueError("unknown provider call outcome")
+    with _provider_call_metrics_lock:
+        _provider_call_metrics[metric_name] += 1
+
+
+def provider_call_stats() -> dict[str, int]:
+    """Return a content-free snapshot of provider transport counters."""
+    with _provider_call_metrics_lock:
+        return dict(_provider_call_metrics)
+
+
+def _reset_provider_call_stats_for_tests() -> None:
+    """Reset provider counters for deterministic contract tests."""
+    with _provider_call_metrics_lock:
+        for name in _PROVIDER_CALL_METRIC_NAMES:
+            _provider_call_metrics[name] = 0
+
 # ── Environment Configuration ────────────────────────────────────────────────
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "local").lower()
@@ -111,6 +146,13 @@ def _estimate_tokens(text: str) -> int:
     cjk = len(_CJK_RE.findall(text))
     other = len(text) - cjk
     return max(1, int(cjk / 1.5 + other / 3.5))
+
+
+def estimate_source_tokens(text: str) -> int:
+    """Return the deterministic source-token estimate used for batching."""
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    return _estimate_tokens(text)
 
 
 def _output_cap(input_text: str, ceiling: int) -> int:
@@ -389,6 +431,17 @@ def _provider_from_config(
 class ProviderUnavailableError(RuntimeError):
     """No configured provider completed a translation request."""
 
+    def __init__(
+        self,
+        message: str = "No configured provider completed the translation",
+        *,
+        error_code: str = "provider_unavailable",
+        retry_after_seconds: int | None = None,
+    ):
+        self.error_code = error_code
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(message)
+
 
 class _ProviderCallError(RuntimeError):
     """Sanitized provider failure retained only for retry decisions/logging."""
@@ -401,6 +454,7 @@ class _ProviderCallError(RuntimeError):
         *,
         retryable: Optional[bool] = None,
         fallback_eligible: Optional[bool] = None,
+        retry_after_seconds: int | None = None,
     ):
         self.provider = provider
         self.status_code = status_code
@@ -410,6 +464,7 @@ class _ProviderCallError(RuntimeError):
         self.fallback_eligible = (
             transient if fallback_eligible is None else fallback_eligible
         )
+        self.retry_after_seconds = retry_after_seconds
         super().__init__("provider call failed")
 
 
@@ -805,6 +860,8 @@ class BatchTranslationItem:
     provider: str
     server_cacheable: bool
     recovery_path: RecoveryPath
+    error_code: str | None = None
+    retry_after_seconds: int | None = None
 
 
 RECOVERY_METRIC_NAMES = (
@@ -1170,12 +1227,30 @@ def _sleep_before_retry(
     budget.ensure_active()
 
 
+def _retry_after_seconds(response: object) -> int | None:
+    """Return a sanitized delta-seconds Retry-After value, capped at 30."""
+    headers = getattr(response, "headers", None)
+    if not hasattr(headers, "get"):
+        return None
+    raw = headers.get("Retry-After")
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not re.fullmatch(r"[0-9]{1,6}", value):
+        return None
+    seconds = int(value)
+    if seconds <= 0:
+        return None
+    return min(30, seconds)
+
+
 def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                    max_retries: int, timeout: int, max_tokens: int,
                    budget: WorkBudget) -> str:
     """Call one provider with retry/backoff. Raises on definitive failure."""
     last_error: _ProviderCallError | None = None
     for attempt in range(max_retries):
+        attempt_recorded = False
         try:
             _acquire_upstream_slot(budget)
             try:
@@ -1193,13 +1268,18 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                     _HTTP_CALL_CONTEXT.reuse_connection = (
                         p.name != CUSTOM_PROVIDER_ID
                     )
+                    _record_provider_call("attempt")
+                    attempt_recorded = True
                     if p.api_type == "openai":
-                        return _translate_openai(
+                        translated = _translate_openai(
                             p, user_content, system_prompt, call_timeout,
                             max_tokens, budget)
-                    return _translate_anthropic(
-                        p, user_content, system_prompt, call_timeout,
-                        max_tokens, budget)
+                    else:
+                        translated = _translate_anthropic(
+                            p, user_content, system_prompt, call_timeout,
+                            max_tokens, budget)
+                    _record_provider_call("success")
+                    return translated
                 finally:
                     _HTTP_CALL_CONTEXT.__dict__.pop(
                         "reuse_connection", None
@@ -1209,6 +1289,8 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
             finally:
                 _UPSTREAM_SEM.release()
         except WorkBudgetExceeded:
+            if attempt_recorded:
+                _record_provider_call("failure")
             raise
         except _CustomEndpointConfigurationError as e:
             error_type = type(e).__name__
@@ -1238,6 +1320,8 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
             )
             _sleep_before_retry(budget, 0.5, attempt, max_retries)
         except requests.exceptions.SSLError as e:
+            if attempt_recorded:
+                _record_provider_call("failure")
             error_type = type(e).__name__
             log.warning(
                 "provider=%s status=0 attempt=%d/%d error_type=%s",
@@ -1266,17 +1350,31 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                 status_code in {408, 429, 500, 502, 503, 504}
                 or transient_transport
             )
+            if attempt_recorded:
+                if status_code == 429:
+                    _record_provider_call("rate_limited")
+                _record_provider_call("failure")
             last_error = _ProviderCallError(
                 p.name,
                 status_code,
                 error_type,
                 retryable=retryable,
                 fallback_eligible=retryable,
+                retry_after_seconds=(
+                    _retry_after_seconds(response)
+                    if status_code == 429
+                    else None
+                ),
             )
             if not retryable:
                 break
             if status_code == 429:
-                _sleep_before_retry(budget, 2 ** attempt, attempt, max_retries)
+                _sleep_before_retry(
+                    budget,
+                    last_error.retry_after_seconds or 2 ** attempt,
+                    attempt,
+                    max_retries,
+                )
             elif status_code:
                 _sleep_before_retry(budget, 1, attempt, max_retries)
             else:
@@ -1285,6 +1383,8 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                 # instead of burning the provider on the first hiccup.
                 _sleep_before_retry(budget, 0.5, attempt, max_retries)
         except (_ProviderResponseTooLarge, ValueError, KeyError, TypeError) as e:
+            if attempt_recorded:
+                _record_provider_call("failure")
             error_type = type(e).__name__
             log.warning(
                 "provider=%s status=0 attempt=%d/%d error_type=%s",
@@ -1297,6 +1397,10 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                 retryable=False,
                 fallback_eligible=True,
             ) from None
+        except Exception:
+            if attempt_recorded:
+                _record_provider_call("failure")
+            raise
     raise last_error or _ProviderCallError(p.name, 0, "UnknownError")
 
 
@@ -1312,6 +1416,7 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
 
     providers = _eligible_providers(
         allow_cloud_fallback=allow_cloud_fallback)
+    last_provider_error: _ProviderCallError | None = None
 
     for p in providers:
         try:
@@ -1321,6 +1426,7 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
         except WorkBudgetExceeded:
             raise
         except _ProviderCallError as e:
+            last_provider_error = e
             log.warning(
                 "provider=%s exhausted status=%s error_type=%s",
                 p.name, e.status_code, e.error_type,
@@ -1334,8 +1440,19 @@ def _complete(user_content: str, system_prompt: str, max_retries: int = 2,
             )
             break
 
+    rate_limited = (
+        last_provider_error is not None
+        and last_provider_error.status_code == 429
+    )
     raise ProviderUnavailableError(
-        "No configured provider completed the translation")
+        "No configured provider completed the translation",
+        error_code=(
+            "provider_rate_limited" if rate_limited else "provider_unavailable"
+        ),
+        retry_after_seconds=(
+            last_provider_error.retry_after_seconds if rate_limited else None
+        ),
+    )
 
 
 def model_for_provider(provider_name: str) -> str:
@@ -1650,7 +1767,7 @@ def translation_groups(
     current: list[int] = []
     current_tokens = 0
     for index in work:
-        paragraph_tokens = _estimate_tokens(texts[index].strip())
+        paragraph_tokens = estimate_source_tokens(texts[index].strip())
         if current and (
             len(current) >= size
             or current_tokens + paragraph_tokens > token_budget
@@ -1818,9 +1935,12 @@ def _translate_group_operation(
         except WorkBudgetExceeded:
             raise
         except Exception as exc:
+            provider_error = (
+                exc if isinstance(exc, ProviderUnavailableError) else None
+            )
             error_code = (
-                "provider_unavailable"
-                if isinstance(exc, ProviderUnavailableError)
+                provider_error.error_code
+                if provider_error is not None
                 else "translation_failed"
             )
             log.warning(
@@ -1832,6 +1952,12 @@ def _translate_group_operation(
                 "",
                 False,
                 "paragraph_fallback_failed",
+                error_code=error_code,
+                retry_after_seconds=(
+                    provider_error.retry_after_seconds
+                    if provider_error is not None
+                    else None
+                ),
             ))
             if recovery_tracker is not None:
                 recovery_tracker.record("paragraph_fallback_failed_segments")
@@ -1963,9 +2089,12 @@ def translate_batch_detailed(
             budget.cancel(exc.reason)
             raise
         except Exception as e:
+            provider_error = (
+                e if isinstance(e, ProviderUnavailableError) else None
+            )
             error_code = (
-                "provider_unavailable"
-                if isinstance(e, ProviderUnavailableError)
+                provider_error.error_code
+                if provider_error is not None
                 else "translation_failed"
             )
             log.error(
@@ -1976,6 +2105,12 @@ def translate_batch_detailed(
                     "",
                     False,
                     "failed",
+                    error_code=error_code,
+                    retry_after_seconds=(
+                        provider_error.retry_after_seconds
+                        if provider_error is not None
+                        else None
+                    ),
                 )
                 for _ in idxs
             ]
