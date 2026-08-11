@@ -780,8 +780,8 @@ class BatchRecoveryTracker:
     """Thread-safe, fixed-cardinality recovery counters for one request.
 
     The tracker deliberately contains no paragraph content, provider value,
-    segment ID, or other caller-controlled dimension. It is passed only to the
-    singleflight leader, so coalesced followers do not double-count provider
+    segment ID, or other caller-controlled dimension. Batch work is never
+    shared across requests, so each request publishes only its own recovery
     work.
     """
 
@@ -1445,10 +1445,21 @@ def translate_text(
     allow_cloud_fallback: bool = False,
 ) -> tuple[str, str]:
     """Translate a single text. Returns (translated_text, provider_name)."""
-    if budget is None:
-        budget = create_work_budget()
-    budget.ensure_active()
     resolved_timeout = BT_TIMEOUT if timeout is None else timeout
+    _validate_operation_namespace(operation_namespace)
+    if budget is not None:
+        budget.ensure_active()
+        return _translate_text_operation(
+            text,
+            source_lang,
+            target_lang,
+            max_retries,
+            resolved_timeout,
+            budget,
+            allow_cloud_fallback,
+        )
+
+    wait_budget = create_work_budget()
     key = _single_operation_key(
         text,
         source_lang,
@@ -1467,10 +1478,10 @@ def translate_text(
                 target_lang,
                 max_retries,
                 resolved_timeout,
-                budget,
+                create_work_budget(),
                 allow_cloud_fallback,
             ),
-            timeout=budget.remaining_seconds(),
+            timeout=wait_budget.remaining_seconds(),
         )
     except SingleFlightTimeout as exc:
         raise WorkBudgetExceeded("deadline") from exc
@@ -1749,81 +1760,38 @@ def _translate_group_operation(
     return recovered
 
 
-def _batch_operation_key(
-    all_texts: list[str],
-    idxs: list[int],
-    source_lang: str,
-    target_lang: str,
-    operation_namespace: str,
-    allow_cloud_fallback: bool,
-) -> str:
-    contract = batch_cache_contract(
-        all_texts, idxs, source_lang, target_lang
-    )
-    return _contract_hash([
-        TRANSLATION_CONTRACT_VERSION,
-        "singleflight-batch",
-        _validate_operation_namespace(operation_namespace),
-        _backend_operation_identity(
-            allow_cloud_fallback=allow_cloud_fallback
-        ),
-        allow_cloud_fallback,
-        contract.prompt_hash,
-        contract.protocol_version,
-        contract.context_hash,
-        BT_BATCH_MAX_TOKENS,
-        BT_OUTPUT_TOKEN_FACTOR,
-        BT_OUTPUT_TOKEN_FLOOR,
-    ])
-
-
 def _translate_group(
     all_texts: list[str],
     idxs: list[int],
     source_lang: str,
     target_lang: str,
     budget: WorkBudget,
-    operation_namespace: str,
     allow_cloud_fallback: bool,
     recovery_tracker: Optional[BatchRecoveryTracker],
 ) -> list[BatchTranslationItem]:
     if len(idxs) == 1 and BT_CONTEXT_WINDOW == 0:
-        translated, provider = translate_text(
+        translated, provider = _translate_text_operation(
             all_texts[idxs[0]],
             source_lang,
             target_lang,
-            max_retries=1,
-            budget=budget,
-            operation_namespace=operation_namespace,
-            allow_cloud_fallback=allow_cloud_fallback,
+            1,
+            BT_TIMEOUT,
+            budget,
+            allow_cloud_fallback,
         )
         return [BatchTranslationItem(
             translated, provider, True, "direct")]
 
     budget.ensure_active()
-    key = _batch_operation_key(
-        all_texts, idxs, source_lang, target_lang, operation_namespace,
+    return _translate_group_operation(
+        all_texts,
+        idxs,
+        source_lang,
+        target_lang,
+        budget,
         allow_cloud_fallback,
+        recovery_tracker,
     )
-    try:
-        flight = _TRANSLATION_SINGLEFLIGHT.run(
-            key,
-            lambda: _translate_group_operation(
-                all_texts,
-                idxs,
-                source_lang,
-                target_lang,
-                budget,
-                allow_cloud_fallback,
-                recovery_tracker,
-            ),
-            timeout=budget.remaining_seconds(),
-        )
-    except SingleFlightTimeout as exc:
-        raise WorkBudgetExceeded("deadline") from exc
-    except SingleFlightCapacityError as exc:
-        raise WorkBudgetExceeded("queue") from exc
-    return flight.value
 
 
 
@@ -1847,6 +1815,7 @@ def translate_batch_detailed(
     ``translate_batch``; the server uses this detailed result to avoid caching
     individual recovery output under a batch prompt contract.
     """
+    _validate_operation_namespace(operation_namespace)
     if max_concurrent is None:
         max_concurrent = BT_MAX_CONCURRENT
     if budget is None:
@@ -1892,7 +1861,6 @@ def translate_batch_detailed(
                 source_lang,
                 target_lang,
                 budget,
-                operation_namespace,
                 allow_cloud_fallback,
                 recovery_tracker,
             )
