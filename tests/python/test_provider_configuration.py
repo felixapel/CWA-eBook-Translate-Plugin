@@ -20,6 +20,18 @@ def _budget() -> WorkBudget:
 
 
 class ProviderConfigurationTests(unittest.TestCase):
+    def test_health_probe_allows_a_text_answer_after_model_thinking(self):
+        provider = translator._Provider(
+            "gemini", "gemini-3.5-flash-lite", "gemini-key"
+        )
+        with mock.patch.object(
+            translator, "_call_provider", return_value="OK"
+        ) as call_provider:
+            health = translator._probe(provider, _budget())
+
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(call_provider.call_args.kwargs["max_tokens"], 32)
+
     def test_expired_budget_never_consumes_dns_thread_capacity(self):
         original_slots = translator._DNS_RESOLVER_SLOTS
         slots = threading.BoundedSemaphore(1)

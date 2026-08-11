@@ -2001,6 +2001,10 @@ def translate_batch(
 
 _health_cache: dict = {"ts": 0.0, "data": None}
 _HEALTH_TTL = 15.0  # seconds
+# Thinking-capable models account reasoning inside the output budget, so a
+# one-token cap can return no visible text even when the provider is healthy.
+# Source: https://ai.google.dev/gemini-api/docs/thinking
+_HEALTH_PROBE_MAX_TOKENS = 32
 
 
 def _probe(p: _Provider, budget: WorkBudget) -> dict:
@@ -2012,7 +2016,7 @@ def _probe(p: _Provider, budget: WorkBudget) -> dict:
             "Reply with OK only.",
             max_retries=1,
             timeout=5,
-            max_tokens=1,
+            max_tokens=_HEALTH_PROBE_MAX_TOKENS,
             budget=budget,
         )
         latency = int((time.monotonic() - start) * 1000)
