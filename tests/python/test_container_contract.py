@@ -275,6 +275,8 @@ class ContainerContractTests(unittest.TestCase):
             "chown 101:102 /data",
             "chmod 0700 /data",
             "wrong ownership or mode",
+            "provider-policy",
+            "provider_policy",
             "docker rm -f",
             "recreate",
             "cached",
