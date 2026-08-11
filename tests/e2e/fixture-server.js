@@ -79,6 +79,25 @@ const server = http.createServer((request, response) => {
         </body></html>`);
         return;
     }
+    if (url.pathname === '/read/delayed') {
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        response.end(`<!doctype html><html lang="en"><head>
+          <meta charset="utf-8">
+          <title>Delayed CWA reader fixture</title>
+          <script src="/bt-static/loader.js?v=e2e"></script>
+        </head><body>
+          <main><div id="viewer"></div></main>
+          <script>
+            setTimeout(() => {
+              const iframe = document.createElement('iframe');
+              iframe.title = 'Book chapter';
+              iframe.src = '/chapter/1';
+              document.querySelector('#viewer').appendChild(iframe);
+            }, 50);
+          </script>
+        </body></html>`);
+        return;
+    }
     if (url.pathname === '/library/7/series/42/book/99') {
         response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         response.end(`<!doctype html><html lang="en"><head>
