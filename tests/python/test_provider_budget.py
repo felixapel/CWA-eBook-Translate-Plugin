@@ -52,6 +52,7 @@ class ProviderBudgetTests(unittest.TestCase):
         translator.LLM_FALLBACK_API_KEY = "x" * 20
         translator._primary_provider = None
         translator._fallback_provider = "unset"
+        translator._reset_provider_call_stats_for_tests()
 
     def tearDown(self):
         translator._provider_post = self.original_post
@@ -72,6 +73,7 @@ class ProviderBudgetTests(unittest.TestCase):
             translator.LLM_FALLBACK_MODEL,
             translator.LLM_FALLBACK_API_KEY,
         ) = self.original_provider_config
+        translator._reset_provider_call_stats_for_tests()
 
     @staticmethod
     def budget(max_attempts=20, deadline_seconds=60):
@@ -541,6 +543,127 @@ class ProviderBudgetTests(unittest.TestCase):
 
         self.assertEqual(sleeps, [])
 
+    def test_retry_after_parser_accepts_only_bounded_delta_seconds(self):
+        response = type("Response", (), {"headers": {"Retry-After": "12"}})()
+        self.assertEqual(translator._retry_after_seconds(response), 12)
+
+        capped = type("Response", (), {"headers": {"Retry-After": "999"}})()
+        self.assertEqual(translator._retry_after_seconds(capped), 30)
+
+        for invalid in ("", "0", "-1", "1.5", "tomorrow", None):
+            with self.subTest(invalid=invalid):
+                malformed = type(
+                    "Response", (), {"headers": {"Retry-After": invalid}}
+                )()
+                self.assertIsNone(translator._retry_after_seconds(malformed))
+
+    def test_provider_rate_limit_preserves_only_sanitized_retry_metadata(self):
+        def rate_limited(*_args, **_kwargs):
+            response = type(
+                "Response",
+                (),
+                {"status_code": 429, "headers": {"Retry-After": "7"}},
+            )()
+            raise translator.requests.exceptions.HTTPError(
+                "private upstream body", response=response
+            )
+
+        translator._provider_post = rate_limited
+        translator._fallback_provider = None
+
+        with self.assertRaises(translator.ProviderUnavailableError) as raised:
+            translator.translate_text(
+                "hello", max_retries=1, budget=self.budget(max_attempts=1)
+            )
+
+        self.assertEqual(raised.exception.error_code, "provider_rate_limited")
+        self.assertEqual(raised.exception.retry_after_seconds, 7)
+        self.assertNotIn("private upstream body", str(raised.exception))
+        self.assertEqual(translator.provider_call_stats(), {
+            "attempts": 1,
+            "successes": 0,
+            "rate_limited": 1,
+            "failures": 1,
+        })
+
+    def test_provider_rate_limit_is_terminal_before_retry_or_fallback(self):
+        calls = []
+
+        def rate_limited(url, *_args, **_kwargs):
+            calls.append(url)
+            response = type(
+                "Response",
+                (),
+                {"status_code": 429, "headers": {"Retry-After": "7"}},
+            )()
+            raise translator.requests.exceptions.HTTPError(
+                "synthetic", response=response
+            )
+
+        translator._provider_post = rate_limited
+        translator._primary_provider = translator._Provider(
+            "local",
+            "primary",
+            "",
+            spec=translator.ProviderSpec(
+                provider_id="local",
+                endpoint="http://primary.test/v1/chat/completions",
+                protocol="openai",
+                locality="local",
+                cache_namespace="primary",
+            ),
+        )
+        translator._fallback_provider = translator._Provider(
+            "gemini",
+            "fallback",
+            "secret",
+            spec=translator.ProviderSpec(
+                provider_id="gemini",
+                endpoint="https://fallback.test/v1/chat/completions",
+                protocol="openai",
+                locality="remote",
+                cache_namespace="fallback",
+            ),
+        )
+
+        with self.assertRaises(translator.ProviderUnavailableError) as raised:
+            translator.translate_text(
+                "hello",
+                budget=self.budget(),
+                allow_cloud_fallback=True,
+            )
+
+        self.assertEqual(raised.exception.error_code, "provider_rate_limited")
+        self.assertEqual(calls, ["http://primary.test/v1/chat/completions"])
+
+    def test_batch_rate_limit_marks_only_the_failed_segments(self):
+        def rate_limited(*_args, **_kwargs):
+            response = type(
+                "Response",
+                (),
+                {"status_code": 429, "headers": {"Retry-After": "9"}},
+            )()
+            raise translator.requests.exceptions.HTTPError(
+                "synthetic", response=response
+            )
+
+        translator._provider_post = rate_limited
+        translator._fallback_provider = None
+        translator.BT_BATCH_SIZE = 1
+
+        result = translator.translate_batch_detailed(
+            ["one"],
+            max_concurrent=1,
+            budget=self.budget(max_attempts=1),
+        )
+
+        self.assertEqual(result[0].error_code, "provider_rate_limited")
+        self.assertEqual(result[0].retry_after_seconds, 9)
+        self.assertEqual(
+            result[0].text,
+            "[TRANSLATION ERROR: provider_rate_limited]",
+        )
+
     def test_retry_backoff_is_clamped_to_request_deadline(self):
         class FakeClock:
             def __init__(self):
@@ -556,8 +679,8 @@ class ProviderBudgetTests(unittest.TestCase):
             sleeps.append(seconds)
             clock.now += seconds
 
-        def rate_limited(*_args, **_kwargs):
-            response = type("Response", (), {"status_code": 429})()
+        def transiently_unavailable(*_args, **_kwargs):
+            response = type("Response", (), {"status_code": 503})()
             raise translator.requests.exceptions.HTTPError(
                 "synthetic", response=response)
 
@@ -568,7 +691,7 @@ class ProviderBudgetTests(unittest.TestCase):
             deadline_seconds=0.25,
             clock=clock,
         )
-        translator._provider_post = rate_limited
+        translator._provider_post = transiently_unavailable
         translator.time.sleep = advance
         translator._fallback_provider = None
 
@@ -604,6 +727,7 @@ class ProviderBudgetTests(unittest.TestCase):
             ("BT_UPSTREAM_QUEUE_TIMEOUT", "inf"),
             ("BT_UPSTREAM_QUEUE_TIMEOUT", "nan"),
             ("BT_MAX_UPSTREAM_RESPONSE_BYTES", "0"),
+            ("BT_BATCH_SOURCE_TOKEN_BUDGET", "-1"),
         ):
             with self.subTest(name=name, value=value):
                 env = os.environ.copy()
@@ -1175,6 +1299,30 @@ class ProviderBudgetTests(unittest.TestCase):
 
 
 class DeploymentBudgetContractTests(unittest.TestCase):
+    def test_api_startup_rejects_browser_batch_above_request_limit(self):
+        env = os.environ.copy()
+        env.update({
+            "BT_AUTH_MODE": "disabled",
+            "BT_ALLOW_INSECURE_AUTH": "true",
+            "BT_BATCH_SIZE": "10",
+            "BT_MAX_BATCH_PARAGRAPHS": "5",
+        })
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import server"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS",
+            result.stderr,
+        )
+
     def test_recommended_compose_pins_safe_budget_defaults(self):
         compose = (ROOT / "docker-compose.yml").read_text()
         expected = {

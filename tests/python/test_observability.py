@@ -11,6 +11,7 @@ os.environ.setdefault("BT_ALLOW_INSECURE_AUTH", "true")
 
 from auth import AuthUnavailable, RequestAuthenticator
 import server
+import translator
 from translator import BatchRecoveryTracker, ProviderUnavailableError
 from work_budget import WorkBudgetExceeded
 
@@ -181,6 +182,37 @@ class ObservabilityContractTests(unittest.TestCase):
             "paragraph_fallback_failed_segments": 1,
         })
 
+    def test_batch_plan_metrics_use_only_fixed_buckets(self):
+        paragraphs = ["a", "bb", "日本語" * 400]
+
+        server._record_batch_plan(paragraphs, [[0, 1], [2]])
+
+        snapshot = self.metrics()
+        self.assertEqual(snapshot["batch_groups_total"], 2)
+        self.assertEqual(snapshot["batch_paragraphs_total"], 3)
+        self.assertEqual(snapshot["batch_group_size_buckets"]["single"], 1)
+        self.assertEqual(snapshot["batch_group_size_buckets"]["2_4"], 1)
+        self.assertEqual(
+            snapshot["batch_group_source_token_buckets"]["up_to_128"], 1
+        )
+        self.assertEqual(
+            snapshot["batch_group_source_token_buckets"]["over_600"], 1
+        )
+
+    def test_provider_attempt_metrics_distinguish_success_429_and_failure(self):
+        translator._record_provider_call("attempt")
+        translator._record_provider_call("success")
+        translator._record_provider_call("attempt")
+        translator._record_provider_call("rate_limited")
+        translator._record_provider_call("failure")
+
+        self.assertEqual(self.metrics()["provider_calls"], {
+            "attempts": 2,
+            "successes": 1,
+            "rate_limited": 1,
+            "failures": 1,
+        })
+
     def test_recovery_metrics_survive_work_budget_failure(self):
         captured = {}
 
@@ -270,6 +302,18 @@ class ObservabilityContractTests(unittest.TestCase):
                 "paragraph_fallback_recovered_segments",
                 "paragraph_fallback_failed_segments",
             },
+        )
+        self.assertEqual(
+            set(snapshot["batch_group_size_buckets"]),
+            {"single", "2_4", "5_8", "9_10", "over_10"},
+        )
+        self.assertEqual(
+            set(snapshot["batch_group_source_token_buckets"]),
+            {"up_to_128", "up_to_256", "up_to_450", "up_to_600", "over_600"},
+        )
+        self.assertEqual(
+            set(snapshot["provider_calls"]),
+            {"attempts", "successes", "rate_limited", "failures"},
         )
         with self.assertRaises(ValueError):
             server._record_outcome("book-title-controlled-label")

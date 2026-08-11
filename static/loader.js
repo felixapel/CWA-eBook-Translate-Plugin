@@ -40,6 +40,15 @@
             : exactCwaRoute(window.location.pathname);
     }
 
+    function optionalBoundedInteger(managed, name, minimum, maximum, fallback) {
+        if (managed[name] === undefined) { return fallback; }
+        if (!Number.isInteger(managed[name])
+                || managed[name] < minimum || managed[name] > maximum) {
+            throw new Error('unsupported browser scheduling contract');
+        }
+        return managed[name];
+    }
+
     function validateManagedConfig(managed) {
         var expectedCredentials = {
             cwa_session: 'same-origin',
@@ -50,6 +59,12 @@
                 || expectedCredentials[managed.authMode] !== managed.credentials) {
             throw new Error('unsupported browser authentication contract');
         }
+        var batchSize = optionalBoundedInteger(
+            managed, 'batchSize', 1, 50, 5
+        );
+        var prefetchGapMs = optionalBoundedInteger(
+            managed, 'prefetchGapMs', 0, 10000, 0
+        );
         if (managed.authMode !== 'reader_session') {
             if (managed.readerType && managed.readerType !== 'cwa') {
                 throw new Error('unsupported reader authentication contract');
@@ -60,7 +75,9 @@
                 credentials: managed.credentials,
                 readerType: 'cwa',
                 readerVersion: '',
-                readerContractVersion: 'cwa-epub-v1'
+                readerContractVersion: 'cwa-epub-v1',
+                batchSize: batchSize,
+                prefetchGapMs: prefetchGapMs
             };
         }
 
@@ -80,7 +97,9 @@
             credentials: managed.credentials,
             readerType: managed.readerType,
             readerVersion: managed.readerVersion,
-            readerContractVersion: managed.readerContractVersion
+            readerContractVersion: managed.readerContractVersion,
+            batchSize: batchSize,
+            prefetchGapMs: prefetchGapMs
         };
     }
 
@@ -163,6 +182,8 @@
             readerType: managedConfig.readerType,
             readerVersion: managedConfig.readerVersion,
             readerContractVersion: managedConfig.readerContractVersion,
+            batchSize: managedConfig.batchSize,
+            prefetchGapMs: managedConfig.prefetchGapMs,
             apiToken: ''
         };
     }

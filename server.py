@@ -3,6 +3,7 @@ book-translator — Flask microservice for ebook paragraph translation.
 Runs on port 8390. Frontend (CWA overlay) calls this service.
 """
 import logging
+import copy
 import hashlib
 import math
 import os
@@ -33,6 +34,8 @@ from translator import (
     cache_lookup_backends, translation_groups, batch_cache_contract,
     single_cache_contract, singleflight_stats, BatchRecoveryTracker,
     RECOVERY_METRIC_NAMES,
+    estimate_source_tokens, provider_call_stats, BT_BATCH_SIZE,
+    _reset_provider_call_stats_for_tests,
     provider_policy,
     initialize_provider_configuration,
 )
@@ -120,6 +123,16 @@ API_TOKEN = os.environ.get("BT_API_TOKEN", "")
 # (GPU starvation locally, an open-ended bill on cloud APIs). Oversized input is
 # rejected with 413 rather than truncated — silent truncation would corrupt text.
 BT_MAX_BATCH_PARAGRAPHS = int(os.environ.get("BT_MAX_BATCH_PARAGRAPHS", "50"))
+if not 1 <= BT_BATCH_SIZE <= 50:
+    raise ValueError("BT_BATCH_SIZE must be an integer from 1 to 50")
+if not 1 <= BT_MAX_BATCH_PARAGRAPHS <= 1000:
+    raise ValueError(
+        "BT_MAX_BATCH_PARAGRAPHS must be an integer from 1 to 1000"
+    )
+if BT_BATCH_SIZE > BT_MAX_BATCH_PARAGRAPHS:
+    raise ValueError(
+        "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS"
+    )
 BT_MAX_PARAGRAPH_CHARS = int(os.environ.get("BT_MAX_PARAGRAPH_CHARS", "8000"))
 BT_CACHE_SCOPE_MAX_CHARS = int(os.environ.get("BT_CACHE_SCOPE_MAX_CHARS", "512"))
 
@@ -657,6 +670,12 @@ _WORK_BUDGET_REASONS = (
     "unknown",
 )
 _SEGMENT_RECOVERY_METRICS = RECOVERY_METRIC_NAMES
+_BATCH_GROUP_SIZE_BUCKETS = (
+    "single", "2_4", "5_8", "9_10", "over_10"
+)
+_BATCH_GROUP_SOURCE_TOKEN_BUCKETS = (
+    "up_to_128", "up_to_256", "up_to_450", "up_to_600", "over_600"
+)
 
 
 def _empty_metrics() -> dict:
@@ -677,6 +696,14 @@ def _empty_metrics() -> dict:
             name: 0 for name in _SEGMENT_RECOVERY_METRICS
         },
         "batch_partial_failure_segments": 0,
+        "batch_groups_total": 0,
+        "batch_paragraphs_total": 0,
+        "batch_group_size_buckets": {
+            name: 0 for name in _BATCH_GROUP_SIZE_BUCKETS
+        },
+        "batch_group_source_token_buckets": {
+            name: 0 for name in _BATCH_GROUP_SOURCE_TOKEN_BUCKETS
+        },
     }
 
 
@@ -746,6 +773,58 @@ def _record_segment_recovery(increments: dict[str, int]) -> None:
             _metrics["segment_recovery"][name] += increments[name]
 
 
+def _batch_group_size_bucket(size: int) -> str:
+    if size == 1:
+        return "single"
+    if size <= 4:
+        return "2_4"
+    if size <= 8:
+        return "5_8"
+    if size <= 10:
+        return "9_10"
+    return "over_10"
+
+
+def _batch_group_source_token_bucket(tokens: int) -> str:
+    if tokens <= 128:
+        return "up_to_128"
+    if tokens <= 256:
+        return "up_to_256"
+    if tokens <= 450:
+        return "up_to_450"
+    if tokens <= 600:
+        return "up_to_600"
+    return "over_600"
+
+
+def _record_batch_plan(paragraphs: list[str], groups: list[list[int]]) -> None:
+    """Record deterministic batch shape without content-derived labels."""
+    size_buckets = {name: 0 for name in _BATCH_GROUP_SIZE_BUCKETS}
+    token_buckets = {
+        name: 0 for name in _BATCH_GROUP_SOURCE_TOKEN_BUCKETS
+    }
+    paragraph_count = 0
+    for group in groups:
+        if not group:
+            raise ValueError("batch groups must not be empty")
+        paragraph_count += len(group)
+        size_buckets[_batch_group_size_bucket(len(group))] += 1
+        source_tokens = sum(
+            estimate_source_tokens(paragraphs[index].strip())
+            for index in group
+        )
+        token_buckets[
+            _batch_group_source_token_bucket(source_tokens)
+        ] += 1
+    with _metrics_lock:
+        _metrics["batch_groups_total"] += len(groups)
+        _metrics["batch_paragraphs_total"] += paragraph_count
+        for name, count in size_buckets.items():
+            _metrics["batch_group_size_buckets"][name] += count
+        for name, count in token_buckets.items():
+            _metrics["batch_group_source_token_buckets"][name] += count
+
+
 def _record_segment_recovery_safely(increments: dict[str, int]) -> None:
     """Best-effort metric sink that can never change an API outcome."""
     try:
@@ -773,6 +852,7 @@ def _reset_metrics_for_tests() -> None:
     with _metrics_lock:
         _metrics.clear()
         _metrics.update(_empty_metrics())
+    _reset_provider_call_stats_for_tests()
 
 
 def _work_budget_response(exc: WorkBudgetExceeded):
@@ -821,6 +901,8 @@ def _translate_paragraphs(
     translations = [""] * len(paragraphs)
     backends = [""] * len(paragraphs)        # NEW: per-paragraph backend attribution
     cached = [False] * len(paragraphs)       # NEW: per-paragraph cache-hit flag
+    error_codes: list[str | None] = [None] * len(paragraphs)
+    retry_after_seconds: list[int | None] = [None] * len(paragraphs)
     cached_count = 0
     fresh_count = 0
     start = time.monotonic()
@@ -831,6 +913,7 @@ def _translate_paragraphs(
     # hit only when every non-empty segment exists under one exact backend and
     # prompt/context contract; otherwise the whole original group is refreshed.
     groups = translation_groups(paragraphs)
+    _record_batch_plan(paragraphs, groups)
     missing_groups: list[list[int]] = []
     contracts = {
         tuple(group): batch_cache_contract(
@@ -914,6 +997,8 @@ def _translate_paragraphs(
                 backend = item.provider
                 translations[index] = translated
                 backends[index] = backend or "unknown"
+                error_codes[index] = item.error_code
+                retry_after_seconds[index] = item.retry_after_seconds
                 if translated.startswith("[TRANSLATION ERROR:"):
                     continue
                 fresh_count += 1
@@ -948,6 +1033,8 @@ def _translate_paragraphs(
         "translations": translations,
         "backends": backends,
         "cached": cached,
+        "error_codes": error_codes,
+        "retry_after_seconds": retry_after_seconds,
         "cached_count": cached_count,
         "fresh_count": fresh_count,
         "total_elapsed_ms": total_elapsed_ms,
@@ -985,6 +1072,8 @@ def before_request_hook():
             response = jsonify({
                 "error": "rate_limited",
                 "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+                "retry_safe": True,
+                "scope": "auth_admission",
                 "request_id": request.request_id,
             })
             response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
@@ -994,6 +1083,8 @@ def before_request_hook():
             response = jsonify({
                 "error": "rate_limited",
                 "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+                "retry_safe": True,
+                "scope": "auth_admission",
                 "request_id": request.request_id,
             })
             response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
@@ -1051,6 +1142,8 @@ def before_request_hook():
             response = jsonify({
                 "error": "rate_limited",
                 "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+                "retry_safe": True,
+                "scope": "api_admission",
                 "request_id": request.request_id,
             })
             response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
@@ -1135,6 +1228,8 @@ def reader_session():
         response = jsonify({
             "error": "rate_limited",
             "retry_after": BT_RATE_LIMIT_RETRY_AFTER,
+            "retry_safe": True,
+            "scope": "auth_admission",
             "request_id": request.request_id,
         })
         response.headers["Retry-After"] = str(BT_RATE_LIMIT_RETRY_AFTER)
@@ -1301,10 +1396,7 @@ def stats():
 def metrics():
     """Return fixed-cardinality, content-free request metrics (M5)."""
     with _metrics_lock:
-        snapshot = {
-            key: dict(value) if isinstance(value, dict) else value
-            for key, value in _metrics.items()
-        }
+        snapshot = copy.deepcopy(_metrics)
     total = snapshot["total_requests"]
     avg_latency = round(snapshot["total_latency_ms"] / total, 1) if total > 0 else 0
     total_cache = snapshot["cache_hits"] + snapshot["cache_misses"]
@@ -1324,6 +1416,15 @@ def metrics():
         "batch_partial_failure_segments": snapshot[
             "batch_partial_failure_segments"
         ],
+        "batch_groups_total": snapshot["batch_groups_total"],
+        "batch_paragraphs_total": snapshot["batch_paragraphs_total"],
+        "batch_group_size_buckets": snapshot[
+            "batch_group_size_buckets"
+        ],
+        "batch_group_source_token_buckets": snapshot[
+            "batch_group_source_token_buckets"
+        ],
+        "provider_calls": provider_call_stats(),
         "singleflight": singleflight_stats(),
     })
 
@@ -1594,6 +1695,8 @@ def translate_batch_endpoint():
             "translations": paragraphs,
             "backends": ["skipped"] * len(paragraphs),
             "cached": [False] * len(paragraphs),
+            "error_codes": [None] * len(paragraphs),
+            "retry_after_seconds": [None] * len(paragraphs),
             "cached_count": 0,
             "fresh_count": 0,
             "skipped": "source==target",

@@ -33,6 +33,8 @@ class ProxyConfigRendererTests(unittest.TestCase):
             "BT_CWA_IDENTITY_HEADER": "Remote-User",
             "BT_BROWSER_AUTH_MODE": "cwa_session",
             "BT_BROWSER_CREDENTIALS": "same-origin",
+            "BT_BATCH_SIZE": "5",
+            "BT_CLIENT_PREFETCH_GAP_MS": "0",
         })
         for name, value in (overrides or {}).items():
             if value is None:
@@ -85,6 +87,8 @@ class ProxyConfigRendererTests(unittest.TestCase):
                 "apiUrl": "/bt-api",
                 "authMode": "cwa_session",
                 "credentials": "same-origin",
+                "batchSize": 5,
+                "prefetchGapMs": 0,
             },
         )
         self.assertEqual(browser_output.stat().st_mode & 0o777, 0o600)
@@ -119,6 +123,8 @@ class ProxyConfigRendererTests(unittest.TestCase):
                 "apiUrl": "/bt-api",
                 "authMode": "forwarded",
                 "credentials": "include",
+                "batchSize": 5,
+                "prefetchGapMs": 0,
             },
         )
 
@@ -161,8 +167,35 @@ class ProxyConfigRendererTests(unittest.TestCase):
                 "readerType": "kavita",
                 "readerVersion": "0.9.0.2",
                 "readerContractVersion": "kavita-0.9.0.2-epub-v1",
+                "batchSize": 5,
+                "prefetchGapMs": 0,
             },
         )
+
+    def test_browser_batch_controls_are_bounded_and_render_as_numbers(self):
+        result, _, browser_output = self.render({
+            "BT_BATCH_SIZE": "10",
+            "BT_CLIENT_PREFETCH_GAP_MS": "1000",
+        })
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(browser_output.read_text())
+        self.assertEqual(config["batchSize"], 10)
+        self.assertEqual(config["prefetchGapMs"], 1000)
+
+        for name, value in (
+            ("BT_BATCH_SIZE", "0"),
+            ("BT_BATCH_SIZE", "51"),
+            ("BT_BATCH_SIZE", "1.5"),
+            ("BT_CLIENT_PREFETCH_GAP_MS", "-1"),
+            ("BT_CLIENT_PREFETCH_GAP_MS", "10001"),
+            ("BT_CLIENT_PREFETCH_GAP_MS", "1.5"),
+        ):
+            with self.subTest(name=name, value=value):
+                failed, output, config_output = self.render({name: value})
+                self.assertEqual(failed.returncode, 78)
+                self.assertFalse(output.exists())
+                self.assertFalse(config_output.exists())
 
     def test_reader_specific_session_cookie_is_rendered_without_cross_reader_alias(self):
         result, output, _ = self.render({

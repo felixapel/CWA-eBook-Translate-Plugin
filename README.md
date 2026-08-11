@@ -13,6 +13,8 @@ modifying either image.
 - Offers 100+ source and target language choices. Translation quality depends
   on the selected model and language pair.
 - Prioritizes visible paragraphs; whole-chapter prefetch is an explicit opt-in.
+- Combines count- and source-budgeted batches to reduce cloud request pressure
+  while keeping the first visible paragraph fast.
 - Supports local, fixed named cloud and public custom OpenAI-compatible backends.
 - Keeps provider credentials server-side and requires explicit consent before
   a configured local provider falls back to a cloud provider.
@@ -54,6 +56,11 @@ LLM_PROVIDER=gemini
 LLM_MODEL=gemini-3.5-flash-lite
 LLM_API_KEY=<Google AI Studio or project API key>
 BT_LOCAL_URL=
+BT_BATCH_SIZE=10
+BT_BATCH_SOURCE_TOKEN_BUDGET=450
+BT_BATCH_MAX_TOKENS=1200
+BT_CLIENT_PREFETCH_GAP_MS=1000
+BT_MAX_BATCH_PARAGRAPHS=50
 ```
 
 Named providers use their fixed HTTPS API endpoints. Local and custom

@@ -56,6 +56,7 @@ _PROCESS_KEYS = {
     "BT_AUTH_RATE_LIMIT_PER_MINUTE",
     "BT_BATCH_MAX_TOKENS",
     "BT_BATCH_SIZE",
+    "BT_BATCH_SOURCE_TOKEN_BUDGET",
     "BT_CACHE_HARDEN_EXISTING_DIR",
     "BT_CACHE_HIT_FLUSH_THRESHOLD",
     "BT_CACHE_MAX_ENTRIES",
@@ -63,6 +64,7 @@ _PROCESS_KEYS = {
     "BT_CACHE_SCOPE_MAX_CHARS",
     "BT_CACHE_TTL_DAYS",
     "BT_CONTEXT_WINDOW",
+    "BT_CLIENT_PREFETCH_GAP_MS",
     "BT_MAX_BATCH_PARAGRAPHS",
     "BT_MAX_CONTENT_LENGTH",
     "BT_MAX_PARAGRAPH_CHARS",
@@ -115,6 +117,26 @@ def _positive_int(source: Mapping[str, str], name: str, default: int) -> int:
     value = int(raw, 10)
     if value <= 0:
         raise HubConfigError(f"{name} must be a positive integer")
+    return value
+
+
+def _bounded_int(
+    source: Mapping[str, str],
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = source.get(name, str(default))
+    if not isinstance(raw, str) or not raw.isdecimal():
+        raise HubConfigError(
+            f"{name} must be an integer from {minimum} to {maximum}"
+        )
+    value = int(raw, 10)
+    if not minimum <= value <= maximum:
+        raise HubConfigError(
+            f"{name} must be an integer from {minimum} to {maximum}"
+        )
     return value
 
 
@@ -310,6 +332,23 @@ class HubConfig:
         upstream_inflight = _allocations(
             values, enabled, "BT_MAX_UPSTREAM_INFLIGHT", 2
         )
+        batch_size = _bounded_int(values, "BT_BATCH_SIZE", 5, 1, 50)
+        batch_source_token_budget = _bounded_int(
+            values, "BT_BATCH_SOURCE_TOKEN_BUDGET", 0, 0, 1_000_000
+        )
+        batch_max_tokens = _bounded_int(
+            values, "BT_BATCH_MAX_TOKENS", 8192, 1, 1_000_000
+        )
+        client_prefetch_gap_ms = _bounded_int(
+            values, "BT_CLIENT_PREFETCH_GAP_MS", 0, 0, 10_000
+        )
+        max_batch_paragraphs = _bounded_int(
+            values, "BT_MAX_BATCH_PARAGRAPHS", 50, 1, 1_000
+        )
+        if batch_size > max_batch_paragraphs:
+            raise HubConfigError(
+                "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS"
+            )
         runtimes: list[ReaderRuntime] = []
         published_ports: set[int] = set()
         for reader in enabled:
@@ -378,6 +417,15 @@ class HubConfig:
                     "BT_TRUSTED_PROXIES": "127.0.0.1/32",
                     "BT_MAX_CONCURRENT": str(concurrency[reader]),
                     "BT_MAX_UPSTREAM_INFLIGHT": str(upstream_inflight[reader]),
+                    "BT_BATCH_SIZE": str(batch_size),
+                    "BT_BATCH_SOURCE_TOKEN_BUDGET": str(
+                        batch_source_token_budget
+                    ),
+                    "BT_BATCH_MAX_TOKENS": str(batch_max_tokens),
+                    "BT_CLIENT_PREFETCH_GAP_MS": str(
+                        client_prefetch_gap_ms
+                    ),
+                    "BT_MAX_BATCH_PARAGRAPHS": str(max_batch_paragraphs),
                 }
             )
             browser_auth = "reader_session"
@@ -403,6 +451,8 @@ class HubConfig:
                     "BT_CWA_IDENTITY_HEADER", "Remote-User"
                 ),
                 "BT_UI_VERSION": values.get("BT_UI_VERSION", "dev"),
+                "BT_BATCH_SIZE": str(batch_size),
+                "BT_CLIENT_PREFETCH_GAP_MS": str(client_prefetch_gap_ms),
             }
             runtimes.append(
                 ReaderRuntime(

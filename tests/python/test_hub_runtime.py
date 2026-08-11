@@ -46,6 +46,9 @@ def dual_reader_environment() -> dict[str, str]:
         "BT_KAVITA_LOCAL_URL": "http://host.docker.internal:8000/v1/chat/completions",
         "BT_MAX_CONCURRENT": "2",
         "BT_MAX_UPSTREAM_INFLIGHT": "2",
+        "BT_BATCH_SIZE": "10",
+        "BT_BATCH_SOURCE_TOKEN_BUDGET": "450",
+        "BT_CLIENT_PREFETCH_GAP_MS": "1000",
         "PATH": "/usr/local/bin:/usr/bin:/bin",
     }
 
@@ -109,6 +112,30 @@ class HubConfigTests(unittest.TestCase):
             self.assertEqual(
                 reader.environment["BT_READER_AUTH_MAX_RESPONSE_BYTES"], "131072"
             )
+
+    def test_batch_controls_reach_api_and_browser_without_reader_secrets(self):
+        config = HubConfig.from_environment(dual_reader_environment())
+
+        for reader in config.readers:
+            self.assertEqual(reader.environment["BT_BATCH_SIZE"], "10")
+            self.assertEqual(
+                reader.environment["BT_BATCH_SOURCE_TOKEN_BUDGET"], "450"
+            )
+            self.assertEqual(reader.proxy_environment["BT_BATCH_SIZE"], "10")
+            self.assertEqual(
+                reader.proxy_environment["BT_CLIENT_PREFETCH_GAP_MS"], "1000"
+            )
+            self.assertNotIn("LLM_API_KEY", reader.proxy_environment)
+
+    def test_browser_batch_cannot_exceed_api_batch_limit(self):
+        env = dual_reader_environment()
+        env["BT_MAX_BATCH_PARAGRAPHS"] = "5"
+
+        with self.assertRaisesRegex(
+            HubConfigError,
+            "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS",
+        ):
+            HubConfig.from_environment(env)
 
     def test_remote_provider_without_key_fails_during_plan_not_after_start(self):
         env = dual_reader_environment()

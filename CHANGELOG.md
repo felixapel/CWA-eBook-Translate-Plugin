@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added managed cloud-oriented batching: a configurable browser/group maximum,
+  an optional CJK-aware source-token budget, and background-only prefetch
+  pacing reduce provider request pressure without delaying the first visible
+  paragraph. Compatibility defaults retain count-only grouping.
+- Added sanitized provider rate-limit metadata, explicit pre-provider replay
+  safety for HTTP `429`, and fixed-cardinality provider/batch metrics. Ambiguous
+  or provider-originated failures remain terminal until an explicit retry.
 - Documented the universal one-container hub as the default CWA/Kavita install,
   with explicit reader switches, topology-specific provider cutover and rollback,
   and split deployment retained as an advanced isolation option.
@@ -32,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Propagated adaptive batching through both hub and split managed installs,
+  rejected browser/API batch-limit mismatches before startup, made provider
+  `429` terminal before retry/fallback, and kept safe browser retry bounds and
+  visible-work priority stable across reader DOM rediscovery.
 - Updated Gemini/OpenAI-compatible request contracts for current Gemini models,
   including omission of deprecated sampling fields and invalid prefilled model
   turns.

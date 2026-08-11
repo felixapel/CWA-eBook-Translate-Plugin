@@ -82,8 +82,10 @@ configuration.
 | `BT_PROXY_PORT` | `8080` | Proxy listen port inside the container. |
 | `BT_CWA_MAX_BODY_SIZE` | `2g` | Finite nginx upload limit for CWA traffic. |
 | `BT_MAX_CONCURRENT` | `2` | Group workers inside one batch request. |
-| `BT_BATCH_SIZE` | `5` | Paragraphs per grouped provider call. |
-| `BT_MAX_BATCH_PARAGRAPHS` | `50` | Maximum paragraphs accepted in one batch request. |
+| `BT_BATCH_SIZE` | `5` | Maximum paragraphs per browser request after the first visible paragraph and per grouped provider call. Managed browser values are restricted to `1..50`. |
+| `BT_BATCH_SOURCE_TOKEN_BUDGET` | `0` | Approximate source-token ceiling per provider group. `0` preserves count-only grouping; a paragraph over the ceiling is allowed only as a singleton. |
+| `BT_CLIENT_PREFETCH_GAP_MS` | `0` | Delay between starts of opt-in background prefetch requests, restricted to `0..10000`. Visible translation is never paced by this setting. |
+| `BT_MAX_BATCH_PARAGRAPHS` | `50` | Maximum paragraphs accepted in one batch request. Managed installs require `BT_BATCH_SIZE` not to exceed this API limit. |
 | `BT_MAX_PARAGRAPH_CHARS` | `8000` | Maximum characters accepted in one paragraph; input is rejected, never truncated. |
 | `BT_CACHE_SCOPE_MAX_CHARS` | `512` | Maximum length of each book/chapter scope input before hashing. |
 | `BT_MAX_CONTENT_LENGTH` | `2097152` | WSGI request-body ceiling in bytes. |
@@ -110,6 +112,26 @@ malformed, paragraphs are recovered sequentially inside the same finite request
 budget. Successful paragraph recovery is not written under the grouped cache
 contract. Ordinary paragraph failures are returned per paragraph; exhausted
 work budgets fail the request before starting more provider work.
+
+`BT_BATCH_SIZE` is a maximum, not a promise. The reader requests the first
+visible paragraph alone, then uses the configured maximum. The API greedily
+forms stable groups in document order and stops at either the count limit or
+`BT_BATCH_SOURCE_TOKEN_BUDGET`. Its deterministic estimate accounts for denser
+CJK scripts. A single long paragraph is never truncated merely to satisfy the
+group budget. Setting the source budget to `0` is the immediate compatibility
+rollback.
+
+Successful batch responses add aligned `error_codes` and
+`retry_after_seconds` arrays. A terminal provider `429` becomes the sanitized
+per-segment code `provider_rate_limited`; the reader does not replay it
+automatically because provider admission may already have occurred. HTTP `429`
+responses are automatically retried only when the API explicitly returns
+`retry_safe: true` with an `api_admission` or `auth_admission` scope.
+
+Both the recommended universal hub and advanced split `btctl` topology validate
+these relationships during `plan`, propagate the API controls only to the API
+process and expose only batch size/prefetch pacing to the browser proxy. The
+standalone Compose example accepts the same environment names.
 
 ## Authentication and network settings
 

@@ -434,7 +434,12 @@ test('rate limiting is presented as a visible non-fatal wait state', async ({ pa
         status: 429,
         contentType: 'application/json',
         headers: { 'Retry-After': '1' },
-        body: JSON.stringify({ error: 'rate_limited', retry_after: 1 }),
+        body: JSON.stringify({
+            error: 'rate_limited',
+            retry_after: 1,
+            retry_safe: true,
+            scope: 'api_admission',
+        }),
     }));
 
     await page.goto('/read/42');

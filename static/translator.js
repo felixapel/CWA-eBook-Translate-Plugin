@@ -8,6 +8,10 @@
     const BT_UI_VERSION = '2.3.0-rc.1';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
+    function boundedInteger(value, minimum, maximum, fallback) {
+        return Number.isInteger(value) && value >= minimum && value <= maximum
+            ? value : fallback;
+    }
     const configuredReaderType = cfg.readerType || '';
     const READER_TYPE = configuredReaderType === 'kavita' ? 'kavita' : 'cwa';
     const STRICT_READER_ROUTE = configuredReaderType === 'cwa'
@@ -70,6 +74,8 @@
     let prefetchQueue = [];
     let isPumpRunning = false;
     let rateLimitUntil = 0;
+    let nextPrefetchAt = 0;
+    let prefetchWaitWake = null;
     let firstVisibleBatchCompleted = false;
     let lastFirstVisibleHash = null;
     let pendingFirstVisibleHash = null; // 2-poll debounce for the page-turn detector
@@ -107,6 +113,10 @@
     let inflightCount = 0;
     let errorCount = 0;       // consecutive failed requests (drives the error state)
     const failedParagraphs = new Set(); // terminal until an explicit user retry
+    // Queue objects are rebuilt whenever the reader DOM is rediscovered. Keep
+    // admission retry counts outside those transient objects so DOM mutations
+    // cannot reset the bound within one generation.
+    const rateLimitResponses = new Map(); // paragraph hash -> response count
     let doneHideTimer = null;
     let lastTriggerReason = 'init'; // why translateCurrentPage last ran (shown in the debug menu)
 
@@ -181,6 +191,8 @@
 
     function newGeneration() {
         generation++;
+        rateLimitResponses.clear();
+        if (prefetchWaitWake) prefetchWaitWake();
         for (const c of activeControllers) {
             try { c.abort(); } catch (e) { /* ignore */ }
         }
@@ -195,6 +207,22 @@
         firstVisibleBatchCompleted = false;
         refreshStatus();
         return generation;
+    }
+
+    function waitForPrefetchGap(milliseconds) {
+        return new Promise(resolve => {
+            let settled = false;
+            let timer = null;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                if (timer !== null) clearTimeout(timer);
+                if (prefetchWaitWake === finish) prefetchWaitWake = null;
+                resolve();
+            };
+            prefetchWaitWake = finish;
+            timer = setTimeout(finish, milliseconds);
+        });
     }
 
     function chapterProgress() {
@@ -524,6 +552,7 @@
             if (bar.dataset.state === 'error') {
                 errorCount = 0;
                 failedParagraphs.clear();
+                rateLimitResponses.clear();
                 if (translationMode !== 'off') translateCurrentPage();
             }
         };
@@ -621,12 +650,14 @@
                 } else if (action === 'clear-lang') {
                     translatedParagraphs = {};
                     failedParagraphs.clear();
+                    rateLimitResponses.clear();
                     try { localStorage.removeItem(CACHE_PREFIX + TARGET_LANG); } catch (e2) {}
                     showToast(t.cleared);
                     buildMenu();
                 } else if (action === 'clear-all') {
                     translatedParagraphs = {};
                     failedParagraphs.clear();
+                    rateLimitResponses.clear();
                     try {
                         Object.keys(localStorage).filter(k => k.startsWith(CACHE_PREFIX))
                             .forEach(k => localStorage.removeItem(k));
@@ -1017,8 +1048,9 @@
 
     // ── Translation engine ─────────────────────────────────────────────
     const FIRST_VISIBLE_CHUNK = 1; // minimize time to the first translated paragraph
-    const VISIBLE_CHUNK = 5;       // amortize later visible work without a large burst
-    const PREFETCH_CHUNK = 5;      // bounded background batches
+    const VISIBLE_CHUNK = boundedInteger(cfg.batchSize, 1, 50, 5);
+    const PREFETCH_CHUNK = VISIBLE_CHUNK;
+    const PREFETCH_GAP_MS = boundedInteger(cfg.prefetchGapMs, 0, 10000, 0);
     const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
 
     // Server rejects paragraphs beyond BT_MAX_PARAGRAPH_CHARS (default 8000)
@@ -1180,6 +1212,12 @@
                 if (resp.status === 429) {
                     let r = {};
                     try { r = await resp.json(); } catch(e) {}
+                    const safeAdmission = r.retry_safe === true
+                        && (r.scope === 'api_admission'
+                            || r.scope === 'auth_admission');
+                    if (!safeAdmission) {
+                        return { error: 'provider_unavailable' };
+                    }
                     let after = Number(r.retry_after || resp.headers.get('Retry-After'));
                     if (!Number.isFinite(after) || after <= 0) {
                         after = BT_CLIENT_RATE_LIMIT_BACKOFF_MS / 1000;
@@ -1230,6 +1268,12 @@
                 if (visibleQueue.length === 0 && prefetchQueue.length === 0) {
                     break; // Nothing to do
                 }
+
+                if (visibleQueue.length === 0 && prefetchQueue.length > 0
+                        && nextPrefetchAt > now) {
+                    await waitForPrefetchGap(nextPrefetchAt - now);
+                    continue;
+                }
                 
                 let isVisible = false;
                 let batch = [];
@@ -1253,7 +1297,10 @@
                 // still be translating after the browser gives up. Mark them
                 // terminal for this session and require an explicit user retry.
                 const markBatchFailed = (items) => {
-                    items.forEach(x => failedParagraphs.add(x.hash));
+                    items.forEach(x => {
+                        failedParagraphs.add(x.hash);
+                        rateLimitResponses.delete(x.hash);
+                    });
                     chapterDone += items.length;
                     errorCount++;
                 };
@@ -1265,8 +1312,9 @@
                     const keep = [];
                     const dropped = [];
                     items.forEach(x => {
-                        x.rateLimitResponses = (x.rateLimitResponses || 0) + 1;
-                        if (x.rateLimitResponses < BT_CLIENT_MAX_RATE_LIMIT_RESPONSES) keep.push(x);
+                        const responses = (rateLimitResponses.get(x.hash) || 0) + 1;
+                        rateLimitResponses.set(x.hash, responses);
+                        if (responses < BT_CLIENT_MAX_RATE_LIMIT_RESPONSES) keep.push(x);
                         else dropped.push(x);
                     });
                     if (dropped.length) markBatchFailed(dropped);
@@ -1276,6 +1324,7 @@
                 };
 
                 let data = null;
+                nextPrefetchAt = Date.now() + PREFETCH_GAP_MS;
                 try {
                     data = await postBatch(batch.map(b => b.text));
                 } catch (e) {
@@ -1314,6 +1363,7 @@
                     if (idx >= batch.length) return; // defensive: never trust response length
                     if (!isBadTranslation(tr)) {
                         translatedParagraphs[batch[idx].hash] = tr;
+                        rateLimitResponses.delete(batch[idx].hash);
                         stored = true;
                         anyGood = true;
                     }
@@ -1372,6 +1422,10 @@
         // on page turns / iframe mutations can only ADD newly-discovered work.
 
         refreshStatus();
+        // A running pump may currently own an interruptible background delay.
+        // Wake it after publishing the new queues so visible work is admitted
+        // immediately instead of inheriting prefetch pacing.
+        if (prefetchWaitWake) prefetchWaitWake();
         pumpQueue();
     }
 

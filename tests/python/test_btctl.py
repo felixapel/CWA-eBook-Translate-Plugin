@@ -291,6 +291,57 @@ class InstallConfigTests(unittest.TestCase):
         self.assertNotIn("BT_IMAGE", api)
         self.assertNotIn("BT_ALLOW_INSECURE_AUTH", api)
 
+    def test_adaptive_batch_controls_are_validated_and_reach_split_roles(self):
+        values = {
+            **self.base,
+            "BT_BATCH_SIZE": "10",
+            "BT_BATCH_SOURCE_TOKEN_BUDGET": "450",
+            "BT_BATCH_MAX_TOKENS": "1200",
+            "BT_CLIENT_PREFETCH_GAP_MS": "1000",
+            "BT_MAX_BATCH_PARAGRAPHS": "50",
+        }
+
+        config = InstallConfig.from_mapping(values, self.identity)
+
+        self.assertEqual(config.api_environment()["BT_BATCH_SIZE"], "10")
+        self.assertEqual(
+            config.api_environment()["BT_BATCH_SOURCE_TOKEN_BUDGET"], "450"
+        )
+        self.assertEqual(config.api_environment()["BT_BATCH_MAX_TOKENS"], "1200")
+        self.assertEqual(
+            config.api_environment()["BT_MAX_BATCH_PARAGRAPHS"], "50"
+        )
+        self.assertEqual(config.proxy_environment()["BT_BATCH_SIZE"], "10")
+        self.assertEqual(
+            config.proxy_environment()["BT_CLIENT_PREFETCH_GAP_MS"], "1000"
+        )
+        self.assertEqual(config.public_contract()["batch_size"], 10)
+
+        invalid = {
+            "BT_BATCH_SIZE": ("0", "1 to 50"),
+            "BT_BATCH_SOURCE_TOKEN_BUDGET": ("-1", "0 to"),
+            "BT_BATCH_MAX_TOKENS": ("0", "1 to"),
+            "BT_CLIENT_PREFETCH_GAP_MS": ("10001", "0 to 10000"),
+        }
+        for name, (value, message) in invalid.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ConfigError, message):
+                InstallConfig.from_mapping(
+                    {**values, name: value}, self.identity
+                )
+
+    def test_browser_batch_cannot_exceed_api_batch_limit(self):
+        with self.assertRaisesRegex(
+            ConfigError, "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS"
+        ):
+            InstallConfig.from_mapping(
+                {
+                    **self.base,
+                    "BT_BATCH_SIZE": "10",
+                    "BT_MAX_BATCH_PARAGRAPHS": "5",
+                },
+                self.identity,
+            )
+
     def test_legacy_and_generic_cwa_reader_inputs_normalize_identically(self):
         legacy = InstallConfig.from_mapping(self.base, self.identity)
         generic_values = {
