@@ -34,7 +34,7 @@ from translator import (
     cache_lookup_backends, translation_groups, batch_cache_contract,
     single_cache_contract, singleflight_stats, BatchRecoveryTracker,
     RECOVERY_METRIC_NAMES,
-    estimate_source_tokens, provider_call_stats,
+    estimate_source_tokens, provider_call_stats, BT_BATCH_SIZE,
     _reset_provider_call_stats_for_tests,
     provider_policy,
     initialize_provider_configuration,
@@ -123,6 +123,16 @@ API_TOKEN = os.environ.get("BT_API_TOKEN", "")
 # (GPU starvation locally, an open-ended bill on cloud APIs). Oversized input is
 # rejected with 413 rather than truncated — silent truncation would corrupt text.
 BT_MAX_BATCH_PARAGRAPHS = int(os.environ.get("BT_MAX_BATCH_PARAGRAPHS", "50"))
+if not 1 <= BT_BATCH_SIZE <= 50:
+    raise ValueError("BT_BATCH_SIZE must be an integer from 1 to 50")
+if not 1 <= BT_MAX_BATCH_PARAGRAPHS <= 1000:
+    raise ValueError(
+        "BT_MAX_BATCH_PARAGRAPHS must be an integer from 1 to 1000"
+    )
+if BT_BATCH_SIZE > BT_MAX_BATCH_PARAGRAPHS:
+    raise ValueError(
+        "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS"
+    )
 BT_MAX_PARAGRAPH_CHARS = int(os.environ.get("BT_MAX_PARAGRAPH_CHARS", "8000"))
 BT_CACHE_SCOPE_MAX_CHARS = int(os.environ.get("BT_CACHE_SCOPE_MAX_CHARS", "512"))
 
