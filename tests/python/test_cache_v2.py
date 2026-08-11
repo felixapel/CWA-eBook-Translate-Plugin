@@ -155,6 +155,29 @@ class CacheV2Tests(unittest.TestCase):
             "target-5",
         )
 
+    def test_put_many_uses_one_transaction_for_one_translation_batch(self) -> None:
+        statements: list[str] = []
+        connection = self.store.connection()
+        connection.set_trace_callback(statements.append)
+        try:
+            self.store.put_many([
+                (
+                    f"source-{index}", "English", "Spanish",
+                    f"target-{index}", scope(context_hash=f"ctx-{index}"),
+                )
+                for index in range(5)
+            ])
+        finally:
+            connection.set_trace_callback(None)
+
+        self.assertEqual(
+            sum(statement == "COMMIT" for statement in statements), 1
+        )
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM translations_v2").fetchone()[0],
+            self.store.max_entries,
+        )
+
     def test_cache_hit_does_not_write_until_counters_are_flushed(self) -> None:
         self.store.put("hello", "English", "Spanish", "hola", scope())
         connection = self.store.connection()

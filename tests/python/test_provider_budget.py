@@ -120,6 +120,82 @@ class ProviderBudgetTests(unittest.TestCase):
         self.assertFalse(session.trust_env)
         self.assertFalse(session.calls[0][1]["allow_redirects"])
 
+    def test_named_provider_transport_reuses_one_thread_local_session(self):
+        class Response:
+            pass
+
+        class Session:
+            def __init__(self):
+                self.trust_env = True
+                self.mount_calls = []
+
+            def mount(self, *args):
+                self.mount_calls.append(args)
+
+            def post(self, *_args, **_kwargs):
+                return Response()
+
+            def close(self):
+                raise AssertionError("pooled provider session must stay open")
+
+        if hasattr(translator._PROVIDER_HTTP_SESSIONS, "session"):
+            del translator._PROVIDER_HTTP_SESSIONS.session
+        with mock.patch.object(
+            translator.requests, "Session", side_effect=Session
+        ) as session_factory:
+            first = translator._deadline_provider_post(
+                "https://provider.example.test/v1/chat/completions",
+                headers={}, json={}, timeout=1, stream=True,
+                budget=self.budget(max_attempts=2), reuse_connection=True,
+            )
+            second = translator._deadline_provider_post(
+                "https://provider.example.test/v1/chat/completions",
+                headers={}, json={}, timeout=1, stream=True,
+                budget=self.budget(max_attempts=2), reuse_connection=True,
+            )
+        self.assertEqual(session_factory.call_count, 1)
+        self.assertEqual(
+            len(translator._PROVIDER_HTTP_SESSIONS.session.mount_calls), 2
+        )
+        self.assertFalse(hasattr(first, "_bt_deadline_session"))
+        self.assertFalse(hasattr(second, "_bt_deadline_session"))
+        del translator._PROVIDER_HTTP_SESSIONS.session
+
+    def test_custom_transport_never_reuses_a_session(self):
+        class Response:
+            pass
+
+        class Session:
+            def __init__(self):
+                self.trust_env = True
+
+            def mount(self, *_args):
+                return None
+
+            def post(self, *_args, **_kwargs):
+                return Response()
+
+            def close(self):
+                return None
+
+        with mock.patch.object(
+            translator.requests, "Session", side_effect=Session
+        ) as session_factory:
+            responses = [
+                translator._deadline_provider_post(
+                    "https://custom.example.test/v1/chat/completions",
+                    headers={}, json={}, timeout=1, stream=True,
+                    budget=self.budget(max_attempts=1),
+                    reuse_connection=False,
+                )
+                for _ in range(2)
+            ]
+        self.assertEqual(session_factory.call_count, 2)
+        self.assertIsNot(
+            responses[0]._bt_deadline_session,
+            responses[1]._bt_deadline_session,
+        )
+
     def test_remote_fallback_requires_explicit_consent(self):
         calls = {"primary": 0, "fallback": 0}
 

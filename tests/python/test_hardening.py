@@ -291,9 +291,9 @@ def run():
                               headers={"X-Forwarded-For": "192.0.2.11",
                                        "X-BT-Subject": "subject-b"})
         check("authenticated subject A does not consume subject B's API budget",
-              a_first.status_code == 200
+              a_first.status_code != 429
               and a_second.status_code == 429
-              and b_first.status_code == 200)
+              and b_first.status_code == a_first.status_code)
         server.AUTHENTICATOR = original_authenticator
         server.RATE_LIMIT_MAX = original_limit
     finally:

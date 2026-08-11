@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 from unittest import mock
 
 import translator
-from work_budget import WorkBudget
+from work_budget import WorkBudget, WorkBudgetExceeded
 
 
 def _budget() -> WorkBudget:
@@ -19,6 +20,51 @@ def _budget() -> WorkBudget:
 
 
 class ProviderConfigurationTests(unittest.TestCase):
+    def test_hung_custom_dns_resolution_has_bounded_thread_capacity(self):
+        release = threading.Event()
+        started = threading.Event()
+        calls = 0
+
+        def hung_resolution(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            started.set()
+            release.wait(1)
+            return []
+
+        original_slots = translator._DNS_RESOLVER_SLOTS
+        translator._DNS_RESOLVER_SLOTS = threading.BoundedSemaphore(2)
+        try:
+            with mock.patch.object(
+                translator._socket, "getaddrinfo", side_effect=hung_resolution
+            ):
+                for _ in range(2):
+                    with self.assertRaises((
+                        translator._CustomEndpointDNSFailure,
+                        WorkBudgetExceeded,
+                    )):
+                        translator._bounded_getaddrinfo(
+                            "hung.example.test", 443,
+                            budget=WorkBudget(
+                                max_attempts=1,
+                                max_input_bytes=1024,
+                                max_output_tokens=1024,
+                                deadline_seconds=0.02,
+                            ),
+                        )
+                with self.assertRaisesRegex(
+                    translator._CustomEndpointDNSFailure, "capacity"
+                ):
+                    translator._bounded_getaddrinfo("hung.example.test", 443)
+                self.assertEqual(calls, 2)
+        finally:
+            release.set()
+            self.assertTrue(translator._DNS_RESOLVER_SLOTS.acquire(timeout=1))
+            self.assertTrue(translator._DNS_RESOLVER_SLOTS.acquire(timeout=1))
+            translator._DNS_RESOLVER_SLOTS.release()
+            translator._DNS_RESOLVER_SLOTS.release()
+            translator._DNS_RESOLVER_SLOTS = original_slots
+
     def test_gemini_request_omits_deprecated_sampling_parameters(self):
         provider = translator._Provider(
             "gemini", "gemini-3.5-flash-lite", "gemini-key"

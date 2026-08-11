@@ -157,6 +157,9 @@ class _CustomEndpointDNSFailure(RuntimeError):
     """A custom endpoint hostname could not be resolved within its budget."""
 
 
+_DNS_RESOLVER_SLOTS = _threading.BoundedSemaphore(2)
+
+
 def _bounded_getaddrinfo(
     hostname: str,
     port: int,
@@ -164,6 +167,9 @@ def _bounded_getaddrinfo(
     budget: Optional[WorkBudget] = None,
 ) -> list[tuple]:
     """Resolve without allowing libc DNS latency to escape the request clock."""
+    resolver_slots = _DNS_RESOLVER_SLOTS
+    if not resolver_slots.acquire(blocking=False):
+        raise _CustomEndpointDNSFailure("custom endpoint DNS capacity exhausted")
     outcome: dict[str, object] = {}
     completed = _threading.Event()
 
@@ -176,13 +182,18 @@ def _bounded_getaddrinfo(
             outcome["error"] = exc
         finally:
             completed.set()
+            resolver_slots.release()
 
     timeout = 5.0
     if budget is not None:
         budget.ensure_active()
         timeout = min(timeout, budget.remaining_seconds())
     worker = _threading.Thread(target=resolve, daemon=True)
-    worker.start()
+    try:
+        worker.start()
+    except BaseException:
+        resolver_slots.release()
+        raise
     if timeout <= 0 or not completed.wait(timeout):
         if budget is not None and budget.remaining_seconds() <= 0:
             raise WorkBudgetExceeded("deadline")
@@ -398,6 +409,7 @@ class _ProviderResponseTooLarge(RuntimeError):
 
 
 _HTTP_CALL_CONTEXT = _threading.local()
+_PROVIDER_HTTP_SESSIONS = _threading.local()
 
 
 class _DeadlineSocket:
@@ -599,16 +611,26 @@ def _deadline_provider_post(
     timeout: float,
     stream: bool,
     budget: WorkBudget,
+    reuse_connection: Optional[bool] = None,
 ):
     """Start one HTTP operation with inactivity and absolute time bounds."""
     budget.ensure_active()
-    session = requests.Session()
-    # Provider credentials and book text must never be redirected to another
-    # authority or routed through ambient host proxy configuration.
-    session.trust_env = False
-    adapter = _DeadlineHTTPAdapter()
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
+    if reuse_connection is None:
+        reuse_connection = bool(getattr(
+            _HTTP_CALL_CONTEXT, "reuse_connection", False
+        ))
+    session = getattr(_PROVIDER_HTTP_SESSIONS, "session", None)
+    session_is_new = session is None or not reuse_connection
+    if session_is_new:
+        session = requests.Session()
+        if reuse_connection:
+            _PROVIDER_HTTP_SESSIONS.session = session
+        # Provider credentials and book text must never be redirected to
+        # another authority or routed through ambient host proxy settings.
+        session.trust_env = False
+        adapter = _DeadlineHTTPAdapter()
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
     _HTTP_CALL_CONTEXT.budget = budget
     _HTTP_CALL_CONTEXT.inactivity_timeout = float(timeout)
     try:
@@ -620,13 +642,22 @@ def _deadline_provider_post(
             stream=stream,
             allow_redirects=False,
         )
-        response._bt_deadline_session = session
+        if not reuse_connection:
+            response._bt_deadline_session = session
         return response
     except WorkBudgetExceeded:
         session.close()
+        if reuse_connection and getattr(
+            _PROVIDER_HTTP_SESSIONS, "session", None
+        ) is session:
+            del _PROVIDER_HTTP_SESSIONS.session
         raise
     except Exception:
         session.close()
+        if reuse_connection and getattr(
+            _PROVIDER_HTTP_SESSIONS, "session", None
+        ) is session:
+            del _PROVIDER_HTTP_SESSIONS.session
         # Convert a socket/read error caused by the absolute deadline while
         # preserving ordinary provider errors for the retry policy.
         budget.ensure_active()
@@ -1150,6 +1181,9 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                     call_timeout = min(float(timeout), budget.remaining_seconds())
                     if call_timeout <= 0:
                         raise WorkBudgetExceeded("deadline")
+                    _HTTP_CALL_CONTEXT.reuse_connection = (
+                        p.name != CUSTOM_PROVIDER_ID
+                    )
                     if p.api_type == "openai":
                         return _translate_openai(
                             p, user_content, system_prompt, call_timeout,
@@ -1158,6 +1192,9 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                         p, user_content, system_prompt, call_timeout,
                         max_tokens, budget)
                 finally:
+                    _HTTP_CALL_CONTEXT.__dict__.pop(
+                        "reuse_connection", None
+                    )
                     _HTTP_CALL_CONTEXT.__dict__.pop("pinned_host", None)
                     _HTTP_CALL_CONTEXT.__dict__.pop("pinned_addresses", None)
             finally:

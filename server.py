@@ -38,7 +38,7 @@ from translator import (
 )
 from work_budget import WorkBudget, WorkBudgetExceeded
 from cache import (
-    CacheScope, get_cached, put_cache, record_cache_hit,
+    CacheScope, get_cached, put_cache, put_cache_many, record_cache_hit,
     get_cache_stats, cleanup_old_entries,
 )
 
@@ -905,6 +905,7 @@ def _translate_paragraphs(
             )
         finally:
             _flush_segment_recovery(recovery_tracker)
+        cache_writes: list[tuple[str, str, str, str, CacheScope]] = []
         for group in missing_groups:
             contract = contracts[tuple(group)]
             for index in group:
@@ -918,29 +919,28 @@ def _translate_paragraphs(
                 fresh_count += 1
                 if not item.server_cacheable:
                     continue
-                try:
-                    scope = _cache_scope(
-                        tenant=tenant,
-                        book_id=book_id,
-                        chapter_id=chapter_id,
-                        context_hash=contract.context_hash,
-                        provider=backend,
-                        model=model_for_provider(backend),
-                        prompt_hash=contract.prompt_hash,
-                        protocol_version=contract.protocol_version,
-                    )
-                    put_cache(
-                        paragraphs[index],
-                        source_lang,
-                        target_lang,
-                        translated,
-                        scope=scope,
-                    )
-                except Exception as exc:
-                    log.error(
-                        "Cache write failed (non-fatal) error_type=%s",
-                        type(exc).__name__,
-                    )
+                scope = _cache_scope(
+                    tenant=tenant,
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    context_hash=contract.context_hash,
+                    provider=backend,
+                    model=model_for_provider(backend),
+                    prompt_hash=contract.prompt_hash,
+                    protocol_version=contract.protocol_version,
+                )
+                cache_writes.append((
+                    paragraphs[index], source_lang, target_lang,
+                    translated, scope,
+                ))
+        if cache_writes:
+            try:
+                put_cache_many(cache_writes)
+            except Exception as exc:
+                log.error(
+                    "Cache write failed (non-fatal) error_type=%s",
+                    type(exc).__name__,
+                )
 
     total_elapsed_ms = int((time.monotonic() - start) * 1000)
 

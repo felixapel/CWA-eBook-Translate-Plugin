@@ -59,7 +59,6 @@
     let TARGET_LANG = localStorage.getItem('bt_lang') || cfg.targetLang || defaultLang;
 
     const BT_CLIENT_MAX_INFLIGHT = 1;
-    const BT_CLIENT_MIN_REQUEST_GAP_MS = 500;
     const BT_CLIENT_RATE_LIMIT_BACKOFF_MS = 10000;
     const BT_CLIENT_MAX_RATE_LIMIT_RESPONSES = 3;
     const BT_CLIENT_MAX_RETRY_AFTER_SECONDS = 60;
@@ -71,7 +70,7 @@
     let prefetchQueue = [];
     let isPumpRunning = false;
     let rateLimitUntil = 0;
-    let lastRequestEnd = 0;
+    let firstVisibleBatchCompleted = false;
     let lastFirstVisibleHash = null;
     let pendingFirstVisibleHash = null; // 2-poll debounce for the page-turn detector
 
@@ -178,6 +177,7 @@
     // fetches immediately instead of blocking the UI until they finish.
     let generation = 0;
     const activeControllers = new Set();
+    let paragraphTextCache = new WeakMap();
 
     function newGeneration() {
         generation++;
@@ -185,12 +185,14 @@
             try { c.abort(); } catch (e) { /* ignore */ }
         }
         activeControllers.clear();
+        paragraphTextCache = new WeakMap();
         visibleQueue = [];
         prefetchQueue = [];
         chapterDone = 0;
         inflightCount = 0;
         isTranslating = false;
         isPrefetching = false;
+        firstVisibleBatchCompleted = false;
         refreshStatus();
         return generation;
     }
@@ -482,6 +484,7 @@
         menu.setAttribute('role', 'dialog');
         menu.setAttribute('aria-label', t.settings);
         menu.setAttribute('aria-hidden', 'true');
+        menu.setAttribute('tabindex', '-1');
         document.body.appendChild(menu);
 
         document.getElementById('bt-toggle').onclick = () => {
@@ -509,7 +512,7 @@
         // Close on outside click (anywhere not on the bar or the menu)...
         document.addEventListener('click', (e) => {
             if (menu.classList.contains('bt-open') && !bar.contains(e.target) && !menu.contains(e.target)) {
-                closeMenu();
+                closeMenu({ restoreFocus: false });
             }
         });
         // ...and on Escape.
@@ -517,12 +520,19 @@
             if (e.key === 'Escape' && menu.classList.contains('bt-open')) closeMenu();
         });
 
-        // Click the error status to retry.
-        document.getElementById('bt-status').onclick = () => {
+        const retryFailed = () => {
             if (bar.dataset.state === 'error') {
                 errorCount = 0;
                 failedParagraphs.clear();
                 if (translationMode !== 'off') translateCurrentPage();
+            }
+        };
+        const status = document.getElementById('bt-status');
+        status.onclick = retryFailed;
+        status.onkeydown = (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                if (bar.dataset.state === 'error') event.preventDefault();
+                retryFailed();
             }
         };
 
@@ -628,14 +638,16 @@
         });
     }
 
-    function closeMenu() {
+    function closeMenu({ restoreFocus = true } = {}) {
         const menu = document.getElementById('bt-menu');
         const gear = document.getElementById('bt-gear');
+        const wasOpen = !!(menu && menu.classList.contains('bt-open'));
         if (menu) {
             menu.classList.remove('bt-open');
             menu.setAttribute('aria-hidden', 'true');
         }
         if (gear) gear.setAttribute('aria-expanded', 'false');
+        if (restoreFocus && wasOpen && gear) gear.focus();
     }
 
     function toggleMenu() {
@@ -647,6 +659,12 @@
         menu.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
         const gear = document.getElementById('bt-gear');
         if (gear) gear.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+        if (isOpen) {
+            const target = menu.querySelector('select, button, [tabindex="0"]') || menu;
+            window.requestAnimationFrame(() => target.focus());
+        } else if (gear) {
+            gear.focus();
+        }
     }
 
     // Single source of truth for the status zone: derives display from state.
@@ -655,6 +673,7 @@
         const bar = document.getElementById('bt-bar');
         const text = document.getElementById('bt-status-text');
         const progress = document.getElementById('bt-progress');
+        const status = document.getElementById('bt-status');
         const fill = document.getElementById('bt-progress-fill');
         if (!bar || !text) return;
 
@@ -701,12 +720,23 @@
                 text.textContent = t.done;
                 doneHideTimer = setTimeout(() => {
                     chapterDone = 0;
-                    const b = document.getElementById('bt-bar');
-                    if (b && b.dataset.state === 'done') { b.dataset.state = 'idle'; }
+                    doneHideTimer = null;
+                    refreshStatus();
                 }, 2500);
             }
         }
         bar.dataset.state = state;
+        if (status) {
+            if (state === 'error') {
+                status.setAttribute('role', 'button');
+                status.setAttribute('tabindex', '0');
+                status.setAttribute('aria-label', t.retryPage);
+            } else {
+                status.setAttribute('role', 'status');
+                status.removeAttribute('tabindex');
+                status.removeAttribute('aria-label');
+            }
+        }
         if (progress) {
             if (state === 'page') {
                 progress.removeAttribute('aria-valuenow');
@@ -871,10 +901,17 @@
     }
 
     function getParagraphText(el) {
-        if (el.dataset.originalText) return el.dataset.originalText;
+        if (el.dataset.originalText) {
+            paragraphTextCache.set(el, el.dataset.originalText);
+            return el.dataset.originalText;
+        }
+        const cached = paragraphTextCache.get(el);
+        if (cached !== undefined) return cached;
         const clone = el.cloneNode(true);
         clone.querySelectorAll('.bt-loading, .bt-translation').forEach(n => n.remove());
-        return clone.textContent.trim();
+        const text = clone.textContent.trim();
+        paragraphTextCache.set(el, text);
+        return text;
     }
 
     function hashText(str) {
@@ -975,8 +1012,9 @@
     }
 
     // ── Translation engine ─────────────────────────────────────────────
-    const VISIBLE_CHUNK = 1;       // paragraphs per request for the on-screen page
-    const PREFETCH_CHUNK = 3;      // paragraphs per request for background fill
+    const FIRST_VISIBLE_CHUNK = 1; // minimize time to the first translated paragraph
+    const VISIBLE_CHUNK = 5;       // amortize later visible work without a large burst
+    const PREFETCH_CHUNK = 5;      // bounded background batches
     const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
 
     // Server rejects paragraphs beyond BT_MAX_PARAGRAPH_CHARS (default 8000)
@@ -1172,12 +1210,6 @@
                     continue;
                 }
                 
-                const gap = BT_CLIENT_MIN_REQUEST_GAP_MS - (now - lastRequestEnd);
-                if (gap > 0) {
-                    await new Promise(r => setTimeout(r, gap));
-                    continue;
-                }
-                
                 // Cleanup stale items and deduplicate
                 const seenHash = new Set();
                 visibleQueue = visibleQueue.filter(x => {
@@ -1198,8 +1230,10 @@
                 let isVisible = false;
                 let batch = [];
                 if (visibleQueue.length > 0) {
-                    batch = visibleQueue.slice(0, VISIBLE_CHUNK);
-                    visibleQueue = visibleQueue.slice(VISIBLE_CHUNK);
+                    const chunkSize = firstVisibleBatchCompleted
+                        ? VISIBLE_CHUNK : FIRST_VISIBLE_CHUNK;
+                    batch = visibleQueue.slice(0, chunkSize);
+                    visibleQueue = visibleQueue.slice(chunkSize);
                     isVisible = true;
                 } else {
                     batch = prefetchQueue.slice(0, PREFETCH_CHUNK);
@@ -1244,13 +1278,11 @@
                     console.error("Translation request failed:", e);
                     markBatchFailed(batch);
                     inflightCount = 0;
-                    lastRequestEnd = Date.now();
                     refreshStatus();
                     continue;
                 }
 
                 inflightCount = 0;
-                lastRequestEnd = Date.now();
 
                 if (data && data.error === 'aborted') {
                     // Deliberate cancel (mode/language/page change) — the items
@@ -1288,6 +1320,9 @@
                 // failed paragraph; successful entries remain available.
                 const succeeded = batch.filter(b => translatedParagraphs[b.hash]);
                 chapterDone += succeeded.length;
+                if (isVisible && succeeded.length > 0) {
+                    firstVisibleBatchCompleted = true;
+                }
                 const failed = batch.filter(b => !translatedParagraphs[b.hash]);
                 if (failed.length) markBatchFailed(failed);
                 else if (anyGood) errorCount = 0;

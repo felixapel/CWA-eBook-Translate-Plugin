@@ -28,6 +28,22 @@ assert(/id="bt-source-lang"/.test(code)
         && /localStorage\.setItem\(['"]bt_source_lang['"]/.test(code)
         && /source_lang:\s*SOURCE_LANG/.test(code),
     'The reader must expose and persist a bounded source-language selector');
+assert(/const FIRST_VISIBLE_CHUNK = 1;/.test(code)
+        && /const VISIBLE_CHUNK = 5;/.test(code)
+        && /const PREFETCH_CHUNK = 5;/.test(code),
+    'The queue must optimize first-paint latency while bounding later batches');
+assert(!/BT_CLIENT_MIN_REQUEST_GAP_MS/.test(code),
+    'Successful requests must not pay an unconditional client-side delay');
+assert(/paragraphTextCache = new WeakMap\(\)/.test(code)
+        && /paragraphTextCache\.get\(el\)/.test(code),
+    'Paragraph extraction must be cached within one DOM generation');
+assert(/status\.onkeydown/.test(code)
+        && /event\.key === 'Enter' \|\| event\.key === ' '/.test(code)
+        && /status\.setAttribute\('tabindex', '0'\)/.test(code),
+    'The visible retry control must be keyboard operable');
+assert(/window\.requestAnimationFrame\(\(\) => target\.focus\(\)\)/.test(code)
+        && /gear\.focus\(\)/.test(code),
+    'The settings dialog must move and restore keyboard focus');
 
 let fetchCalls = [];
 let fetchResponses = [];
@@ -559,14 +575,13 @@ async function runTest() {
         body: { translations: ["Translated visible 2"] }
     });
     
-    // Provide responses for the remaining prefetch blocks
+    // Provide one bounded response for the remaining prefetch block
     fetchResponses.push({
         status: 200,
-        body: { translations: ["Translated prefetch 1", "Translated prefetch 2", "Translated prefetch 3"] }
-    });
-    fetchResponses.push({
-        status: 200,
-        body: { translations: ["Translated prefetch 4"] }
+        body: { translations: [
+            "Translated prefetch 1", "Translated prefetch 2",
+            "Translated prefetch 3", "Translated prefetch 4"
+        ] }
     });
     
     const timeBeforeResume = Date.now();
