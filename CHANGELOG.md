@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Propagated adaptive batching through both hub and split managed installs,
+  rejected browser/API batch-limit mismatches before startup, made provider
+  `429` terminal before retry/fallback, and kept safe browser retry bounds and
+  visible-work priority stable across reader DOM rediscovery.
 - Updated Gemini/OpenAI-compatible request contracts for current Gemini models,
   including omission of deprecated sampling fields and invalid prefilled model
   turns.

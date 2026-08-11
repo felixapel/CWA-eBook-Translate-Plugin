@@ -270,11 +270,14 @@ bounded setting at a time.
 
 Start with the fixed-cardinality `/metrics` fields `provider_calls`,
 `batch_groups_total`, `batch_paragraphs_total`,
-`batch_group_size_buckets` and `batch_group_source_token_buckets`. The ratio of
-paragraphs to provider attempts shows whether grouping is actually reducing
-RPM pressure; `provider_calls.rate_limited` distinguishes provider `429`s from
-the API's own `outcomes.api_rate_limited` admission counter. Counters are
-process-local and reset when the API process restarts.
+`batch_group_size_buckets` and `batch_group_source_token_buckets`.
+`batch_paragraphs_total / batch_groups_total` describes planned grouping before
+cache lookup. Compare provider attempts over a controlled fresh-cache canary,
+not as an unconditional live ratio: cached plans and provider health probes do
+not represent translation calls one-for-one. `provider_calls.rate_limited`
+distinguishes provider `429`s from the API's own
+`outcomes.api_rate_limited` admission counter. Counters are process-local and
+reset when the API process restarts.
 
 For an RPM-limited cloud model, raise `BT_BATCH_SIZE` gradually and use a
 positive `BT_BATCH_SOURCE_TOKEN_BUDGET` so unusually long paragraphs cannot

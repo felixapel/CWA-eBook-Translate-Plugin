@@ -58,7 +58,9 @@ LLM_API_KEY=<Google AI Studio or project API key>
 BT_LOCAL_URL=
 BT_BATCH_SIZE=10
 BT_BATCH_SOURCE_TOKEN_BUDGET=450
+BT_BATCH_MAX_TOKENS=1200
 BT_CLIENT_PREFETCH_GAP_MS=1000
+BT_MAX_BATCH_PARAGRAPHS=50
 ```
 
 Named providers use their fixed HTTPS API endpoints. Local and custom

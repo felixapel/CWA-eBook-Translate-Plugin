@@ -418,6 +418,26 @@ def _optional_port(value: object, name: str) -> int | None:
     return int(cleaned)
 
 
+def _bounded_integer(
+    value: object,
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    cleaned = _clean_value(
+        str(default) if value is None else value,
+        name,
+    )
+    if not cleaned.isdecimal():
+        raise ConfigError(f"{name} must be an integer from {minimum} to {maximum}")
+    parsed = int(cleaned, 10)
+    if not minimum <= parsed <= maximum:
+        raise ConfigError(f"{name} must be an integer from {minimum} to {maximum}")
+    return parsed
+
+
 def _validate_authentik_version(value: object) -> str:
     cleaned = _clean_value(value, "BT_AUTHENTIK_VERSION")
     match = re.fullmatch(r"(20[0-9]{2})\.([0-9]{1,2})\.([0-9]+)", cleaned)
@@ -573,6 +593,11 @@ class InstallConfig:
     authentik_version: str
     authentik_outpost_url: str
     reverse_proxy: str
+    batch_size: int
+    batch_source_token_budget: int
+    batch_max_tokens: int
+    client_prefetch_gap_ms: int
+    max_batch_paragraphs: int
     llm_provider: str
     llm_model: str
     local_url: str
@@ -771,6 +796,46 @@ class InstallConfig:
         if edge_network and edge_network == reader_network:
             raise ConfigError("BT_EDGE_NETWORK and BT_READER_NETWORK must be separate")
 
+        batch_size = _bounded_integer(
+            values.get("BT_BATCH_SIZE"),
+            "BT_BATCH_SIZE",
+            default=5,
+            minimum=1,
+            maximum=50,
+        )
+        batch_source_token_budget = _bounded_integer(
+            values.get("BT_BATCH_SOURCE_TOKEN_BUDGET"),
+            "BT_BATCH_SOURCE_TOKEN_BUDGET",
+            default=0,
+            minimum=0,
+            maximum=1_000_000,
+        )
+        batch_max_tokens = _bounded_integer(
+            values.get("BT_BATCH_MAX_TOKENS"),
+            "BT_BATCH_MAX_TOKENS",
+            default=8192,
+            minimum=1,
+            maximum=1_000_000,
+        )
+        client_prefetch_gap_ms = _bounded_integer(
+            values.get("BT_CLIENT_PREFETCH_GAP_MS"),
+            "BT_CLIENT_PREFETCH_GAP_MS",
+            default=0,
+            minimum=0,
+            maximum=10_000,
+        )
+        max_batch_paragraphs = _bounded_integer(
+            values.get("BT_MAX_BATCH_PARAGRAPHS"),
+            "BT_MAX_BATCH_PARAGRAPHS",
+            default=50,
+            minimum=1,
+            maximum=1_000,
+        )
+        if batch_size > max_batch_paragraphs:
+            raise ConfigError(
+                "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS"
+            )
+
         llm_provider = _choice(values, "LLM_PROVIDER", _LLM_PROVIDERS)
         llm_model = _clean_value(values.get("LLM_MODEL", ""), "LLM_MODEL")
         if not _TOKEN_RE.fullmatch(llm_model):
@@ -967,6 +1032,11 @@ class InstallConfig:
             authentik_version=authentik_version,
             authentik_outpost_url=authentik_outpost_url,
             reverse_proxy=reverse_proxy,
+            batch_size=batch_size,
+            batch_source_token_budget=batch_source_token_budget,
+            batch_max_tokens=batch_max_tokens,
+            client_prefetch_gap_ms=client_prefetch_gap_ms,
+            max_batch_paragraphs=max_batch_paragraphs,
             llm_provider=llm_provider,
             llm_model=llm_model,
             local_url=local_url,
@@ -1024,6 +1094,12 @@ class InstallConfig:
             "LLM_FALLBACK_API_KEY": self.llm_fallback_api_key,
             "LLM_FALLBACK_CUSTOM_ENDPOINT": self.llm_fallback_custom_endpoint,
             "LLM_FALLBACK_CUSTOM_API_KEY": self.llm_fallback_custom_api_key,
+            "BT_BATCH_SIZE": str(self.batch_size),
+            "BT_BATCH_SOURCE_TOKEN_BUDGET": str(
+                self.batch_source_token_budget
+            ),
+            "BT_BATCH_MAX_TOKENS": str(self.batch_max_tokens),
+            "BT_MAX_BATCH_PARAGRAPHS": str(self.max_batch_paragraphs),
         }
         if self.install_profile == "compose-existing":
             values["BT_CACHE_OPERATOR_GROUP_ACCESS"] = "true"
@@ -1070,6 +1146,8 @@ class InstallConfig:
             "BT_BROWSER_CREDENTIALS": (
                 "same-origin" if self.uses_reader_session else "include"
             ),
+            "BT_BATCH_SIZE": str(self.batch_size),
+            "BT_CLIENT_PREFETCH_GAP_MS": str(self.client_prefetch_gap_ms),
         }
         if self.reader_type == "cwa":
             values["CWA_UPSTREAM"] = self.reader_upstream
@@ -1095,6 +1173,11 @@ class InstallConfig:
             "identity_proxy_peer": self.identity_proxy_peer,
             "authentik_version": self.authentik_version,
             "authentik_outpost_url": self.authentik_outpost_url,
+            "batch_size": self.batch_size,
+            "batch_source_token_budget": self.batch_source_token_budget,
+            "batch_max_tokens": self.batch_max_tokens,
+            "client_prefetch_gap_ms": self.client_prefetch_gap_ms,
+            "max_batch_paragraphs": self.max_batch_paragraphs,
             "llm_provider": self.llm_provider,
             "llm_model": self.llm_model,
             "local_url": self.local_url,

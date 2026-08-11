@@ -1346,8 +1346,12 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
                 e,
                 (requests.exceptions.ConnectionError, requests.exceptions.Timeout),
             )
+            # A provider 429 may arrive after the provider admitted or even
+            # completed work. Replaying it here would amplify the project RPM
+            # burst and could also fall through to another paid provider.
+            # Only the API's own pre-provider admission 429 is browser-retryable.
             retryable = (
-                status_code in {408, 429, 500, 502, 503, 504}
+                status_code in {408, 500, 502, 503, 504}
                 or transient_transport
             )
             if attempt_recorded:
@@ -1368,14 +1372,7 @@ def _call_provider(p: _Provider, user_content: str, system_prompt: str,
             )
             if not retryable:
                 break
-            if status_code == 429:
-                _sleep_before_retry(
-                    budget,
-                    last_error.retry_after_seconds or 2 ** attempt,
-                    attempt,
-                    max_retries,
-                )
-            elif status_code:
+            if status_code:
                 _sleep_before_retry(budget, 1, attempt, max_retries)
             else:
                 # No HTTP response at all (timeout / connection refused): often a

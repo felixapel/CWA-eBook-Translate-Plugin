@@ -450,6 +450,145 @@ async function assertConfiguredBatchSizeIsUsed() {
     batchDom.window.close();
 }
 
+async function assertSafe429RetryBoundSurvivesRediscovery() {
+    const retryDom = new JSDOM(
+        '<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>',
+        { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' }
+    );
+    retryDom.window.BOOK_TRANSLATOR = {
+        apiUrl: '/bt-api', authMode: 'cwa_session'
+    };
+    retryDom.window.localStorage.setItem('bt_mode', 'translated');
+    retryDom.window.localStorage.setItem('bt_prefetch', '0');
+    retryDom.window.localStorage.setItem('bt_lang', 'Spanish');
+    retryDom.window.requestAnimationFrame = cb => setTimeout(cb, 0);
+    const document = retryDom.window.document.querySelector('iframe').contentDocument;
+    document.body.innerHTML = '<p>stable rate-limit paragraph</p>';
+    document.querySelector('p').getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+    let translationCalls = 0;
+    retryDom.window.fetch = async url => {
+        if (String(url).endsWith('/provider-policy')) {
+            return {
+                ok: true, status: 200,
+                json: async () => ({
+                    primary: 'local', fallback: null,
+                    generation: '0123456789abcdef0123456789abcdef'
+                }),
+                headers: { get: () => null },
+            };
+        }
+        translationCalls++;
+        return {
+            ok: false, status: 429,
+            json: async () => ({
+                error: 'rate_limited', retry_after: 1,
+                retry_safe: true, scope: 'api_admission'
+            }),
+            headers: { get: () => '1' },
+        };
+    };
+    const script = retryDom.window.document.createElement('script');
+    script.textContent = code;
+    retryDom.window.document.body.appendChild(script);
+
+    // Rediscover the same paragraph during each admission wait. Queue objects
+    // are transient; the retry budget must remain stable for this generation.
+    [300, 1300, 2300].forEach(delay => setTimeout(() => {
+        const marker = document.createElement('div');
+        document.body.appendChild(marker);
+    }, delay));
+    await wait(3400);
+
+    assert.strictEqual(translationCalls, 3,
+        'Rediscovery must not reset the three-response safe 429 bound');
+    assert.strictEqual(
+        retryDom.window.document.getElementById('bt-bar').dataset.state,
+        'error',
+        'Exhausting safe admission retries must become an actionable failure'
+    );
+    retryDom.window.close();
+}
+
+async function assertVisibleWorkInterruptsPrefetchDelay() {
+    const pacingDom = new JSDOM(
+        '<!DOCTYPE html><html><body><div id="viewer"><iframe></iframe></div></body></html>',
+        { url: 'http://reader.example.test/read/1', runScripts: 'dangerously' }
+    );
+    pacingDom.window.BOOK_TRANSLATOR = {
+        apiUrl: '/bt-api', authMode: 'cwa_session',
+        batchSize: 1, prefetchGapMs: 1000
+    };
+    pacingDom.window.localStorage.setItem('bt_mode', 'translated');
+    pacingDom.window.localStorage.setItem('bt_prefetch', '1');
+    pacingDom.window.localStorage.setItem('bt_lang', 'Spanish');
+    pacingDom.window.requestAnimationFrame = cb => setTimeout(cb, 0);
+    const document = pacingDom.window.document.querySelector('iframe').contentDocument;
+    document.body.innerHTML = '<p id="first">first visible</p><p id="background">background</p>';
+    document.getElementById('first').getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+    document.getElementById('background').getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 1000
+    });
+    let renderedHook = null;
+    pacingDom.window.reader = {
+        rendition: { on: (name, callback) => {
+            if (name === 'rendered') renderedHook = callback;
+        } }
+    };
+    const calls = [];
+    pacingDom.window.fetch = async (url, options) => {
+        if (String(url).endsWith('/provider-policy')) {
+            return {
+                ok: true, status: 200,
+                json: async () => ({
+                    primary: 'local', fallback: null,
+                    generation: '0123456789abcdef0123456789abcdef'
+                }),
+                headers: { get: () => null },
+            };
+        }
+        const payload = JSON.parse(options.body);
+        calls.push({ time: Date.now(), paragraphs: payload.paragraphs });
+        return {
+            ok: true, status: 200,
+            json: async () => ({
+                translations: payload.paragraphs.map(text => `ES: ${text}`)
+            }),
+            headers: { get: () => null },
+        };
+    };
+    const script = pacingDom.window.document.createElement('script');
+    script.textContent = code;
+    pacingDom.window.document.body.appendChild(script);
+    let deadline = Date.now() + 1000;
+    while ((calls.length < 1 || !renderedHook) && Date.now() < deadline) {
+        await wait(10);
+    }
+    assert(renderedHook, 'The EPUB rendered hook must be attached');
+    await wait(30); // ensure the sole pump is waiting on the background gap
+
+    const paragraph = document.createElement('p');
+    paragraph.textContent = 'new visible work';
+    paragraph.getBoundingClientRect = () => ({
+        width: 100, height: 20, left: 0, top: 0
+    });
+    document.body.appendChild(paragraph);
+    const admittedAt = Date.now();
+    renderedHook();
+    deadline = Date.now() + 500;
+    while (!calls.some(call => call.paragraphs.includes('new visible work'))
+            && Date.now() < deadline) await wait(5);
+    const visibleCall = calls.find(call => call.paragraphs.includes('new visible work'));
+
+    assert(visibleCall, 'New visible work must preempt a paced background queue');
+    assert(visibleCall.time - admittedAt < 150,
+        'Visible work must not inherit any part of the 1000ms prefetch delay');
+    pacingDom.window.close();
+}
+
 async function assertManagedLoaderContract() {
     const loaderDom = new JSDOM(
         '<!DOCTYPE html><html><head></head><body></body></html>',
@@ -842,6 +981,8 @@ async function runTest() {
     await assertStalePolicyIsRefetchedWithoutTranslationReplay();
     await assertAmbiguous429IsTerminal();
     await assertConfiguredBatchSizeIsUsed();
+    await assertSafe429RetryBoundSurvivesRediscovery();
+    await assertVisibleWorkInterruptsPrefetchDelay();
 
     const [tokenTransport, forwardedTransport, cwaTransport, consentedTransport] = await Promise.all([
         captureAuthTransport({ authMode: 'token', apiToken: 'browser-token' }),

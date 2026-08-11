@@ -35,11 +35,16 @@ visible request at one paragraph, then uses the managed batch maximum.
 `BT_CLIENT_PREFETCH_GAP_MS` spaces only opt-in background request starts. Its
 managed range is `0..10000`; batch size is `1..50`. Missing browser fields use
 the historical values `5` and `0`. No new browser request concurrency is added.
+Managed configuration also fails closed when the browser batch maximum exceeds
+`BT_MAX_BATCH_PARAGRAPHS`, so a valid-looking profile cannot generate routine
+API `413` responses.
 
 Provider transport attempts, successes, failures and `429`s are exposed as
 fixed process-local counters. Batch group counts and fixed size/source-token
 buckets are also exposed without provider, book, identity, text or arbitrary
-error labels.
+error labels. Group counters describe the plan before cache lookup; provider
+attempt counters also include explicit provider health probes, so operators
+compare them only during controlled fresh-cache canaries.
 
 Provider `Retry-After` is accepted only as positive delta seconds and capped at
 30 seconds before entering sanitized per-segment metadata. A provider `429`

@@ -586,6 +586,56 @@ class ProviderBudgetTests(unittest.TestCase):
             "failures": 1,
         })
 
+    def test_provider_rate_limit_is_terminal_before_retry_or_fallback(self):
+        calls = []
+
+        def rate_limited(url, *_args, **_kwargs):
+            calls.append(url)
+            response = type(
+                "Response",
+                (),
+                {"status_code": 429, "headers": {"Retry-After": "7"}},
+            )()
+            raise translator.requests.exceptions.HTTPError(
+                "synthetic", response=response
+            )
+
+        translator._provider_post = rate_limited
+        translator._primary_provider = translator._Provider(
+            "local",
+            "primary",
+            "",
+            spec=translator.ProviderSpec(
+                provider_id="local",
+                endpoint="http://primary.test/v1/chat/completions",
+                protocol="openai",
+                locality="local",
+                cache_namespace="primary",
+            ),
+        )
+        translator._fallback_provider = translator._Provider(
+            "gemini",
+            "fallback",
+            "secret",
+            spec=translator.ProviderSpec(
+                provider_id="gemini",
+                endpoint="https://fallback.test/v1/chat/completions",
+                protocol="openai",
+                locality="remote",
+                cache_namespace="fallback",
+            ),
+        )
+
+        with self.assertRaises(translator.ProviderUnavailableError) as raised:
+            translator.translate_text(
+                "hello",
+                budget=self.budget(),
+                allow_cloud_fallback=True,
+            )
+
+        self.assertEqual(raised.exception.error_code, "provider_rate_limited")
+        self.assertEqual(calls, ["http://primary.test/v1/chat/completions"])
+
     def test_batch_rate_limit_marks_only_the_failed_segments(self):
         def rate_limited(*_args, **_kwargs):
             response = type(
@@ -629,8 +679,8 @@ class ProviderBudgetTests(unittest.TestCase):
             sleeps.append(seconds)
             clock.now += seconds
 
-        def rate_limited(*_args, **_kwargs):
-            response = type("Response", (), {"status_code": 429})()
+        def transiently_unavailable(*_args, **_kwargs):
+            response = type("Response", (), {"status_code": 503})()
             raise translator.requests.exceptions.HTTPError(
                 "synthetic", response=response)
 
@@ -641,7 +691,7 @@ class ProviderBudgetTests(unittest.TestCase):
             deadline_seconds=0.25,
             clock=clock,
         )
-        translator._provider_post = rate_limited
+        translator._provider_post = transiently_unavailable
         translator.time.sleep = advance
         translator._fallback_provider = None
 

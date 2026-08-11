@@ -127,6 +127,16 @@ class HubConfigTests(unittest.TestCase):
             )
             self.assertNotIn("LLM_API_KEY", reader.proxy_environment)
 
+    def test_browser_batch_cannot_exceed_api_batch_limit(self):
+        env = dual_reader_environment()
+        env["BT_MAX_BATCH_PARAGRAPHS"] = "5"
+
+        with self.assertRaisesRegex(
+            HubConfigError,
+            "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS",
+        ):
+            HubConfig.from_environment(env)
+
     def test_remote_provider_without_key_fails_during_plan_not_after_start(self):
         env = dual_reader_environment()
         env["LLM_API_KEY"] = ""
