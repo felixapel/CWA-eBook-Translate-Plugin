@@ -33,6 +33,8 @@ class ProxyConfigRendererTests(unittest.TestCase):
             "BT_CWA_IDENTITY_HEADER": "Remote-User",
             "BT_BROWSER_AUTH_MODE": "cwa_session",
             "BT_BROWSER_CREDENTIALS": "same-origin",
+            "BT_BATCH_SIZE": "5",
+            "BT_CLIENT_PREFETCH_GAP_MS": "0",
         })
         for name, value in (overrides or {}).items():
             if value is None:
