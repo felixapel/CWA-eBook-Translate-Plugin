@@ -19,6 +19,45 @@ def _budget() -> WorkBudget:
 
 
 class ProviderConfigurationTests(unittest.TestCase):
+    def test_gemini_request_omits_deprecated_sampling_parameters(self):
+        provider = translator._Provider(
+            "gemini", "gemini-3.5-flash-lite", "gemini-key"
+        )
+        captured = {}
+
+        class Response:
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "translated"}}]}
+
+            def close(self):
+                return None
+
+        def provider_post(_url, **kwargs):
+            captured.update(kwargs["json"])
+            return Response()
+
+        with mock.patch.object(
+            translator, "_provider_post", side_effect=provider_post
+        ):
+            result = translator._translate_openai(
+                provider,
+                "source text",
+                "translate faithfully",
+                timeout=5,
+                max_tokens=256,
+                budget=_budget(),
+            )
+
+        self.assertEqual(result, "translated")
+        self.assertNotIn("temperature", captured)
+        self.assertEqual(captured["model"], "gemini-3.5-flash-lite")
+        self.assertEqual(captured["max_tokens"], 256)
+
     def test_named_gemini_endpoint_is_fixed_and_remote(self):
         provider = translator._provider_from_config(
             name="gemini",

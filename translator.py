@@ -982,13 +982,16 @@ def _translate_openai(
 
     payload = {
         "model": p.model,
-        "temperature": 0.3,
         "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
     }
+    # Gemini 3.5+ deprecates OpenAI sampling parameters and may reject them in
+    # future model generations. Source: https://ai.google.dev/gemini-api/docs/latest-model
+    if p.name != "gemini":
+        payload["temperature"] = 0.3
 
     resp = _provider_post(
         p.url,
