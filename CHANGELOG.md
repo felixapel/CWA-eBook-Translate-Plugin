@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Normalized fresh universal-hub data directories before inspecting private
+  reader credentials, so caller-owned mode-`0700` paths work for non-root
+  Compose and root Unraid while retained UID-101 keys remain distinguishable
+  from credentials created by a failed install attempt.
 - Ran read-only hub credential and data verification as the owning runtime UID,
   allowing reinstall and non-root Compose operation to traverse retained
   mode-`0700` reader directories without adding Docker capabilities.

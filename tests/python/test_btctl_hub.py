@@ -273,6 +273,7 @@ class HubBtctlTests(unittest.TestCase):
                 self.calls.append(("data-readers", tuple(readers)))
 
             def inspect_hub_data_credentials(self, _image, _path, readers):
+                self.calls.append("inspect-credentials")
                 return {reader: False for reader in readers}
 
             def compose_validate(self, document, _project):
@@ -364,12 +365,13 @@ class HubBtctlTests(unittest.TestCase):
                 environment_path.read_text(encoding="utf-8"),
             )
             self.assertEqual(
-                docker.calls[:5],
+                docker.calls[:6],
                 [
                     "available",
                     "build",
                     "data",
                     ("data-readers", ("cwa", "kavita")),
+                    "inspect-credentials",
                     "validate",
                 ],
             )

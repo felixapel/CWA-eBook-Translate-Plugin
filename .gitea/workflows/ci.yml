@@ -102,3 +102,5 @@ jobs:
         run: ./scripts/ca-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-ca"
       - name: Exercise the universal one-container hub
         run: ./scripts/hub-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-hub"
+      - name: Exercise the managed hub fresh and retained lifecycle
+        run: ./scripts/hub-btctl-lifecycle-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-hl"

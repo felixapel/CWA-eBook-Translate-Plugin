@@ -824,15 +824,15 @@ class HubInstaller:
             reader_names = tuple(
                 reader.name for reader in config.runtime.readers
             )
-            session_keys_preexisting = (
-                self.docker.inspect_hub_data_credentials(
-                    config.image, data_dir, reader_names
-                )
-            )
             self.docker.prepare_hub_data_directory(
                 config.image,
                 data_dir,
                 reader_names,
+            )
+            session_keys_preexisting = (
+                self.docker.inspect_hub_data_credentials(
+                    config.image, data_dir, reader_names
+                )
             )
             if config.install_profile == "compose-existing":
                 _write_private_environment(
