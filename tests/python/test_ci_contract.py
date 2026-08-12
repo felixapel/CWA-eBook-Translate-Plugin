@@ -12,6 +12,7 @@ GITEA_CI = ROOT / ".gitea" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".gitea" / "workflows" / "release.yml"
 PUBLISH_IMAGE = ROOT / ".github" / "workflows" / "publish-image.yml"
 DOCKER_NAMES = ROOT / "scripts" / "ci-docker-names.sh"
+HUB_LIFECYCLE_SMOKE = ROOT / "scripts" / "hub-btctl-lifecycle-smoke.sh"
 FRONTEND_WORKFLOWS = (
     GITHUB_CI,
     GITEA_CI,
@@ -121,6 +122,13 @@ class CIContractTests(unittest.TestCase):
             './scripts/hub-container-smoke.sh "$SMOKE_IMAGE" "$SMOKE_PREFIX-hub"',
             self.workflow,
         )
+        managed_hub_smoke = (
+            './scripts/hub-btctl-lifecycle-smoke.sh '
+            '"$SMOKE_IMAGE" "$SMOKE_PREFIX-hl"'
+        )
+        for workflow in (GITHUB_CI, GITEA_CI, RELEASE):
+            with self.subTest(workflow=workflow):
+                self.assertIn(managed_hub_smoke, workflow.read_text())
         self.assertNotIn("docker build -t bt-audit:ci", self.workflow)
 
     def test_docker_names_are_isolated_across_repositories(self):
@@ -171,6 +179,41 @@ class CIContractTests(unittest.TestCase):
         self.assertRegex(
             long_identifiers["SMOKE_PREFIX"], r"^bt-ci-[0-9a-f]{20}$")
         self.assertLessEqual(len(long_identifiers["SMOKE_PREFIX"]), 49)
+
+    def test_derived_ci_prefix_fits_the_managed_hub_smoke_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = Path(temp_dir) / "github-env"
+            env = os.environ.copy()
+            env.update({
+                "GITHUB_REPOSITORY": "felix/CWA-translate-plugin",
+                "GITHUB_RUN_ID": "4242",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_ENV": str(env_file),
+            })
+            subprocess.run(
+                ["sh", str(DOCKER_NAMES)],
+                cwd=ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            generated = dict(
+                line.split("=", 1) for line in env_file.read_text().splitlines()
+            )
+            derived = generated["SMOKE_PREFIX"] + "-hl"
+            env["BT_SMOKE_VALIDATE_PREFIX_ONLY"] = "1"
+            validated = subprocess.run(
+                [str(HUB_LIFECYCLE_SMOKE), generated["SMOKE_IMAGE"], derived],
+                cwd=ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(validated.returncode, 0, validated.stderr)
+        self.assertLessEqual(len(derived), 49)
 
     def test_package_lock_root_metadata_matches_package_manifest(self):
         package = json.loads((ROOT / "package.json").read_text())
