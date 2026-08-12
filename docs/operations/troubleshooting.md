@@ -271,6 +271,9 @@ bounded setting at a time.
 Start with the fixed-cardinality `/metrics` fields `provider_calls`,
 `batch_groups_total`, `batch_paragraphs_total`,
 `batch_group_size_buckets` and `batch_group_source_token_buckets`.
+Use `translation_latency_ms_buckets` to detect tail movement without exposing
+request, reader or book labels. Calculate an approximate percentile from the
+cumulative fixed buckets rather than relying only on `average_latency_ms`.
 `batch_paragraphs_total / batch_groups_total` describes planned grouping before
 cache lookup. Compare provider attempts over a controlled fresh-cache canary,
 not as an unconditional live ratio: cached plans and provider health probes do

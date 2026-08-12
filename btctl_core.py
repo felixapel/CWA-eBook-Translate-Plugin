@@ -1504,7 +1504,9 @@ class StateStore:
         self.state_dir = Path(state_dir)
         self.path = self.state_dir / "state.json"
 
-    def _validate_destination(self) -> None:
+    def _validate_destination(
+        self, additional_allowed_files: frozenset[str] = frozenset()
+    ) -> None:
         if self.state_dir.is_symlink() or self.path.is_symlink():
             raise ConfigError("state destination must not be a symbolic link")
         if self.state_dir.exists() and not self.state_dir.is_dir():
@@ -1551,7 +1553,7 @@ class StateStore:
             "migration-v214.json",
             "proxy.env",
             "proxy.template.xml",
-        }
+        } | set(additional_allowed_files)
         try:
             entries = list(self.state_dir.iterdir())
         except OSError as exc:
@@ -1698,9 +1700,15 @@ class InstallAttemptStore:
         }
     )
 
-    def __init__(self, state_dir: Path):
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        additional_allowed_files: frozenset[str] = frozenset(),
+    ):
         self.state_dir = Path(state_dir)
         self.path = self.state_dir / "install-attempt.json"
+        self.additional_allowed_files = additional_allowed_files
 
     @classmethod
     def _validate(cls, payload: object) -> dict[str, object]:
@@ -1758,7 +1766,9 @@ class InstallAttemptStore:
         document = dict(payload)
         document["schema_version"] = INSTALL_ATTEMPT_SCHEMA_VERSION
         validated = self._validate(document)
-        StateStore(self.state_dir)._validate_destination()
+        StateStore(self.state_dir)._validate_destination(
+            self.additional_allowed_files
+        )
         ensure_directory_durable(self.state_dir)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".install-attempt.json.", dir=self.state_dir

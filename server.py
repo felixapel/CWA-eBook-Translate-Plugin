@@ -676,6 +676,10 @@ _BATCH_GROUP_SIZE_BUCKETS = (
 _BATCH_GROUP_SOURCE_TOKEN_BUCKETS = (
     "up_to_128", "up_to_256", "up_to_450", "up_to_600", "over_600"
 )
+_TRANSLATION_LATENCY_MS_BUCKETS = (
+    "up_to_250", "up_to_500", "up_to_1000", "up_to_2500", "up_to_5000",
+    "over_5000",
+)
 
 
 def _empty_metrics() -> dict:
@@ -687,6 +691,9 @@ def _empty_metrics() -> dict:
         "cache_hits": 0,
         "cache_misses": 0,
         "errors": 0,
+        "translation_latency_ms_buckets": {
+            name: 0 for name in _TRANSLATION_LATENCY_MS_BUCKETS
+        },
         # No route, identity, book, provider URL, or error string is ever a
         # metric key. Every dimension below is owned by this module.
         "http_responses": {name: 0 for name in _HTTP_RESPONSE_CLASSES},
@@ -717,6 +724,19 @@ def _record_metric(latency_ms: float, hits: int = 0, misses: int = 0, error: boo
         _metrics["total_latency_ms"] += latency_ms
         _metrics["cache_hits"] += hits
         _metrics["cache_misses"] += misses
+        if latency_ms <= 250:
+            bucket = "up_to_250"
+        elif latency_ms <= 500:
+            bucket = "up_to_500"
+        elif latency_ms <= 1000:
+            bucket = "up_to_1000"
+        elif latency_ms <= 2500:
+            bucket = "up_to_2500"
+        elif latency_ms <= 5000:
+            bucket = "up_to_5000"
+        else:
+            bucket = "over_5000"
+        _metrics["translation_latency_ms_buckets"][bucket] += 1
         if error:
             _metrics["errors"] += 1
 
@@ -1408,6 +1428,9 @@ def metrics():
         "cache_hits": snapshot["cache_hits"],
         "cache_misses": snapshot["cache_misses"],
         "errors": snapshot["errors"],
+        "translation_latency_ms_buckets": snapshot[
+            "translation_latency_ms_buckets"
+        ],
         "http_responses_total": sum(snapshot["http_responses"].values()),
         "http_responses": snapshot["http_responses"],
         "outcomes": snapshot["outcomes"],

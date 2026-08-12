@@ -107,6 +107,107 @@ finally:
 """
 
 
+_INSPECT_HUB_KEYS_SCRIPT = r"""
+import json
+import os
+import stat
+import sys
+
+root, expected_uid_raw, *readers = sys.argv[1:]
+expected_uid = int(expected_uid_raw)
+if not readers or len(set(readers)) != len(readers) or any(
+        reader not in {"cwa", "kavita"} for reader in readers
+):
+    raise SystemExit(3)
+root_fd = os.open(
+    root,
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+)
+present = {}
+try:
+    for reader in readers:
+        try:
+            reader_fd = os.open(
+                reader,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            present[reader] = False
+            continue
+        try:
+            try:
+                metadata = os.stat(
+                    "reader_session_key",
+                    dir_fd=reader_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                present[reader] = False
+                continue
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != expected_uid
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != 32
+            ):
+                raise SystemExit(3)
+            present[reader] = True
+        finally:
+            os.close(reader_fd)
+finally:
+    os.close(root_fd)
+print(json.dumps(present, sort_keys=True, separators=(",", ":")))
+"""
+
+
+_VERIFY_HUB_DATA_SCRIPT = r"""
+import os
+import stat
+import sys
+
+root, *readers = sys.argv[1:]
+expected = set(readers)
+if not expected or len(expected) != len(readers) or any(
+        reader not in {"cwa", "kavita"} for reader in readers
+):
+    raise SystemExit(3)
+root_metadata = os.lstat(root)
+if (
+    not stat.S_ISDIR(root_metadata.st_mode)
+    or stat.S_ISLNK(root_metadata.st_mode)
+    or root_metadata.st_uid != 101
+    or stat.S_IMODE(root_metadata.st_mode) != 0o2750
+):
+    raise SystemExit(3)
+entries = list(os.scandir(root))
+if any(
+    entry.name not in expected or not entry.is_dir(follow_symlinks=False)
+    for entry in entries
+):
+    raise SystemExit(3)
+if {entry.name for entry in entries} != expected:
+    raise SystemExit(3)
+for reader in readers:
+    directory = os.path.join(root, reader)
+    directory_metadata = os.lstat(directory)
+    key_metadata = os.lstat(os.path.join(directory, "reader_session_key"))
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or stat.S_ISLNK(directory_metadata.st_mode)
+        or directory_metadata.st_uid != 101
+        or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        or not stat.S_ISREG(key_metadata.st_mode)
+        or key_metadata.st_nlink != 1
+        or key_metadata.st_uid != 101
+        or stat.S_IMODE(key_metadata.st_mode) != 0o600
+        or key_metadata.st_size != 32
+    ):
+        raise SystemExit(3)
+"""
+
+
 class DockerCommandError(RuntimeError):
     """Docker could not satisfy an operation; command output stays private."""
 
@@ -338,6 +439,59 @@ class DockerCLI:
                 _REMOVE_HUB_KEYS_SCRIPT,
                 "/data",
                 *readers,
+            ],
+            timeout=60,
+        )
+
+    def inspect_hub_data_credentials(
+        self, image: str, path: Path, readers: tuple[str, ...]
+    ) -> dict[str, bool]:
+        """Return exact key presence without host traversal of private trees."""
+        if not readers or len(set(readers)) != len(readers) or any(
+            reader not in {"cwa", "kavita"} for reader in readers
+        ):
+            raise DockerCommandError("hub credential readers are invalid")
+        result = self._run(
+            [
+                "run", "--rm", "--network", "none", "--user", "0:0",
+                "--read-only", "--cap-drop", "ALL", "--security-opt",
+                "no-new-privileges:true", "--entrypoint", "python", "--mount",
+                f"type=bind,src={path},dst=/data,readonly", image, "-c",
+                _INSPECT_HUB_KEYS_SCRIPT, "/data", "101", *readers,
+            ],
+            timeout=60,
+        )
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise DockerCommandError(
+                "hub credential inspection returned invalid JSON"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != set(readers)
+            or any(type(payload[reader]) is not bool for reader in readers)
+        ):
+            raise DockerCommandError(
+                "hub credential inspection returned an unexpected shape"
+            )
+        return {reader: payload[reader] for reader in readers}
+
+    def verify_hub_data_directory(
+        self, image: str, path: Path, readers: tuple[str, ...]
+    ) -> None:
+        """Verify private hub ownership and keys without reading their values."""
+        if not readers or len(set(readers)) != len(readers) or any(
+            reader not in {"cwa", "kavita"} for reader in readers
+        ):
+            raise DockerCommandError("hub data verification readers are invalid")
+        self._run(
+            [
+                "run", "--rm", "--network", "none", "--user", "0:0",
+                "--read-only", "--cap-drop", "ALL", "--security-opt",
+                "no-new-privileges:true", "--entrypoint", "python", "--mount",
+                f"type=bind,src={path},dst=/data,readonly", image, "-c",
+                _VERIFY_HUB_DATA_SCRIPT, "/data", *readers,
             ],
             timeout=60,
         )

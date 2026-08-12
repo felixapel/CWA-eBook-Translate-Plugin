@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Journaled universal-hub installs before persistent mutation, preserved exact
+  cleaned retry evidence, removed only session keys created by a failed attempt,
+  and surfaced cleanup failures instead of leaving an ambiguous partial runtime.
+- Corrected the immutable release sequence so the identical annotated tag is
+  verified on the GitHub mirror before authoritative Gitea publication begins.
+- Added fixed-cardinality translation latency buckets so cloud batch tuning can
+  observe tail movement without book, reader or request labels.
 - Propagated adaptive batching through both hub and split managed installs,
   rejected browser/API batch-limit mismatches before startup, made provider
   `429` terminal before retry/fallback, and kept safe browser retry bounds and

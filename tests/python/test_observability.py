@@ -269,6 +269,8 @@ class ObservabilityContractTests(unittest.TestCase):
         self.assertEqual(failed.get_json()["reason"], "attempts")
 
     def test_metric_dimensions_are_fixed_and_reject_dynamic_labels(self):
+        for latency_ms in (100, 300, 900, 1_700, 3_500, 7_000):
+            server._record_metric(latency_ms)
         snapshot = self.metrics()
 
         self.assertEqual(
@@ -310,6 +312,17 @@ class ObservabilityContractTests(unittest.TestCase):
         self.assertEqual(
             set(snapshot["batch_group_source_token_buckets"]),
             {"up_to_128", "up_to_256", "up_to_450", "up_to_600", "over_600"},
+        )
+        self.assertEqual(
+            snapshot["translation_latency_ms_buckets"],
+            {
+                "up_to_250": 1,
+                "up_to_500": 1,
+                "up_to_1000": 1,
+                "up_to_2500": 1,
+                "up_to_5000": 1,
+                "over_5000": 1,
+            },
         )
         self.assertEqual(
             set(snapshot["provider_calls"]),

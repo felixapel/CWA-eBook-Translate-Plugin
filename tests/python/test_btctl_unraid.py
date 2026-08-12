@@ -461,6 +461,53 @@ class DockerCLIContractTests(unittest.TestCase):
                 self.assertFalse((root / reader / "reader_session_key").exists())
                 self.assertTrue((root / reader / "keep.marker").is_file())
 
+    def test_hub_credential_inspection_is_read_only_and_fixed_shape(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout='{"cwa":true,"kavita":false}\n',
+            stderr="",
+        )
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            result = DockerCLI().inspect_hub_data_credentials(
+                "local/book-translator-hub:2.3.0-abcdef012345",
+                Path("/srv/book-translator-hub/data"),
+                ("cwa", "kavita"),
+            )
+
+        self.assertEqual(result, {"cwa": True, "kavita": False})
+        arguments = run.call_args.args[0]
+        self.assertIn("--network", arguments)
+        self.assertIn("none", arguments)
+        self.assertIn("--read-only", arguments)
+        self.assertIn(
+            "type=bind,src=/srv/book-translator-hub/data,dst=/data,readonly",
+            arguments,
+        )
+        self.assertIn("0:0", arguments)
+        self.assertEqual(arguments[-3:], ["101", "cwa", "kavita"])
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_hub_data_verification_uses_networkless_read_only_sandbox(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            DockerCLI().verify_hub_data_directory(
+                "local/book-translator-hub:2.3.0-abcdef012345",
+                Path("/srv/book-translator-hub/data"),
+                ("cwa", "kavita"),
+            )
+
+        arguments = run.call_args.args[0]
+        self.assertIn("--network", arguments)
+        self.assertIn("none", arguments)
+        self.assertIn("--read-only", arguments)
+        self.assertIn(
+            "type=bind,src=/srv/book-translator-hub/data,dst=/data,readonly",
+            arguments,
+        )
+        self.assertNotIn("shell", run.call_args.kwargs)
+
     def test_legacy_data_preparation_preserves_owner_and_grants_operator_checkpoint_access(self):
         completed = mock.Mock(returncode=0, stdout="", stderr="")
 

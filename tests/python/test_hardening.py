@@ -164,7 +164,8 @@ def run():
     check("/metrics: all counters present",
           all(k in body for k in [
               "total_requests", "average_latency_ms", "cache_hit_rate_pct",
-              "cache_hits", "cache_misses", "errors", "singleflight"]))
+              "cache_hits", "cache_misses", "errors",
+              "translation_latency_ms_buckets", "singleflight"]))
     check("/metrics: total_requests is non-negative int",
           isinstance(body["total_requests"], int) and body["total_requests"] >= 0)
     check("/metrics: cache_hit_rate_pct is a percentage in [0, 100]",
