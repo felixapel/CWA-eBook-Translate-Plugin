@@ -453,7 +453,7 @@ class DockerCLI:
             raise DockerCommandError("hub credential readers are invalid")
         result = self._run(
             [
-                "run", "--rm", "--network", "none", "--user", "0:0",
+                "run", "--rm", "--network", "none", "--user", "101:102",
                 "--read-only", "--cap-drop", "ALL", "--security-opt",
                 "no-new-privileges:true", "--entrypoint", "python", "--mount",
                 f"type=bind,src={path},dst=/data,readonly", image, "-c",
@@ -487,7 +487,7 @@ class DockerCLI:
             raise DockerCommandError("hub data verification readers are invalid")
         self._run(
             [
-                "run", "--rm", "--network", "none", "--user", "0:0",
+                "run", "--rm", "--network", "none", "--user", "101:102",
                 "--read-only", "--cap-drop", "ALL", "--security-opt",
                 "no-new-privileges:true", "--entrypoint", "python", "--mount",
                 f"type=bind,src={path},dst=/data,readonly", image, "-c",

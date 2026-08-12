@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ran read-only hub credential and data verification as the owning runtime UID,
+  allowing reinstall and non-root Compose operation to traverse retained
+  mode-`0700` reader directories without adding Docker capabilities.
 - Journaled universal-hub installs before persistent mutation, preserved exact
   cleaned retry evidence, removed only session keys created by a failed attempt,
   and surfaced cleanup failures instead of leaving an ambiguous partial runtime.
