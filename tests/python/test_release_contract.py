@@ -344,6 +344,14 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertNotIn("continue-on-error", workflow)
 
+    def test_release_runbook_mirrors_exact_tag_before_gitea_trigger(self):
+        release = (ROOT / "docs" / "maintainers" / "release.md").read_text()
+        github = release.index("Push that exact object to the public GitHub")
+        gitea = release.index("then push the same tag object to authoritative Gitea")
+
+        self.assertLess(github, gitea)
+        self.assertIn("Gitea tag workflow immediately verifies", release)
+
     def test_unverified_tag_code_cannot_run_before_trusted_preflight(self):
         workflow = GITEA_RELEASE.read_text()
         self.assertIn("ref: main", workflow)
