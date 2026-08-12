@@ -484,7 +484,7 @@ class DockerCLIContractTests(unittest.TestCase):
             "type=bind,src=/srv/book-translator-hub/data,dst=/data,readonly",
             arguments,
         )
-        self.assertIn("0:0", arguments)
+        self.assertEqual(arguments[arguments.index("--user") + 1], "101:102")
         self.assertEqual(arguments[-3:], ["101", "cwa", "kavita"])
         self.assertNotIn("shell", run.call_args.kwargs)
 
@@ -506,6 +506,7 @@ class DockerCLIContractTests(unittest.TestCase):
             "type=bind,src=/srv/book-translator-hub/data,dst=/data,readonly",
             arguments,
         )
+        self.assertEqual(arguments[arguments.index("--user") + 1], "101:102")
         self.assertNotIn("shell", run.call_args.kwargs)
 
     def test_legacy_data_preparation_preserves_owner_and_grants_operator_checkpoint_access(self):
