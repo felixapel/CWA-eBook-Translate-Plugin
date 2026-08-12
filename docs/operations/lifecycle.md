@@ -153,6 +153,15 @@ upgrade.
   leaves exact `cleaned` retry evidence, so rerunning the unchanged install is
   supported even though the data directory is now nonempty. Any plan mismatch
   or cleanup error remains fail-closed.
+- The universal hub applies the same journal before image/data/runtime mutation.
+  It removes only per-reader session keys first created by that failed attempt;
+  existing keys and both translation databases remain. A cleanup failure leaves
+  private `cleanup-failed` evidence and reports every bounded cleanup error
+  instead of permitting an ambiguous retry. Compose operators do not need host
+  access to UID-101 reader trees: key presence, ownership and cleanup are checked
+  by exact network-disabled Docker helpers. If state committed but final journal
+  removal failed, successful `doctor` remains read-only; the matching `uninstall`
+  reconciles only exact `starting` evidence before a later reinstall.
 - State is committed only after live postconditions pass.
 - Do not recover by exposing the API, setting disabled auth, editing generated
   state or applying generated Unraid templates manually.

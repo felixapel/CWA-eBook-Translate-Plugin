@@ -18,6 +18,7 @@ from btctl_core import (
     ConfigError,
     DeploymentPlan,
     DeploymentState,
+    InstallAttemptStore,
     InstallConfig,
     ReleaseIdentity,
     StateStore,
@@ -271,6 +272,9 @@ class HubBtctlTests(unittest.TestCase):
                 path.chmod(0o700)
                 self.calls.append(("data-readers", tuple(readers)))
 
+            def inspect_hub_data_credentials(self, _image, _path, readers):
+                return {reader: False for reader in readers}
+
             def compose_validate(self, document, _project):
                 self.calls.append("validate")
                 self.document = json.loads(document.read_text(encoding="utf-8"))
@@ -376,6 +380,276 @@ class HubBtctlTests(unittest.TestCase):
             )
             self.assertEqual(docker.calls.count("sqlite"), 2)
 
+    def test_failed_hub_cleanup_is_recorded_and_reported(self):
+        class Docker:
+            def __init__(self, plan):
+                self.plan = plan
+                self.image = None
+
+            def require_available(self):
+                pass
+
+            def inspect_container(self, name):
+                for reader, evidence in self.plan.readers.items():
+                    if name == evidence["container"]:
+                        return {
+                            "State": {"Status": "running"},
+                            "Config": {"Image": f"reader:{evidence['version']}"},
+                            "NetworkSettings": {
+                                "Networks": {evidence["network"]: {}}
+                            },
+                        }
+                return None
+
+            def build_image(self, _repository, _image, labels):
+                self.image = {
+                    "Id": "sha256:" + "a" * 64,
+                    "Config": {"Labels": labels},
+                }
+
+            def inspect_image(self, _name):
+                return self.image
+
+            def prepare_hub_data_directory(self, _image, path, readers):
+                path.mkdir(parents=True, exist_ok=True)
+                for reader in readers:
+                    (path / reader).mkdir(exist_ok=True)
+
+            def inspect_hub_data_credentials(self, _image, _path, readers):
+                return {reader: False for reader in readers}
+
+            def compose_validate(self, _document, _project):
+                pass
+
+            def compose_up(self, _document, _project):
+                raise RuntimeError("synthetic start failure")
+
+            def compose_down(self, _document, _project):
+                raise RuntimeError("synthetic cleanup failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root), IDENTITY)
+            plan = HubPlan.from_config(config)
+
+            with self.assertRaisesRegex(
+                InstallError, "cleanup failed: compose: synthetic cleanup failure"
+            ):
+                HubInstaller(Docker(plan)).install(config, plan, root)
+
+            attempt = InstallAttemptStore(Path(config.state_dir)).load()
+            self.assertEqual(attempt["status"], "cleanup-failed")
+            self.assertEqual(
+                attempt["cleanup_errors"],
+                ["compose: synthetic cleanup failure"],
+            )
+
+    def test_cleaned_hub_attempt_allows_exact_retry_with_retained_data(self):
+        class Docker:
+            def __init__(self, plan):
+                self.plan = plan
+                self.image = None
+                self.fail_once = True
+                self.hub = None
+
+            def require_available(self):
+                pass
+
+            def inspect_container(self, name):
+                for reader, evidence in self.plan.readers.items():
+                    if name == evidence["container"]:
+                        return {
+                            "State": {"Status": "running"},
+                            "Config": {"Image": f"reader:{evidence['version']}"},
+                            "NetworkSettings": {
+                                "Networks": {evidence["network"]: {}}
+                            },
+                        }
+                return self.hub
+
+            def build_image(self, _repository, _image, labels):
+                self.image = {
+                    "Id": "sha256:" + "a" * 64,
+                    "Config": {"Labels": labels},
+                }
+
+            def inspect_image(self, _name):
+                return self.image
+
+            def prepare_hub_data_directory(self, _image, path, readers):
+                path.mkdir(parents=True, exist_ok=True)
+                for reader in readers:
+                    child = path / reader
+                    child.mkdir(exist_ok=True)
+                    (child / "translations.db").touch()
+
+            def inspect_hub_data_credentials(self, _image, _path, readers):
+                return {
+                    reader: (Path(config.data_dir) / reader / "reader_session_key").exists()
+                    for reader in readers
+                }
+
+            def compose_validate(self, _document, _project):
+                pass
+
+            def compose_up(self, _document, _project):
+                self.hub = {"Id": "hub-container-id"}
+                for reader in self.plan.readers:
+                    key = Path(config.data_dir) / reader / "reader_session_key"
+                    key.write_bytes(b"x" * 32)
+                    key.chmod(0o600)
+
+            def compose_down(self, _document, _project):
+                self.hub = None
+
+            def remove_data_credential(self, _image, path, filename):
+                (path / filename).unlink()
+
+            def remove_hub_data_credentials(self, _image, path, readers):
+                for reader in readers:
+                    (path / reader / "reader_session_key").unlink()
+
+            def wait_healthy(self, _names, _timeout):
+                if self.fail_once:
+                    self.fail_once = False
+                    raise RuntimeError("synthetic health failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root), IDENTITY)
+            plan = HubPlan.from_config(config)
+            docker = Docker(plan)
+            installer = HubInstaller(docker)
+            verified = {
+                "Id": "hub-container-id",
+                "State": {"Status": "running", "Health": {"Status": "healthy"}},
+            }
+
+            with (
+                mock.patch.object(installer, "_probe"),
+                mock.patch.object(installer, "_verify_hub", return_value=verified),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic health failure"):
+                    installer.install(config, plan, root)
+                attempt = InstallAttemptStore(Path(config.state_dir)).load()
+                self.assertEqual(attempt["status"], "cleaned")
+                for reader in plan.readers:
+                    self.assertFalse(
+                        (Path(config.data_dir) / reader / "reader_session_key").exists()
+                    )
+                    self.assertTrue(
+                        (Path(config.data_dir) / reader / "translations.db").exists()
+                    )
+                state = installer.install(config, plan, root)
+
+            self.assertEqual(state.status, "installed")
+            self.assertFalse(InstallAttemptStore(Path(config.state_dir)).path.exists())
+
+    def test_hub_cleanup_preserves_preexisting_reader_session_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = HubInstallConfig.from_mapping(
+                hub_values(Path(directory)), IDENTITY
+            )
+            original = b"p" * 32
+            for reader in config.runtime.readers:
+                child = Path(config.data_dir) / reader.name
+                child.mkdir(parents=True)
+                key = child / "reader_session_key"
+                key.write_bytes(original)
+                key.chmod(0o600)
+            docker = mock.Mock()
+            docker.inspect_hub_data_credentials.return_value = {
+                reader.name: True for reader in config.runtime.readers
+            }
+
+            HubInstaller(docker)._remove_new_session_keys(
+                config, {reader.name: True for reader in config.runtime.readers}
+            )
+
+            docker.remove_data_credential.assert_not_called()
+            for reader in config.runtime.readers:
+                self.assertEqual(
+                    (Path(config.data_dir) / reader.name / "reader_session_key").read_bytes(),
+                    original,
+                )
+
+    def test_hub_key_cleanup_never_requires_host_tree_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = HubInstallConfig.from_mapping(
+                hub_values(Path(directory)), IDENTITY
+            )
+            readers = tuple(reader.name for reader in config.runtime.readers)
+            docker = mock.Mock()
+            docker.inspect_hub_data_credentials.side_effect = [
+                {reader: True for reader in readers},
+                {reader: False for reader in readers},
+            ]
+            installer = HubInstaller(docker)
+
+            with mock.patch(
+                "pathlib.Path.lstat",
+                side_effect=PermissionError("synthetic host EACCES"),
+            ):
+                installer._remove_new_session_keys(
+                    config, {reader: False for reader in readers}
+                )
+
+            docker.remove_hub_data_credentials.assert_called_once_with(
+                config.image, Path(config.data_dir), readers
+            )
+
+    def test_hub_install_journal_accepts_exact_topology_migration_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root), IDENTITY)
+            plan = HubPlan.from_config(config)
+            state_dir = Path(config.state_dir)
+            state_dir.mkdir(parents=True)
+            state_dir.chmod(0o700)
+            _write_private_json(
+                state_dir / "topology-migration.json",
+                {"schema_version": 1, "status": "copying"},
+            )
+            docker = mock.Mock()
+            readers_by_container = {
+                evidence["container"]: evidence
+                for evidence in plan.readers.values()
+            }
+            docker.inspect_container.side_effect = lambda name: (
+                {
+                    "State": {"Status": "running"},
+                    "Config": {
+                        "Image": f"reader:{readers_by_container[name]['version']}"
+                    },
+                    "NetworkSettings": {
+                        "Networks": {readers_by_container[name]["network"]: {}}
+                    },
+                }
+                if name in readers_by_container
+                else None
+            )
+            docker.build_image.side_effect = RuntimeError("journal accepted")
+            docker.inspect_hub_data_credentials.return_value = {
+                reader.name: False for reader in config.runtime.readers
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "journal accepted"):
+                HubInstaller(docker).install(
+                    config, plan, root, allow_existing_data=True
+                )
+
+            attempt = InstallAttemptStore(
+                state_dir,
+                additional_allowed_files=frozenset(
+                    {
+                        "deployment.hub.compose.json",
+                        "hub.env",
+                        "topology-migration.json",
+                    }
+                ),
+            ).load()
+            self.assertEqual(attempt["status"], "cleaned")
+
     def test_hub_dependency_probe_fails_when_one_reader_auth_boundary_is_down(self):
         class Docker:
             def __init__(self):
@@ -420,6 +694,9 @@ class HubBtctlTests(unittest.TestCase):
             def probe_hub_providers(self, container):
                 self.calls.append(("probe_hub_providers", container))
 
+            def verify_hub_data_directory(self, _image, _path, _readers):
+                self.calls.append(("verify_hub_data_directory",))
+
         with tempfile.TemporaryDirectory() as directory:
             config = HubInstallConfig.from_mapping(
                 hub_values(Path(directory)), IDENTITY
@@ -450,7 +727,7 @@ class HubBtctlTests(unittest.TestCase):
                 mock.patch.object(HubInstaller, "_verify_readers"),
                 mock.patch.object(HubInstaller, "_verify_hub"),
                 mock.patch.object(HubInstaller, "_probe"),
-                mock.patch.object(HubDoctor, "_verify_data"),
+                mock.patch.object(docker, "verify_hub_data_directory"),
             ):
                 ordinary = doctor.run(config, plan)
                 deep = doctor.run(config, plan, deep=True)
@@ -468,8 +745,8 @@ class HubBtctlTests(unittest.TestCase):
                 mock.patch.object(HubInstaller, "_verify_hub"),
                 mock.patch.object(HubInstaller, "_probe"),
                 mock.patch.object(
-                    HubDoctor,
-                    "_verify_data",
+                    docker,
+                    "verify_hub_data_directory",
                     side_effect=InstallError("structural drift"),
                 ),
             ):
@@ -907,6 +1184,184 @@ class HubBtctlTests(unittest.TestCase):
                     (Path(config.data_dir) / reader / "keep.marker").is_file()
                 )
                 self.assertTrue(removed.resources[f"session_key_{reader}"]["removed"])
+
+    def test_hub_uninstall_reconciles_only_exact_committed_install_attempt(self):
+        class Docker:
+            def inspect_container(self, _name):
+                return None
+
+            def remove_hub_data_credentials(self, _image, _path, _readers):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root), IDENTITY)
+            plan = HubPlan.from_config(config)
+            state = HubState.new(
+                install_id="91234567-89ab-4cde-8123-0123456789ab",
+                plan=plan,
+            )
+            HubStateStore(Path(config.state_dir)).save(state)
+            attempt_store = InstallAttemptStore(
+                Path(config.state_dir),
+                additional_allowed_files=frozenset(
+                    {
+                        "deployment.hub.compose.json",
+                        "hub.env",
+                        "topology-migration.json",
+                    }
+                ),
+            )
+            attempt_store.save(
+                {
+                    "install_id": state.install_id,
+                    "status": "starting",
+                    "version": plan.version,
+                    "revision": plan.revision,
+                    "image": plan.image,
+                    "config_fingerprint": plan.config_fingerprint,
+                    "install_profile": plan.install_profile,
+                    "resources": plan.resources,
+                    "cleanup_errors": [],
+                }
+            )
+
+            completed = HubUninstaller(Docker()).uninstall(config, plan)
+
+            self.assertEqual(completed.status, "uninstalled")
+            self.assertFalse(attempt_store.path.exists())
+
+    def test_hub_uninstall_rejects_mismatched_install_attempt(self):
+        class Docker:
+            def inspect_container(self, _name):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root), IDENTITY)
+            plan = HubPlan.from_config(config)
+            state = HubState.new(
+                install_id="a1234567-89ab-4cde-8123-0123456789ab",
+                plan=plan,
+            )
+            HubStateStore(Path(config.state_dir)).save(state)
+            attempt_store = InstallAttemptStore(
+                Path(config.state_dir),
+                additional_allowed_files=frozenset(
+                    {
+                        "deployment.hub.compose.json",
+                        "hub.env",
+                        "topology-migration.json",
+                    }
+                ),
+            )
+            attempt_store.save(
+                {
+                    "install_id": "b1234567-89ab-4cde-8123-0123456789ab",
+                    "status": "starting",
+                    "version": plan.version,
+                    "revision": plan.revision,
+                    "image": plan.image,
+                    "config_fingerprint": plan.config_fingerprint,
+                    "install_profile": plan.install_profile,
+                    "resources": plan.resources,
+                    "cleanup_errors": [],
+                }
+            )
+
+            with self.assertRaisesRegex(
+                InstallError, "does not match committed state"
+            ):
+                HubUninstaller(Docker()).uninstall(config, plan)
+
+            self.assertEqual(
+                HubStateStore(Path(config.state_dir)).load().status,
+                "installed",
+            )
+            self.assertTrue(attempt_store.path.exists())
+
+    def test_repeated_hub_uninstall_retries_committed_attempt_cleanup(self):
+        class Docker:
+            def require_available(self):
+                pass
+
+            def inspect_container(self, name):
+                for evidence in plan.readers.values():
+                    if name == evidence["container"]:
+                        return {
+                            "State": {"Status": "running"},
+                            "Config": {"Image": f"reader:{evidence['version']}"},
+                            "NetworkSettings": {
+                                "Networks": {evidence["network"]: {}}
+                            },
+                        }
+                return None
+
+            def remove_hub_data_credentials(self, _image, _path, _readers):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = HubInstallConfig.from_mapping(hub_values(root), IDENTITY)
+            plan = HubPlan.from_config(config)
+            state = HubState.new(
+                install_id="c1234567-89ab-4cde-8123-0123456789ab",
+                plan=plan,
+            )
+            HubStateStore(Path(config.state_dir)).save(state)
+            attempt_store = InstallAttemptStore(
+                Path(config.state_dir),
+                additional_allowed_files=frozenset(
+                    {
+                        "deployment.hub.compose.json",
+                        "hub.env",
+                        "topology-migration.json",
+                    }
+                ),
+            )
+            attempt_store.save(
+                {
+                    "install_id": state.install_id,
+                    "status": "starting",
+                    "version": plan.version,
+                    "revision": plan.revision,
+                    "image": plan.image,
+                    "config_fingerprint": plan.config_fingerprint,
+                    "install_profile": plan.install_profile,
+                    "resources": plan.resources,
+                    "cleanup_errors": [],
+                }
+            )
+            original_remove = InstallAttemptStore.remove
+            failures = 1
+
+            def fail_once(store):
+                nonlocal failures
+                if failures:
+                    failures -= 1
+                    raise ConfigError("synthetic unlink failure")
+                return original_remove(store)
+
+            with mock.patch.object(InstallAttemptStore, "remove", fail_once):
+                with self.assertRaisesRegex(
+                    InstallError, "reconciliation failed"
+                ):
+                    HubUninstaller(Docker()).uninstall(config, plan)
+                self.assertEqual(
+                    HubStateStore(Path(config.state_dir)).load().status,
+                    "uninstalled",
+                )
+                self.assertTrue(attempt_store.path.exists())
+                repeated = HubUninstaller(Docker()).uninstall(config, plan)
+
+            self.assertEqual(repeated.status, "uninstalled")
+            self.assertFalse(attempt_store.path.exists())
+            self.assertEqual(
+                HubInstaller(Docker())._preflight(
+                    config, allow_existing_data=False
+                ),
+                repeated,
+            )
 
 
 if __name__ == "__main__":

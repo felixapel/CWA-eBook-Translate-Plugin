@@ -9,7 +9,6 @@ import copy
 import fcntl
 import re
 import shutil
-import stat
 import tempfile
 import uuid
 from dataclasses import dataclass, field, replace
@@ -17,10 +16,17 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
 
-from btctl_compose import InstallError
-from btctl_compose import _container_networks, _has_exact_reader_version
+from btctl_compose import (
+    InstallError,
+    _bounded_error,
+    _cleaned_attempt_matches,
+    _container_networks,
+    _has_exact_reader_version,
+    _install_attempt_payload,
+)
 from btctl_core import (
     ConfigError,
+    InstallAttemptStore,
     OperationLock,
     ReleaseIdentity,
     StateStore,
@@ -714,6 +720,34 @@ class HubInstaller:
             raise InstallError("BT_DATA_DIR must be empty for a fresh hub install")
         return prior
 
+    def _remove_new_session_keys(
+        self,
+        config: HubInstallConfig,
+        preexisting: Mapping[str, bool],
+    ) -> None:
+        """Remove only credentials created by this uncommitted attempt."""
+        readers = tuple(reader.name for reader in config.runtime.readers)
+        current = self.docker.inspect_hub_data_credentials(
+            config.image, Path(config.data_dir), readers
+        )
+        created = tuple(
+            reader
+            for reader in readers
+            if current[reader] and not preexisting.get(reader, False)
+        )
+        if not created:
+            return
+        self.docker.remove_hub_data_credentials(
+            config.image, Path(config.data_dir), created
+        )
+        remaining = self.docker.inspect_hub_data_credentials(
+            config.image, Path(config.data_dir), created
+        )
+        if any(remaining.values()):
+            raise InstallError(
+                "reader session credential cleanup did not complete"
+            )
+
     def install(
         self,
         config: HubInstallConfig,
@@ -732,31 +766,74 @@ class HubInstaller:
                     allow_existing_data=allow_existing_data,
                     _operation_locked=True,
                 )
+        attempt_store = InstallAttemptStore(
+            Path(config.state_dir),
+            additional_allowed_files=frozenset(
+                {
+                    "deployment.hub.compose.json",
+                    "hub.env",
+                    "topology-migration.json",
+                }
+            ),
+        )
+        retry_evidence: dict[str, object] | None = None
+        if attempt_store.path.exists():
+            try:
+                retry_evidence = attempt_store.load()
+            except ConfigError as exc:
+                raise InstallError(
+                    "cleaned hub retry evidence could not be reloaded"
+                ) from exc
+            if not _cleaned_attempt_matches(retry_evidence, plan):
+                raise InstallError(
+                    "hub install attempt is not exact completed cleanup evidence"
+                )
         prior_state = self._preflight(
-            config, allow_existing_data=allow_existing_data
+            config,
+            allow_existing_data=(
+                allow_existing_data or retry_evidence is not None
+            ),
         )
         install_id = str(uuid.uuid4())
         state_dir = Path(config.state_dir)
         ensure_directory_durable(state_dir)
-        image_labels = {
-            "io.book-translator.version": config.identity.version,
-            "io.book-translator.revision": config.identity.sha,
-            "io.book-translator.source": "local-checkout",
-            "io.book-translator.topology": "hub",
-        }
-        self.docker.build_image(Path(repository), config.image, image_labels)
-        image_id = self._verify_image(config)
+        attempt = _install_attempt_payload(plan, install_id)
+        try:
+            attempt_store.save(attempt)
+        except ConfigError as exc:
+            raise InstallError("hub install attempt could not be committed") from exc
+        image_id = ""
         data_dir = Path(config.data_dir)
-        ensure_directory_durable(data_dir, enforce_existing_mode=False)
-        self.docker.prepare_hub_data_directory(
-            config.image,
-            data_dir,
-            tuple(reader.name for reader in config.runtime.readers),
-        )
         started = False
+        state_committed = False
+        session_keys_preexisting: dict[str, bool] = {}
         compose_path = state_dir / "deployment.hub.compose.json"
         environment_path = state_dir / "hub.env"
         try:
+            attempt["status"] = "starting"
+            attempt_store.save(attempt)
+            image_labels = {
+                "io.book-translator.version": config.identity.version,
+                "io.book-translator.revision": config.identity.sha,
+                "io.book-translator.source": "local-checkout",
+                "io.book-translator.topology": "hub",
+            }
+            self.docker.build_image(Path(repository), config.image, image_labels)
+            image_id = self._verify_image(config)
+            ensure_directory_durable(data_dir, enforce_existing_mode=False)
+            reader_names = tuple(
+                reader.name for reader in config.runtime.readers
+            )
+            session_keys_preexisting = (
+                self.docker.inspect_hub_data_credentials(
+                    config.image, data_dir, reader_names
+                )
+            )
+            self.docker.prepare_hub_data_directory(
+                config.image,
+                data_dir,
+                reader_names,
+            )
             if config.install_profile == "compose-existing":
                 _write_private_environment(
                     environment_path,
@@ -812,50 +889,64 @@ class HubInstaller:
             if prior_state is not None:
                 state_store.archive(prior_state)
             state_store.save(state)
+            state_committed = True
+            attempt_store.remove()
             return state
-        except BaseException:
+        except BaseException as exc:
+            if state_committed:
+                raise InstallError(
+                    "hub runtime state committed but install-attempt cleanup failed; "
+                    "run doctor before further lifecycle operations"
+                ) from exc
+            cleanup_errors: list[str] = []
             if started:
                 try:
                     if config.install_profile == "compose-existing" and compose_path.exists():
                         self.docker.compose_down(compose_path, config.install_name)
                     elif self.docker.inspect_container(config.install_name) is not None:
                         self.docker.remove_container(config.install_name)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(_bounded_error("compose" if config.install_profile == "compose-existing" else "hub container", cleanup_exc))
+            if started and not cleanup_errors:
+                try:
+                    self._remove_new_session_keys(
+                        config, session_keys_preexisting
+                    )
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(
+                        _bounded_error("reader session credential", cleanup_exc)
+                    )
+            if cleanup_errors:
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
+                except BaseException as journal_exc:
+                    cleanup_errors.append(_bounded_error("journal", journal_exc))
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
+            attempt["status"] = "cleaned"
+            attempt["cleanup_errors"] = []
+            try:
+                attempt_store.save(attempt)
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(_bounded_error("journal", cleanup_exc))
+                attempt["status"] = "cleanup-failed"
+                attempt["cleanup_errors"] = cleanup_errors
+                try:
+                    attempt_store.save(attempt)
                 except BaseException:
                     pass
+                raise InstallError(
+                    f"{exc}; cleanup failed: {'; '.join(cleanup_errors)}"
+                ) from exc
             raise
 
 
 class HubDoctor:
     def __init__(self, docker):
         self.docker = docker
-
-    @staticmethod
-    def _verify_data(config: HubInstallConfig) -> None:
-        root = Path(config.data_dir)
-        metadata = root.lstat()
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != 101
-            or stat.S_IMODE(metadata.st_mode) != 0o2750
-        ):
-            raise InstallError("hub data root ownership or mode does not match")
-        for reader in config.runtime.readers:
-            directory = root / reader.name
-            key = directory / "reader_session_key"
-            directory_metadata = directory.lstat()
-            key_metadata = key.lstat()
-            if (
-                not stat.S_ISDIR(directory_metadata.st_mode)
-                or directory_metadata.st_uid != 101
-                or stat.S_IMODE(directory_metadata.st_mode) != 0o700
-                or not stat.S_ISREG(key_metadata.st_mode)
-                or key_metadata.st_uid != 101
-                or stat.S_IMODE(key_metadata.st_mode) != 0o600
-                or key_metadata.st_size != 32
-            ):
-                raise InstallError(
-                    f"{reader.name} session credential ownership does not match"
-                )
 
     def run(
         self,
@@ -947,7 +1038,14 @@ class HubDoctor:
 
         check("artifacts", verify_artifacts)
 
-        check("data-isolation", lambda: self._verify_data(config))
+        check(
+            "data-isolation",
+            lambda: self.docker.verify_hub_data_directory(
+                config.image,
+                Path(config.data_dir),
+                tuple(reader.name for reader in config.runtime.readers),
+            ),
+        )
         if deep and all(item["status"] == "ok" for item in checks):
             def verify_providers() -> None:
                 try:
@@ -975,12 +1073,53 @@ class HubUninstaller:
                 return self.uninstall(config, plan, _operation_locked=True)
         store = HubStateStore(Path(config.state_dir))
         state = store.load()
-        if state.status == "uninstalled":
-            return state
-        if state.status not in _ACTIVE_STATES | {"uninstalling"}:
+        if state.status not in _ACTIVE_STATES | {"uninstalling", "uninstalled"}:
             raise InstallError("hub deployment is not active")
         if state.config_fingerprint != plan.config_fingerprint:
             raise InstallError("hub state does not match this plan")
+        attempt_store = InstallAttemptStore(
+            Path(config.state_dir),
+            additional_allowed_files=frozenset(
+                {
+                    "deployment.hub.compose.json",
+                    "hub.env",
+                    "topology-migration.json",
+                }
+            ),
+        )
+        committed_attempt = False
+        if attempt_store.path.exists():
+            try:
+                attempt = attempt_store.load()
+            except ConfigError as exc:
+                raise InstallError(
+                    "hub install attempt could not be reconciled"
+                ) from exc
+            committed_attempt = (
+                attempt.get("status") == "starting"
+                and attempt.get("install_id") == state.install_id
+                and attempt.get("version") == state.version
+                and attempt.get("revision") == state.revision
+                and attempt.get("image") == state.image
+                and attempt.get("config_fingerprint")
+                == state.config_fingerprint
+                and attempt.get("install_profile") == state.install_profile
+                and attempt.get("resources") == plan.resources
+                and attempt.get("cleanup_errors") == []
+            )
+            if not committed_attempt:
+                raise InstallError(
+                    "hub install attempt does not match committed state"
+                )
+        if state.status == "uninstalled":
+            if committed_attempt:
+                try:
+                    attempt_store.remove()
+                except ConfigError as exc:
+                    raise InstallError(
+                        "hub uninstall completed but install-attempt reconciliation failed"
+                    ) from exc
+            return state
         expected_image_id = str(state.resources.get("hub", {}).get("image_id", ""))
         if self.docker.inspect_container(config.install_name) is not None:
             HubInstaller(self.docker)._verify_hub(
@@ -1026,6 +1165,13 @@ class HubUninstaller:
                 resources[f"session_key_{reader}"]["removed"] = True
         completed = replace(current, status="uninstalled", resources=resources)
         store.save(completed)
+        if committed_attempt:
+            try:
+                attempt_store.remove()
+            except ConfigError as exc:
+                raise InstallError(
+                    "hub uninstall completed but install-attempt reconciliation failed"
+                ) from exc
         return completed
 
 
