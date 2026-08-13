@@ -120,16 +120,27 @@ not certified.
 Before relying on the connector:
 
 1. Confirm stock Kavita reports exactly `0.9.0.2` and `doctor` is fully green.
-2. Sign in through the configured HTTPS origin and open a DRM-free EPUB at the
-   exact `/library/.../series/.../book/...` route.
-3. Translate one non-sensitive paragraph, change language/display mode, move
-   between chapters and reload the page.
-4. Navigate to a manga, PDF or non-reader page and confirm no translation
-   toolbar is mounted and no translation request is sent.
-5. Inspect browser storage and generated files: neither a provider key nor a
-   translator token may appear. Kavita's own native login state is unchanged.
-6. Confirm a separate CWA installation, if present, still has its own names,
-   network attachment, data and lifecycle state.
+2. Record the exact deployed checkout commit and immutable hub image digest,
+   then sign in through the configured HTTPS origin. After reinstalling or
+   replacing the image, force a hard reload and sign in again because the
+   reader session key is regenerated.
+3. Open a DRM-free EPUB at the exact
+   `/library/<positive-id>/series/<positive-id>/book/<positive-id>` route.
+   In DevTools, verify `GET /bt-config.json` is `200` with
+   `Cache-Control: no-store`, the config says `reader_type: kavita` and
+   `reader_version: 0.9.0.2`, and exactly one loader is mounted.
+4. Verify `POST /bt-api/session` returns `200` with the exact Kavita identity
+   and an opaque expiry of at most five minutes. The provider key, native
+   Kavita token, refresh token and book text must not appear in the response,
+   generated config or browser storage.
+5. Translate one short, non-sensitive paragraph through the same-origin
+   `POST /bt-api/translate/batch`, change language/display mode, move between
+   chapters and reload the page.
+6. Navigate to a manga, PDF or non-reader page and confirm no translator
+   loader, toolbar or translation request is sent.
+7. Confirm a separate CWA installation, if present, still has its own names,
+   network attachment, state/data directories, SQLite database, session key,
+   cookie and lifecycle state.
 
 Automated Chromium and real-container gates cover the route, DOM, native-token
 exchange, credential stripping and SPA teardown. Physical stock-Unraid and

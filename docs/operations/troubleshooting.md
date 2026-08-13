@@ -74,6 +74,8 @@ confirming no other `btctl` operation is running; do not bypass the lock.
 1. Open the reader through `BT_PUBLIC_ORIGIN`, not the reader's direct port. A
    stock reader reached directly intentionally has no overlay.
 2. Hard-refresh once (`Ctrl+Shift+R` or `Cmd+Shift+R`).
+   After a hub reinstall or image replacement, sign out and back in as well:
+   the regenerated reader session key invalidates old translator sessions.
 3. In Browser DevTools, confirm `GET /bt-config.json` returns `200`, a JSON
    object, and `Cache-Control: no-store`. A missing or invalid managed config
    makes the loader fail closed; page variables cannot override it.
