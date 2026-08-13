@@ -176,3 +176,34 @@ session exchange because sessions are process-local and intentionally short.
 - Each reader has its own `translations.db`, `reader_session_key` and cookie.
 - Stopping any hub child makes the container unhealthy or exited and Docker
   restarts the complete generation.
+
+### Browser gate for an exact candidate
+
+The browser gate belongs to the exact checkout commit and immutable runtime
+image under review. A green `doctor`, health endpoint, automated Chromium run,
+or successful session on an older image does not replace an authenticated
+browser check on the deployed candidate. After an uninstall/install or image
+replacement, the hub regenerates reader session keys; sign in again and do not
+rely on a cached reader tab.
+
+For every enabled reader, record the commit, image digest, stock-reader version,
+browser/version and provider/model in the release issue. Then use the public
+HTTPS origin (never the stock reader port) and verify:
+
+1. `GET /bt-config.json` returns `200`, `Cache-Control: no-store`, and the
+   expected reader type/version. The page loads one translator loader only.
+2. The authenticated `POST /bt-api/session` returns `200` with the expected
+   reader type/version and an opaque expiry of at most five minutes. Provider
+   keys, native reader tokens and book text must not appear in the response,
+   configuration or browser storage.
+3. A short, non-sensitive paragraph produces a successful same-origin
+   `POST /bt-api/translate/batch`; then change language/display mode, navigate
+   between chapters and reload the EPUB.
+4. An unsupported manga, PDF or non-reader route mounts no toolbar, loads no
+   translator request and sends no translation request.
+5. CWA and Kavita remain isolated: each has its own public route, state/data
+   directory, SQLite database, session key, cookie and backup boundary.
+
+Record pass/fail evidence for each item before promoting a candidate to a
+stable release. `/ping`, `/health` and `/ready` prove process health only; they
+do not prove authenticated translation.

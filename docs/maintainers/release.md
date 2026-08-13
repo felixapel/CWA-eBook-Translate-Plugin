@@ -79,6 +79,12 @@ acceptance on that exact commit. The source-built path must complete
 EPUB through the public route. Record host, exact reader version and image,
 browser, LLM, commit/digest and result in the release issue without secrets.
 
+Do not copy browser results from a prior candidate. Re-run the authenticated
+checks after each runtime-image or checkout change, and hard-refresh/sign in
+again after reinstall because reader session keys are regenerated. A healthy
+`/ping`, `/health` or `/ready` response is process evidence only, not proof of
+translation or browser authentication.
+
 Record the physical gate with this complete template:
 
 ```text
