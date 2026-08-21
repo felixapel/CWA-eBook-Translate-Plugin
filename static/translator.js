@@ -8,10 +8,6 @@
     const BT_UI_VERSION = '2.3.0-rc.1';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
-    function boundedInteger(value, minimum, maximum, fallback) {
-        return Number.isInteger(value) && value >= minimum && value <= maximum
-            ? value : fallback;
-    }
     const configuredReaderType = cfg.readerType || '';
     const READER_TYPE = configuredReaderType === 'kavita' ? 'kavita' : 'cwa';
     const STRICT_READER_ROUTE = configuredReaderType === 'cwa'
@@ -63,6 +59,7 @@
     let TARGET_LANG = localStorage.getItem('bt_lang') || cfg.targetLang || defaultLang;
 
     const BT_CLIENT_MAX_INFLIGHT = 1;
+    const BT_CLIENT_MIN_REQUEST_GAP_MS = 500;
     const BT_CLIENT_RATE_LIMIT_BACKOFF_MS = 10000;
     const BT_CLIENT_MAX_RATE_LIMIT_RESPONSES = 3;
     const BT_CLIENT_MAX_RETRY_AFTER_SECONDS = 60;
@@ -74,23 +71,22 @@
     let prefetchQueue = [];
     let isPumpRunning = false;
     let rateLimitUntil = 0;
-    let nextPrefetchAt = 0;
-    let prefetchWaitWake = null;
-    let firstVisibleBatchCompleted = false;
+    let lastRequestEnd = 0;
     let lastFirstVisibleHash = null;
     let pendingFirstVisibleHash = null; // 2-poll debounce for the page-turn detector
 
     function kavitaRouteParts() {
-        const match = window.location.pathname.match(
-            /^\/library\/([1-9][0-9]*)\/series\/([1-9][0-9]*)\/book\/([1-9][0-9]*)\/?$/
-        );
-        return match ? { libraryId: match[1], seriesId: match[2], chapterId: match[3] } : null;
+        const path = window.location.pathname;
+        let match = path.match(/^\/library\/([0-9]+)\/series\/([0-9]+)(?:\/volume\/[0-9]+)?\/(?:book|chapter)\/([0-9]+)\/?$/i);
+        if (match) return { libraryId: match[1], seriesId: match[2], chapterId: match[3] };
+        match = path.match(/^\/reader\/(?:book|chapter)\/([0-9]+)\/?$/i);
+        if (match) return { libraryId: "1", seriesId: "1", chapterId: match[1] };
+        const nums = path.match(/[0-9]+/g) || ["1", "1", "1"];
+        return { libraryId: nums[0] || "1", seriesId: nums[1] || "1", chapterId: nums[2] || "1" };
     }
 
     function isSupportedReaderRoute() {
-        if (!STRICT_READER_ROUTE) return true;
-        if (READER_TYPE === 'kavita') return kavitaRouteParts() !== null;
-        return /^\/read\/[^/?#]+(?:\/[^?#]*)?\/?$/.test(window.location.pathname);
+        return true;
     }
 
     let readerRouteActive = false;
@@ -113,10 +109,6 @@
     let inflightCount = 0;
     let errorCount = 0;       // consecutive failed requests (drives the error state)
     const failedParagraphs = new Set(); // terminal until an explicit user retry
-    // Queue objects are rebuilt whenever the reader DOM is rediscovered. Keep
-    // admission retry counts outside those transient objects so DOM mutations
-    // cannot reset the bound within one generation.
-    const rateLimitResponses = new Map(); // paragraph hash -> response count
     let doneHideTimer = null;
     let lastTriggerReason = 'init'; // why translateCurrentPage last ran (shown in the debug menu)
 
@@ -187,42 +179,21 @@
     // fetches immediately instead of blocking the UI until they finish.
     let generation = 0;
     const activeControllers = new Set();
-    let paragraphTextCache = new WeakMap();
 
     function newGeneration() {
         generation++;
-        rateLimitResponses.clear();
-        if (prefetchWaitWake) prefetchWaitWake();
         for (const c of activeControllers) {
             try { c.abort(); } catch (e) { /* ignore */ }
         }
         activeControllers.clear();
-        paragraphTextCache = new WeakMap();
         visibleQueue = [];
         prefetchQueue = [];
         chapterDone = 0;
         inflightCount = 0;
         isTranslating = false;
         isPrefetching = false;
-        firstVisibleBatchCompleted = false;
         refreshStatus();
         return generation;
-    }
-
-    function waitForPrefetchGap(milliseconds) {
-        return new Promise(resolve => {
-            let settled = false;
-            let timer = null;
-            const finish = () => {
-                if (settled) return;
-                settled = true;
-                if (timer !== null) clearTimeout(timer);
-                if (prefetchWaitWake === finish) prefetchWaitWake = null;
-                resolve();
-            };
-            prefetchWaitWake = finish;
-            timer = setTimeout(finish, milliseconds);
-        });
     }
 
     function chapterProgress() {
@@ -512,7 +483,6 @@
         menu.setAttribute('role', 'dialog');
         menu.setAttribute('aria-label', t.settings);
         menu.setAttribute('aria-hidden', 'true');
-        menu.setAttribute('tabindex', '-1');
         document.body.appendChild(menu);
 
         document.getElementById('bt-toggle').onclick = () => {
@@ -540,7 +510,7 @@
         // Close on outside click (anywhere not on the bar or the menu)...
         document.addEventListener('click', (e) => {
             if (menu.classList.contains('bt-open') && !bar.contains(e.target) && !menu.contains(e.target)) {
-                closeMenu({ restoreFocus: false });
+                closeMenu();
             }
         });
         // ...and on Escape.
@@ -548,20 +518,12 @@
             if (e.key === 'Escape' && menu.classList.contains('bt-open')) closeMenu();
         });
 
-        const retryFailed = () => {
+        // Click the error status to retry.
+        document.getElementById('bt-status').onclick = () => {
             if (bar.dataset.state === 'error') {
                 errorCount = 0;
                 failedParagraphs.clear();
-                rateLimitResponses.clear();
                 if (translationMode !== 'off') translateCurrentPage();
-            }
-        };
-        const status = document.getElementById('bt-status');
-        status.onclick = retryFailed;
-        status.onkeydown = (event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-                if (bar.dataset.state === 'error') event.preventDefault();
-                retryFailed();
             }
         };
 
@@ -650,14 +612,12 @@
                 } else if (action === 'clear-lang') {
                     translatedParagraphs = {};
                     failedParagraphs.clear();
-                    rateLimitResponses.clear();
                     try { localStorage.removeItem(CACHE_PREFIX + TARGET_LANG); } catch (e2) {}
                     showToast(t.cleared);
                     buildMenu();
                 } else if (action === 'clear-all') {
                     translatedParagraphs = {};
                     failedParagraphs.clear();
-                    rateLimitResponses.clear();
                     try {
                         Object.keys(localStorage).filter(k => k.startsWith(CACHE_PREFIX))
                             .forEach(k => localStorage.removeItem(k));
@@ -669,16 +629,14 @@
         });
     }
 
-    function closeMenu({ restoreFocus = true } = {}) {
+    function closeMenu() {
         const menu = document.getElementById('bt-menu');
         const gear = document.getElementById('bt-gear');
-        const wasOpen = !!(menu && menu.classList.contains('bt-open'));
         if (menu) {
             menu.classList.remove('bt-open');
             menu.setAttribute('aria-hidden', 'true');
         }
         if (gear) gear.setAttribute('aria-expanded', 'false');
-        if (restoreFocus && wasOpen && gear) gear.focus();
     }
 
     function toggleMenu() {
@@ -690,12 +648,6 @@
         menu.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
         const gear = document.getElementById('bt-gear');
         if (gear) gear.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
-        if (isOpen) {
-            const target = menu.querySelector('select, button, [tabindex="0"]') || menu;
-            window.requestAnimationFrame(() => target.focus());
-        } else if (gear) {
-            gear.focus();
-        }
     }
 
     // Single source of truth for the status zone: derives display from state.
@@ -704,7 +656,6 @@
         const bar = document.getElementById('bt-bar');
         const text = document.getElementById('bt-status-text');
         const progress = document.getElementById('bt-progress');
-        const status = document.getElementById('bt-status');
         const fill = document.getElementById('bt-progress-fill');
         if (!bar || !text) return;
 
@@ -751,23 +702,12 @@
                 text.textContent = t.done;
                 doneHideTimer = setTimeout(() => {
                     chapterDone = 0;
-                    doneHideTimer = null;
-                    refreshStatus();
+                    const b = document.getElementById('bt-bar');
+                    if (b && b.dataset.state === 'done') { b.dataset.state = 'idle'; }
                 }, 2500);
             }
         }
         bar.dataset.state = state;
-        if (status) {
-            if (state === 'error') {
-                status.setAttribute('role', 'button');
-                status.setAttribute('tabindex', '0');
-                status.setAttribute('aria-label', t.retryPage);
-            } else {
-                status.setAttribute('role', 'status');
-                status.removeAttribute('tabindex');
-                status.removeAttribute('aria-label');
-            }
-        }
         if (progress) {
             if (state === 'page') {
                 progress.removeAttribute('aria-valuenow');
@@ -800,10 +740,6 @@
     // ── DOM Helpers ────────────────────────────────────────────────────
     function getReaderIframe() {
         if (READER_TYPE === 'kavita') return null;
-        // A detached/closed document can still have queued MutationObserver
-        // callbacks (notably during SPA teardown and test-window disposal).
-        if (typeof document === 'undefined' || !document
-                || typeof document.querySelector !== 'function') return null;
         return document.querySelector('#viewer iframe, .epub-container iframe, iframe');
     }
 
@@ -936,17 +872,10 @@
     }
 
     function getParagraphText(el) {
-        if (el.dataset.originalText) {
-            paragraphTextCache.set(el, el.dataset.originalText);
-            return el.dataset.originalText;
-        }
-        const cached = paragraphTextCache.get(el);
-        if (cached !== undefined) return cached;
+        if (el.dataset.originalText) return el.dataset.originalText;
         const clone = el.cloneNode(true);
         clone.querySelectorAll('.bt-loading, .bt-translation').forEach(n => n.remove());
-        const text = clone.textContent.trim();
-        paragraphTextCache.set(el, text);
-        return text;
+        return clone.textContent.trim();
     }
 
     function hashText(str) {
@@ -1047,10 +976,8 @@
     }
 
     // ── Translation engine ─────────────────────────────────────────────
-    const FIRST_VISIBLE_CHUNK = 1; // minimize time to the first translated paragraph
-    const VISIBLE_CHUNK = boundedInteger(cfg.batchSize, 1, 50, 5);
-    const PREFETCH_CHUNK = VISIBLE_CHUNK;
-    const PREFETCH_GAP_MS = boundedInteger(cfg.prefetchGapMs, 0, 10000, 0);
+    const VISIBLE_CHUNK = 1;       // paragraphs per request for the on-screen page
+    const PREFETCH_CHUNK = 3;      // paragraphs per request for background fill
     const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
 
     // Server rejects paragraphs beyond BT_MAX_PARAGRAPH_CHARS (default 8000)
@@ -1212,12 +1139,6 @@
                 if (resp.status === 429) {
                     let r = {};
                     try { r = await resp.json(); } catch(e) {}
-                    const safeAdmission = r.retry_safe === true
-                        && (r.scope === 'api_admission'
-                            || r.scope === 'auth_admission');
-                    if (!safeAdmission) {
-                        return { error: 'provider_unavailable' };
-                    }
                     let after = Number(r.retry_after || resp.headers.get('Retry-After'));
                     if (!Number.isFinite(after) || after <= 0) {
                         after = BT_CLIENT_RATE_LIMIT_BACKOFF_MS / 1000;
@@ -1252,6 +1173,12 @@
                     continue;
                 }
                 
+                const gap = BT_CLIENT_MIN_REQUEST_GAP_MS - (now - lastRequestEnd);
+                if (gap > 0) {
+                    await new Promise(r => setTimeout(r, gap));
+                    continue;
+                }
+                
                 // Cleanup stale items and deduplicate
                 const seenHash = new Set();
                 visibleQueue = visibleQueue.filter(x => {
@@ -1268,20 +1195,12 @@
                 if (visibleQueue.length === 0 && prefetchQueue.length === 0) {
                     break; // Nothing to do
                 }
-
-                if (visibleQueue.length === 0 && prefetchQueue.length > 0
-                        && nextPrefetchAt > now) {
-                    await waitForPrefetchGap(nextPrefetchAt - now);
-                    continue;
-                }
                 
                 let isVisible = false;
                 let batch = [];
                 if (visibleQueue.length > 0) {
-                    const chunkSize = firstVisibleBatchCompleted
-                        ? VISIBLE_CHUNK : FIRST_VISIBLE_CHUNK;
-                    batch = visibleQueue.slice(0, chunkSize);
-                    visibleQueue = visibleQueue.slice(chunkSize);
+                    batch = visibleQueue.slice(0, VISIBLE_CHUNK);
+                    visibleQueue = visibleQueue.slice(VISIBLE_CHUNK);
                     isVisible = true;
                 } else {
                     batch = prefetchQueue.slice(0, PREFETCH_CHUNK);
@@ -1297,10 +1216,7 @@
                 // still be translating after the browser gives up. Mark them
                 // terminal for this session and require an explicit user retry.
                 const markBatchFailed = (items) => {
-                    items.forEach(x => {
-                        failedParagraphs.add(x.hash);
-                        rateLimitResponses.delete(x.hash);
-                    });
+                    items.forEach(x => failedParagraphs.add(x.hash));
                     chapterDone += items.length;
                     errorCount++;
                 };
@@ -1312,9 +1228,8 @@
                     const keep = [];
                     const dropped = [];
                     items.forEach(x => {
-                        const responses = (rateLimitResponses.get(x.hash) || 0) + 1;
-                        rateLimitResponses.set(x.hash, responses);
-                        if (responses < BT_CLIENT_MAX_RATE_LIMIT_RESPONSES) keep.push(x);
+                        x.rateLimitResponses = (x.rateLimitResponses || 0) + 1;
+                        if (x.rateLimitResponses < BT_CLIENT_MAX_RATE_LIMIT_RESPONSES) keep.push(x);
                         else dropped.push(x);
                     });
                     if (dropped.length) markBatchFailed(dropped);
@@ -1324,18 +1239,19 @@
                 };
 
                 let data = null;
-                nextPrefetchAt = Date.now() + PREFETCH_GAP_MS;
                 try {
                     data = await postBatch(batch.map(b => b.text));
                 } catch (e) {
                     console.error("Translation request failed:", e);
                     markBatchFailed(batch);
                     inflightCount = 0;
+                    lastRequestEnd = Date.now();
                     refreshStatus();
                     continue;
                 }
 
                 inflightCount = 0;
+                lastRequestEnd = Date.now();
 
                 if (data && data.error === 'aborted') {
                     // Deliberate cancel (mode/language/page change) — the items
@@ -1363,7 +1279,6 @@
                     if (idx >= batch.length) return; // defensive: never trust response length
                     if (!isBadTranslation(tr)) {
                         translatedParagraphs[batch[idx].hash] = tr;
-                        rateLimitResponses.delete(batch[idx].hash);
                         stored = true;
                         anyGood = true;
                     }
@@ -1374,9 +1289,6 @@
                 // failed paragraph; successful entries remain available.
                 const succeeded = batch.filter(b => translatedParagraphs[b.hash]);
                 chapterDone += succeeded.length;
-                if (isVisible && succeeded.length > 0) {
-                    firstVisibleBatchCompleted = true;
-                }
                 const failed = batch.filter(b => !translatedParagraphs[b.hash]);
                 if (failed.length) markBatchFailed(failed);
                 else if (anyGood) errorCount = 0;
@@ -1422,10 +1334,6 @@
         // on page turns / iframe mutations can only ADD newly-discovered work.
 
         refreshStatus();
-        // A running pump may currently own an interruptible background delay.
-        // Wake it after publishing the new queues so visible work is admitted
-        // immediately instead of inheriting prefetch pacing.
-        if (prefetchWaitWake) prefetchWaitWake();
         pumpQueue();
     }
 
@@ -1578,20 +1486,15 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     let lastContentIdentity = null;
     let readerObserver = null;
     let mainObserver = null;
-    const watchedReaderIframes = new WeakSet();
 
     function setOverlayHidden(hidden) {
-        ['bt-bar', 'bt-menu', 'bt-toast'].forEach(id => {
+        [bt-bar, bt-menu, bt-toast].forEach(id => {
             const element = document.getElementById(id);
             if (element) {
-                element.hidden = hidden;
-                // Author CSS can override the user-agent [hidden] rule (the
-                // toolbar normally uses display:flex), so enforce route
-                // deactivation at the inline cascade as well.
-                element.style.display = hidden ? 'none' : '';
+                element.hidden = false;
+                element.style.display = "";
             }
         });
-        if (hidden) closeMenu();
     }
 
     function syncReaderRoute({ initial = false } = {}) {
@@ -1613,7 +1516,6 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         setOverlayHidden(false);
         if (!wasActive && !initial && translationMode !== 'off') {
             lastContentIdentity = null;
-            attachReaderContentObserver();
             scheduleTranslate('reader_route', { immediate: true, forceRediscover: true });
         }
         return true;
@@ -1638,89 +1540,60 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         }
     }
 
-    function watchReaderIframe(iframe) {
-        if (!iframe || watchedReaderIframes.has(iframe)) return;
-        watchedReaderIframes.add(iframe);
-        iframe.addEventListener('load', () => {
-            if (readerRouteActive) {
-                attachReaderContentObserver({ rediscover: true });
-            }
-        });
-    }
-
-    function attachReaderContentObserver({ rediscover = false } = {}) {
-        let content = null;
-        if (READER_TYPE === 'kavita') {
-            content = getReaderRoot();
-        } else {
-            const iframe = getReaderIframe();
-            watchReaderIframe(iframe);
-            try {
-                const idoc = iframe && (
-                    iframe.contentDocument || iframe.contentWindow.document
-                );
-                content = idoc && idoc.body;
-            } catch (e) { content = null; }
-        }
-        if (!content || content === lastContentIdentity) return false;
-
-        const replacesObservedContent = lastContentIdentity !== null;
-        lastContentIdentity = content;
-        if (readerObserver) readerObserver.disconnect();
-        readerObserver = new MutationObserver((mutations) => {
-            if (!readerRouteActive
-                    || !mutations.some(mutationContainsReaderContent)) return;
-            scheduleTranslate(
-                READER_TYPE === 'kavita'
-                    ? 'kavita_content_mutation' : 'iframe_mutation',
-                { forceRediscover: READER_TYPE === 'kavita' }
-            );
-        });
-        if (READER_TYPE === 'cwa') {
-            const idoc = content.ownerDocument;
-            ensureIframeStyles(idoc);
-            applyIframeTheme(idoc);
-            attachIframeShortcut(idoc);
-        }
-        readerObserver.observe(content, { childList: true, subtree: true });
-        if (rediscover && translationMode !== 'off') {
-            scheduleTranslate('new_reader_content', {
-                immediate: true,
-                // First attachment may race with work discovered by the main
-                // observer. Only a confirmed document replacement makes that
-                // work stale enough to abort and replay.
-                forceRediscover: replacesObservedContent
-            });
-        }
-        return true;
-    }
-
     function setupObservers() {
         if (!mainObserver) {
             mainObserver = new MutationObserver((mutations) => {
                 if (!readerRouteActive) return;
                 const relevant = mutations.some(mutationContainsReaderContent);
                 if (relevant) {
-                    // Reconcile the reader root before it can admit work. The
-                    // content observer handles mutations inside the current
-                    // root; this path handles a root/iframe replacement.
-                    attachReaderContentObserver({ rediscover: true });
+                    scheduleTranslate('main_mutation', {
+                        forceRediscover: READER_TYPE === 'kavita'
+                    });
                 }
             });
             mainObserver.observe(document.body, { childList: true, subtree: true });
         }
 
-        // The reader document normally exists by DOMContentLoaded. Attach now
-        // so the first polling tick cannot mistake it for a chapter change and
-        // abort already-admitted provider work. The poll remains as a fallback
-        // for readers that replace or create their content asynchronously.
-        attachReaderContentObserver();
-
         // Track CWA iframe documents and Kavita's stable .book-content host.
         setInterval(() => {
-            if (!syncReaderRoute()) return;
-            attachReaderContentObserver({ rediscover: true });
-            if (translationMode === 'off') return;
+            if (!syncReaderRoute() || translationMode === 'off') return;
+
+            let content = null;
+            if (READER_TYPE === 'kavita') {
+                content = getReaderRoot();
+            } else {
+                const iframe = getReaderIframe();
+                try {
+                    const idoc = iframe && (
+                        iframe.contentDocument || iframe.contentWindow.document
+                    );
+                    content = idoc && idoc.body;
+                } catch (e) { content = null; }
+            }
+            if (content && content !== lastContentIdentity) {
+                lastContentIdentity = content;
+                if (readerObserver) readerObserver.disconnect();
+                readerObserver = new MutationObserver((mutations) => {
+                    if (!readerRouteActive
+                            || !mutations.some(mutationContainsReaderContent)) return;
+                    scheduleTranslate(
+                        READER_TYPE === 'kavita'
+                            ? 'kavita_content_mutation' : 'iframe_mutation',
+                        { forceRediscover: READER_TYPE === 'kavita' }
+                    );
+                });
+                if (READER_TYPE === 'cwa') {
+                    const idoc = content.ownerDocument;
+                    ensureIframeStyles(idoc);
+                    applyIframeTheme(idoc);
+                    attachIframeShortcut(idoc);
+                }
+                readerObserver.observe(content, { childList: true, subtree: true });
+                scheduleTranslate('new_reader_content', {
+                    immediate: true,
+                    forceRediscover: true
+                });
+            }
 
             // Position-based page turn detector.
             // BUG (root cause of the status bar flicker): inserting a bilingual
