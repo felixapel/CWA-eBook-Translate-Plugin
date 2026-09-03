@@ -19,7 +19,7 @@ RUN apk add --no-cache \
     libgomp=15.2.0-r5 \
     libxml2=2.13.9-r2 \
     nginx=1.30.4-r1 \
-    pcre2=10.47-r1
+    pcre2=10.48-r0
 
 # Copy requirements and install. Then strip packaging tooling that is only needed
 # to install wheels: setuptools/wheel/pip (and their vendored trees) are not used
@@ -36,12 +36,13 @@ COPY VERSION ./
 COPY static/loader.js static/translator.css static/translator.js ./static/
 COPY proxy/nginx-main.conf proxy/nginx.conf.template proxy/render_config.py ./proxy/
 COPY docker-entrypoint.sh ./
-RUN chmod +x docker-entrypoint.sh
+RUN chmod 755 docker-entrypoint.sh
 
 # Keep the identity used by all previously published images. Explicit IDs
 # avoid changing ownership semantics when Alpine's system users change.
 RUN addgroup -S -g 102 appuser \
  && adduser -S -D -H -u 101 -G appuser appuser \
+ && chmod -R a+rX /app \
  && mkdir -p /app/data \
  && chown appuser:appuser /app/data \
  && chmod 755 /app \
