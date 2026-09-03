@@ -138,6 +138,7 @@ configure_proxy() {
 
 start_api() {
     gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 \
+        --worker-tmp-dir /dev/shm \
         --timeout 120 server:app
 }
 
@@ -152,6 +153,7 @@ case "$BT_ROLE" in
         initialize_cache
         echo "[entrypoint] API role on :${PORT}"
         exec gunicorn --bind "0.0.0.0:${PORT}" --workers 1 --threads 8 \
+            --worker-tmp-dir /dev/shm \
             --timeout 120 server:app
         ;;
     proxy)
