@@ -27,13 +27,12 @@ modifying either image.
 The production path is the universal `btctl` hub. It builds an immutable local
 image from an exact clean checkout and runs CWA, Kavita or both through
 one hardened container while keeping separate internal API processes, caches,
-keys and cookies. Version `2.3.0-rc.1` is still an unreleased candidate; no
-installable release tag is claimed by this branch:
+keys and cookies:
 
 ```bash
 git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git cwa-translate
 cd cwa-translate
-git status --short
+git switch --detach v2.3.0
 ```
 
 Copy the managed configuration outside the checkout and make it private:
