@@ -64,6 +64,8 @@
     left: 50%;
     bottom: 22px;
     transform: translateX(-50%);
+    height: auto;
+    max-height: 48px;
     z-index: 2147483000;
     display: flex;
     align-items: center;
@@ -224,6 +226,9 @@
     transform: translateX(-50%);
     min-width: 250px;
     max-width: min(92vw, 340px);
+    max-height: min(80vh, 520px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     background: var(--bt-bar-bg);
     color: #fff;
     border-radius: 14px;

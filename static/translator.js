@@ -483,13 +483,13 @@
         if (!bar) return;
         const raw = localStorage.getItem('bt_pos');
         if (!raw || raw === 'bottom') {
-            bar.style.top = '';
+            bar.style.top = 'auto';
             bar.style.bottom = '22px';
             bar.style.left = '50%';
             bar.style.transform = 'translateX(-50%)';
             bar.style.cursor = 'default';
         } else if (raw === 'top') {
-            bar.style.bottom = '';
+            bar.style.bottom = 'auto';
             bar.style.top = '22px';
             bar.style.left = '50%';
             bar.style.transform = 'translateX(-50%)';
@@ -520,6 +520,7 @@
         localStorage.setItem('bt_pos', posName);
         applyBarPosition();
         buildMenu();
+        closeMenu({ restoreFocus: false });
         showToast(posName === 'top' ? (t.posTop || 'Arriba') : (t.posBottom || 'Abajo'));
     }
 
@@ -541,7 +542,7 @@
             menu.style.bottom = (window.innerHeight - rect.top + 10) + 'px';
         } else {
             menu.style.bottom = 'auto';
-            menu.style.top = (rect.bottom + 10) + 'px';
+            menu.style.top = Math.min(window.innerHeight - 80, rect.bottom + 10) + 'px';
         }
     }
 
@@ -638,6 +639,10 @@
             `<div id="bt-progress" role="progressbar" aria-label="${t.translatingChapter}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="bt-progress-fill"></div></div>`;
 
         document.body.appendChild(bar);
+        bar.ondblclick = (e) => {
+            if (e.target.closest('#bt-lang, #bt-gear, select, button')) return;
+            setBarPresetPosition('bottom');
+        };
         setupBarDragEvents(bar);
 
         // The settings popover lives at body level (NOT inside #bt-bar) because the
