@@ -8,6 +8,10 @@
     const BT_UI_VERSION = '2.3.0-rc.1';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
+    function boundedInteger(value, minimum, maximum, fallback) {
+        return Number.isInteger(value) && value >= minimum && value <= maximum
+            ? value : fallback;
+    }
     const configuredReaderType = cfg.readerType || '';
     const READER_TYPE = configuredReaderType === 'kavita' ? 'kavita' : 'cwa';
     const STRICT_READER_ROUTE = configuredReaderType === 'cwa'
@@ -59,7 +63,6 @@
     let TARGET_LANG = localStorage.getItem('bt_lang') || cfg.targetLang || defaultLang;
 
     const BT_CLIENT_MAX_INFLIGHT = 1;
-    const BT_CLIENT_MIN_REQUEST_GAP_MS = 500;
     const BT_CLIENT_RATE_LIMIT_BACKOFF_MS = 10000;
     const BT_CLIENT_MAX_RATE_LIMIT_RESPONSES = 3;
     const BT_CLIENT_MAX_RETRY_AFTER_SECONDS = 60;
@@ -71,22 +74,23 @@
     let prefetchQueue = [];
     let isPumpRunning = false;
     let rateLimitUntil = 0;
-    let lastRequestEnd = 0;
+    let nextPrefetchAt = 0;
+    let prefetchWaitWake = null;
+    let firstVisibleBatchCompleted = false;
     let lastFirstVisibleHash = null;
     let pendingFirstVisibleHash = null; // 2-poll debounce for the page-turn detector
 
     function kavitaRouteParts() {
-        const path = window.location.pathname;
-        let match = path.match(/^\/library\/([0-9]+)\/series\/([0-9]+)(?:\/volume\/[0-9]+)?\/(?:book|chapter)\/([0-9]+)\/?$/i);
-        if (match) return { libraryId: match[1], seriesId: match[2], chapterId: match[3] };
-        match = path.match(/^\/reader\/(?:book|chapter)\/([0-9]+)\/?$/i);
-        if (match) return { libraryId: "1", seriesId: "1", chapterId: match[1] };
-        const nums = path.match(/[0-9]+/g) || ["1", "1", "1"];
-        return { libraryId: nums[0] || "1", seriesId: nums[1] || "1", chapterId: nums[2] || "1" };
+        const match = window.location.pathname.match(
+            /^\/library\/([1-9][0-9]*)\/series\/([1-9][0-9]*)\/book\/([1-9][0-9]*)\/?$/
+        );
+        return match ? { libraryId: match[1], seriesId: match[2], chapterId: match[3] } : null;
     }
 
     function isSupportedReaderRoute() {
-        return true;
+        if (!STRICT_READER_ROUTE) return true;
+        if (READER_TYPE === 'kavita') return kavitaRouteParts() !== null;
+        return /^\/read\/[^/?#]+(?:\/[^?#]*)?\/?$/.test(window.location.pathname);
     }
 
     let readerRouteActive = false;
@@ -109,6 +113,10 @@
     let inflightCount = 0;
     let errorCount = 0;       // consecutive failed requests (drives the error state)
     const failedParagraphs = new Set(); // terminal until an explicit user retry
+    // Queue objects are rebuilt whenever the reader DOM is rediscovered. Keep
+    // admission retry counts outside those transient objects so DOM mutations
+    // cannot reset the bound within one generation.
+    const rateLimitResponses = new Map(); // paragraph hash -> response count
     let doneHideTimer = null;
     let lastTriggerReason = 'init'; // why translateCurrentPage last ran (shown in the debug menu)
 
@@ -179,21 +187,42 @@
     // fetches immediately instead of blocking the UI until they finish.
     let generation = 0;
     const activeControllers = new Set();
+    let paragraphTextCache = new WeakMap();
 
     function newGeneration() {
         generation++;
+        rateLimitResponses.clear();
+        if (prefetchWaitWake) prefetchWaitWake();
         for (const c of activeControllers) {
             try { c.abort(); } catch (e) { /* ignore */ }
         }
         activeControllers.clear();
+        paragraphTextCache = new WeakMap();
         visibleQueue = [];
         prefetchQueue = [];
         chapterDone = 0;
         inflightCount = 0;
         isTranslating = false;
         isPrefetching = false;
+        firstVisibleBatchCompleted = false;
         refreshStatus();
         return generation;
+    }
+
+    function waitForPrefetchGap(milliseconds) {
+        return new Promise(resolve => {
+            let settled = false;
+            let timer = null;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                if (timer !== null) clearTimeout(timer);
+                if (prefetchWaitWake === finish) prefetchWaitWake = null;
+                resolve();
+            };
+            prefetchWaitWake = finish;
+            timer = setTimeout(finish, milliseconds);
+        });
     }
 
     function chapterProgress() {
@@ -235,6 +264,7 @@
             cloudActive: 'Cloud translation is active: book text is sent to the configured remote primary provider.',
             cloudSecondary: 'Allow secondary remote fallback',
             cloudSecondaryPrivacy: 'The primary provider is already remote. This additionally permits the configured remote fallback for this tab.',
+            barPos: 'Position', posTop: 'Top', posBottom: 'Bottom', posReset: 'Reset to bottom', posDragHint: 'Touch or drag the bar anywhere to move it.',
             dbgQueue: 'Queue', dbgGen: 'Generation', dbgTrigger: 'Last trigger',
         },
         es: {
@@ -252,6 +282,7 @@
             cloudActive: 'La traducción cloud está activa: el texto se envía al proveedor primario remoto configurado.',
             cloudSecondary: 'Permitir fallback remoto secundario',
             cloudSecondaryPrivacy: 'El proveedor primario ya es remoto. Esto además permite el fallback remoto configurado durante esta pestaña.',
+            barPos: 'Posición', posTop: 'Arriba', posBottom: 'Abajo', posReset: 'Restablecer abajo', posDragHint: 'Arrastra la barra para moverla libremente.',
             dbgQueue: 'Cola', dbgGen: 'Generación', dbgTrigger: 'Último disparo',
         },
         fr: {
@@ -441,6 +472,139 @@
         }
     }
 
+    // ── Draggable Floating Bar & Position Persistence ────────────────────────
+    let isDraggingBar = false;
+    let dragStartX = 0, dragStartY = 0;
+    let barStartX = 0, barStartY = 0;
+    let hasMovedDuringDrag = false;
+
+    function applyBarPosition() {
+        const bar = document.getElementById('bt-bar');
+        if (!bar) return;
+        const raw = localStorage.getItem('bt_pos');
+        if (!raw || raw === 'bottom') {
+            bar.style.top = '';
+            bar.style.bottom = '22px';
+            bar.style.left = '50%';
+            bar.style.transform = 'translateX(-50%)';
+            bar.style.cursor = 'default';
+        } else if (raw === 'top') {
+            bar.style.bottom = '';
+            bar.style.top = '22px';
+            bar.style.left = '50%';
+            bar.style.transform = 'translateX(-50%)';
+            bar.style.cursor = 'default';
+        } else {
+            try {
+                const pos = JSON.parse(raw);
+                if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
+                    const maxX = Math.max(10, window.innerWidth - (bar.offsetWidth || 280) - 10);
+                    const maxY = Math.max(10, window.innerHeight - (bar.offsetHeight || 44) - 10);
+                    const x = Math.max(10, Math.min(maxX, pos.x));
+                    const y = Math.max(10, Math.min(maxY, pos.y));
+                    bar.style.bottom = 'auto';
+                    bar.style.left = x + 'px';
+                    bar.style.top = y + 'px';
+                    bar.style.transform = 'none';
+                    bar.style.cursor = 'move';
+                }
+            } catch (e) {
+                localStorage.removeItem('bt_pos');
+            }
+        }
+        updateMenuPosition();
+    }
+
+    function setBarPresetPosition(posName) {
+        if (posName === 'custom') return;
+        localStorage.setItem('bt_pos', posName);
+        applyBarPosition();
+        buildMenu();
+        showToast(posName === 'top' ? (t.posTop || 'Arriba') : (t.posBottom || 'Abajo'));
+    }
+
+    function updateMenuPosition() {
+        const bar = document.getElementById('bt-bar');
+        const menu = document.getElementById('bt-menu');
+        if (!bar || !menu) return;
+        const rect = bar.getBoundingClientRect();
+        const menuWidth = menu.offsetWidth || 280;
+        const menuHeight = menu.offsetHeight || 300;
+
+        let left = rect.left + (rect.width / 2) - (menuWidth / 2);
+        left = Math.max(10, Math.min(window.innerWidth - menuWidth - 10, left));
+        menu.style.left = left + 'px';
+        menu.style.transform = 'none';
+
+        if (rect.top > menuHeight + 30) {
+            menu.style.top = 'auto';
+            menu.style.bottom = (window.innerHeight - rect.top + 10) + 'px';
+        } else {
+            menu.style.bottom = 'auto';
+            menu.style.top = (rect.bottom + 10) + 'px';
+        }
+    }
+
+    function setupBarDragEvents(bar) {
+        function onPointerDown(e) {
+            if (e.target.closest('#bt-lang, #bt-gear, select')) return;
+            isDraggingBar = true;
+            hasMovedDuringDrag = false;
+            dragStartX = e.clientX || (e.touches && e.touches[0].clientX) || 0;
+            dragStartY = e.clientY || (e.touches && e.touches[0].clientY) || 0;
+            const rect = bar.getBoundingClientRect();
+            barStartX = rect.left;
+            barStartY = rect.top;
+
+            document.addEventListener('pointermove', onPointerMove, { passive: false });
+            document.addEventListener('touchmove', onPointerMove, { passive: false });
+            document.addEventListener('pointerup', onPointerUp);
+            document.addEventListener('touchend', onPointerUp);
+        }
+
+        function onPointerMove(e) {
+            if (!isDraggingBar) return;
+            const cx = e.clientX || (e.touches && e.touches[0].clientX) || 0;
+            const cy = e.clientY || (e.touches && e.touches[0].clientY) || 0;
+            const dx = cx - dragStartX;
+            const dy = cy - dragStartY;
+
+            if (Math.hypot(dx, dy) > 5) {
+                hasMovedDuringDrag = true;
+                if (e.cancelable) e.preventDefault();
+                const maxX = Math.max(10, window.innerWidth - bar.offsetWidth - 10);
+                const maxY = Math.max(10, window.innerHeight - bar.offsetHeight - 10);
+                const newX = Math.max(10, Math.min(maxX, barStartX + dx));
+                const newY = Math.max(10, Math.min(maxY, barStartY + dy));
+
+                bar.style.bottom = 'auto';
+                bar.style.left = newX + 'px';
+                bar.style.top = newY + 'px';
+                bar.style.transform = 'none';
+                bar.style.cursor = 'move';
+            }
+        }
+
+        function onPointerUp(e) {
+            if (!isDraggingBar) return;
+            isDraggingBar = false;
+            document.removeEventListener('pointermove', onPointerMove);
+            document.removeEventListener('touchmove', onPointerMove);
+            document.removeEventListener('pointerup', onPointerUp);
+            document.removeEventListener('touchend', onPointerUp);
+
+            if (hasMovedDuringDrag) {
+                const rect = bar.getBoundingClientRect();
+                localStorage.setItem('bt_pos', JSON.stringify({ x: Math.round(rect.left), y: Math.round(rect.top) }));
+                updateMenuPosition();
+            }
+        }
+
+        bar.addEventListener('pointerdown', onPointerDown);
+        bar.addEventListener('touchstart', onPointerDown, { passive: true });
+        window.addEventListener('resize', applyBarPosition);
+    }
+
     function createFloatingUI() {
         if (document.getElementById('bt-bar')) return;
 
@@ -474,6 +638,7 @@
             `<div id="bt-progress" role="progressbar" aria-label="${t.translatingChapter}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="bt-progress-fill"></div></div>`;
 
         document.body.appendChild(bar);
+        setupBarDragEvents(bar);
 
         // The settings popover lives at body level (NOT inside #bt-bar) because the
         // bar uses overflow:hidden to clip the progress bar, which would also clip
@@ -483,9 +648,11 @@
         menu.setAttribute('role', 'dialog');
         menu.setAttribute('aria-label', t.settings);
         menu.setAttribute('aria-hidden', 'true');
+        menu.setAttribute('tabindex', '-1');
         document.body.appendChild(menu);
 
         document.getElementById('bt-toggle').onclick = () => {
+            if (hasMovedDuringDrag) { hasMovedDuringDrag = false; return; }
             const next = translationMode === 'off' ? 'bilingual'
                 : translationMode === 'bilingual' ? 'translated' : 'off';
             setMode(next);
@@ -510,7 +677,7 @@
         // Close on outside click (anywhere not on the bar or the menu)...
         document.addEventListener('click', (e) => {
             if (menu.classList.contains('bt-open') && !bar.contains(e.target) && !menu.contains(e.target)) {
-                closeMenu();
+                closeMenu({ restoreFocus: false });
             }
         });
         // ...and on Escape.
@@ -518,12 +685,20 @@
             if (e.key === 'Escape' && menu.classList.contains('bt-open')) closeMenu();
         });
 
-        // Click the error status to retry.
-        document.getElementById('bt-status').onclick = () => {
+        const retryFailed = () => {
             if (bar.dataset.state === 'error') {
                 errorCount = 0;
                 failedParagraphs.clear();
+                rateLimitResponses.clear();
                 if (translationMode !== 'off') translateCurrentPage();
+            }
+        };
+        const status = document.getElementById('bt-status');
+        status.onclick = retryFailed;
+        status.onkeydown = (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                if (bar.dataset.state === 'error') event.preventDefault();
+                retryFailed();
             }
         };
 
@@ -559,6 +734,11 @@
                 `</button>` +
                 `<div class="bt-menu-note bt-menu-warning" data-provider-policy="remote-fallback">${t.cloudPrivacy || strings.en.cloudPrivacy}</div>`;
         }
+        const curPos = localStorage.getItem('bt_pos') || 'bottom';
+        const isTop = curPos === 'top';
+        const isCustom = curPos !== 'bottom' && curPos !== 'top';
+        const posLabel = isTop ? (t.posTop || 'Arriba') : isCustom ? 'Libre (arrastrada)' : (t.posBottom || 'Abajo');
+
         menu.innerHTML =
             `<div class="bt-menu-header">${t.bookTranslator}<span class="bt-menu-ver">v${BT_UI_VERSION}</span></div>` +
             `<div class="bt-menu-row"><span>${t.modeLabel}</span><span class="bt-menu-val">${modeLabel}</span></div>` +
@@ -566,6 +746,14 @@
                 `<select id="bt-source-lang" class="bt-menu-select" title="${t.sourceLangHint}" aria-label="${t.sourceLangHint}">` +
                     `${languageOptions(SOURCE_LANG)}</select></label>` +
             `<div class="bt-menu-row"><span>${t.targetLabel}</span><span class="bt-menu-val">${esc(TARGET_LANG)}</span></div>` +
+            `<div class="bt-menu-row"><span>${t.barPos || 'Posición'}</span><span class="bt-menu-val">${posLabel}</span></div>` +
+            `<div class="bt-menu-sep"></div>` +
+            `<button type="button" class="bt-menu-item" data-action="toggle-pos">` +
+                `<span>↕ Mover a ${isTop ? (t.posBottom || 'Abajo') : (t.posTop || 'Arriba')}</span>` +
+            `</button>` +
+            `<button type="button" class="bt-menu-item" data-action="reset-pos">` +
+                `<span>↺ ${t.posReset || 'Restablecer abajo'}</span>` +
+            `</button>` +
             `<div class="bt-menu-sep"></div>` +
             `<button type="button" class="bt-menu-item" data-action="prefetch" role="switch" aria-checked="${prefetchEnabled}">` +
                 `<span>${t.prefetchWhole}</span>` +
@@ -576,6 +764,7 @@
             `<button type="button" class="bt-menu-item" data-action="clear-lang"><span>${t.clearLang}</span></button>` +
             `<button type="button" class="bt-menu-item" data-action="clear-all"><span>${t.clearAll}</span></button>` +
             `<div class="bt-menu-sep"></div>` +
+            `<div class="bt-menu-note">💡 ${t.posDragHint || 'Arrastra la barra para moverla libremente.'}</div>` +
             `<div class="bt-menu-note">${t.cached}: ${entryCount} · ${esc(TARGET_LANG)}</div>` +
             `<div class="bt-menu-note">${t.debug}: ${t.dbgQueue} ${prefetchQueue.length} · ${t.dbgGen} ${generation} · ${t.dbgTrigger} ${esc(lastTriggerReason)}</div>`;
 
@@ -596,7 +785,12 @@
             item.onclick = (e) => {
                 e.stopPropagation();
                 const action = item.dataset.action;
-                if (action === 'prefetch') {
+                if (action === 'toggle-pos') {
+                    const nextPos = (localStorage.getItem('bt_pos') === 'top') ? 'bottom' : 'top';
+                    setBarPresetPosition(nextPos);
+                } else if (action === 'reset-pos') {
+                    setBarPresetPosition('bottom');
+                } else if (action === 'prefetch') {
                     prefetchEnabled = !prefetchEnabled;
                     localStorage.setItem('bt_prefetch', prefetchEnabled ? '1' : '0');
                     buildMenu();
@@ -612,12 +806,14 @@
                 } else if (action === 'clear-lang') {
                     translatedParagraphs = {};
                     failedParagraphs.clear();
+                    rateLimitResponses.clear();
                     try { localStorage.removeItem(CACHE_PREFIX + TARGET_LANG); } catch (e2) {}
                     showToast(t.cleared);
                     buildMenu();
                 } else if (action === 'clear-all') {
                     translatedParagraphs = {};
                     failedParagraphs.clear();
+                    rateLimitResponses.clear();
                     try {
                         Object.keys(localStorage).filter(k => k.startsWith(CACHE_PREFIX))
                             .forEach(k => localStorage.removeItem(k));
@@ -629,25 +825,37 @@
         });
     }
 
-    function closeMenu() {
+    function closeMenu({ restoreFocus = true } = {}) {
         const menu = document.getElementById('bt-menu');
         const gear = document.getElementById('bt-gear');
+        const wasOpen = !!(menu && menu.classList.contains('bt-open'));
         if (menu) {
             menu.classList.remove('bt-open');
             menu.setAttribute('aria-hidden', 'true');
         }
         if (gear) gear.setAttribute('aria-expanded', 'false');
+        if (restoreFocus && wasOpen && gear) gear.focus();
     }
 
     function toggleMenu() {
         const menu = document.getElementById('bt-menu');
         if (!menu) return;
-        if (!menu.classList.contains('bt-open')) buildMenu(); // refresh snapshot (mode/queue/gen)
+        if (!menu.classList.contains('bt-open')) {
+            buildMenu(); // refresh snapshot (mode/queue/gen)
+            updateMenuPosition();
+        }
         menu.classList.toggle('bt-open');
+        if (menu.classList.contains('bt-open')) updateMenuPosition();
         const isOpen = menu.classList.contains('bt-open');
         menu.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
         const gear = document.getElementById('bt-gear');
         if (gear) gear.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+        if (isOpen) {
+            const target = menu.querySelector('select, button, [tabindex="0"]') || menu;
+            window.requestAnimationFrame(() => target.focus());
+        } else if (gear) {
+            gear.focus();
+        }
     }
 
     // Single source of truth for the status zone: derives display from state.
@@ -656,6 +864,7 @@
         const bar = document.getElementById('bt-bar');
         const text = document.getElementById('bt-status-text');
         const progress = document.getElementById('bt-progress');
+        const status = document.getElementById('bt-status');
         const fill = document.getElementById('bt-progress-fill');
         if (!bar || !text) return;
 
@@ -702,12 +911,23 @@
                 text.textContent = t.done;
                 doneHideTimer = setTimeout(() => {
                     chapterDone = 0;
-                    const b = document.getElementById('bt-bar');
-                    if (b && b.dataset.state === 'done') { b.dataset.state = 'idle'; }
+                    doneHideTimer = null;
+                    refreshStatus();
                 }, 2500);
             }
         }
         bar.dataset.state = state;
+        if (status) {
+            if (state === 'error') {
+                status.setAttribute('role', 'button');
+                status.setAttribute('tabindex', '0');
+                status.setAttribute('aria-label', t.retryPage);
+            } else {
+                status.setAttribute('role', 'status');
+                status.removeAttribute('tabindex');
+                status.removeAttribute('aria-label');
+            }
+        }
         if (progress) {
             if (state === 'page') {
                 progress.removeAttribute('aria-valuenow');
@@ -740,6 +960,10 @@
     // ── DOM Helpers ────────────────────────────────────────────────────
     function getReaderIframe() {
         if (READER_TYPE === 'kavita') return null;
+        // A detached/closed document can still have queued MutationObserver
+        // callbacks (notably during SPA teardown and test-window disposal).
+        if (typeof document === 'undefined' || !document
+                || typeof document.querySelector !== 'function') return null;
         return document.querySelector('#viewer iframe, .epub-container iframe, iframe');
     }
 
@@ -872,10 +1096,17 @@
     }
 
     function getParagraphText(el) {
-        if (el.dataset.originalText) return el.dataset.originalText;
+        if (el.dataset.originalText) {
+            paragraphTextCache.set(el, el.dataset.originalText);
+            return el.dataset.originalText;
+        }
+        const cached = paragraphTextCache.get(el);
+        if (cached !== undefined) return cached;
         const clone = el.cloneNode(true);
         clone.querySelectorAll('.bt-loading, .bt-translation').forEach(n => n.remove());
-        return clone.textContent.trim();
+        const text = clone.textContent.trim();
+        paragraphTextCache.set(el, text);
+        return text;
     }
 
     function hashText(str) {
@@ -976,8 +1207,10 @@
     }
 
     // ── Translation engine ─────────────────────────────────────────────
-    const VISIBLE_CHUNK = 1;       // paragraphs per request for the on-screen page
-    const PREFETCH_CHUNK = 3;      // paragraphs per request for background fill
+    const FIRST_VISIBLE_CHUNK = 1; // minimize time to the first translated paragraph
+    const VISIBLE_CHUNK = boundedInteger(cfg.batchSize, 1, 50, 5);
+    const PREFETCH_CHUNK = VISIBLE_CHUNK;
+    const PREFETCH_GAP_MS = boundedInteger(cfg.prefetchGapMs, 0, 10000, 0);
     const REQUEST_TIMEOUT_MS = 90000; // client-side safety net so a hung request can't freeze the UI
 
     // Server rejects paragraphs beyond BT_MAX_PARAGRAPH_CHARS (default 8000)
@@ -1139,6 +1372,12 @@
                 if (resp.status === 429) {
                     let r = {};
                     try { r = await resp.json(); } catch(e) {}
+                    const safeAdmission = r.retry_safe === true
+                        && (r.scope === 'api_admission'
+                            || r.scope === 'auth_admission');
+                    if (!safeAdmission) {
+                        return { error: 'provider_unavailable' };
+                    }
                     let after = Number(r.retry_after || resp.headers.get('Retry-After'));
                     if (!Number.isFinite(after) || after <= 0) {
                         after = BT_CLIENT_RATE_LIMIT_BACKOFF_MS / 1000;
@@ -1173,12 +1412,6 @@
                     continue;
                 }
                 
-                const gap = BT_CLIENT_MIN_REQUEST_GAP_MS - (now - lastRequestEnd);
-                if (gap > 0) {
-                    await new Promise(r => setTimeout(r, gap));
-                    continue;
-                }
-                
                 // Cleanup stale items and deduplicate
                 const seenHash = new Set();
                 visibleQueue = visibleQueue.filter(x => {
@@ -1195,12 +1428,20 @@
                 if (visibleQueue.length === 0 && prefetchQueue.length === 0) {
                     break; // Nothing to do
                 }
+
+                if (visibleQueue.length === 0 && prefetchQueue.length > 0
+                        && nextPrefetchAt > now) {
+                    await waitForPrefetchGap(nextPrefetchAt - now);
+                    continue;
+                }
                 
                 let isVisible = false;
                 let batch = [];
                 if (visibleQueue.length > 0) {
-                    batch = visibleQueue.slice(0, VISIBLE_CHUNK);
-                    visibleQueue = visibleQueue.slice(VISIBLE_CHUNK);
+                    const chunkSize = firstVisibleBatchCompleted
+                        ? VISIBLE_CHUNK : FIRST_VISIBLE_CHUNK;
+                    batch = visibleQueue.slice(0, chunkSize);
+                    visibleQueue = visibleQueue.slice(chunkSize);
                     isVisible = true;
                 } else {
                     batch = prefetchQueue.slice(0, PREFETCH_CHUNK);
@@ -1216,7 +1457,10 @@
                 // still be translating after the browser gives up. Mark them
                 // terminal for this session and require an explicit user retry.
                 const markBatchFailed = (items) => {
-                    items.forEach(x => failedParagraphs.add(x.hash));
+                    items.forEach(x => {
+                        failedParagraphs.add(x.hash);
+                        rateLimitResponses.delete(x.hash);
+                    });
                     chapterDone += items.length;
                     errorCount++;
                 };
@@ -1228,8 +1472,9 @@
                     const keep = [];
                     const dropped = [];
                     items.forEach(x => {
-                        x.rateLimitResponses = (x.rateLimitResponses || 0) + 1;
-                        if (x.rateLimitResponses < BT_CLIENT_MAX_RATE_LIMIT_RESPONSES) keep.push(x);
+                        const responses = (rateLimitResponses.get(x.hash) || 0) + 1;
+                        rateLimitResponses.set(x.hash, responses);
+                        if (responses < BT_CLIENT_MAX_RATE_LIMIT_RESPONSES) keep.push(x);
                         else dropped.push(x);
                     });
                     if (dropped.length) markBatchFailed(dropped);
@@ -1239,19 +1484,18 @@
                 };
 
                 let data = null;
+                nextPrefetchAt = Date.now() + PREFETCH_GAP_MS;
                 try {
                     data = await postBatch(batch.map(b => b.text));
                 } catch (e) {
                     console.error("Translation request failed:", e);
                     markBatchFailed(batch);
                     inflightCount = 0;
-                    lastRequestEnd = Date.now();
                     refreshStatus();
                     continue;
                 }
 
                 inflightCount = 0;
-                lastRequestEnd = Date.now();
 
                 if (data && data.error === 'aborted') {
                     // Deliberate cancel (mode/language/page change) — the items
@@ -1279,6 +1523,7 @@
                     if (idx >= batch.length) return; // defensive: never trust response length
                     if (!isBadTranslation(tr)) {
                         translatedParagraphs[batch[idx].hash] = tr;
+                        rateLimitResponses.delete(batch[idx].hash);
                         stored = true;
                         anyGood = true;
                     }
@@ -1289,6 +1534,9 @@
                 // failed paragraph; successful entries remain available.
                 const succeeded = batch.filter(b => translatedParagraphs[b.hash]);
                 chapterDone += succeeded.length;
+                if (isVisible && succeeded.length > 0) {
+                    firstVisibleBatchCompleted = true;
+                }
                 const failed = batch.filter(b => !translatedParagraphs[b.hash]);
                 if (failed.length) markBatchFailed(failed);
                 else if (anyGood) errorCount = 0;
@@ -1334,6 +1582,10 @@
         // on page turns / iframe mutations can only ADD newly-discovered work.
 
         refreshStatus();
+        // A running pump may currently own an interruptible background delay.
+        // Wake it after publishing the new queues so visible work is admitted
+        // immediately instead of inheriting prefetch pacing.
+        if (prefetchWaitWake) prefetchWaitWake();
         pumpQueue();
     }
 
@@ -1486,15 +1738,20 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
     let lastContentIdentity = null;
     let readerObserver = null;
     let mainObserver = null;
+    const watchedReaderIframes = new WeakSet();
 
     function setOverlayHidden(hidden) {
-        [bt-bar, bt-menu, bt-toast].forEach(id => {
+        ['bt-bar', 'bt-menu', 'bt-toast'].forEach(id => {
             const element = document.getElementById(id);
             if (element) {
-                element.hidden = false;
-                element.style.display = "";
+                element.hidden = hidden;
+                // Author CSS can override the user-agent [hidden] rule (the
+                // toolbar normally uses display:flex), so enforce route
+                // deactivation at the inline cascade as well.
+                element.style.display = hidden ? 'none' : '';
             }
         });
+        if (hidden) closeMenu();
     }
 
     function syncReaderRoute({ initial = false } = {}) {
@@ -1513,9 +1770,11 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
 
         readerRouteActive = true;
         createFloatingUI();
+        applyBarPosition();
         setOverlayHidden(false);
         if (!wasActive && !initial && translationMode !== 'off') {
             lastContentIdentity = null;
+            attachReaderContentObserver();
             scheduleTranslate('reader_route', { immediate: true, forceRediscover: true });
         }
         return true;
@@ -1540,60 +1799,89 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         }
     }
 
+    function watchReaderIframe(iframe) {
+        if (!iframe || watchedReaderIframes.has(iframe)) return;
+        watchedReaderIframes.add(iframe);
+        iframe.addEventListener('load', () => {
+            if (readerRouteActive) {
+                attachReaderContentObserver({ rediscover: true });
+            }
+        });
+    }
+
+    function attachReaderContentObserver({ rediscover = false } = {}) {
+        let content = null;
+        if (READER_TYPE === 'kavita') {
+            content = getReaderRoot();
+        } else {
+            const iframe = getReaderIframe();
+            watchReaderIframe(iframe);
+            try {
+                const idoc = iframe && (
+                    iframe.contentDocument || iframe.contentWindow.document
+                );
+                content = idoc && idoc.body;
+            } catch (e) { content = null; }
+        }
+        if (!content || content === lastContentIdentity) return false;
+
+        const replacesObservedContent = lastContentIdentity !== null;
+        lastContentIdentity = content;
+        if (readerObserver) readerObserver.disconnect();
+        readerObserver = new MutationObserver((mutations) => {
+            if (!readerRouteActive
+                    || !mutations.some(mutationContainsReaderContent)) return;
+            scheduleTranslate(
+                READER_TYPE === 'kavita'
+                    ? 'kavita_content_mutation' : 'iframe_mutation',
+                { forceRediscover: READER_TYPE === 'kavita' }
+            );
+        });
+        if (READER_TYPE === 'cwa') {
+            const idoc = content.ownerDocument;
+            ensureIframeStyles(idoc);
+            applyIframeTheme(idoc);
+            attachIframeShortcut(idoc);
+        }
+        readerObserver.observe(content, { childList: true, subtree: true });
+        if (rediscover && translationMode !== 'off') {
+            scheduleTranslate('new_reader_content', {
+                immediate: true,
+                // First attachment may race with work discovered by the main
+                // observer. Only a confirmed document replacement makes that
+                // work stale enough to abort and replay.
+                forceRediscover: replacesObservedContent
+            });
+        }
+        return true;
+    }
+
     function setupObservers() {
         if (!mainObserver) {
             mainObserver = new MutationObserver((mutations) => {
                 if (!readerRouteActive) return;
                 const relevant = mutations.some(mutationContainsReaderContent);
                 if (relevant) {
-                    scheduleTranslate('main_mutation', {
-                        forceRediscover: READER_TYPE === 'kavita'
-                    });
+                    // Reconcile the reader root before it can admit work. The
+                    // content observer handles mutations inside the current
+                    // root; this path handles a root/iframe replacement.
+                    attachReaderContentObserver({ rediscover: true });
                 }
             });
             mainObserver.observe(document.body, { childList: true, subtree: true });
         }
 
+        // The reader document normally exists by DOMContentLoaded. Attach now
+        // so the first polling tick cannot mistake it for a chapter change and
+        // abort already-admitted provider work. The poll remains as a fallback
+        // for readers that replace or create their content asynchronously.
+        attachReaderContentObserver();
+
         // Track CWA iframe documents and Kavita's stable .book-content host.
         setInterval(() => {
-            if (!syncReaderRoute() || translationMode === 'off') return;
-
-            let content = null;
-            if (READER_TYPE === 'kavita') {
-                content = getReaderRoot();
-            } else {
-                const iframe = getReaderIframe();
-                try {
-                    const idoc = iframe && (
-                        iframe.contentDocument || iframe.contentWindow.document
-                    );
-                    content = idoc && idoc.body;
-                } catch (e) { content = null; }
-            }
-            if (content && content !== lastContentIdentity) {
-                lastContentIdentity = content;
-                if (readerObserver) readerObserver.disconnect();
-                readerObserver = new MutationObserver((mutations) => {
-                    if (!readerRouteActive
-                            || !mutations.some(mutationContainsReaderContent)) return;
-                    scheduleTranslate(
-                        READER_TYPE === 'kavita'
-                            ? 'kavita_content_mutation' : 'iframe_mutation',
-                        { forceRediscover: READER_TYPE === 'kavita' }
-                    );
-                });
-                if (READER_TYPE === 'cwa') {
-                    const idoc = content.ownerDocument;
-                    ensureIframeStyles(idoc);
-                    applyIframeTheme(idoc);
-                    attachIframeShortcut(idoc);
-                }
-                readerObserver.observe(content, { childList: true, subtree: true });
-                scheduleTranslate('new_reader_content', {
-                    immediate: true,
-                    forceRediscover: true
-                });
-            }
+            if (!syncReaderRoute()) return;
+            attachReaderContentObserver({ rediscover: true });
+            if (translationMode === 'off') return;
 
             // Position-based page turn detector.
             // BUG (root cause of the status bar flicker): inserting a bilingual

@@ -40,7 +40,7 @@ APK_PACKAGES = {
     "libgomp": "15.2.0-r5",
     "libxml2": "2.13.9-r2",
     "nginx": "1.30.4-r1",
-    "pcre2": "10.47-r1",
+    "pcre2": "10.48-r0",
 }
 
 USES_LINE = re.compile(

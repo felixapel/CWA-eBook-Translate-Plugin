@@ -971,6 +971,7 @@ class PlanAndStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "state"
             root.mkdir(mode=0o755)
+            root.chmod(0o755)
             marker = root / "belongs-to-another-tool"
             marker.write_text("preserve", encoding="utf-8")
             store = StateStore(root)

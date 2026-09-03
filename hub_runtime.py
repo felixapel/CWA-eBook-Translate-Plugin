@@ -484,6 +484,8 @@ def process_specs(config: HubConfig) -> tuple[ProcessSpec, ...]:
                 "1",
                 "--threads",
                 "8",
+                "--worker-tmp-dir",
+                "/dev/shm",
                 "--timeout",
                 "120",
                 "server:app",
