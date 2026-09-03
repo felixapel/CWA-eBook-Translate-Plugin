@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0-rc.1] - 2026-09-03
+
+### Added
+
+- Added draggable floating translator interface with pointer and touch events,
+  viewport boundary clamping, quick-position controls, and persistent geometry
+  stored in `localStorage` under `bt_pos` ([ADR-018](docs/decisions/ADR-018-decoupled-reverse-proxy-and-draggable-controls.md)).
+- Added architectural support and guidance for master reverse proxy (SWAG)
+  decoupling using HTTP `sub_filter` injection, allowing stock readers (CWA, Kavita)
+  to stay online independently while the hub runs in pure API mode (`BT_ROLE=api`).
+- Configured Gunicorn worker heartbeat tmpdir to `/dev/shm` across standalone API
+  and supervised hub runtimes to eliminate spurious heartbeat timeouts during heavy inference.
+- Pinned updated Alpine 3.24 dependencies in base container images and exporter
+  bootstrap: `pcre2=10.48-r0`, `libcurl=8.22.0-r0`, and `libexpat=2.8.4-r0`.
+
 ### Changed
 
 - Added managed cloud-oriented batching: a configurable browser/group maximum,

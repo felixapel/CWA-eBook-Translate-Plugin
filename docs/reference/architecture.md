@@ -22,7 +22,15 @@ translation/cache/provider core. There are three deployment profiles:
    child exit stops the complete container. This simplifies deployment at the
    cost of one shared compromise and restart boundary. See
    [ADR-015](../decisions/ADR-015-universal-reader-hub.md).
-2. **Managed split profile (`btctl`, advanced isolation).** Two isolated non-root
+2. **Decoupled reverse proxy architecture (SWAG / master proxy).** The master
+   reverse proxy fronts stock reader instances (CWA, Kavita) directly on their
+   native ports and injects `<script src="/bt-static/loader.js"></script>` via
+   HTTP `sub_filter`. The translation hub operates in pure API mode
+   (`BT_ROLE=api`, `CWA_UPSTREAM=""`) serving `/bt-api/` and static assets under
+   `/bt-static/`. This fully isolates reader uptime from translator lifecycle
+   and eliminates redundant internal proxy worker overhead. See
+   [ADR-018](../decisions/ADR-018-decoupled-reverse-proxy-and-draggable-controls.md).
+3. **Managed split profile (`btctl`, advanced isolation).** Two isolated non-root
    containers run the same release image with `BT_ROLE=proxy` and
    `BT_ROLE=api`. nginx sits in front of a **stock** CWA or pinned Kavita
    instance (`BT_READER_UPSTREAM`). HTML responses get a
