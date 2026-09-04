@@ -155,6 +155,8 @@ class CacheStore:
         self._pending_hits_total = 0
         self._pending_lock = threading.Lock()
         self._flush_lock = threading.Lock()
+        self._writes_since_prune = 0
+        self._prune_lock = threading.Lock()
         self._init_lock = threading.Lock()
         self._initialized = False
         self._prepare_directory()
@@ -558,8 +560,20 @@ class CacheStore:
                        last_accessed_at = excluded.last_accessed_at""",
                 rows,
             )
-            self._delete_expired(conn)
-            self._enforce_cap(conn)
+            # Retention (expiry + cap ORDER BY/OFFSET scan) runs on a
+            # watermark, not on every write: the scan serializes the WAL
+            # writer and adds p95 on every fresh batch once near capacity.
+            # The watermark scales down for tiny test caps so cap behavior
+            # stays observable in unit tests.
+            with self._prune_lock:
+                self._writes_since_prune += len(rows)
+                threshold = min(1000, self.max_entries)
+                due = self._writes_since_prune >= threshold
+                if due:
+                    self._writes_since_prune = 0
+            if due:
+                self._delete_expired(conn)
+                self._enforce_cap(conn)
             conn.commit()
         except Exception:
             conn.rollback()

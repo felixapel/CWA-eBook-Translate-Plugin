@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject impossible batch/attempt configurations at startup: require
+  `ceil(BT_MAX_BATCH_PARAGRAPHS / BT_BATCH_SIZE) <= BT_REQUEST_MAX_ATTEMPTS`
+  so a max-size request can execute in the attempt budget.
+- Bound batch dispatch to a `max_concurrent` replenishment window instead of
+  submitting every group upfront, cutting parked-thread pressure on the
+  upstream semaphore under concurrent API requests.
+- Run cache retention (expiry + cap scan) on a write watermark instead of on
+  every `put_many`, reducing SQLite WAL writer serialization on fresh batches.
+- Harden `.env.hub.example` to token auth and a budget-consistent batch size.
+- Make the reader prefetch toggle honest (enable rediscovers, disable drops
+  queued background work), discard stale in-flight batch responses on
+  page/language/mode change, add a compact narrow-viewport bar layout, and
+  safeguard reader element extraction.
+
 ## [2.3.0] - 2026-09-03
 
 ### Added

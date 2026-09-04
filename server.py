@@ -35,6 +35,7 @@ from translator import (
     single_cache_contract, singleflight_stats, BatchRecoveryTracker,
     RECOVERY_METRIC_NAMES,
     estimate_source_tokens, provider_call_stats, BT_BATCH_SIZE,
+    BT_REQUEST_MAX_ATTEMPTS,
     _reset_provider_call_stats_for_tests,
     provider_policy,
     initialize_provider_configuration,
@@ -132,6 +133,14 @@ if not 1 <= BT_MAX_BATCH_PARAGRAPHS <= 1000:
 if BT_BATCH_SIZE > BT_MAX_BATCH_PARAGRAPHS:
     raise ValueError(
         "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS"
+    )
+# A max-size request must be executable within the attempt budget even
+# in the clean path with no retries.
+_min_attempts = -(-BT_MAX_BATCH_PARAGRAPHS // BT_BATCH_SIZE)
+if BT_REQUEST_MAX_ATTEMPTS < _min_attempts:
+    raise ValueError(
+        "BT_REQUEST_MAX_ATTEMPTS too small for BT_MAX_BATCH_PARAGRAPHS / "
+        f"BT_BATCH_SIZE: need at least {_min_attempts} attempts"
     )
 BT_MAX_PARAGRAPH_CHARS = int(os.environ.get("BT_MAX_PARAGRAPH_CHARS", "8000"))
 BT_CACHE_SCOPE_MAX_CHARS = int(os.environ.get("BT_CACHE_SCOPE_MAX_CHARS", "512"))

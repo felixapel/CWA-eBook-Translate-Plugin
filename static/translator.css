@@ -66,6 +66,8 @@
     transform: translateX(-50%);
     height: auto;
     max-height: 48px;
+    max-width: calc(100vw - 20px);
+    touch-action: none;
     z-index: 2147483000;
     display: flex;
     align-items: center;
@@ -314,3 +316,11 @@ button.bt-menu-item:focus-visible { outline: 2px solid var(--bt-bilingual); }
 #bt-toast.bt-toast-visible { opacity: 1; transform: translateX(-50%) translateY(0); }
 
 @media print { #bt-bar, #bt-toast { display: none !important; } }
+
+/* ── Compact layout for narrow viewports ──────────────────────────── */
+@media (max-width: 420px) {
+    #bt-bar { gap: 4px; padding: 5px 6px; font-size: 12px; }
+    #bt-status { width: 64px; }
+    #bt-toggle-label { max-width: 64px; overflow: hidden; text-overflow: ellipsis; }
+    #bt-lang { max-width: 96px; }
+}

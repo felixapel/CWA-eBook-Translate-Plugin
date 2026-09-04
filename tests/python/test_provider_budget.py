@@ -1323,6 +1323,31 @@ class DeploymentBudgetContractTests(unittest.TestCase):
             result.stderr,
         )
 
+    def test_api_startup_rejects_attempt_budget_below_worst_case(self):
+        env = os.environ.copy()
+        env.update({
+            "BT_AUTH_MODE": "disabled",
+            "BT_ALLOW_INSECURE_AUTH": "true",
+            "BT_BATCH_SIZE": "2",
+            "BT_MAX_BATCH_PARAGRAPHS": "50",
+            "BT_REQUEST_MAX_ATTEMPTS": "20",
+        })
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import server"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "BT_REQUEST_MAX_ATTEMPTS too small",
+            result.stderr,
+        )
+
     def test_recommended_compose_pins_safe_budget_defaults(self):
         compose = (ROOT / "docker-compose.yml").read_text()
         expected = {

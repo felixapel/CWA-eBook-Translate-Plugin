@@ -799,7 +799,12 @@
                     prefetchEnabled = !prefetchEnabled;
                     localStorage.setItem('bt_prefetch', prefetchEnabled ? '1' : '0');
                     buildMenu();
-                    if (prefetchEnabled && translationMode !== 'off') triggerPrefetch();
+                    if (!prefetchEnabled) {
+                        prefetchQueue = [];
+                        refreshStatus();
+                    } else if (translationMode !== 'off') {
+                        scheduleTranslate('prefetch_enabled', { immediate: true, forceRediscover: true });
+                    }
                 } else if (action === 'cloud-fallback') {
                     allowCloudFallback = !allowCloudFallback;
                     buildMenu();
@@ -1425,6 +1430,7 @@
                     return true;
                 });
                 prefetchQueue = prefetchQueue.filter(x => {
+                    if (!prefetchEnabled) return false;
                     if (x.gen !== generation || translatedParagraphs[x.hash] || seenHash.has(x.hash)) return false;
                     seenHash.add(x.hash);
                     return true;
@@ -1501,6 +1507,15 @@
                 }
 
                 inflightCount = 0;
+
+                // Stale-response guard: page/language/mode may have changed
+                // while the request was in flight. Never let an old batch
+                // pollute cache, counters, or DOM.
+                if ((batch.length ? batch[0].gen : generation) !== generation
+                        || translationMode === 'off' || !readerRouteActive) {
+                    refreshStatus();
+                    continue;
+                }
 
                 if (data && data.error === 'aborted') {
                     // Deliberate cancel (mode/language/page change) — the items
