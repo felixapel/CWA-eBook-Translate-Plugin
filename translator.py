@@ -24,7 +24,7 @@ import threading as _threading
 import time
 import logging
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from requests.adapters import HTTPAdapter
 from typing import Callable, Literal, Optional
@@ -2114,31 +2114,41 @@ def translate_batch_detailed(
         return idxs, translations
 
     executor = ThreadPoolExecutor(max_workers=max_concurrent)
-    futures = [executor.submit(_do_group, g) for g in groups]
+    pending = list(groups)
+    futures = {}
     try:
-        for future in as_completed(futures):
-            try:
-                idxs, translations = future.result()
-            except WorkBudgetExceeded as exc:
-                if exc.reason == "cancelled":
-                    with fatal_lock:
-                        protocol_error = fatal_protocol_error[0]
-                    if protocol_error is not None:
-                        raise protocol_error
-                raise
-            for j, idx in enumerate(idxs):
-                # Each entry carries the provider that ACTUALLY served it
-                # (the fallback provider when the primary failed).
-                results[idx] = (
-                    translations[j]
-                    if j < len(translations)
-                    else BatchTranslationItem(
-                        "[TRANSLATION ERROR: missing segment]",
-                        "",
-                        False,
-                        "failed",
+        # Bounded window: never hold more than max_concurrent futures at once.
+        # Previously every group was submitted upfront, so 8 concurrent API
+        # requests could park dozens of threads on the 2s upstream semaphore.
+        while pending or futures:
+            while pending and len(futures) < max_concurrent:
+                g = pending.pop(0)
+                futures[executor.submit(_do_group, g)] = g
+            done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                idxs = futures.pop(future)
+                try:
+                    idxs, translations = future.result()
+                except WorkBudgetExceeded as exc:
+                    if exc.reason == "cancelled":
+                        with fatal_lock:
+                            protocol_error = fatal_protocol_error[0]
+                        if protocol_error is not None:
+                            raise protocol_error
+                    raise
+                for j, idx in enumerate(idxs):
+                    # Each entry carries the provider that ACTUALLY served it
+                    # (the fallback provider when the primary failed).
+                    results[idx] = (
+                        translations[j]
+                        if j < len(translations)
+                        else BatchTranslationItem(
+                            "[TRANSLATION ERROR: missing segment]",
+                            "",
+                            False,
+                            "failed",
+                        )
                     )
-                )
     except (SegmentProtocolError, WorkBudgetExceeded):
         for future in futures:
             future.cancel()
