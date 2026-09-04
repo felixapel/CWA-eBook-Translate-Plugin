@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-09-04
+
+### Added
+- Instant Viewport Rush: first 1, 2, and 3 uncached visible paragraphs on every page are dispatched concurrently in parallel micro-requests directly to `/translate`.
+- Progressive per-paragraph rendering: each of the first 3 paragraphs appears in the DOM the moment its individual inference completes (~1.9s - 2.2s total for all 3 paragraphs).
+- Reader navigation keyboard shortcuts (`ArrowRight`, `ArrowLeft`, `PageDown`, `PageUp`, `Space`) with fast 80ms settle detection.
+- Cross-endpoint bidirectional cache interoperability: single-paragraph translations saved by `/translate` are immediately recognized as cache hits by `/translate/batch`, and vice versa.
+
+### Fixed
+- Unblocked page-turn detector during background prefetching: background prefetch no longer freezes page turn recognition, allowing instant cancellation of background work to prioritize the reader's new visible page immediately.
+
 ## [2.3.1] - 2026-09-04
 
 ### Added

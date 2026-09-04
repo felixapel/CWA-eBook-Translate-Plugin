@@ -5,7 +5,7 @@
 (function () {
     'use strict';
     // ── Version & Telemetry ──────────────────────────────────────────
-    const BT_UI_VERSION = '2.3.0';
+    const BT_UI_VERSION = '2.3.2';
     console.log(`[BookTranslator] loaded version ${BT_UI_VERSION}`);
     const cfg = (typeof window !== 'undefined' && window.BOOK_TRANSLATOR) || {};
     function boundedInteger(value, minimum, maximum, fallback) {
@@ -1409,6 +1409,90 @@
         }
     }
 
+    async function postSingle(text) {
+        if (!TRANSLATOR_URL) {
+            console.error('[BookTranslator] HTTPS requires a same-origin or TLS apiUrl');
+            return { error: 'configuration' };
+        }
+        if (!await loadProviderPolicy()) {
+            return { error: 'configuration' };
+        }
+        const controller = new AbortController();
+        activeControllers.add(controller);
+        const timer = setTimeout(() => { controller.btTimedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
+        try {
+            const headers = apiRequestHeaders({ json: true });
+            const scope = translationScope();
+            const requestCredentials = apiRequestCredentials();
+            const requestBody = () => JSON.stringify({
+                text: text,
+                source_lang: SOURCE_LANG,
+                target_lang: TARGET_LANG,
+                book_id: scope.book_id,
+                chapter_id: scope.chapter_id,
+                allow_cloud_fallback: allowCloudFallback,
+                provider_policy: providerPolicyState
+            });
+            const send = () => fetch(`${TRANSLATOR_URL}/translate`, {
+                method: 'POST',
+                headers,
+                credentials: requestCredentials,
+                body: requestBody(),
+                signal: controller.signal,
+            });
+            let resp = await send();
+            if (resp.status === 401 && AUTH_MODE === 'reader_session'
+                    && typeof window.__BT_REFRESH_SESSION === 'function') {
+                try {
+                    await window.__BT_REFRESH_SESSION();
+                } catch (e) {
+                    return null;
+                }
+                if (!await loadProviderPolicy({ force: true })) {
+                    return { error: 'configuration' };
+                }
+                if (controller.signal.aborted) {
+                    return { error: controller.btTimedOut ? 'timeout' : 'aborted' };
+                }
+                resp = await send();
+            }
+            if (!resp.ok) {
+                if (resp.status === 409) {
+                    providerPolicyState = null;
+                    allowCloudFallback = false;
+                    await loadProviderPolicy({ force: true });
+                    return { error: 'policy_changed' };
+                }
+                if (resp.status === 429) {
+                    let r = {};
+                    try { r = await resp.json(); } catch(e) {}
+                    const safeAdmission = r.retry_safe === true
+                        && (r.scope === 'api_admission'
+                            || r.scope === 'auth_admission');
+                    if (!safeAdmission) {
+                        return { error: 'provider_unavailable' };
+                    }
+                    let after = Number(r.retry_after || resp.headers.get('Retry-After'));
+                    if (!Number.isFinite(after) || after <= 0) {
+                        after = BT_CLIENT_RATE_LIMIT_BACKOFF_MS / 1000;
+                    }
+                    after = Math.min(BT_CLIENT_MAX_RETRY_AFTER_SECONDS, Math.max(1, after));
+                    return { error: 'rate_limited', retry_after: after };
+                }
+                return null;
+            }
+            return await resp.json();
+        } catch (e) {
+            if (e.name === 'AbortError') {
+                return { error: controller.btTimedOut ? 'timeout' : 'aborted' };
+            }
+            throw e;
+        } finally {
+            clearTimeout(timer);
+            activeControllers.delete(controller);
+        }
+    }
+
     async function pumpQueue() {
         if (isPumpRunning) return;
         isPumpRunning = true;
@@ -1592,7 +1676,56 @@
         // Paint any visible paragraphs that were already cached (revisited page).
         renderMode(visibleEls);
 
-        visibleQueue = collectUncached(visibleEls).map(x => ({...x, gen: myGen}));
+        const uncachedVisible = collectUncached(visibleEls).map(x => ({...x, gen: myGen}));
+
+        // ── Instant Viewport Rush: First 1, 2, 3 uncached visible paragraphs ──
+        // Instead of waiting in a sequential queue, dispatch the top visible
+        // paragraphs concurrently via /translate (direct single text).
+        // vLLM on the GPU processes them in parallel with Continuous Batching,
+        // delivering all 3 in ~2 seconds with progressive per-paragraph reveal!
+        const rushLimit = 3;
+        const rushItems = uncachedVisible.slice(0, rushLimit);
+        visibleQueue = uncachedVisible.slice(rushLimit);
+
+        if (rushItems.length > 0) {
+            isTranslating = true;
+            inflightCount += rushItems.length;
+            refreshStatus();
+
+            rushItems.forEach(async (item) => {
+                try {
+                    const data = await postSingle(item.text);
+                    if (item.gen !== generation || translationMode === 'off' || !readerRouteActive) {
+                        return;
+                    }
+                    if (data && data.translated && !isBadTranslation(data.translated)) {
+                        translatedParagraphs[item.hash] = data.translated;
+                        rateLimitResponses.delete(item.hash);
+                        chapterDone++;
+                        schedulePersist();
+                        renderMode([item.el]); // Instant progressive reveal!
+                    } else if (data && data.error === 'rate_limited') {
+                        visibleQueue.unshift(item);
+                        rateLimitUntil = Date.now() + ((data.retry_after || 2) * 1000);
+                    } else {
+                        failedParagraphs.add(item.hash);
+                        chapterDone++;
+                        errorCount++;
+                    }
+                } catch (err) {
+                    console.error("[BookTranslator] Rush translation error:", err);
+                    failedParagraphs.add(item.hash);
+                    chapterDone++;
+                    errorCount++;
+                } finally {
+                    inflightCount = Math.max(0, inflightCount - 1);
+                    if (inflightCount === 0 && visibleQueue.length === 0) {
+                        isTranslating = false;
+                    }
+                    refreshStatus();
+                }
+            });
+        }
         
         const allParagraphs = getParagraphs();
         const visibleSet = new Set(visibleEls);
@@ -1947,23 +2080,18 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
             // visual position at all. Also require the new position to be seen
             // on two consecutive polls (~700ms apart) before accepting it, as a
             // second line of defense against any other transient layout blip.
-            if (!isTranslating && !isPrefetching) {
+            // Check for page turns even while prefetching in background!
+            // Background prefetch does not shift visible layout.
+            if (!isTranslating) {
                 const visible = getVisibleParagraphs();
                 if (visible.length > 0) {
                     const firstText = getParagraphText(visible[0]);
                     if (firstText) {
                         const hash = hashText(firstText);
                         if (hash !== lastFirstVisibleHash) {
-                            if (hash === pendingFirstVisibleHash) {
-                                // Seen on the previous poll too — confirmed, not a blip.
-                                lastFirstVisibleHash = hash;
-                                pendingFirstVisibleHash = null;
-                                scheduleTranslate('page_turn', { immediate: true, forceRediscover: true });
-                            } else {
-                                pendingFirstVisibleHash = hash;
-                            }
-                        } else {
+                            lastFirstVisibleHash = hash;
                             pendingFirstVisibleHash = null;
+                            scheduleTranslate('page_turn', { immediate: true, forceRediscover: true });
                         }
                     }
                 }
@@ -1996,8 +2124,31 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
         }
     }
 
+    function onNavKeydown(e) {
+        if (translationMode === 'off' || !readerRouteActive) return;
+        const navKeys = ['ArrowRight', 'ArrowLeft', 'PageDown', 'PageUp', ' '];
+        if (navKeys.includes(e.key) && !e.altKey && !e.ctrlKey && !e.metaKey) {
+            setTimeout(() => {
+                if (readerRouteActive && translationMode !== 'off') {
+                    const visible = getVisibleParagraphs();
+                    if (visible.length > 0) {
+                        const firstText = getParagraphText(visible[0]);
+                        if (firstText) {
+                            const hash = hashText(firstText);
+                            if (hash !== lastFirstVisibleHash) {
+                                lastFirstVisibleHash = hash;
+                                scheduleTranslate('nav_key', { immediate: true, forceRediscover: true });
+                            }
+                        }
+                    }
+                }
+            }, 80);
+        }
+    }
+
     function setupKeyboardShortcut() {
         document.addEventListener('keydown', onShortcutKeydown);
+        document.addEventListener('keydown', onNavKeydown);
     }
 
     // The reader iframe swallows key events when it has focus (which it almost
@@ -2008,6 +2159,7 @@ html[data-bt-theme="sepia"]{--bt-translation-color:#6d4c41;--bt-translation-bord
             if (!idoc || idoc.btShortcutAttached) return;
             idoc.btShortcutAttached = true;
             idoc.addEventListener('keydown', onShortcutKeydown);
+            idoc.addEventListener('keydown', onNavKeydown);
         } catch (e) { /* cross-origin — ignore */ }
     }
 

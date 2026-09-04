@@ -87,24 +87,29 @@ def _cache_lookup(
     chapter_id: str = "unscoped",
     allow_cloud_fallback: bool = False,
 ) -> str | None:
-    """Probe exact single-translation contracts in provider failover order."""
-    contract = single_cache_contract(source_lang, target_lang)
+    """Probe exact single-translation and 1-item batch contracts in provider failover order."""
+    contracts = [single_cache_contract(source_lang, target_lang)]
+    try:
+        contracts.append(batch_cache_contract([text], [0], source_lang, target_lang))
+    except Exception:
+        pass
     for provider, model in cache_lookup_backends(
         allow_cloud_fallback=allow_cloud_fallback
     ):
-        scope = _cache_scope(
-            tenant=tenant,
-            book_id=book_id,
-            chapter_id=chapter_id,
-            context_hash=contract.context_hash,
-            provider=provider,
-            model=model,
-            prompt_hash=contract.prompt_hash,
-            protocol_version=contract.protocol_version,
-        )
-        hit = get_cached(text, source_lang, target_lang, scope=scope)
-        if hit is not None:
-            return hit
+        for contract in contracts:
+            scope = _cache_scope(
+                tenant=tenant,
+                book_id=book_id,
+                chapter_id=chapter_id,
+                context_hash=contract.context_hash,
+                provider=provider,
+                model=model,
+                prompt_hash=contract.prompt_hash,
+                protocol_version=contract.protocol_version,
+            )
+            hit = get_cached(text, source_lang, target_lang, scope=scope)
+            if hit is not None:
+                return hit
     return None
 
 # Single version source: the VERSION file (also stamped into cache-bust query
@@ -985,6 +990,34 @@ def _translate_paragraphs(
                 break
 
         if accepted is None:
+            single_c = single_cache_contract(source_lang, target_lang)
+            for provider, model in cache_lookup_backends(
+                allow_cloud_fallback=allow_cloud_fallback
+            ):
+                candidate_single = []
+                for idx in group:
+                    scope = _cache_scope(
+                        tenant=tenant,
+                        book_id=book_id,
+                        chapter_id=chapter_id,
+                        context_hash=single_c.context_hash,
+                        provider=provider,
+                        model=model,
+                        prompt_hash=single_c.prompt_hash,
+                        protocol_version=single_c.protocol_version,
+                    )
+                    hit = get_cached(
+                        paragraphs[idx], source_lang, target_lang, scope=scope, record_hit=False
+                    )
+                    if hit is None:
+                        candidate_single = []
+                        break
+                    candidate_single.append((idx, hit, scope))
+                if candidate_single:
+                    accepted = candidate_single
+                    break
+
+        if accepted is None:
             missing_groups.append(group)
             continue
 
@@ -1622,6 +1655,27 @@ def translate():
             translated,
             scope=scope,
         )
+        try:
+            batch_c = batch_cache_contract([text], [0], source_lang, target_lang)
+            batch_scope = _cache_scope(
+                tenant=tenant,
+                book_id=book_id,
+                chapter_id=chapter_id,
+                context_hash=batch_c.context_hash,
+                provider=backend,
+                model=model_for_provider(backend),
+                prompt_hash=batch_c.prompt_hash,
+                protocol_version=batch_c.protocol_version,
+            )
+            put_cache(
+                text,
+                source_lang,
+                target_lang,
+                translated,
+                scope=batch_scope,
+            )
+        except Exception:
+            pass
     except Exception as e:
         log.error("Cache write failed (non-fatal) error_type=%s", type(e).__name__)
 
