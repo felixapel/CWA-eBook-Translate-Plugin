@@ -546,35 +546,27 @@
         }
     }
 
-    let activeDragPointerId = null;
-
     function setupBarDragEvents(bar) {
         function onPointerDown(e) {
             if (e.target.closest('#bt-lang, #bt-gear, select')) return;
-            if (e.pointerId !== undefined) {
-                if (activeDragPointerId !== null) return;
-                activeDragPointerId = e.pointerId;
-                try { bar.setPointerCapture(e.pointerId); } catch (err) {}
-            }
             isDraggingBar = true;
             hasMovedDuringDrag = false;
-            dragStartX = e.clientX || 0;
-            dragStartY = e.clientY || 0;
+            dragStartX = e.clientX || (e.touches && e.touches[0].clientX) || 0;
+            dragStartY = e.clientY || (e.touches && e.touches[0].clientY) || 0;
             const rect = bar.getBoundingClientRect();
             barStartX = rect.left;
             barStartY = rect.top;
 
             document.addEventListener('pointermove', onPointerMove, { passive: false });
+            document.addEventListener('touchmove', onPointerMove, { passive: false });
             document.addEventListener('pointerup', onPointerUp);
-            document.addEventListener('pointercancel', onPointerUp);
+            document.addEventListener('touchend', onPointerUp);
         }
 
         function onPointerMove(e) {
             if (!isDraggingBar) return;
-            if (e.pointerId !== undefined && activeDragPointerId !== null
-                    && e.pointerId !== activeDragPointerId) return;
-            const cx = e.clientX || 0;
-            const cy = e.clientY || 0;
+            const cx = e.clientX || (e.touches && e.touches[0].clientX) || 0;
+            const cy = e.clientY || (e.touches && e.touches[0].clientY) || 0;
             const dx = cx - dragStartX;
             const dy = cy - dragStartY;
 
@@ -596,14 +588,11 @@
 
         function onPointerUp(e) {
             if (!isDraggingBar) return;
-            if (e && e.pointerId !== undefined && activeDragPointerId !== null
-                    && e.pointerId !== activeDragPointerId
-                    && e.type !== 'pointercancel') return;
             isDraggingBar = false;
-            activeDragPointerId = null;
             document.removeEventListener('pointermove', onPointerMove);
+            document.removeEventListener('touchmove', onPointerMove);
             document.removeEventListener('pointerup', onPointerUp);
-            document.removeEventListener('pointercancel', onPointerUp);
+            document.removeEventListener('touchend', onPointerUp);
 
             if (hasMovedDuringDrag) {
                 const rect = bar.getBoundingClientRect();
@@ -613,6 +602,7 @@
         }
 
         bar.addEventListener('pointerdown', onPointerDown);
+        bar.addEventListener('touchstart', onPointerDown, { passive: true });
         window.addEventListener('resize', applyBarPosition);
     }
 
@@ -810,11 +800,9 @@
                     localStorage.setItem('bt_prefetch', prefetchEnabled ? '1' : '0');
                     buildMenu();
                     if (!prefetchEnabled) {
-                        // Honest off: drop not-yet-admitted background work.
                         prefetchQueue = [];
                         refreshStatus();
                     } else if (translationMode !== 'off') {
-                        // Honest on: rediscover remaining chapter work now.
                         scheduleTranslate('prefetch_enabled', { immediate: true, forceRediscover: true });
                     }
                 } else if (action === 'cloud-fallback') {
@@ -989,26 +977,10 @@
         return document.querySelector('#viewer iframe, .epub-container iframe, iframe');
     }
 
-    // Tri-state reader access: 'ok' | 'loading' | 'blocked' (cross-origin).
-    function readerAccess() {
-        if (READER_TYPE === 'kavita') {
-            return document.querySelector('.book-content') ? 'ok' : 'loading';
-        }
-        const iframe = getReaderIframe();
-        if (!iframe) return 'loading';
-        try {
-            const doc = iframe.contentDocument || iframe.contentWindow.document;
-            // Accessing a cross-origin document throws on property access.
-            void (doc && doc.readyState);
-            return doc ? 'ok' : 'loading';
-        } catch (e) { return 'blocked'; }
-    }
-
     function getReaderDoc() {
         if (READER_TYPE === 'kavita') {
             return document.querySelector('.book-content') ? document : null;
         }
-        if (readerAccess() !== 'ok') return null;
         const iframe = getReaderIframe();
         if (iframe) {
             try { return iframe.contentDocument || iframe.contentWindow.document; } catch (e) { return null; }
@@ -1020,9 +992,7 @@
         if (READER_TYPE === 'kavita') {
             return document.querySelector('.book-content');
         }
-        // Never fall back to the parent document: it would scan unrelated
-        // page chrome and mistranslate navigation text.
-        return getReaderDoc();
+        return getReaderDoc() || document;
     }
 
     const HEADING_CLASS_RE = /title|subtitle|chapter|heading|epigraph/i;
@@ -1609,12 +1579,6 @@
 
     async function translateCurrentPage() {
         if (translationMode === 'off' || !readerRouteActive) return;
-        if (typeof readerAccess === 'function' && readerAccess() === 'blocked') {
-            const blockedBar = document.getElementById('bt-bar');
-            if (blockedBar) blockedBar.dataset.state = 'error';
-            showToast('Reader content not accessible (cross-origin)');
-            return;
-        }
         
         const myGen = generation;
         const idoc = getReaderDoc();

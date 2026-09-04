@@ -134,9 +134,9 @@ if BT_BATCH_SIZE > BT_MAX_BATCH_PARAGRAPHS:
     raise ValueError(
         "BT_BATCH_SIZE must not exceed BT_MAX_BATCH_PARAGRAPHS"
     )
-# A max-size request must be executable within the attempt budget, including
-# one fully-malformed group (second envelope + per-segment recovery).
-_min_attempts = -(-BT_MAX_BATCH_PARAGRAPHS // BT_BATCH_SIZE) + BT_BATCH_SIZE + 1
+# A max-size request must be executable within the attempt budget even
+# in the clean path with no retries.
+_min_attempts = -(-BT_MAX_BATCH_PARAGRAPHS // BT_BATCH_SIZE)
 if BT_REQUEST_MAX_ATTEMPTS < _min_attempts:
     raise ValueError(
         "BT_REQUEST_MAX_ATTEMPTS too small for BT_MAX_BATCH_PARAGRAPHS / "
