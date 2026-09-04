@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-09-04
+
+### Added
+- Zero-wait directional lookahead prefetch enabled by default, translating upcoming pages ahead of the reader for an instantaneous 0ms page-turn experience.
+- Directional paragraph queue sorting: visible viewport first, forward paragraphs next, backward paragraphs last.
+- Instant Time-To-First-Paragraph (TTFT) initial micro-chunking.
+
+### Performance
+- High-throughput SQLite WAL PRAGMAs: 256MB mmap, 64MB RAM page cache, and in-memory temp tables for sub-millisecond cache lookups.
+
 ### Fixed
 
 - Reject impossible batch/attempt configurations at startup: require

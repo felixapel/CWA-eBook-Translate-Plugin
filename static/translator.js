@@ -96,7 +96,7 @@
     let readerRouteActive = false;
 
     // UI / status state
-    let prefetchEnabled = localStorage.getItem('bt_prefetch') === '1'; // explicit whole-chapter opt-in
+    let prefetchEnabled = localStorage.getItem('bt_prefetch') !== '0'; // default ON for zero-wait reading
     // Privacy decision scoped to this reader tab/book. Never restore it from
     // browser storage: every new book session starts with remote fallback off.
     let allowCloudFallback = false;
@@ -255,7 +255,7 @@
             retrying: 'Retrying…',
             restoring: 'Restoring saved translations…',
             cycleHint: 'Click to cycle: Original → Bilingual → Translated', langHint: 'Target language', sourceLangHint: 'Source language', topLanguages: 'Most spoken', allLanguages: 'All languages (A–Z)', settings: 'Settings',
-            prefetchWhole: 'Pre-translate whole chapter', clearLang: 'Clear this language\'s cache', clearAll: 'Clear all cache',
+            prefetchWhole: 'Smooth reading (lookahead prefetch)', clearLang: 'Clear this language\'s cache', clearAll: 'Clear all cache',
             cached: 'Cached', cleared: 'Cache cleared',
             bookTranslator: 'Book Translator', modeLabel: 'Mode', sourceLabel: 'Source', targetLabel: 'Target', langLabel: 'Language',
             retryPage: 'Retry current page', debug: 'Debug',
@@ -273,7 +273,7 @@
             rateLimited: 'Esperando {n}s…',
             retrying: 'Reintentando…',
             cycleHint: 'Clic para cambiar: Original → Bilingüe → Traducido', langHint: 'Idioma destino', sourceLangHint: 'Idioma fuente', topLanguages: 'Más hablados', allLanguages: 'Todos los idiomas (A–Z)', settings: 'Ajustes',
-            prefetchWhole: 'Pre-traducir capítulo completo', clearLang: 'Borrar caché de este idioma', clearAll: 'Borrar toda la caché',
+            prefetchWhole: 'Lectura fluida (precarga anticipada)', clearLang: 'Borrar caché de este idioma', clearAll: 'Borrar toda la caché',
             cached: 'En caché', cleared: 'Caché borrada',
             bookTranslator: 'Book Translator', modeLabel: 'Modo', sourceLabel: 'Fuente', targetLabel: 'Destino', langLabel: 'Idioma',
             retryPage: 'Reintentar página actual', debug: 'Depuración',
@@ -1594,8 +1594,30 @@
 
         visibleQueue = collectUncached(visibleEls).map(x => ({...x, gen: myGen}));
         
+        const allParagraphs = getParagraphs();
         const visibleSet = new Set(visibleEls);
-        const prefetchEls = prefetchEnabled ? getParagraphs().filter(el => !visibleSet.has(el)) : [];
+
+        // Directional Lookahead: find the boundary of visible elements in the full chapter
+        let lastVisibleIdx = -1;
+        for (let i = allParagraphs.length - 1; i >= 0; i--) {
+            if (visibleSet.has(allParagraphs[i])) {
+                lastVisibleIdx = i;
+                break;
+            }
+        }
+
+        // Priority 1: Forward paragraphs (the next pages ahead in reading order)
+        const forwardEls = (lastVisibleIdx >= 0)
+            ? allParagraphs.slice(lastVisibleIdx + 1).filter(el => !visibleSet.has(el))
+            : allParagraphs.filter(el => !visibleSet.has(el));
+
+        // Priority 2: Backward paragraphs (prior pages in chapter, lower priority)
+        const backwardEls = (lastVisibleIdx >= 0)
+            ? allParagraphs.slice(0, lastVisibleIdx).filter(el => !visibleSet.has(el))
+            : [];
+
+        // Combined prefetch queue in strict reading direction: forward first, backward last!
+        const prefetchEls = prefetchEnabled ? [...forwardEls, ...backwardEls] : [];
         prefetchQueue = collectUncached(prefetchEls).map(x => ({...x, gen: myGen}));
         // No snapshot total here: refreshStatus derives done/total live from
         // chapterDone + inflight + queues (see chapterProgress), so re-triggers
