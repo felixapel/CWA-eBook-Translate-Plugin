@@ -1,6 +1,6 @@
-# eBook Translate for CWA and Kavita
+# Book Translator Hub
 
-eBook Translate adds bilingual, paragraph-level LLM translation to stock
+Book Translator Hub adds universal, low-latency bilingual, paragraph-level LLM translation to stock
 [Calibre-Web-Automated](https://github.com/crocodilestick/Calibre-Web-Automated)
 and the pinned [Kavita](https://github.com/Kareadita/Kavita) EPUB reader without
 modifying either image.
@@ -30,8 +30,8 @@ one hardened container while keeping separate internal API processes, caches,
 keys and cookies:
 
 ```bash
-git clone https://github.com/felixapel/CWA-eBook-Translate-Plugin.git cwa-translate
-cd cwa-translate
+git clone https://github.com/felixapel/book-translator-hub.git book-translator-hub
+cd book-translator-hub
 git switch --detach v2.3.0
 ```
 
