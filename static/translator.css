@@ -324,3 +324,15 @@ button.bt-menu-item:focus-visible { outline: 2px solid var(--bt-bilingual); }
     #bt-toggle-label { max-width: 64px; overflow: hidden; text-overflow: ellipsis; }
     #bt-lang { max-width: 96px; }
 }
+
+
+/* ── Real-Time Streaming Indicator ───────────────────────────── */
+.bt-streaming-live {
+    border-left: 2px solid #3b82f6;
+    padding-left: 4px;
+    animation: btPulseStream 1s infinite alternate;
+}
+@keyframes btPulseStream {
+    from { opacity: 0.85; }
+    to { opacity: 1; }
+}

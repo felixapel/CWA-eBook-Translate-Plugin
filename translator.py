@@ -1652,6 +1652,121 @@ def translate_text(
     return translated, provider
 
 
+def _call_provider_stream(
+    p: _Provider,
+    user_content: str,
+    system_prompt: str,
+    timeout: float,
+    max_tokens: int,
+    budget: WorkBudget,
+):
+    """Call provider with SSE streaming if supported, yielding token strings."""
+    if p.api_type == "openai":
+        headers = {"Content-Type": "application/json"}
+        if p.api_key:
+            headers["Authorization"] = f"Bearer {p.api_key}"
+        payload = {
+            "model": p.model,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        if p.name != "gemini":
+            payload["temperature"] = 0.3
+
+        resp = _provider_post(
+            p.url,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+            stream=True,
+            budget=budget,
+        )
+        for line in resp.iter_lines():
+            budget.ensure_active()
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="replace")
+            if line_str.startswith("data: "):
+                chunk_data = line_str[6:].strip()
+                if chunk_data == "[DONE]":
+                    break
+                try:
+                    data = json.loads(chunk_data)
+                    delta = (
+                        data.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("content", "")
+                    )
+                    if delta:
+                        yield delta
+                except Exception:
+                    continue
+    else:
+        res = _call_provider(p, user_content, system_prompt, 1, timeout, max_tokens, budget)
+        yield res
+
+
+def translate_text_stream(
+    text: str,
+    source_lang: str = "English",
+    target_lang: str = "Spanish",
+    timeout: Optional[int] = None,
+    budget: Optional[WorkBudget] = None,
+    *,
+    allow_cloud_fallback: bool = False,
+):
+    """
+    Translate a single text, yielding deltas as they are generated.
+    Yields (delta_text, provider_name).
+    """
+    resolved_timeout = BT_TIMEOUT if timeout is None else timeout
+    if budget is None:
+        budget = create_work_budget()
+    budget.ensure_active()
+    system = SYSTEM_PROMPT.format(source_lang=source_lang, target_lang=target_lang)
+    max_tokens = _output_cap(text, BT_MAX_TOKENS)
+
+    providers = _eligible_providers(allow_cloud_fallback=allow_cloud_fallback)
+
+    for p in providers:
+        attempt_recorded = False
+        try:
+            _acquire_upstream_slot(budget)
+            try:
+                budget.reserve_attempt(text + system, max_tokens)
+                _record_provider_call("attempt")
+                attempt_recorded = True
+
+                yielded_any = False
+                for delta in _call_provider_stream(p, text, system, resolved_timeout, max_tokens, budget):
+                    yielded_any = True
+                    yield delta, p.cache_namespace
+                if yielded_any:
+                    _record_provider_call("success")
+                    return
+            finally:
+                _UPSTREAM_SEM.release()
+        except WorkBudgetExceeded:
+            if attempt_recorded:
+                _record_provider_call("failure")
+            raise
+        except Exception as e:
+            if attempt_recorded:
+                _record_provider_call("failure")
+            log.warning(
+                "provider=%s stream failed error_type=%s, trying fallback",
+                p.name, type(e).__name__,
+            )
+            continue
+
+    raise ProviderUnavailableError("All providers exhausted for stream")
+
+
+
 # ── Batched translation ──────────────────────────────────────────────────────
 
 def _reject_duplicate_json_keys(pairs):

@@ -32,7 +32,7 @@ keys and cookies:
 ```bash
 git clone https://github.com/felixapel/book-translator-hub.git book-translator-hub
 cd book-translator-hub
-git switch --detach v2.3.2
+git switch --detach v2.4.0
 ```
 
 Copy the managed configuration outside the checkout and make it private:

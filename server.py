@@ -3,6 +3,7 @@ book-translator — Flask microservice for ebook paragraph translation.
 Runs on port 8390. Frontend (CWA overlay) calls this service.
 """
 import logging
+import json
 import copy
 import hashlib
 import math
@@ -17,7 +18,7 @@ import socket
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlsplit
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
 
 from auth import (
@@ -27,7 +28,7 @@ from auth import (
     RequestAuthenticator,
 )
 from translator import (
-    translate_text, translate_batch_detailed as translate_batch,
+    translate_text, translate_text_stream, translate_batch_detailed as translate_batch,
     check_backend_health,
     BT_UPSTREAM_QUEUE_TIMEOUT, SegmentProtocolError,
     ProviderUnavailableError, create_work_budget, model_for_provider,
@@ -1686,6 +1687,171 @@ def translate():
         "backend": backend,
         "request_id": req_id,
     })
+
+
+
+@app.route("/translate/stream", methods=["POST"])
+def translate_stream():
+    """
+    Translate a single paragraph with Server-Sent Events (SSE) token streaming.
+
+    POST body: {
+        "text": "Hello world",
+        "source_lang": "English",
+        "target_lang": "Spanish",
+        "allow_cloud_fallback": false
+    }
+
+    Yields SSE events:
+      data: {"delta": "Hola", "cached": false}
+      ...
+      event: done
+      data: {"translated": "Hola mundo", "cached": false, "backend": "local", "elapsed_ms": 120}
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    if "text" not in data or not isinstance(data["text"], str):
+        return jsonify({"error": "Missing or invalid 'text' field"}), 400
+
+    text = data["text"].strip()
+    if _has_invalid_unicode(text):
+        return jsonify({"error": "'text' contains invalid Unicode"}), 400
+    if len(text) > BT_MAX_PARAGRAPH_CHARS:
+        return jsonify({
+            "error": f"'text' exceeds the {BT_MAX_PARAGRAPH_CHARS}-character limit"
+        }), 413
+
+    source_lang = data.get("source_lang", "English")
+    target_lang = data.get("target_lang", "Spanish")
+
+    lang_error = _validate_languages(source_lang, target_lang)
+    if lang_error:
+        return jsonify({"error": lang_error}), 400
+
+    try:
+        allow_cloud_fallback = _cloud_fallback_consent(data)
+        stale_provider_policy = _stale_provider_policy(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if stale_provider_policy:
+        return jsonify({
+            "error": "provider_policy_changed",
+            "request_id": getattr(request, "request_id", None),
+        }), 409
+
+    try:
+        tenant, book_id, chapter_id = _request_cache_namespace(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    req_id = getattr(request, "request_id", None)
+
+    if not text:
+        def empty_gen():
+            yield f"data: {json.dumps({'delta': '', 'cached': False})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'translated': '', 'cached': False, 'elapsed_ms': 0, 'request_id': req_id})}\n\n"
+        return Response(empty_gen(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    if source_lang == target_lang:
+        def echo_gen():
+            yield f"data: {json.dumps({'delta': text, 'cached': False})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'translated': text, 'cached': False, 'skipped': 'source==target', 'elapsed_ms': 0, 'request_id': req_id})}\n\n"
+        return Response(echo_gen(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    cached = _cache_lookup(
+        text,
+        source_lang,
+        target_lang,
+        tenant=tenant,
+        book_id=book_id,
+        chapter_id=chapter_id,
+        allow_cloud_fallback=allow_cloud_fallback,
+    )
+    if cached is not None:
+        _record_metric(0, hits=1, misses=0)
+        def cached_gen():
+            yield f"data: {json.dumps({'delta': cached, 'cached': True})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'translated': cached, 'cached': True, 'elapsed_ms': 0, 'request_id': req_id})}\n\n"
+        return Response(cached_gen(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    budget = create_work_budget()
+    start = time.monotonic()
+
+    def stream_gen():
+        full_text = []
+        backend_used = "local"
+        try:
+            for delta, backend in translate_text_stream(
+                text,
+                source_lang,
+                target_lang,
+                budget=budget,
+                allow_cloud_fallback=allow_cloud_fallback,
+            ):
+                full_text.append(delta)
+                backend_used = backend
+                yield f"data: {json.dumps({'delta': delta, 'cached': False})}\n\n"
+
+            complete_translation = "".join(full_text)
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            _record_metric(elapsed_ms, hits=0, misses=1)
+
+            try:
+                contract = single_cache_contract(source_lang, target_lang)
+                scope = _cache_scope(
+                    tenant=tenant,
+                    book_id=book_id,
+                    chapter_id=chapter_id,
+                    context_hash=contract.context_hash,
+                    provider=backend_used,
+                    model=model_for_provider(backend_used),
+                    prompt_hash=contract.prompt_hash,
+                    protocol_version=contract.protocol_version,
+                )
+                put_cache(
+                    text,
+                    source_lang,
+                    target_lang,
+                    complete_translation,
+                    scope=scope,
+                )
+                try:
+                    batch_c = batch_cache_contract([text], [0], source_lang, target_lang)
+                    batch_scope = _cache_scope(
+                        tenant=tenant,
+                        book_id=book_id,
+                        chapter_id=chapter_id,
+                        context_hash=batch_c.context_hash,
+                        provider=backend_used,
+                        model=model_for_provider(backend_used),
+                        prompt_hash=batch_c.prompt_hash,
+                        protocol_version=batch_c.protocol_version,
+                    )
+                    put_cache(
+                        text,
+                        source_lang,
+                        target_lang,
+                        complete_translation,
+                        scope=batch_scope,
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                log.error("Failed to cache streamed translation: %s", e)
+
+            yield f"event: done\ndata: {json.dumps({'translated': complete_translation, 'cached': False, 'backend': backend_used, 'elapsed_ms': elapsed_ms, 'request_id': req_id})}\n\n"
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            _record_metric(elapsed_ms, hits=0, misses=1, error=True)
+            log.error("Stream generation failed error_type=%s", type(exc).__name__)
+            yield f"event: error\ndata: {json.dumps({'error': 'translation_failed', 'request_id': req_id})}\n\n"
+
+    return Response(
+        stream_with_context(stream_gen()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
 
 
 @app.route("/translate/batch", methods=["POST"])

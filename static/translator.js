@@ -177,7 +177,56 @@
         }
     }
 
-    let translatedParagraphs = loadCacheForLang(TARGET_LANG); // hash -> text (restored from last session)
+
+    // ── High-Capacity IndexedDB Cache ──────────────────────────────────
+    const IDB_NAME = 'BookTranslatorDB';
+    const IDB_STORE = 'translations_v1';
+    let idbPromise = null;
+
+    function getIDB() {
+        if (!idbPromise && window.indexedDB) {
+            idbPromise = new Promise((resolve) => {
+                try {
+                    const req = window.indexedDB.open(IDB_NAME, 1);
+                    req.onupgradeneeded = (e) => {
+                        const db = e.target.result;
+                        if (!db.objectStoreNames.contains(IDB_STORE)) {
+                            db.createObjectStore(IDB_STORE, { keyPath: 'key' });
+                        }
+                    };
+                    req.onsuccess = (e) => resolve(e.target.result);
+                    req.onerror = () => resolve(null);
+                } catch (e) {
+                    resolve(null);
+                }
+            });
+        }
+        return idbPromise;
+    }
+
+    async function loadCacheAsync(lang) {
+        if (!PERSIST_CACHE) return;
+        try {
+            const db = await getIDB();
+            if (!db) return;
+            const tx = db.transaction(IDB_STORE, 'readonly');
+            const store = tx.objectStore(IDB_STORE);
+            const req = store.getAll();
+            req.onsuccess = () => {
+                if (req.result && Array.isArray(req.result)) {
+                    for (let i = 0; i < req.result.length; i++) {
+                        const item = req.result[i];
+                        if (item && item.key && item.text) {
+                            translatedParagraphs[item.key] = item.text;
+                        }
+                    }
+                }
+            };
+        } catch (e) {}
+    }
+
+    let translatedParagraphs = loadCacheForLang(TARGET_LANG);
+    loadCacheAsync(TARGET_LANG); // hash -> text (restored from last session)
 
     // ── In-flight request control (responsive buttons + language switches) ──
     // `generation` is bumped whenever the user changes mode/language so that
@@ -1409,6 +1458,108 @@
         }
     }
 
+
+    function renderStreamingProgress(el, partialText) {
+        if (!el || !partialText) return;
+        if (translationMode === 'bilingual') {
+            let transEl = el.querySelector(':scope > .bt-translation');
+            if (!transEl) {
+                const heading = isHeading(el);
+                transEl = el.ownerDocument.createElement(heading ? 'div' : 'span');
+                transEl.className = 'bt-translation bt-streaming-live ' + (heading ? 'bt-heading-translation' : 'bt-translation-bilingual');
+                if (heading && isCentered(el)) transEl.className += ' bt-center';
+                el.appendChild(transEl);
+            }
+            transEl.textContent = partialText;
+        } else if (translationMode === 'translated') {
+            if (!el.dataset.btOriginal) {
+                el.dataset.btOriginal = el.innerHTML;
+            }
+            el.textContent = partialText;
+        }
+    }
+
+    async function postStream(text, onChunk) {
+        if (!TRANSLATOR_URL || !window.ReadableStream) {
+            return postSingle(text);
+        }
+        if (!await loadProviderPolicy()) {
+            return { error: 'configuration' };
+        }
+        const controller = new AbortController();
+        activeControllers.add(controller);
+        const timer = setTimeout(() => { controller.btTimedOut = true; controller.abort(); }, REQUEST_TIMEOUT_MS);
+        try {
+            const headers = apiRequestHeaders({ json: true });
+            const scope = translationScope();
+            const requestCredentials = apiRequestCredentials();
+            const requestBody = () => JSON.stringify({
+                text: text,
+                source_lang: SOURCE_LANG,
+                target_lang: TARGET_LANG,
+                book_id: scope.book_id,
+                chapter_id: scope.chapter_id,
+                allow_cloud_fallback: allowCloudFallback,
+                provider_policy: providerPolicyState
+            });
+            const resp = await fetch(`${TRANSLATOR_URL}/translate/stream`, {
+                method: 'POST',
+                headers,
+                credentials: requestCredentials,
+                body: requestBody(),
+                signal: controller.signal,
+            });
+            if (!resp.ok) {
+                return postSingle(text);
+            }
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let completeText = '';
+            let backend = 'local';
+            let cached = false;
+            let elapsed_ms = 0;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i].trim();
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+                            if (data.delta) {
+                                completeText += data.delta;
+                                if (typeof onChunk === 'function') onChunk(completeText);
+                            }
+                            if (data.translated) completeText = data.translated;
+                            if (data.backend) backend = data.backend;
+                            if (data.cached !== undefined) cached = data.cached;
+                            if (data.elapsed_ms) elapsed_ms = data.elapsed_ms;
+                        } catch (err) {}
+                    }
+                }
+            }
+            return {
+                translated: completeText,
+                backend: backend,
+                cached: cached,
+                elapsed_ms: elapsed_ms
+            };
+        } catch (e) {
+            if (e.name === 'AbortError') {
+                return { error: controller.btTimedOut ? 'timeout' : 'aborted' };
+            }
+            return postSingle(text);
+        } finally {
+            clearTimeout(timer);
+            activeControllers.delete(controller);
+        }
+    }
+
     async function postSingle(text) {
         if (!TRANSLATOR_URL) {
             console.error('[BookTranslator] HTTPS requires a same-origin or TLS apiUrl');
@@ -1692,9 +1843,18 @@
             inflightCount += rushItems.length;
             refreshStatus();
 
-            rushItems.forEach(async (item) => {
+            rushItems.forEach(async (item, idx) => {
                 try {
-                    const data = await postSingle(item.text);
+                    let data;
+                    if (idx === 0 && window.ReadableStream) {
+                        data = await postStream(item.text, (partial) => {
+                            if (item.gen === generation && translationMode !== 'off' && readerRouteActive) {
+                                renderStreamingProgress(item.el, partial);
+                            }
+                        });
+                    } else {
+                        data = await postSingle(item.text);
+                    }
                     if (item.gen !== generation || translationMode === 'off' || !readerRouteActive) {
                         return;
                     }

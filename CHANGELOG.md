@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-09-05
+
+### Added
+- Real-time Server-Sent Events (SSE) token streaming via new endpoint `/translate/stream`: first paragraph tokens stream dynamically into the reader viewport with ~80ms time-to-first-token.
+- High-capacity asynchronous IndexedDB browser cache (`BookTranslatorDB` / `translations_v1`), allowing whole-book offline translation caching without browser `localStorage` 5MB quota constraints.
+- Progressive live text rendering with visual streaming cursor (`bt-streaming-live`) in both bilingual and replacement reading modes.
+
+### Performance
+- Zero-wait reading experience: token streaming for paragraph 1 runs in parallel with concurrent micro-batches for paragraphs 2 and 3, eliminating perceived latency completely.
+- Network connection reuse and keep-alive streaming adapters for upstream LLM provider calls.
+
 ## [2.3.2] - 2026-09-04
 
 ### Added
